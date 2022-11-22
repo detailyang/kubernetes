@@ -18,6 +18,7 @@ package scheduler
 
 import (
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
 
@@ -351,9 +352,15 @@ func addAllEventHandlers(
 				buildEvtResHandler(at, framework.CSIDriver, "CSIDriver"),
 			)
 		case framework.CSIStorageCapacity:
-			informerFactory.Storage().V1().CSIStorageCapacities().Informer().AddEventHandler(
-				buildEvtResHandler(at, framework.CSIStorageCapacity, "CSIStorageCapacity"),
-			)
+			if len(os.Getenv("ENABLE_CSIStorageCapacities_V1")) != 0 {
+				informerFactory.Storage().V1().CSIStorageCapacities().Informer().AddEventHandler(
+					buildEvtResHandler(at, framework.CSIStorageCapacity, "CSIStorageCapacity"),
+				)
+			} else {
+				informerFactory.Storage().V1beta1().CSIStorageCapacities().Informer().AddEventHandler(
+					buildEvtResHandler(at, framework.CSIStorageCapacity, "CSIStorageCapacity"),
+				)
+			}
 		case framework.PersistentVolume:
 			// MaxPDVolumeCountPredicate: since it relies on the counts of PV.
 			//

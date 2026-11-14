@@ -20,11 +20,13 @@ import (
 	"encoding/json"
 	"strings"
 
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apiextensions-apiserver/pkg/features"
+	apiextensionsv1conversion "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/apiserver/pkg/cel/common"
+	"k8s.io/apiserver/pkg/cel/environment"
 	openapierrors "k8s.io/kube-openapi/pkg/validation/errors"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 	"k8s.io/kube-openapi/pkg/validation/strfmt"
@@ -33,62 +35,81 @@ import (
 
 type SchemaValidator interface {
 	SchemaCreateValidator
-	ValidateUpdate(new, old interface{}) *validate.Result
+	ValidateUpdate(new, old interface{}, options ...ValidationOption) *validate.Result
 }
 
 type SchemaCreateValidator interface {
-	Validate(value interface{}) *validate.Result
+	Validate(value interface{}, options ...ValidationOption) *validate.Result
 }
 
-// basicSchemaValidator wraps a kube-openapi SchemaCreateValidator to
-// support ValidateUpdate. It implements ValidateUpdate by simply validating
-// the new value via kube-openapi, ignoring the old value.
-type basicSchemaValidator struct {
-	*validate.SchemaValidator
+type ValidationOptions struct {
+	// Whether errors from unchanged portions of the schema should be ratcheted
+	// This field is ignored for Validate
+	Ratcheting bool
+
+	// Correlation between old and new arguments.
+	// If set, this is expected to be the correlation between the `new` and
+	// `old` arguments to ValidateUpdate, and values for `new` and `old` will
+	// be taken from the correlation.
+	//
+	// This field is ignored for Validate
+	//
+	// Used for ratcheting, but left as a separate field since it may be used
+	// for other purposes in the future.
+	CorrelatedObject *common.CorrelatedObject
 }
 
-func (s basicSchemaValidator) ValidateUpdate(new, old interface{}) *validate.Result {
-	return s.Validate(new)
+type ValidationOption func(*ValidationOptions)
+
+func NewValidationOptions(opts ...ValidationOption) ValidationOptions {
+	options := ValidationOptions{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+	return options
 }
 
-// NewSchemaValidator creates an openapi schema validator for the given CRD validation.
-//
-// If feature `CRDValidationRatcheting` is disabled, this returns validator which
-// validates all `Update`s and `Create`s as a `Create` - without considering old value.
-//
-// If feature `CRDValidationRatcheting` is enabled - the validator returned
-// will support ratcheting unchanged correlatable fields across an update.
+func WithRatcheting(correlation *common.CorrelatedObject) ValidationOption {
+	return func(options *ValidationOptions) {
+		options.Ratcheting = true
+		options.CorrelatedObject = correlation
+	}
+}
+
+// NewSchemaValidator creates an openapi schema validator for the given CRD validation using environment.DefaultCompatibilityVersion().
 func NewSchemaValidator(customResourceValidation *apiextensions.JSONSchemaProps) (SchemaValidator, *spec.Schema, error) {
+	return NewSchemaValidatorForVersion(customResourceValidation, environment.DefaultCompatibilityVersion())
+}
+
+// NewSchemaValidatorForVersion creates an openapi schema validator for the given CRD validation and compatibilityVersion.
+//
+// The returned validator supports ratcheting unchanged correlatable fields across an update.
+func NewSchemaValidatorForVersion(customResourceValidation *apiextensions.JSONSchemaProps, compatibilityVersion *version.Version) (SchemaValidator, *spec.Schema, error) {
 	// Convert CRD schema to openapi schema
 	openapiSchema := &spec.Schema{}
 	if customResourceValidation != nil {
 		// TODO: replace with NewStructural(...).ToGoOpenAPI
-		if err := ConvertJSONSchemaPropsWithPostProcess(customResourceValidation, openapiSchema, StripUnsupportedFormatsPostProcess); err != nil {
+		formatPostProcessor := StripUnsupportedFormatsPostProcessorForVersion(compatibilityVersion)
+		if err := ConvertJSONSchemaPropsWithPostProcess(customResourceValidation, openapiSchema, formatPostProcessor); err != nil {
 			return nil, nil, err
 		}
 	}
+	return NewSchemaValidatorFromOpenAPI(openapiSchema), openapiSchema, nil
+}
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.CRDValidationRatcheting) {
-		return NewRatchetingSchemaValidator(openapiSchema, nil, "", strfmt.Default), openapiSchema, nil
-	}
-	return basicSchemaValidator{validate.NewSchemaValidator(openapiSchema, nil, "", strfmt.Default)}, openapiSchema, nil
+func NewSchemaValidatorFromOpenAPI(openapiSchema *spec.Schema) SchemaValidator {
+	return NewRatchetingSchemaValidator(openapiSchema, nil, "", strfmt.Default)
 }
 
 // ValidateCustomResourceUpdate validates the transition of Custom Resource from
 // `old` to `new` against the schema in the CustomResourceDefinition.
 // Both customResource and old represent a JSON data structures.
-//
-// If feature `CRDValidationRatcheting` is disabled, this behaves identically to
-// ValidateCustomResource(customResource).
-func ValidateCustomResourceUpdate(fldPath *field.Path, customResource, old interface{}, validator SchemaValidator) field.ErrorList {
-	// Additional feature gate check for sanity
-	if !utilfeature.DefaultFeatureGate.Enabled(features.CRDValidationRatcheting) {
-		return ValidateCustomResource(nil, customResource, validator)
-	} else if validator == nil {
+func ValidateCustomResourceUpdate(fldPath *field.Path, customResource, old interface{}, validator SchemaValidator, options ...ValidationOption) field.ErrorList {
+	if validator == nil {
 		return nil
 	}
 
-	result := validator.ValidateUpdate(customResource, old)
+	result := validator.ValidateUpdate(customResource, old, options...)
 	if result.IsValid() {
 		return nil
 	}
@@ -98,12 +119,12 @@ func ValidateCustomResourceUpdate(fldPath *field.Path, customResource, old inter
 
 // ValidateCustomResource validates the Custom Resource against the schema in the CustomResourceDefinition.
 // CustomResource is a JSON data structure.
-func ValidateCustomResource(fldPath *field.Path, customResource interface{}, validator SchemaCreateValidator) field.ErrorList {
+func ValidateCustomResource(fldPath *field.Path, customResource interface{}, validator SchemaCreateValidator, options ...ValidationOption) field.ErrorList {
 	if validator == nil {
 		return nil
 	}
 
-	result := validator.Validate(customResource)
+	result := validator.Validate(customResource, options...)
 	if result.IsValid() {
 		return nil
 	}
@@ -139,17 +160,21 @@ func kubeOpenAPIResultToFieldErrors(fldPath *field.Path, result *validate.Result
 				allErrs = append(allErrs, field.NotSupported(errPath, err.Value, values))
 
 			case openapierrors.TooLongFailCode:
-				value := interface{}("")
-				if err.Value != nil {
-					value = err.Value
-				}
 				max := int64(-1)
 				if i, ok := err.Valid.(int64); ok {
 					max = i
 				}
-				allErrs = append(allErrs, field.TooLongMaxLength(errPath, value, int(max)))
+				allErrs = append(allErrs, field.TooLong(errPath, "" /*unused*/, int(max)))
 
-			case openapierrors.MaxItemsFailCode:
+			case openapierrors.TooShortFailCode:
+				min := int64(-1)
+				if i, ok := err.Valid.(int64); ok {
+					min = i
+				}
+				value, _ := err.Value.(string)
+				allErrs = append(allErrs, field.TooShort(errPath, value, int(min)))
+
+			case openapierrors.MaxItemsFailCode, openapierrors.TooManyPropertiesCode:
 				actual := int64(-1)
 				if i, ok := err.Value.(int64); ok {
 					actual = i
@@ -160,16 +185,16 @@ func kubeOpenAPIResultToFieldErrors(fldPath *field.Path, result *validate.Result
 				}
 				allErrs = append(allErrs, field.TooMany(errPath, int(actual), int(max)))
 
-			case openapierrors.TooManyPropertiesCode:
+			case openapierrors.MinItemsFailCode, openapierrors.TooFewPropertiesCode:
 				actual := int64(-1)
 				if i, ok := err.Value.(int64); ok {
 					actual = i
 				}
-				max := int64(-1)
+				min := int64(-1)
 				if i, ok := err.Valid.(int64); ok {
-					max = i
+					min = i
 				}
-				allErrs = append(allErrs, field.TooMany(errPath, int(actual), int(max)))
+				allErrs = append(allErrs, field.TooFew(errPath, int(actual), int(min)))
 
 			case openapierrors.InvalidTypeCode:
 				value := interface{}("")
@@ -356,7 +381,7 @@ func ConvertJSONSchemaPropsWithPostProcess(in *apiextensions.JSONSchemaProps, ou
 	}
 	if len(in.XValidations) != 0 {
 		var serializationValidationRules apiextensionsv1.ValidationRules
-		if err := apiextensionsv1.Convert_apiextensions_ValidationRules_To_v1_ValidationRules(&in.XValidations, &serializationValidationRules, nil); err != nil {
+		if err := apiextensionsv1conversion.Convert_apiextensions_ValidationRules_To_v1_ValidationRules(&in.XValidations, &serializationValidationRules, nil); err != nil {
 			return err
 		}
 		out.VendorExtensible.AddExtension("x-kubernetes-validations", convertSliceToInterfaceSlice(serializationValidationRules))

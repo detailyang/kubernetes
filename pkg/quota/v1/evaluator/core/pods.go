@@ -22,6 +22,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -33,16 +34,19 @@ import (
 	"k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/utils/clock"
 
-	resourcehelper "k8s.io/kubernetes/pkg/api/v1/resource"
+	resourcehelper "k8s.io/component-helpers/resource"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	k8s_api_v1 "k8s.io/kubernetes/pkg/apis/core/v1"
 	"k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	"k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
 	"k8s.io/kubernetes/pkg/features"
+	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
 )
 
 // the name used for object count quota
 var podObjectCountName = generic.ObjectCountQuotaResourceNameFor(corev1.SchemeGroupVersion.WithResource("pods").GroupResource())
+var resourceRequestsDeviceClassPrefix = corev1.DefaultResourceRequestsPrefix + resourceapi.ResourceDeviceClassPrefix
 
 // podResources are the set of resources managed by quota associated with pods.
 var podResources = []corev1.ResourceName{
@@ -82,8 +86,15 @@ func maskResourceWithPrefix(resource corev1.ResourceName, prefix string) corev1.
 // has the quota related resource prefix.
 func isExtendedResourceNameForQuota(name corev1.ResourceName) bool {
 	// As overcommit is not supported by extended resources for now,
-	// only quota objects in format of "requests.resourceName" is allowed.
-	return !helper.IsNativeResource(name) && strings.HasPrefix(string(name), corev1.DefaultResourceRequestsPrefix)
+	// quota objects in format of "requests.resourceName" is allowed
+	nonNative := !helper.IsNativeResource(name)
+	// allow the implicit extended resource name in the format of
+	// requests.deviceclass.resource.kubernetes.io/device-class-name
+	implicitExtendedResource := strings.HasPrefix(string(name), resourceRequestsDeviceClassPrefix)
+	// name starts with 'requests.'
+	isQuotaRequest := strings.HasPrefix(string(name), corev1.DefaultResourceRequestsPrefix)
+
+	return (nonNative || implicitExtendedResource) && isQuotaRequest
 }
 
 // NOTE: it was a mistake, but if a quota tracks cpu or memory related resources,
@@ -122,6 +133,18 @@ func (p *podEvaluator) Constraints(required []corev1.ResourceName, item runtime.
 		return err
 	}
 
+	// As mentioned in the subsequent comment, the older versions required explicit
+	// resource requests for CPU & memory for each container if resource quotas were
+	// enabled for these resources. This was a design flaw as resource validation is
+	// coupled with quota enforcement. With pod-level resources
+	// feature, container-level resources are not mandatory. Hence the check for
+	// missing container requests, for CPU/memory resources that have quotas set,
+	// is skipped when pod-level resources feature is enabled and resources are set
+	// at pod level.
+	if feature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+		return nil
+	}
+
 	// BACKWARD COMPATIBILITY REQUIREMENT: if we quota cpu or memory, then each container
 	// must make an explicit request for the resource.  this was a mistake.  it coupled
 	// validation with resource counting, but we did this before QoS was even defined.
@@ -156,11 +179,53 @@ func (p *podEvaluator) GroupResource() schema.GroupResource {
 // Handles returns true if the evaluator should handle the specified attributes.
 func (p *podEvaluator) Handles(a admission.Attributes) bool {
 	op := a.GetOperation()
-	if op == admission.Create {
-		return true
+	switch a.GetSubresource() {
+	case "":
+		if op == admission.Update {
+			pod, err1 := toExternalPodOrError(a.GetObject())
+			oldPod, err2 := toExternalPodOrError(a.GetOldObject())
+			if err1 != nil || err2 != nil {
+				return false
+			}
+			// when scope changed
+			if IsTerminating(oldPod) != IsTerminating(pod) {
+				return true
+			}
+		}
+		return op == admission.Create
+	case "resize":
+		return op == admission.Update
+	case "dynamic":
+		if op != admission.Update {
+			return false
+		}
+		pod, err1 := toExternalPodOrError(a.GetObject())
+		oldPod, err2 := toExternalPodOrError(a.GetOldObject())
+		if err1 != nil || err2 != nil {
+			return true
+		}
+		// Updates that don't change usage or scope aren't charged, as on the main resource, so a
+		// pod that predates a quota's constraints can still get e.g. an image update.
+		return IsTerminating(oldPod) != IsTerminating(pod) || resourcesChanged(oldPod, pod) || containersAdded(oldPod, pod)
+	default:
+		return false
 	}
-	if feature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) && op == admission.Update {
-		return true
+}
+
+// resourcesChanged returns true if the pod's total requests or limits changed.
+func resourcesChanged(oldPod, pod *corev1.Pod) bool {
+	opts := podResourcesOptions()
+	return !quota.Equals(resourcehelper.PodRequests(oldPod, opts), resourcehelper.PodRequests(pod, opts)) ||
+		!quota.Equals(resourcehelper.PodLimits(oldPod, opts), resourcehelper.PodLimits(pod, opts))
+}
+
+// containersAdded returns true if pod has a container that oldPod doesn't. Added containers must
+// meet the quota's per-container constraints even if the totals don't change.
+func containersAdded(oldPod, pod *corev1.Pod) bool {
+	for pair := range podutil.ContainerPairs(pod, oldPod, podutil.Containers) {
+		if pair.Old == nil {
+			return true
+		}
 	}
 	return false
 }
@@ -288,7 +353,7 @@ func podComputeUsageHelper(requests corev1.ResourceList, limits corev1.ResourceL
 			result[maskResourceWithPrefix(resource, corev1.DefaultResourceRequestsPrefix)] = request
 		}
 		// for extended resources
-		if helper.IsExtendedResourceName(resource) {
+		if schedutil.IsDRAExtendedResourceName(resource) {
 			// only quota objects in format of "requests.resourceName" is allowed for extended resource.
 			result[maskResourceWithPrefix(resource, corev1.DefaultResourceRequestsPrefix)] = request
 		}
@@ -320,9 +385,9 @@ func podMatchesScopeFunc(selector corev1.ScopedResourceSelectorRequirement, obje
 	}
 	switch selector.ScopeName {
 	case corev1.ResourceQuotaScopeTerminating:
-		return isTerminating(pod), nil
+		return IsTerminating(pod), nil
 	case corev1.ResourceQuotaScopeNotTerminating:
-		return !isTerminating(pod), nil
+		return !IsTerminating(pod), nil
 	case corev1.ResourceQuotaScopeBestEffort:
 		return isBestEffort(pod), nil
 	case corev1.ResourceQuotaScopeNotBestEffort:
@@ -364,9 +429,7 @@ func PodUsageFunc(obj runtime.Object, clock clock.Clock) (corev1.ResourceList, e
 		return result, nil
 	}
 
-	opts := resourcehelper.PodResourcesOptions{
-		InPlacePodVerticalScalingEnabled: feature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling),
-	}
+	opts := podResourcesOptions()
 	requests := resourcehelper.PodRequests(pod, opts)
 	limits := resourcehelper.PodLimits(pod, opts)
 
@@ -374,11 +437,19 @@ func PodUsageFunc(obj runtime.Object, clock clock.Clock) (corev1.ResourceList, e
 	return result, nil
 }
 
+func podResourcesOptions() resourcehelper.PodResourcesOptions {
+	return resourcehelper.PodResourcesOptions{
+		UseStatusResources: true,
+		// SkipPodLevelResources is set to false when PodLevelResources feature is enabled.
+		SkipPodLevelResources: !feature.DefaultFeatureGate.Enabled(features.PodLevelResources),
+	}
+}
+
 func isBestEffort(pod *corev1.Pod) bool {
 	return qos.GetPodQOS(pod) == corev1.PodQOSBestEffort
 }
 
-func isTerminating(pod *corev1.Pod) bool {
+func IsTerminating(pod *corev1.Pod) bool {
 	if pod.Spec.ActiveDeadlineSeconds != nil && *pod.Spec.ActiveDeadlineSeconds >= int64(0) {
 		return true
 	}

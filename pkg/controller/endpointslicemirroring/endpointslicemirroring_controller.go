@@ -19,6 +19,7 @@ package endpointslicemirroring
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -62,9 +63,9 @@ const (
 	// maxSyncBackOff is the max backoff period for syncEndpoints calls.
 	maxSyncBackOff = 100 * time.Second
 
-	// controllerName is a unique value used with LabelManagedBy to indicated
+	// ControllerName is a unique value used with LabelManagedBy to indicated
 	// the component managing an EndpointSlice.
-	controllerName = "endpointslicemirroring-controller.k8s.io"
+	ControllerName = "endpointslicemirroring-controller.k8s.io"
 )
 
 // NewController creates and initializes a new Controller
@@ -76,7 +77,7 @@ func NewController(ctx context.Context, endpointsInformer coreinformers.Endpoint
 	endpointUpdatesBatchPeriod time.Duration,
 ) *Controller {
 	logger := klog.FromContext(ctx)
-	broadcaster := record.NewBroadcaster()
+	broadcaster := record.NewBroadcaster(record.WithContext(ctx))
 	recorder := broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "endpoint-slice-mirroring-controller"})
 
 	metrics.RegisterMetrics()
@@ -88,16 +89,21 @@ func NewController(ctx context.Context, endpointsInformer coreinformers.Endpoint
 		// processes events that can require significant EndpointSlice changes.
 		// A more significant rate limit back off here helps ensure that the
 		// Controller does not overwhelm the API Server.
-		queue: workqueue.NewNamedRateLimitingQueue(workqueue.NewMaxOfRateLimiter(
-			workqueue.NewItemExponentialFailureRateLimiter(defaultSyncBackOff, maxSyncBackOff),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.NewTypedMaxOfRateLimiter(
+			workqueue.NewTypedItemExponentialFailureRateLimiter[string](defaultSyncBackOff, maxSyncBackOff),
 			// 10 qps, 100 bucket size. This is only for retry speed and its
 			// only the overall factor (not per item).
-			&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
-		), "endpoint_slice_mirroring"),
+			&workqueue.TypedBucketRateLimiter[string]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+		),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: new(klog.FromContext(ctx)),
+				Name:   "endpoint_slice_mirroring",
+			},
+		),
 		workerLoopPeriod: time.Second,
 	}
 
-	endpointsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = endpointsInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			c.onEndpointsAdd(logger, obj)
 		},
@@ -107,17 +113,17 @@ func NewController(ctx context.Context, endpointsInformer coreinformers.Endpoint
 		DeleteFunc: func(obj interface{}) {
 			c.onEndpointsDelete(logger, obj)
 		},
-	})
+	}, cache.HandlerOptions{Logger: &logger})
 	c.endpointsLister = endpointsInformer.Lister()
 	c.endpointsSynced = endpointsInformer.Informer().HasSynced
 
-	endpointSliceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = endpointSliceInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.onEndpointSliceAdd,
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			c.onEndpointSliceUpdate(logger, oldObj, newObj)
 		},
 		DeleteFunc: c.onEndpointSliceDelete,
-	})
+	}, cache.HandlerOptions{Logger: &logger})
 
 	c.endpointSliceLister = endpointSliceInformer.Lister()
 	c.endpointSlicesSynced = endpointSliceInformer.Informer().HasSynced
@@ -125,11 +131,11 @@ func NewController(ctx context.Context, endpointsInformer coreinformers.Endpoint
 
 	c.serviceLister = serviceInformer.Lister()
 	c.servicesSynced = serviceInformer.Informer().HasSynced
-	serviceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = serviceInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.onServiceAdd,
 		UpdateFunc: c.onServiceUpdate,
 		DeleteFunc: c.onServiceDelete,
-	})
+	}, cache.HandlerOptions{Logger: &logger})
 
 	c.maxEndpointsPerSubset = maxEndpointsPerSubset
 
@@ -192,7 +198,7 @@ type Controller struct {
 	// more often than Endpoints with few addresses; it also would cause an
 	// Endpoints resource that's inserted multiple times to be processed more
 	// than necessary.
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 
 	// maxEndpointsPerSubset references the maximum number of endpoints that
 	// should be added to an EndpointSlice for an EndpointSubset.
@@ -210,28 +216,34 @@ type Controller struct {
 
 // Run will not return until stopCh is closed.
 func (c *Controller) Run(ctx context.Context, workers int) {
-	defer utilruntime.HandleCrash()
+	defer utilruntime.HandleCrashWithContext(ctx)
 
 	// Start events processing pipeline.
 	c.eventBroadcaster.StartLogging(klog.Infof)
 	c.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: c.client.CoreV1().Events("")})
 	defer c.eventBroadcaster.Shutdown()
 
-	defer c.queue.ShutDown()
-
 	logger := klog.FromContext(ctx)
 	logger.Info("Starting EndpointSliceMirroring controller")
-	defer logger.Info("Shutting down EndpointSliceMirroring controller")
 
-	if !cache.WaitForNamedCacheSync("endpoint_slice_mirroring", ctx.Done(), c.endpointsSynced, c.endpointSlicesSynced, c.servicesSynced) {
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down EndpointSliceMirroring controller")
+		c.queue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, c.endpointsSynced, c.endpointSlicesSynced, c.servicesSynced) {
 		return
 	}
 
 	logger.V(2).Info("Starting worker threads", "total", workers)
-	for i := 0; i < workers; i++ {
-		go wait.Until(func() { c.worker(logger) }, c.workerLoopPeriod, ctx.Done())
-	}
 
+	for i := 0; i < workers; i++ {
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, c.worker, c.workerLoopPeriod)
+		})
+	}
 	<-ctx.Done()
 }
 
@@ -239,25 +251,25 @@ func (c *Controller) Run(ctx context.Context, workers int) {
 // marks them done. You may run as many of these in parallel as you wish; the
 // workqueue guarantees that they will not end up processing the same service
 // at the same time
-func (c *Controller) worker(logger klog.Logger) {
-	for c.processNextWorkItem(logger) {
+func (c *Controller) worker(ctx context.Context) {
+	for c.processNextWorkItem(ctx) {
 	}
 }
 
-func (c *Controller) processNextWorkItem(logger klog.Logger) bool {
+func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	cKey, quit := c.queue.Get()
 	if quit {
 		return false
 	}
 	defer c.queue.Done(cKey)
 
-	err := c.syncEndpoints(logger, cKey.(string))
-	c.handleErr(logger, err, cKey)
+	err := c.syncEndpoints(ctx, cKey)
+	c.handleErr(klog.FromContext(ctx), err, cKey)
 
 	return true
 }
 
-func (c *Controller) handleErr(logger klog.Logger, err error, key interface{}) {
+func (c *Controller) handleErr(logger klog.Logger, err error, key string) {
 	if err == nil {
 		c.queue.Forget(key)
 		return
@@ -274,7 +286,8 @@ func (c *Controller) handleErr(logger klog.Logger, err error, key interface{}) {
 	utilruntime.HandleError(err)
 }
 
-func (c *Controller) syncEndpoints(logger klog.Logger, key string) error {
+func (c *Controller) syncEndpoints(ctx context.Context, key string) error {
+	logger := klog.FromContext(ctx)
 	startTime := time.Now()
 	defer func() {
 		syncDuration := float64(time.Since(startTime).Milliseconds()) / 1000
@@ -294,7 +307,7 @@ func (c *Controller) syncEndpoints(logger klog.Logger, key string) error {
 		if apierrors.IsNotFound(err) {
 			logger.V(4).Info("Endpoints not found, cleaning up any mirrored EndpointSlices", "endpoints", klog.KRef(namespace, name))
 			c.endpointSliceTracker.DeleteService(namespace, name)
-			return c.deleteMirroredSlices(namespace, name)
+			return c.deleteMirroredSlices(ctx, namespace, name)
 		}
 		return err
 	}
@@ -302,7 +315,7 @@ func (c *Controller) syncEndpoints(logger klog.Logger, key string) error {
 	if !c.shouldMirror(endpoints) {
 		logger.V(4).Info("Endpoints should not be mirrored, cleaning up any mirrored EndpointSlices", "endpoints", klog.KRef(namespace, name))
 		c.endpointSliceTracker.DeleteService(namespace, name)
-		return c.deleteMirroredSlices(namespace, name)
+		return c.deleteMirroredSlices(ctx, namespace, name)
 	}
 
 	svc, err := c.serviceLister.Services(namespace).Get(name)
@@ -310,7 +323,7 @@ func (c *Controller) syncEndpoints(logger klog.Logger, key string) error {
 		if apierrors.IsNotFound(err) {
 			logger.V(4).Info("Service not found, cleaning up any mirrored EndpointSlices", "service", klog.KRef(namespace, name))
 			c.endpointSliceTracker.DeleteService(namespace, name)
-			return c.deleteMirroredSlices(namespace, name)
+			return c.deleteMirroredSlices(ctx, namespace, name)
 		}
 		return err
 	}
@@ -319,7 +332,7 @@ func (c *Controller) syncEndpoints(logger klog.Logger, key string) error {
 	if svc.Spec.Selector != nil {
 		logger.V(4).Info("Service now has selector, cleaning up any mirrored EndpointSlices", "service", klog.KRef(namespace, name))
 		c.endpointSliceTracker.DeleteService(namespace, name)
-		return c.deleteMirroredSlices(namespace, name)
+		return c.deleteMirroredSlices(ctx, namespace, name)
 	}
 
 	endpointSlices, err := endpointSlicesMirroredForService(c.endpointSliceLister, namespace, name)
@@ -331,7 +344,7 @@ func (c *Controller) syncEndpoints(logger klog.Logger, key string) error {
 		return endpointslicepkg.NewStaleInformerCache("EndpointSlice informer cache is out of date")
 	}
 
-	err = c.reconciler.reconcile(logger, endpoints, endpointSlices)
+	err = c.reconciler.reconcile(ctx, endpoints, endpointSlices)
 	if err != nil {
 		return err
 	}
@@ -464,8 +477,8 @@ func (c *Controller) onEndpointSliceAdd(obj interface{}) {
 // version in the endpointSliceTracker or the managed-by value of the
 // EndpointSlice has changed from or to this controller.
 func (c *Controller) onEndpointSliceUpdate(logger klog.Logger, prevObj, obj interface{}) {
-	prevEndpointSlice := obj.(*discovery.EndpointSlice)
-	endpointSlice := prevObj.(*discovery.EndpointSlice)
+	endpointSlice := obj.(*discovery.EndpointSlice)
+	prevEndpointSlice := prevObj.(*discovery.EndpointSlice)
 	if endpointSlice == nil || prevEndpointSlice == nil {
 		utilruntime.HandleError(fmt.Errorf("onEndpointSliceUpdated() expected type discovery.EndpointSlice, got %T, %T", prevObj, obj))
 		return
@@ -518,14 +531,14 @@ func (c *Controller) queueEndpointsForEndpointSlice(endpointSlice *discovery.End
 
 // deleteMirroredSlices will delete and EndpointSlices that have been mirrored
 // for Endpoints with this namespace and name.
-func (c *Controller) deleteMirroredSlices(namespace, name string) error {
+func (c *Controller) deleteMirroredSlices(ctx context.Context, namespace, name string) error {
 	endpointSlices, err := endpointSlicesMirroredForService(c.endpointSliceLister, namespace, name)
 	if err != nil {
 		return err
 	}
 
 	c.endpointSliceTracker.DeleteService(namespace, name)
-	return c.reconciler.deleteEndpoints(namespace, name, endpointSlices)
+	return c.reconciler.deleteEndpoints(ctx, namespace, name, endpointSlices)
 }
 
 // endpointSlicesMirroredForService returns the EndpointSlices that have been
@@ -533,7 +546,7 @@ func (c *Controller) deleteMirroredSlices(namespace, name string) error {
 func endpointSlicesMirroredForService(endpointSliceLister discoverylisters.EndpointSliceLister, namespace, name string) ([]*discovery.EndpointSlice, error) {
 	esLabelSelector := labels.Set(map[string]string{
 		discovery.LabelServiceName: name,
-		discovery.LabelManagedBy:   controllerName,
+		discovery.LabelManagedBy:   ControllerName,
 	}).AsSelectorPreValidated()
 	return endpointSliceLister.EndpointSlices(namespace).List(esLabelSelector)
 }

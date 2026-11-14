@@ -28,6 +28,8 @@ var PodConditionsByKubelet = []v1.PodConditionType{
 	v1.PodReady,
 	v1.PodInitialized,
 	v1.ContainersReady,
+	v1.PodResizeInProgress,
+	v1.PodResizePending,
 }
 
 // PodConditionByKubelet returns if the pod condition type is owned by kubelet
@@ -38,7 +40,12 @@ func PodConditionByKubelet(conditionType v1.PodConditionType) bool {
 		}
 	}
 	if utilfeature.DefaultFeatureGate.Enabled(features.PodReadyToStartContainersCondition) {
-		if conditionType == PodReadyToStartContainers {
+		if conditionType == v1.PodReadyToStartContainers {
+			return true
+		}
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) {
+		if conditionType == v1.AllContainersRestarting {
 			return true
 		}
 	}
@@ -47,10 +54,5 @@ func PodConditionByKubelet(conditionType v1.PodConditionType) bool {
 
 // PodConditionSharedByKubelet returns if the pod condition type is shared by kubelet
 func PodConditionSharedByKubelet(conditionType v1.PodConditionType) bool {
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodDisruptionConditions) {
-		if conditionType == v1.DisruptionTarget {
-			return true
-		}
-	}
-	return false
+	return conditionType == v1.DisruptionTarget
 }

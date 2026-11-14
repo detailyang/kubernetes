@@ -37,7 +37,7 @@ import (
 	"github.com/onsi/gomega"
 )
 
-var _ = SIGDescribe("Ephemeral Containers [NodeConformance]", func() {
+var _ = SIGDescribe("Ephemeral Containers", framework.WithNodeConformance(), func() {
 	f := framework.NewDefaultFramework("ephemeral-containers-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 	var podClient *e2epod.PodClient
@@ -63,6 +63,7 @@ var _ = SIGDescribe("Ephemeral Containers [NodeConformance]", func() {
 				},
 			},
 		})
+		gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(1))
 
 		ginkgo.By("adding an ephemeral container")
 		ecName := "debugger"
@@ -78,13 +79,22 @@ var _ = SIGDescribe("Ephemeral Containers [NodeConformance]", func() {
 		err := podClient.AddEphemeralContainerSync(ctx, pod, ec, time.Minute)
 		framework.ExpectNoError(err, "Failed to patch ephemeral containers in pod %q", e2epod.FormatPod(pod))
 
+		ginkgo.By("verifying the pod's generation is 2")
+		pod, err = podClient.Get(ctx, pod.Name, metav1.GetOptions{})
+		framework.ExpectNoError(err, "failed to query for pod")
+		gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(2))
+
 		ginkgo.By("checking pod container endpoints")
 		// Can't use anything depending on kubectl here because it's not available in the node test environment
 		output := e2epod.ExecCommandInContainer(f, pod.Name, ecName, "/bin/echo", "marco")
 		gomega.Expect(output).To(gomega.ContainSubstring("marco"))
-		log, err := e2epod.GetPodLogs(ctx, f.ClientSet, pod.Namespace, pod.Name, ecName)
-		framework.ExpectNoError(err, "Failed to get logs for pod %q ephemeral container %q", e2epod.FormatPod(pod), ecName)
-		gomega.Expect(log).To(gomega.ContainSubstring("polo"))
+		// Poll for the expected log output. The ephemeral container may report Running before
+		// it has actually executed the command and produced "polo" stdout, especially on
+		// runtimes with slower container startup (e.g. VM-isolated containers).
+		gomega.Eventually(ctx, func() (string, error) {
+			return e2epod.GetPodLogs(ctx, f.ClientSet, pod.Namespace, pod.Name, ecName)
+		}, f.Timeouts.PodStartShort, framework.PollInterval()).Should(gomega.ContainSubstring("polo"),
+			"Failed to get expected log output for pod %q ephemeral container %q", e2epod.FormatPod(pod), ecName)
 	})
 
 	/*
@@ -110,6 +120,7 @@ var _ = SIGDescribe("Ephemeral Containers [NodeConformance]", func() {
 				},
 			},
 		})
+		gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(1))
 
 		ginkgo.By("adding an ephemeral container")
 		ecName := "debugger"
@@ -125,13 +136,22 @@ var _ = SIGDescribe("Ephemeral Containers [NodeConformance]", func() {
 		err := podClient.AddEphemeralContainerSync(ctx, pod, ec, time.Minute)
 		framework.ExpectNoError(err, "Failed to patch ephemeral containers in pod %q", e2epod.FormatPod(pod))
 
+		ginkgo.By("verifying the pod's generation is 2")
+		pod, err = podClient.Get(ctx, pod.Name, metav1.GetOptions{})
+		framework.ExpectNoError(err, "failed to query for pod")
+		gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(2))
+
 		ginkgo.By("checking pod container endpoints")
 		// Can't use anything depending on kubectl here because it's not available in the node test environment
 		output := e2epod.ExecCommandInContainer(f, pod.Name, ecName, "/bin/echo", "marco")
 		gomega.Expect(output).To(gomega.ContainSubstring("marco"))
-		log, err := e2epod.GetPodLogs(ctx, f.ClientSet, pod.Namespace, pod.Name, ecName)
-		framework.ExpectNoError(err, "Failed to get logs for pod %q ephemeral container %q", e2epod.FormatPod(pod), ecName)
-		gomega.Expect(log).To(gomega.ContainSubstring("polo"))
+		// Poll for the expected log output. The ephemeral container may report Running before
+		// it has actually executed the command and produced "polo" stdout, especially on
+		// runtimes with slower container startup (e.g. VM-isolated containers).
+		gomega.Eventually(ctx, func() (string, error) {
+			return e2epod.GetPodLogs(ctx, f.ClientSet, pod.Namespace, pod.Name, ecName)
+		}, f.Timeouts.PodStartShort, framework.PollInterval()).Should(gomega.ContainSubstring("polo"),
+			"Failed to get expected log output for pod %q ephemeral container %q", e2epod.FormatPod(pod), ecName)
 
 		ginkgo.By(fmt.Sprintf("checking pod %q has only one ephemeralcontainer", pod.Name))
 		podResource := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}

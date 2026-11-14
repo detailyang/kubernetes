@@ -25,8 +25,8 @@ import (
 	"testing"
 	"time"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	apiextensionsclient "k8s.io/apiextensions-api/pkg/client/clientset/clientset"
 	"k8s.io/apiextensions-apiserver/test/integration/fixtures"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1368,7 +1368,7 @@ func testFieldValidationApplyCreate(t *testing.T, client clientset.Interface) {
 				FieldValidation: "Strict",
 				FieldManager:    "mgr",
 			},
-			strictDecodingError: `error strict decoding YAML: error converting YAML to JSON: yaml: unmarshal errors:
+			strictDecodingError: `error strict decoding patch: error converting YAML to JSON: yaml: unmarshal errors:
   line 10: key "paused" already set in map
   line 27: key "imagePullPolicy" already set in map`,
 		},
@@ -1448,7 +1448,7 @@ func testFieldValidationApplyUpdate(t *testing.T, client clientset.Interface) {
 				FieldValidation: "Strict",
 				FieldManager:    "mgr",
 			},
-			strictDecodingError: `error strict decoding YAML: error converting YAML to JSON: yaml: unmarshal errors:
+			strictDecodingError: `error strict decoding patch: error converting YAML to JSON: yaml: unmarshal errors:
   line 10: key "paused" already set in map
   line 27: key "imagePullPolicy" already set in map`,
 		},
@@ -2573,7 +2573,7 @@ func testFieldValidationApplyCreateCRD(t *testing.T, rest rest.Interface, gvk sc
 				FieldValidation: "Strict",
 				FieldManager:    "mgr",
 			},
-			strictDecodingError: `error strict decoding YAML: error converting YAML to JSON: yaml: unmarshal errors:
+			strictDecodingError: `error strict decoding patch: error converting YAML to JSON: yaml: unmarshal errors:
   line 10: key "knownField1" already set in map
   line 16: key "hostPort" already set in map`,
 		},
@@ -2659,7 +2659,7 @@ func testFieldValidationApplyCreateCRDSchemaless(t *testing.T, rest rest.Interfa
 				FieldValidation: "Strict",
 				FieldManager:    "mgr",
 			},
-			strictDecodingError: `error strict decoding YAML: error converting YAML to JSON: yaml: unmarshal errors:
+			strictDecodingError: `error strict decoding patch: error converting YAML to JSON: yaml: unmarshal errors:
   line 10: key "knownField1" already set in map
   line 16: key "hostPort" already set in map`,
 		},
@@ -2744,7 +2744,7 @@ func testFieldValidationApplyUpdateCRD(t *testing.T, rest rest.Interface, gvk sc
 				FieldValidation: "Strict",
 				FieldManager:    "mgr",
 			},
-			strictDecodingError: `error strict decoding YAML: error converting YAML to JSON: yaml: unmarshal errors:
+			strictDecodingError: `error strict decoding patch: error converting YAML to JSON: yaml: unmarshal errors:
   line 10: key "knownField1" already set in map
   line 16: key "hostPort" already set in map`,
 		},
@@ -2839,7 +2839,7 @@ func testFieldValidationApplyUpdateCRDSchemaless(t *testing.T, rest rest.Interfa
 				FieldValidation: "Strict",
 				FieldManager:    "mgr",
 			},
-			strictDecodingError: `error strict decoding YAML: error converting YAML to JSON: yaml: unmarshal errors:
+			strictDecodingError: `error strict decoding patch: error converting YAML to JSON: yaml: unmarshal errors:
   line 10: key "knownField1" already set in map
   line 16: key "hostPort" already set in map`,
 		},
@@ -2936,6 +2936,13 @@ func testFinalizerValidationApplyCreateAndUpdateCRD(t *testing.T, rest rest.Inte
 		{
 			name:      "create-crd-with-valid-finalizer",
 			finalizer: []string{"kubernetes.io/valid-finalizer"},
+		},
+		{
+			name:      "create-crd-with-fqdn-like-finalizer-without-path",
+			finalizer: []string{"finalizer.without.valid-path.io"},
+			expectCreateWarnings: []string{
+				`metadata.finalizers: "finalizer.without.valid-path.io": prefer a domain-qualified finalizer name including a path (/) to avoid accidental conflicts with other finalizer writers`,
+			},
 		},
 		{
 			name:             "update-crd-with-invalid-finalizer",

@@ -21,6 +21,8 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/ktesting"
+	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
 )
 
 func TestContainerCalculateAffinity(t *testing.T) {
@@ -38,7 +40,7 @@ func TestContainerCalculateAffinity(t *testing.T) {
 			name: "HintProvider returns empty non-nil map[string][]TopologyHint",
 			hp: []HintProvider{
 				&mockHintProvider{
-					map[string][]TopologyHint{},
+					th: map[string][]TopologyHint{},
 				},
 			},
 			expected: []map[string][]TopologyHint{
@@ -49,7 +51,7 @@ func TestContainerCalculateAffinity(t *testing.T) {
 			name: "HintProvider returns -nil map[string][]TopologyHint from provider",
 			hp: []HintProvider{
 				&mockHintProvider{
-					map[string][]TopologyHint{
+					th: map[string][]TopologyHint{
 						"resource": nil,
 					},
 				},
@@ -64,7 +66,7 @@ func TestContainerCalculateAffinity(t *testing.T) {
 			name: "Assorted HintProviders",
 			hp: []HintProvider{
 				&mockHintProvider{
-					map[string][]TopologyHint{
+					th: map[string][]TopologyHint{
 						"resource-1/A": {
 							{NUMANodeAffinity: NewTestBitMask(0), Preferred: true},
 							{NUMANodeAffinity: NewTestBitMask(0, 1), Preferred: false},
@@ -76,7 +78,7 @@ func TestContainerCalculateAffinity(t *testing.T) {
 					},
 				},
 				&mockHintProvider{
-					map[string][]TopologyHint{
+					th: map[string][]TopologyHint{
 						"resource-2/A": {
 							{NUMANodeAffinity: NewTestBitMask(2), Preferred: true},
 							{NUMANodeAffinity: NewTestBitMask(3, 4), Preferred: false},
@@ -88,7 +90,7 @@ func TestContainerCalculateAffinity(t *testing.T) {
 					},
 				},
 				&mockHintProvider{
-					map[string][]TopologyHint{
+					th: map[string][]TopologyHint{
 						"resource-3": nil,
 					},
 				},
@@ -121,16 +123,18 @@ func TestContainerCalculateAffinity(t *testing.T) {
 		},
 	}
 
+	logger, _ := ktesting.NewTestContext(t)
+
 	for _, tc := range tcases {
 		ctnScope := &containerScope{
 			scope{
 				hintProviders: tc.hp,
 				policy:        &mockPolicy{},
-				name:          podTopologyScope,
+				name:          PodTopologyScope,
 			},
 		}
 
-		ctnScope.calculateAffinity(&v1.Pod{}, &v1.Container{})
+		ctnScope.calculateAffinity(logger, &v1.Pod{}, &v1.Container{}, lifecycle.AddOperation)
 		actual := ctnScope.policy.(*mockPolicy).ph
 		if !reflect.DeepEqual(tc.expected, actual) {
 			t.Errorf("Test Case: %s", tc.name)
@@ -154,7 +158,7 @@ func TestContainerAccumulateProvidersHints(t *testing.T) {
 			name: "HintProvider returns empty non-nil map[string][]TopologyHint",
 			hp: []HintProvider{
 				&mockHintProvider{
-					map[string][]TopologyHint{},
+					th: map[string][]TopologyHint{},
 				},
 			},
 			expected: []map[string][]TopologyHint{
@@ -165,7 +169,7 @@ func TestContainerAccumulateProvidersHints(t *testing.T) {
 			name: "HintProvider returns - nil map[string][]TopologyHint from provider",
 			hp: []HintProvider{
 				&mockHintProvider{
-					map[string][]TopologyHint{
+					th: map[string][]TopologyHint{
 						"resource": nil,
 					},
 				},
@@ -180,12 +184,12 @@ func TestContainerAccumulateProvidersHints(t *testing.T) {
 			name: "2 HintProviders with 1 resource returns hints",
 			hp: []HintProvider{
 				&mockHintProvider{
-					map[string][]TopologyHint{
+					th: map[string][]TopologyHint{
 						"resource1": {TopologyHint{}},
 					},
 				},
 				&mockHintProvider{
-					map[string][]TopologyHint{
+					th: map[string][]TopologyHint{
 						"resource2": {TopologyHint{}},
 					},
 				},
@@ -203,11 +207,11 @@ func TestContainerAccumulateProvidersHints(t *testing.T) {
 			name: "2 HintProviders 1 with 1 resource 1 with nil hints",
 			hp: []HintProvider{
 				&mockHintProvider{
-					map[string][]TopologyHint{
+					th: map[string][]TopologyHint{
 						"resource1": {TopologyHint{}},
 					},
 				},
-				&mockHintProvider{nil},
+				&mockHintProvider{th: nil},
 			},
 			expected: []map[string][]TopologyHint{
 				{
@@ -220,12 +224,12 @@ func TestContainerAccumulateProvidersHints(t *testing.T) {
 			name: "2 HintProviders 1 with 1 resource 1 empty hints",
 			hp: []HintProvider{
 				&mockHintProvider{
-					map[string][]TopologyHint{
+					th: map[string][]TopologyHint{
 						"resource1": {TopologyHint{}},
 					},
 				},
 				&mockHintProvider{
-					map[string][]TopologyHint{},
+					th: map[string][]TopologyHint{},
 				},
 			},
 			expected: []map[string][]TopologyHint{
@@ -239,7 +243,7 @@ func TestContainerAccumulateProvidersHints(t *testing.T) {
 			name: "HintProvider with 2 resources returns hints",
 			hp: []HintProvider{
 				&mockHintProvider{
-					map[string][]TopologyHint{
+					th: map[string][]TopologyHint{
 						"resource1": {TopologyHint{}},
 						"resource2": {TopologyHint{}},
 					},
@@ -254,13 +258,15 @@ func TestContainerAccumulateProvidersHints(t *testing.T) {
 		},
 	}
 
+	logger, _ := ktesting.NewTestContext(t)
+
 	for _, tc := range tcases {
 		ctnScope := containerScope{
 			scope{
 				hintProviders: tc.hp,
 			},
 		}
-		actual := ctnScope.accumulateProvidersHints(&v1.Pod{}, &v1.Container{})
+		actual := ctnScope.accumulateProvidersHints(logger, &v1.Pod{}, &v1.Container{}, lifecycle.AddOperation)
 		if !reflect.DeepEqual(actual, tc.expected) {
 			t.Errorf("Test Case %s: Expected NUMANodeAffinity in result to be %v, got %v", tc.name, tc.expected, actual)
 		}

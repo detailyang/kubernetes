@@ -2,13 +2,11 @@
 
 reviewers:
   - thockin
-  - smarterclayton
   - wojtek-t
   - deads2k
   - yujuhong
   - derekwaynecarr
   - caesarxuchao
-  - mikedanese
   - liggitt
   - sttts
   - dchen1107
@@ -16,8 +14,9 @@ reviewers:
   - luxas
   - janetkuo
   - justinsb
-  - ncdc
   - tallclair
   - jsafrane
   - dims
   - jayunit100
+emeritus_reviewers:
+  - ncdc

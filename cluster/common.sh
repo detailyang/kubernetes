@@ -308,6 +308,8 @@ function find-tar() {
   locations=(
     "${KUBE_ROOT}/node/${tarball}"
     "${KUBE_ROOT}/server/${tarball}"
+    "${KUBE_ROOT}/kubernetes/node/${tarball}"
+    "${KUBE_ROOT}/kubernetes/server/${tarball}"    
     "${KUBE_ROOT}/_output/release-tars/${tarball}"
   )
   location=$( (ls -t "${locations[@]}" 2>/dev/null || true) | head -1 )
@@ -479,13 +481,13 @@ EOF
       ;;
     server)
       echo "Generate server certificates..."
-      echo '{"CN":"'"${member_ip}"'","hosts":[""],"key":{"algo":"ecdsa","size":256}}' \
+      echo '{"CN":"'"${member_ip}"'","hosts":[],"key":{"algo":"ecdsa","size":256}}' \
        | ${CFSSL_BIN} gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=server -hostname="${member_ip},127.0.0.1" - \
        | ${CFSSLJSON_BIN} -bare "${prefix}"
       ;;
     peer)
       echo "Generate peer certificates..."
-      echo '{"CN":"'"${member_ip}"'","hosts":[""],"key":{"algo":"ecdsa","size":256}}' \
+      echo '{"CN":"'"${member_ip}"'","hosts":[],"key":{"algo":"ecdsa","size":256}}' \
        | ${CFSSL_BIN} gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=peer -hostname="${member_ip},127.0.0.1" - \
        | ${CFSSLJSON_BIN} -bare "${prefix}"
       ;;

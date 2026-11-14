@@ -2,19 +2,18 @@
 
 reviewers:
   - thockin
-  - smarterclayton
   - wojtek-t
   - deads2k
   - derekwaynecarr
   - caesarxuchao
-  - mikedanese
   - liggitt
   - sttts
   - saad-ali
   - janetkuo
   - justinsb
-  - ncdc
   - tallclair
   - mwielgus
   - soltysh
   - dims
+emeritus_reviewers:
+  - ncdc

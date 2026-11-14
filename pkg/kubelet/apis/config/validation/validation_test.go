@@ -17,6 +17,7 @@ limitations under the License.
 package validation_test
 
 import (
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -26,61 +27,87 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	logsapi "k8s.io/component-base/logs/api/v1"
 	tracingapi "k8s.io/component-base/tracing/api/v1"
+	"k8s.io/kubernetes/pkg/features"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/apis/config/validation"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
-	utilpointer "k8s.io/utils/pointer"
+	kubeletutil "k8s.io/kubernetes/pkg/kubelet/util"
+	"k8s.io/utils/ptr"
 )
 
 var (
 	successConfig = kubeletconfig.KubeletConfiguration{
-		CgroupsPerQOS:                   cgroupsPerQOS,
-		EnforceNodeAllocatable:          enforceNodeAllocatable,
-		SystemReservedCgroup:            "/system.slice",
-		KubeReservedCgroup:              "/kubelet.service",
-		SystemCgroups:                   "",
-		CgroupRoot:                      "",
-		EventBurst:                      10,
-		EventRecordQPS:                  5,
-		HealthzPort:                     10248,
-		ImageGCHighThresholdPercent:     85,
-		ImageGCLowThresholdPercent:      80,
-		IPTablesDropBit:                 15,
-		IPTablesMasqueradeBit:           14,
-		KubeAPIBurst:                    10,
-		KubeAPIQPS:                      5,
-		MaxOpenFiles:                    1000000,
-		MaxPods:                         110,
-		OOMScoreAdj:                     -999,
-		PodsPerCore:                     100,
-		Port:                            65535,
-		ReadOnlyPort:                    0,
-		RegistryBurst:                   10,
-		RegistryPullQPS:                 5,
-		MaxParallelImagePulls:           nil,
-		HairpinMode:                     kubeletconfig.PromiscuousBridge,
-		NodeLeaseDurationSeconds:        1,
-		CPUCFSQuotaPeriod:               metav1.Duration{Duration: 25 * time.Millisecond},
-		TopologyManagerScope:            kubeletconfig.PodTopologyManagerScope,
-		TopologyManagerPolicy:           kubeletconfig.SingleNumaNodeTopologyManagerPolicy,
-		ShutdownGracePeriod:             metav1.Duration{Duration: 30 * time.Second},
-		ShutdownGracePeriodCriticalPods: metav1.Duration{Duration: 10 * time.Second},
-		MemoryThrottlingFactor:          utilpointer.Float64(0.9),
+		CgroupsPerQOS:                          cgroupsPerQOS,
+		EnforceNodeAllocatable:                 enforceNodeAllocatable,
+		SystemReservedCgroup:                   "/system.slice",
+		KubeReservedCgroup:                     "/kubelet.service",
+		PodLogsDir:                             "/logs",
+		SystemCgroups:                          "",
+		CgroupRoot:                             "",
+		EventBurst:                             10,
+		EventRecordQPS:                         5,
+		HealthzPort:                            10248,
+		ImageGCHighThresholdPercent:            85,
+		ImageGCLowThresholdPercent:             80,
+		ImageMinimumGCAge:                      metav1.Duration{Duration: 2 * time.Minute},
+		ImagePullCredentialsVerificationPolicy: "NeverVerifyPreloadedImages",
+		IPTablesDropBit:                        15,
+		IPTablesMasqueradeBit:                  14,
+		KubeAPIBurst:                           10,
+		KubeAPIQPS:                             5,
+		MaxOpenFiles:                           1000000,
+		MaxPods:                                110,
+		OOMScoreAdj:                            -999,
+		PodsPerCore:                            100,
+		Port:                                   65535,
+		ReadOnlyPort:                           0,
+		RegistryBurst:                          10,
+		RegistryPullQPS:                        5,
+		MaxParallelImagePulls:                  nil,
+		HairpinMode:                            kubeletconfig.PromiscuousBridge,
+		NodeLeaseDurationSeconds:               1,
+		CPUCFSQuotaPeriod:                      metav1.Duration{Duration: 25 * time.Millisecond},
+		TopologyManagerScope:                   kubeletconfig.PodTopologyManagerScope,
+		TopologyManagerPolicy:                  kubeletconfig.SingleNumaNodeTopologyManagerPolicy,
+		ShutdownGracePeriod:                    metav1.Duration{Duration: 30 * time.Second},
+		ShutdownGracePeriodCriticalPods:        metav1.Duration{Duration: 10 * time.Second},
+		MemoryThrottlingFactor:                 new(float64(0.9)),
+		MemoryReservationPolicy:                kubeletconfig.NoneMemoryReservationPolicy,
 		FeatureGates: map[string]bool{
-			"CustomCPUCFSQuotaPeriod": true,
-			"GracefulNodeShutdown":    true,
-			"MemoryQoS":               true,
+			"GracefulNodeShutdown":       true,
+			"MemoryQoS":                  true,
+			"KubeletCrashLoopBackOffMax": true,
 		},
 		Logging: logsapi.LoggingConfiguration{
-			Format: "text",
+			Format:         "text",
+			FlushFrequency: logsapi.TimeOrMetaDuration{Duration: metav1.Duration{Duration: logsapi.LogFlushFreqDefault}},
 		},
-		ContainerRuntimeEndpoint: "unix:///run/containerd/containerd.sock",
+		ContainerRuntimeEndpoint:    "unix:///run/containerd/containerd.sock",
+		ContainerLogMaxWorkers:      1,
+		ContainerLogMaxFiles:        5,
+		ContainerLogMonitorInterval: metav1.Duration{Duration: 10 * time.Second},
+		SingleProcessOOMKill: func() *bool {
+			if goruntime.GOOS == "linux" {
+				return ptr.To(!kubeletutil.IsCgroup2UnifiedMode())
+			}
+			return nil
+		}(),
+		CrashLoopBackOff: kubeletconfig.CrashLoopBackOffConfig{
+			MaxContainerRestartPeriod: &metav1.Duration{Duration: 3 * time.Second},
+		},
 	}
 )
 
 func TestValidateKubeletConfiguration(t *testing.T) {
 	featureGate := utilfeature.DefaultFeatureGate.DeepCopy()
 	logsapi.AddFeatureGates(featureGate)
+
+	var defaultPodSysctlsUnsupportedErrMsg string
+	if goruntime.GOOS == "windows" {
+		defaultPodSysctlsUnsupportedErrMsg = "invalid configuration: defaultPodSysctls is not supported on Windows"
+	} else if goruntime.GOOS != "linux" {
+		defaultPodSysctlsUnsupportedErrMsg = "invalid configuration: defaultPodSysctls is only supported on linux"
+	}
 
 	cases := []struct {
 		name      string
@@ -102,10 +129,10 @@ func TestValidateKubeletConfiguration(t *testing.T) {
 		name: "specify EnforceNodeAllocatable without enabling CgroupsPerQOS",
 		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
 			conf.CgroupsPerQOS = false
-			conf.EnforceNodeAllocatable = []string{"pods"}
+			conf.EnforceNodeAllocatable = []string{kubetypes.NodeAllocatableEnforcementKey}
 			return conf
 		},
-		errMsg: "invalid configuration: enforceNodeAllocatable (--enforce-node-allocatable) is not supported unless cgroupsPerQOS (--cgroups-per-qos) is set to true",
+		errMsg: "invalid configuration: cgroupsPerQOS (--cgroups-per-qos) must be set to true when \"pods\" contained in enforceNodeAllocatable (--enforce-node-allocatable)",
 	}, {
 		name: "specify SystemCgroups without CgroupRoot",
 		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
@@ -146,7 +173,6 @@ func TestValidateKubeletConfiguration(t *testing.T) {
 	}, {
 		name: "invalid CPUCFSQuotaPeriod",
 		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.FeatureGates = map[string]bool{"CustomCPUCFSQuotaPeriod": true}
 			conf.CPUCFSQuotaPeriod = metav1.Duration{Duration: 2 * time.Second}
 			return conf
 		},
@@ -275,14 +301,14 @@ func TestValidateKubeletConfiguration(t *testing.T) {
 	}, {
 		name: "invalid MaxParallelImagePulls",
 		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.MaxParallelImagePulls = utilpointer.Int32(0)
+			conf.MaxParallelImagePulls = ptr.To[int32](0)
 			return conf
 		},
 		errMsg: "invalid configuration: maxParallelImagePulls 0 must be a positive number",
 	}, {
 		name: "invalid MaxParallelImagePulls and SerializeImagePulls combination",
 		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.MaxParallelImagePulls = utilpointer.Int32(3)
+			conf.MaxParallelImagePulls = ptr.To[int32](3)
 			conf.SerializeImagePulls = true
 			return conf
 		},
@@ -290,7 +316,7 @@ func TestValidateKubeletConfiguration(t *testing.T) {
 	}, {
 		name: "valid MaxParallelImagePulls and SerializeImagePulls combination",
 		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.MaxParallelImagePulls = utilpointer.Int32(1)
+			conf.MaxParallelImagePulls = ptr.To[int32](1)
 			conf.SerializeImagePulls = true
 			return conf
 		},
@@ -344,7 +370,12 @@ func TestValidateKubeletConfiguration(t *testing.T) {
 	}, {
 		name: "specify ShutdownGracePeriod without enabling GracefulNodeShutdown",
 		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.FeatureGates = map[string]bool{"GracefulNodeShutdown": false}
+			conf.FeatureGates = map[string]bool{
+				"GracefulNodeShutdown": false,
+				// Disable dependents.
+				"GracefulNodeShutdownBasedOnPodPriority": false,
+				"WindowsGracefulNodeShutdown":            false,
+			}
 			conf.ShutdownGracePeriod = metav1.Duration{Duration: 1 * time.Second}
 			return conf
 		},
@@ -352,7 +383,12 @@ func TestValidateKubeletConfiguration(t *testing.T) {
 	}, {
 		name: "specify ShutdownGracePeriodCriticalPods without enabling GracefulNodeShutdown",
 		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.FeatureGates = map[string]bool{"GracefulNodeShutdown": false}
+			conf.FeatureGates = map[string]bool{
+				"GracefulNodeShutdown": false,
+				// Disable dependents.
+				"GracefulNodeShutdownBasedOnPodPriority": false,
+				"WindowsGracefulNodeShutdown":            false,
+			}
 			conf.ShutdownGracePeriodCriticalPods = metav1.Duration{Duration: 1 * time.Second}
 			return conf
 		},
@@ -360,168 +396,592 @@ func TestValidateKubeletConfiguration(t *testing.T) {
 	}, {
 		name: "invalid MemorySwap.SwapBehavior",
 		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.FeatureGates = map[string]bool{"NodeSwap": true}
 			conf.MemorySwap.SwapBehavior = "invalid-behavior"
 			return conf
 		},
-		errMsg: "invalid configuration: memorySwap.swapBehavior \"invalid-behavior\" must be one of: \"\", \"LimitedSwap\", or \"UnlimitedSwap\"",
+		errMsg: "invalid configuration: memorySwap.swapBehavior \"invalid-behavior\" must be one of: \"\", \"LimitedSwap\" or \"NoSwap\"",
 	}, {
-		name: "specify MemorySwap.SwapBehavior without enabling NodeSwap",
+		name: "CrashLoopBackOff.MaxContainerRestartPeriod too low",
 		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.FeatureGates = map[string]bool{"NodeSwap": false}
-			conf.MemorySwap.SwapBehavior = kubetypes.LimitedSwap
+			conf.FeatureGates = map[string]bool{"KubeletCrashLoopBackOffMax": true}
+			conf.CrashLoopBackOff = kubeletconfig.CrashLoopBackOffConfig{
+				MaxContainerRestartPeriod: &metav1.Duration{Duration: 0 * time.Second},
+			}
 			return conf
 		},
-		errMsg: "invalid configuration: memorySwap.swapBehavior cannot be set when NodeSwap feature flag is disabled",
+		errMsg: "invalid configuration: CrashLoopBackOff.MaxContainerRestartPeriod (got: 0 seconds) must be set between 1s and 300s",
 	}, {
-		name: "specify SystemReservedEnforcementKey without specifying SystemReservedCgroup",
+		name: "CrashLoopBackOff.MaxContainerRestartPeriod too high",
 		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.EnforceNodeAllocatable = []string{kubetypes.SystemReservedEnforcementKey}
-			conf.SystemReservedCgroup = ""
+			conf.FeatureGates = map[string]bool{"KubeletCrashLoopBackOffMax": true}
+			conf.CrashLoopBackOff = kubeletconfig.CrashLoopBackOffConfig{
+				MaxContainerRestartPeriod: &metav1.Duration{Duration: 301 * time.Second},
+			}
 			return conf
 		},
-		errMsg: "invalid configuration: systemReservedCgroup (--system-reserved-cgroup) must be specified when \"system-reserved\" contained in enforceNodeAllocatable (--enforce-node-allocatable)",
+		errMsg: "invalid configuration: CrashLoopBackOff.MaxContainerRestartPeriod (got: 301 seconds) must be set between 1s and 300s",
 	}, {
-		name: "specify KubeReservedEnforcementKey without specifying KubeReservedCgroup",
+		name: "CrashLoopBackOff.MaxContainerRestartPeriod just a little too high",
 		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.EnforceNodeAllocatable = []string{kubetypes.KubeReservedEnforcementKey}
-			conf.KubeReservedCgroup = ""
+			conf.FeatureGates = map[string]bool{"KubeletCrashLoopBackOffMax": true}
+			conf.CrashLoopBackOff = kubeletconfig.CrashLoopBackOffConfig{
+				// 300.9 seconds
+				MaxContainerRestartPeriod: &metav1.Duration{Duration: 300900 * time.Millisecond},
+			}
 			return conf
 		},
-		errMsg: "invalid configuration: kubeReservedCgroup (--kube-reserved-cgroup) must be specified when \"kube-reserved\" contained in enforceNodeAllocatable (--enforce-node-allocatable)",
-	}, {
-		name: "specify NodeAllocatableNoneKey with additional enforcements",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.EnforceNodeAllocatable = []string{kubetypes.NodeAllocatableNoneKey, kubetypes.KubeReservedEnforcementKey}
-			return conf
+		errMsg: "invalid configuration: CrashLoopBackOff.MaxContainerRestartPeriod (got: 300.9 seconds) must be set between 1s and 300s",
+	},
+		{
+			name: "CrashLoopBackOff.MaxContainerRestartPeriod just a little too low",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates = map[string]bool{"KubeletCrashLoopBackOffMax": true}
+				conf.CrashLoopBackOff = kubeletconfig.CrashLoopBackOffConfig{
+					// 300.9 seconds
+					MaxContainerRestartPeriod: &metav1.Duration{Duration: 999 * time.Millisecond},
+				}
+				return conf
+			},
+			errMsg: "invalid configuration: CrashLoopBackOff.MaxContainerRestartPeriod (got: 0.999 seconds) must be set between 1s and 300s",
 		},
-		errMsg: "invalid configuration: enforceNodeAllocatable (--enforce-node-allocatable) may not contain additional enforcements when \"none\" is specified",
-	}, {
-		name: "invalid EnforceNodeAllocatable",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.EnforceNodeAllocatable = []string{"invalid-enforce-node-allocatable"}
-			return conf
+		{
+			name: "KubeletCrashLoopBackOffMax feature gate on, no crashLoopBackOff config, ok",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates = map[string]bool{"KubeletCrashLoopBackOffMax": true}
+				return conf
+			},
+		}, {
+			name: "KubeletCrashLoopBackOffMax feature gate on, but no crashLoopBackOff.MaxContainerRestartPeriod config",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates = map[string]bool{"KubeletCrashLoopBackOffMax": true}
+				conf.CrashLoopBackOff = kubeletconfig.CrashLoopBackOffConfig{}
+				return conf
+			},
+			errMsg: "invalid configuration: FeatureGate KubeletCrashLoopBackOffMax is enabled, CrashLoopBackOff.MaxContainerRestartPeriod must be set",
 		},
-		errMsg: "invalid configuration: option \"invalid-enforce-node-allocatable\" specified for enforceNodeAllocatable (--enforce-node-allocatable). Valid options are \"pods\", \"system-reserved\", \"kube-reserved\", or \"none\"",
-	}, {
-		name: "invalid HairpinMode",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.HairpinMode = "invalid-hair-pin-mode"
-			return conf
+		{
+			name: "specify SystemReservedEnforcementKey without specifying SystemReservedCgroup",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.EnforceNodeAllocatable = []string{kubetypes.SystemReservedEnforcementKey}
+				conf.SystemReservedCgroup = ""
+				return conf
+			},
+			errMsg: "invalid configuration: systemReservedCgroup (--system-reserved-cgroup) must be specified when \"system-reserved\" or \"system-reserved-compressible\" included in enforceNodeAllocatable (--enforce-node-allocatable)",
+		}, {
+			name: "specify SystemReservedCompressibleEnforcementKey without specifying SystemReservedCgroup",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.EnforceNodeAllocatable = []string{kubetypes.SystemReservedCompressibleEnforcementKey}
+				conf.SystemReservedCgroup = ""
+				return conf
+			},
+			errMsg: "invalid configuration: systemReservedCgroup (--system-reserved-cgroup) must be specified when \"system-reserved\" or \"system-reserved-compressible\" included in enforceNodeAllocatable (--enforce-node-allocatable)",
+		}, {
+			name: "specify SystemReservedCompressibleEnforcementKey with SystemReservedEnforcementKey",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.EnforceNodeAllocatable = []string{kubetypes.SystemReservedCompressibleEnforcementKey, kubetypes.SystemReservedEnforcementKey}
+				return conf
+			},
+			errMsg: "invalid configuration: both \"system-reserved\" and \"system-reserved-compressible\" cannot be specified together in enforceNodeAllocatable (--enforce-node-allocatable)",
+		}, {
+			name: "specify KubeReservedCompressibleEnforcementKey without specifying KubeReservedCgroup",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.EnforceNodeAllocatable = []string{kubetypes.KubeReservedCompressibleEnforcementKey}
+				conf.KubeReservedCgroup = ""
+				return conf
+			},
+			errMsg: "invalid configuration: kubeReservedCgroup (--kube-reserved-cgroup) must be specified when \"kube-reserved\" or \"kube-reserved-compressible\" included in enforceNodeAllocatable (--enforce-node-allocatable)",
+		}, {
+			name: "specify KubeReservedEnforcementKey without specifying KubeReservedCgroup",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.EnforceNodeAllocatable = []string{kubetypes.KubeReservedEnforcementKey}
+				conf.KubeReservedCgroup = ""
+				return conf
+			},
+			errMsg: "invalid configuration: kubeReservedCgroup (--kube-reserved-cgroup) must be specified when \"kube-reserved\" or \"kube-reserved-compressible\" included in enforceNodeAllocatable (--enforce-node-allocatable)",
+		}, {
+			name: "specify KubeReservedCompressibleEnforcementKey with KubeReservedEnforcementKey",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.EnforceNodeAllocatable = []string{kubetypes.KubeReservedCompressibleEnforcementKey, kubetypes.KubeReservedEnforcementKey}
+				return conf
+			},
+			errMsg: "invalid configuration: both \"kube-reserved\" and \"kube-reserved-compressible\" cannot be specified together in enforceNodeAllocatable (--enforce-node-allocatable)",
+		}, {
+			name: "specify NodeAllocatableNoneKey with additional enforcements",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.EnforceNodeAllocatable = []string{kubetypes.NodeAllocatableNoneKey, kubetypes.KubeReservedEnforcementKey}
+				return conf
+			},
+			errMsg: "invalid configuration: enforceNodeAllocatable (--enforce-node-allocatable) may not contain additional enforcements when \"none\" is specified",
+		}, {
+			name: "duplicated EnforceNodeAllocatable",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.EnforceNodeAllocatable = []string{kubetypes.NodeAllocatableNoneKey, kubetypes.NodeAllocatableNoneKey}
+				return conf
+			},
+			errMsg: "invalid configuration: duplicated enforcements \"none\" in enforceNodeAllocatable (--enforce-node-allocatable)",
+		}, {
+			name: "invalid EnforceNodeAllocatable",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.EnforceNodeAllocatable = []string{"invalid-enforce-node-allocatable"}
+				return conf
+			},
+			errMsg: "invalid configuration: option \"invalid-enforce-node-allocatable\" specified for enforceNodeAllocatable (--enforce-node-allocatable). Valid options are \"pods\", \"system-reserved\", \"system-reserved-compressible\", \"kube-reserved\", \"kube-reserved-compressible\" or \"none\"",
+		}, {
+			name: "invalid HairpinMode",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.HairpinMode = "invalid-hair-pin-mode"
+				return conf
+			},
+			errMsg: "invalid configuration: option \"invalid-hair-pin-mode\" specified for hairpinMode (--hairpin-mode). Valid options are \"none\", \"hairpin-veth\" or \"promiscuous-bridge\"",
+		}, {
+			name: "specify ReservedSystemCPUs with SystemReservedCgroup",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ReservedSystemCPUs = "0-3"
+				conf.SystemReservedCgroup = "/system.slice"
+				return conf
+			},
+			errMsg: "invalid configuration: can't use reservedSystemCPUs (--reserved-cpus) with systemReservedCgroup (--system-reserved-cgroup) or kubeReservedCgroup (--kube-reserved-cgroup)",
+		}, {
+			name: "specify ReservedSystemCPUs with KubeReservedCgroup",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ReservedSystemCPUs = "0-3"
+				conf.KubeReservedCgroup = "/system.slice"
+				return conf
+			},
+			errMsg: "invalid configuration: can't use reservedSystemCPUs (--reserved-cpus) with systemReservedCgroup (--system-reserved-cgroup) or kubeReservedCgroup (--kube-reserved-cgroup)",
+		}, {
+			name: "invalid ReservedSystemCPUs",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ReservedSystemCPUs = "invalid-reserved-system-cpus"
+				return conf
+			},
+			errMsg: "invalid configuration: unable to parse reservedSystemCPUs (--reserved-cpus) invalid-reserved-system-cpus, error:",
+		}, {
+			name: "valid enable MemoryQoS without specifying MemoryThrottlingFactor",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates = map[string]bool{"MemoryQoS": true}
+				conf.MemoryThrottlingFactor = nil
+				return conf
+			},
+		}, {
+			name: "invalid MemoryThrottlingFactor",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.MemoryThrottlingFactor = ptr.To(1.1)
+				return conf
+			},
+			errMsg: "invalid configuration: memoryThrottlingFactor 1.1 must be greater than 0 and less than or equal to 1.0",
+		}, {
+			name: "MemoryReservationPolicy requires MemoryQoS",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates = map[string]bool{"MemoryQoS": false}
+				conf.MemoryThrottlingFactor = nil
+				conf.MemoryReservationPolicy = kubeletconfig.TieredReservationMemoryReservationPolicy
+				return conf
+			},
+			errMsg: "invalid configuration: memoryReservationPolicy \"TieredReservation\" requires MemoryQoS feature gate to be enabled",
+		}, {
+			name: "invalid MemoryReservationPolicy",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.MemoryReservationPolicy = "invalid"
+				return conf
+			},
+			errMsg: "invalid configuration: option \"invalid\" specified for memoryReservationPolicy. Valid options are \"None\" or \"TieredReservation\"",
+		}, {
+			name: "invalid Taint.TimeAdded",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				now := metav1.Now()
+				conf.RegisterWithTaints = []v1.Taint{{TimeAdded: &now}}
+				return conf
+			},
+			errMsg: "invalid configuration: taint.TimeAdded is not nil",
+		}, {
+			name: "specify tracing invalid sampling rate",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				samplingRate := int32(-1)
+				conf.Tracing = &tracingapi.TracingConfiguration{SamplingRatePerMillion: &samplingRate}
+				return conf
+			},
+			errMsg: "tracing.samplingRatePerMillion: Invalid value: -1: sampling rate must be positive",
+		}, {
+			name: "specify tracing invalid endpoint",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				ep := "dn%2s://localhost:4317"
+				conf.Tracing = &tracingapi.TracingConfiguration{Endpoint: &ep}
+				return conf
+			},
+			errMsg: "tracing.endpoint: Invalid value: \"dn%2s://localhost:4317\": parse \"dn%2s://localhost:4317\": first path segment in URL cannot contain colon",
+		}, {
+			name: "invalid GracefulNodeShutdownBasedOnPodPriority",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates = map[string]bool{"GracefulNodeShutdownBasedOnPodPriority": true}
+				conf.ShutdownGracePeriodByPodPriority = []kubeletconfig.ShutdownGracePeriodByPodPriority{{
+					Priority:                   0,
+					ShutdownGracePeriodSeconds: 0,
+				}}
+				return conf
+			},
+			errMsg: "invalid configuration: Cannot specify both shutdownGracePeriodByPodPriority and shutdownGracePeriod at the same time",
+		}, {
+			name: "Specifying shutdownGracePeriodByPodPriority without enable GracefulNodeShutdownBasedOnPodPriority",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates = map[string]bool{"GracefulNodeShutdownBasedOnPodPriority": false}
+				conf.ShutdownGracePeriodByPodPriority = []kubeletconfig.ShutdownGracePeriodByPodPriority{{
+					Priority:                   0,
+					ShutdownGracePeriodSeconds: 0,
+				}}
+				return conf
+			},
+			errMsg: "invalid configuration: Specifying shutdownGracePeriodByPodPriority requires feature gate GracefulNodeShutdownBasedOnPodPriority",
+		}, {
+			name: "enableSystemLogQuery is enabled with explicit default NodeLogQuery feature gate enabled",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates = map[string]bool{"NodeLogQuery": true}
+				conf.EnableSystemLogHandler = true
+				conf.EnableSystemLogQuery = true
+				return conf
+			},
+			errMsg: "",
+		}, {
+			name: "enableSystemLogQuery is enabled without NodeLogQuery feature gate",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates = map[string]bool{"NodeLogQuery": false}
+				conf.EnableSystemLogQuery = true
+				return conf
+			},
+			errMsg: "cannot set feature gate NodeLogQuery to false, feature is locked to true",
+		}, {
+			name: "enableSystemLogQuery is enabled without enableSystemLogHandler",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.EnableSystemLogHandler = false
+				conf.EnableSystemLogQuery = true
+				return conf
+			},
+			errMsg: "invalid configuration: enableSystemLogHandler is required for enableSystemLogQuery",
+		}, {
+			name: "enableSystemLogQuery is enabled with enableSystemLogHandler",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.EnableSystemLogHandler = true
+				conf.EnableSystemLogQuery = true
+				return conf
+			},
+			errMsg: "",
+		}, {
+			name: "imageMaximumGCAge should not be negative",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ImageMaximumGCAge = metav1.Duration{Duration: -1}
+				return conf
+			},
+			errMsg: "invalid configuration: imageMaximumGCAge -1ns must not be negative",
+		}, {
+			name: "imageMaximumGCAge should not be less than imageMinimumGCAge",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ImageMaximumGCAge = metav1.Duration{Duration: 1}
+				conf.ImageMinimumGCAge = metav1.Duration{Duration: 2}
+				return conf
+			},
+			errMsg: "invalid configuration: imageMaximumGCAge 1ns must be greater than imageMinimumGCAge 2ns",
+		}, {
+			name: "containerLogMaxWorkers must be greater than or equal to 1",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ContainerLogMaxWorkers = 0
+				return conf
+			},
+			errMsg: "invalid configuration: containerLogMaxWorkers must be greater than or equal to 1",
+		}, {
+			name: "containerLogMonitorInterval must be a positive time duration",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ContainerLogMonitorInterval = metav1.Duration{Duration: -1 * time.Second}
+				return conf
+			},
+			errMsg: "invalid configuration: containerLogMonitorInterval must be a positive time duration greater than or equal to 3s",
+		}, {
+			name: "containerLogMonitorInterval must be at least 3s or higher",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ContainerLogMonitorInterval = metav1.Duration{Duration: 2 * time.Second}
+				return conf
+			},
+			errMsg: "invalid configuration: containerLogMonitorInterval must be a positive time duration greater than or equal to 3s",
+		}, {
+			name: "pod logs path must be not empty",
+			configure: func(config *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				config.PodLogsDir = ""
+				return config
+			},
+			errMsg: "invalid configuration: podLogsDir was not specified",
+		}, {
+			name: "pod logs path must be absolute",
+			configure: func(config *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				config.PodLogsDir = "./test"
+				return config
+			},
+			errMsg: `invalid configuration: pod logs path "./test" must be absolute path`,
+		}, {
+			name: "pod logs path must be normalized",
+			configure: func(config *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				config.PodLogsDir = "/path/../"
+				return config
+			},
+			errMsg: `invalid configuration: pod logs path "/path/../" must be normalized`,
+		}, {
+			name: "pod logs path is ascii only",
+			configure: func(config *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				config.PodLogsDir = "/🧪"
+				return config
+			},
+			errMsg: `invalid configuration: pod logs path "/🧪" mut contains ASCII characters only`,
+		}, {
+			name: "invalid containerLogMaxFiles",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ContainerLogMaxFiles = 1
+				return conf
+			},
+			errMsg: "invalid configuration: containerLogMaxFiles must be greater than 1",
+		}, {
+			name: "invalid ContainerRuntimeEndpoint",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ContainerRuntimeEndpoint = ""
+				return conf
+			},
+			errMsg: "invalid configuration: the containerRuntimeEndpoint was not specified or empty",
+		}, {
+			name: "invalid Logging configuration",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.Logging.Format = "invalid"
+				return conf
+			},
+			errMsg: "logging.format: Invalid value: \"invalid\": Unsupported log format",
+		}, {
+			name: "invalid imagePullCredentialsVerificationPolicy configuration",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates = map[string]bool{"KubeletEnsureSecretPulledImages": true}
+				conf.ImagePullCredentialsVerificationPolicy = "invalid"
+				return conf
+			},
+			errMsg: `option "invalid" specified for imagePullCredentialsVerificationPolicy. Valid options are "NeverVerify", "NeverVerifyPreloadedImages", "NeverVerifyAllowlistedImages" or "AlwaysVerify"`,
+		}, {
+			name: "invalid PreloadedImagesVerificationAllowlist configuration - featuregate enabled",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates = map[string]bool{"KubeletEnsureSecretPulledImages": true}
+				conf.ImagePullCredentialsVerificationPolicy = string(kubeletconfig.NeverVerify)
+				conf.PreloadedImagesVerificationAllowlist = []string{"test.test/repo"}
+				return conf
+			},
+			errMsg: "can't set `preloadedImagesVerificationAllowlist` if `imagePullCredentialsVertificationPolicy` is not \"NeverVerifyAllowlistedImages\"",
+		}, {
+			name: "invalid PreloadedImagesVerificationAllowlist configuration - featuregate disabled",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates = map[string]bool{"KubeletEnsureSecretPulledImages": false}
+				conf.ImagePullCredentialsVerificationPolicy = string(kubeletconfig.NeverVerify)
+				return conf
+			},
+			errMsg: "invalid configuration: `imagePullCredentialsVerificationPolicy` must not be set if KubeletEnsureSecretPulledImages feature gate is not enabled",
+		}, {
+			name: "invalid PreloadedImagesVerificationAllowlist configuration",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates = map[string]bool{"KubeletEnsureSecretPulledImages": false}
+				conf.PreloadedImagesVerificationAllowlist = []string{"test.test/repo"}
+				return conf
+			},
+			errMsg: "invalid configuration: `preloadedImagesVerificationAllowlist` must not be set if KubeletEnsureSecretPulledImages feature gate is not enabled",
+		}, {
+			name: "invalid FeatureGate",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.FeatureGates["invalid"] = true
+				return conf
+			},
+			errMsg: "unrecognized feature gate: invalid",
+		}, {
+			name: "invalid configuration: invalid ImageMinimumGCAge",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ImageMinimumGCAge = metav1.Duration{Duration: -1}
+				return conf
+			},
+			errMsg: "invalid configuration: imageMinimumGCAge -1ns must not be negative",
+		}, {
+			name: "valid ImageMinimumGCAge set to default 1ns",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				// Verify that values other than the default are accepted.
+				conf.ImageMinimumGCAge = metav1.Duration{Duration: 1 * time.Nanosecond}
+				return conf
+			},
+		}, {
+			name: "DefaultPodSysctls configured with feature gate disabled",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.DefaultPodSysctls = map[string]string{"net.ipv4.ip_forward": "1"}
+				return conf
+			},
+			errMsg: "invalid configuration: DefaultPodSysctls feature gate is required for Kubelet configuration option defaultPodSysctls",
+		}, {
+			name: "DefaultPodSysctls configured with feature gate enabled",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				if conf.FeatureGates == nil {
+					conf.FeatureGates = make(map[string]bool)
+				}
+				conf.FeatureGates[string(features.DefaultPodSysctls)] = true
+				conf.DefaultPodSysctls = map[string]string{"net.ipv4.ip_forward": "1"}
+				return conf
+			},
+			errMsg: defaultPodSysctlsUnsupportedErrMsg,
+		}, {
+			name: "DefaultPodSysctls with invalid sysctl name (uppercase)",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				if conf.FeatureGates == nil {
+					conf.FeatureGates = make(map[string]bool)
+				}
+				conf.FeatureGates[string(features.DefaultPodSysctls)] = true
+				conf.DefaultPodSysctls = map[string]string{"Invalid.Sysctl": "1"}
+				return conf
+			},
+			errMsg: `invalid configuration: "Invalid.Sysctl" is not a valid sysctl name for defaultPodSysctls`,
+		}, {
+			name: "DefaultPodSysctls with invalid sysctl name (invalid char)",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				if conf.FeatureGates == nil {
+					conf.FeatureGates = make(map[string]bool)
+				}
+				conf.FeatureGates[string(features.DefaultPodSysctls)] = true
+				conf.DefaultPodSysctls = map[string]string{"net.ipv4.ip@forward": "1"}
+				return conf
+			},
+			errMsg: `invalid configuration: "net.ipv4.ip@forward" is not a valid sysctl name for defaultPodSysctls`,
+		}, {
+			name: "DefaultPodSysctls with invalid sysctl name (too long)",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				if conf.FeatureGates == nil {
+					conf.FeatureGates = make(map[string]bool)
+				}
+				conf.FeatureGates[string(features.DefaultPodSysctls)] = true
+				conf.DefaultPodSysctls = map[string]string{strings.Repeat("a", 254): "1"}
+				return conf
+			},
+			errMsg: "is not a valid sysctl name for defaultPodSysctls",
+		}, {
+			name: "DefaultPodSysctls with valid sysctl name containing slashes",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				if conf.FeatureGates == nil {
+					conf.FeatureGates = make(map[string]bool)
+				}
+				conf.FeatureGates[string(features.DefaultPodSysctls)] = true
+				conf.DefaultPodSysctls = map[string]string{"net/ipv4/ip_forward": "1"}
+				return conf
+			},
+			errMsg: defaultPodSysctlsUnsupportedErrMsg,
+		}, {
+			name: "DefaultPodSysctls with non-namespaced sysctl",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				if conf.FeatureGates == nil {
+					conf.FeatureGates = make(map[string]bool)
+				}
+				conf.FeatureGates[string(features.DefaultPodSysctls)] = true
+				conf.DefaultPodSysctls = map[string]string{"kernel.printk": "7"}
+				return conf
+			},
+			errMsg: `invalid configuration: "kernel.printk" is not known to be namespaced for defaultPodSysctls`,
+		}, {
+			name: "DefaultPodSysctls with duplicate sysctl names",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				if conf.FeatureGates == nil {
+					conf.FeatureGates = make(map[string]bool)
+				}
+				conf.FeatureGates[string(features.DefaultPodSysctls)] = true
+				conf.DefaultPodSysctls = map[string]string{
+					"net.ipv4.ip_forward": "1",
+					"net/ipv4/ip_forward": "1",
+				}
+				return conf
+			},
+			errMsg: `invalid configuration: duplicate sysctl "net.ipv4.ip_forward" found in defaultPodSysctls`,
+		}, {
+			name: "valid ClientCertificateKeyAlgorithm ECDSA-P256",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ClientCertificateKeyAlgorithm = ptr.To(kubeletconfig.CertificateKeyAlgorithmECDSAP256)
+				return conf
+			},
+		}, {
+			name: "valid ClientCertificateKeyAlgorithm ML-DSA-65",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ClientCertificateKeyAlgorithm = ptr.To(kubeletconfig.CertificateKeyAlgorithmMLDSA65)
+				return conf
+			},
+		}, {
+			name: "valid ClientCertificateKeyAlgorithm nil",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ClientCertificateKeyAlgorithm = nil
+				return conf
+			},
+		}, {
+			name: "invalid ClientCertificateKeyAlgorithm",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ClientCertificateKeyAlgorithm = ptr.To(kubeletconfig.CertificateKeyAlgorithmType("INVALID"))
+				return conf
+			},
+			errMsg: `invalid configuration: clientCertificateKeyAlgorithm "INVALID" is not a supported algorithm`,
+		}, {
+			name: "valid ServerCertificateKeyAlgorithm RSA-4096",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ServerCertificateKeyAlgorithm = ptr.To(kubeletconfig.CertificateKeyAlgorithmRSA4096)
+				return conf
+			},
+		}, {
+			name: "valid ServerCertificateKeyAlgorithm ML-DSA-87",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ServerCertificateKeyAlgorithm = ptr.To(kubeletconfig.CertificateKeyAlgorithmMLDSA87)
+				conf.TLSMinVersion = "VersionTLS13"
+				return conf
+			},
+		}, {
+			name: "valid ServerCertificateKeyAlgorithm nil",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ServerCertificateKeyAlgorithm = nil
+				return conf
+			},
+		}, {
+			name: "invalid ServerCertificateKeyAlgorithm",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ServerCertificateKeyAlgorithm = ptr.To(kubeletconfig.CertificateKeyAlgorithmType("BOGUS"))
+				return conf
+			},
+			errMsg: `invalid configuration: serverCertificateKeyAlgorithm "BOGUS" is not a supported algorithm`,
+		}, {
+			name: "valid ML-DSA ServerCertificateKeyAlgorithm with TLSMinVersion VersionTLS13",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ServerCertificateKeyAlgorithm = ptr.To(kubeletconfig.CertificateKeyAlgorithmMLDSA65)
+				conf.TLSMinVersion = "VersionTLS13"
+				return conf
+			},
+		}, {
+			name: "invalid ML-DSA ServerCertificateKeyAlgorithm with TLSMinVersion unset",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ServerCertificateKeyAlgorithm = ptr.To(kubeletconfig.CertificateKeyAlgorithmMLDSA65)
+				conf.TLSMinVersion = ""
+				return conf
+			},
+			errMsg: `invalid configuration: tlsMinVersion "" is incompatible with serverCertificateKeyAlgorithm "ML-DSA-65", ML-DSA requires VersionTLS13`,
+		}, {
+			name: "valid ECDSA ServerCertificateKeyAlgorithm with TLSMinVersion VersionTLS12",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ServerCertificateKeyAlgorithm = ptr.To(kubeletconfig.CertificateKeyAlgorithmECDSAP256)
+				conf.TLSMinVersion = "VersionTLS12"
+				return conf
+			},
+		}, {
+			name: "invalid ML-DSA-44 ServerCertificateKeyAlgorithm with TLSMinVersion VersionTLS12",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ServerCertificateKeyAlgorithm = ptr.To(kubeletconfig.CertificateKeyAlgorithmMLDSA44)
+				conf.TLSMinVersion = "VersionTLS12"
+				return conf
+			},
+			errMsg: `invalid configuration: tlsMinVersion "VersionTLS12" is incompatible with serverCertificateKeyAlgorithm "ML-DSA-44", ML-DSA requires VersionTLS13`,
+		}, {
+			name: "invalid ML-DSA-87 ServerCertificateKeyAlgorithm with TLSMinVersion VersionTLS10",
+			configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
+				conf.ServerCertificateKeyAlgorithm = ptr.To(kubeletconfig.CertificateKeyAlgorithmMLDSA87)
+				conf.TLSMinVersion = "VersionTLS10"
+				return conf
+			},
+			errMsg: `invalid configuration: tlsMinVersion "VersionTLS10" is incompatible with serverCertificateKeyAlgorithm "ML-DSA-87", ML-DSA requires VersionTLS13`,
 		},
-		errMsg: "invalid configuration: option \"invalid-hair-pin-mode\" specified for hairpinMode (--hairpin-mode). Valid options are \"none\", \"hairpin-veth\" or \"promiscuous-bridge\"",
-	}, {
-		name: "specify ReservedSystemCPUs with SystemReservedCgroup",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.ReservedSystemCPUs = "0-3"
-			conf.SystemReservedCgroup = "/system.slice"
-			return conf
-		},
-		errMsg: "invalid configuration: can't use reservedSystemCPUs (--reserved-cpus) with systemReservedCgroup (--system-reserved-cgroup) or kubeReservedCgroup (--kube-reserved-cgroup)",
-	}, {
-		name: "specify ReservedSystemCPUs with KubeReservedCgroup",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.ReservedSystemCPUs = "0-3"
-			conf.KubeReservedCgroup = "/system.slice"
-			return conf
-		},
-		errMsg: "invalid configuration: can't use reservedSystemCPUs (--reserved-cpus) with systemReservedCgroup (--system-reserved-cgroup) or kubeReservedCgroup (--kube-reserved-cgroup)",
-	}, {
-		name: "invalid ReservedSystemCPUs",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.ReservedSystemCPUs = "invalid-reserved-system-cpus"
-			return conf
-		},
-		errMsg: "invalid configuration: unable to parse reservedSystemCPUs (--reserved-cpus) invalid-reserved-system-cpus, error:",
-	}, {
-		name: "enable MemoryQoS without specifying MemoryThrottlingFactor",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.FeatureGates = map[string]bool{"MemoryQoS": true}
-			conf.MemoryThrottlingFactor = nil
-			return conf
-		},
-		errMsg: "invalid configuration: memoryThrottlingFactor is required when MemoryQoS feature flag is enabled",
-	}, {
-		name: "invalid MemoryThrottlingFactor",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.MemoryThrottlingFactor = utilpointer.Float64(1.1)
-			return conf
-		},
-		errMsg: "invalid configuration: memoryThrottlingFactor 1.1 must be greater than 0 and less than or equal to 1.0",
-	}, {
-		name: "invalid Taint.TimeAdded",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			now := metav1.Now()
-			conf.RegisterWithTaints = []v1.Taint{{TimeAdded: &now}}
-			return conf
-		},
-		errMsg: "invalid configuration: taint.TimeAdded is not nil",
-	}, {
-		name: "specify tracing with KubeletTracing disabled",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			samplingRate := int32(99999)
-			conf.FeatureGates = map[string]bool{"KubeletTracing": false}
-			conf.Tracing = &tracingapi.TracingConfiguration{SamplingRatePerMillion: &samplingRate}
-			return conf
-		},
-		errMsg: "invalid configuration: tracing should not be configured if KubeletTracing feature flag is disabled.",
-	}, {
-		name: "specify tracing invalid sampling rate",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			samplingRate := int32(-1)
-			conf.FeatureGates = map[string]bool{"KubeletTracing": true}
-			conf.Tracing = &tracingapi.TracingConfiguration{SamplingRatePerMillion: &samplingRate}
-			return conf
-		},
-		errMsg: "tracing.samplingRatePerMillion: Invalid value: -1: sampling rate must be positive",
-	}, {
-		name: "specify tracing invalid endpoint",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			ep := "dn%2s://localhost:4317"
-			conf.FeatureGates = map[string]bool{"KubeletTracing": true}
-			conf.Tracing = &tracingapi.TracingConfiguration{Endpoint: &ep}
-			return conf
-		},
-		errMsg: "tracing.endpoint: Invalid value: \"dn%2s://localhost:4317\": parse \"dn%2s://localhost:4317\": first path segment in URL cannot contain colon",
-	}, {
-		name: "invalid GracefulNodeShutdownBasedOnPodPriority",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.FeatureGates = map[string]bool{"GracefulNodeShutdownBasedOnPodPriority": true}
-			conf.ShutdownGracePeriodByPodPriority = []kubeletconfig.ShutdownGracePeriodByPodPriority{{
-				Priority:                   0,
-				ShutdownGracePeriodSeconds: 0,
-			}}
-			return conf
-		},
-		errMsg: "invalid configuration: Cannot specify both shutdownGracePeriodByPodPriority and shutdownGracePeriod at the same time",
-	}, {
-		name: "Specifying shutdownGracePeriodByPodPriority without enable GracefulNodeShutdownBasedOnPodPriority",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.FeatureGates = map[string]bool{"GracefulNodeShutdownBasedOnPodPriority": false}
-			conf.ShutdownGracePeriodByPodPriority = []kubeletconfig.ShutdownGracePeriodByPodPriority{{
-				Priority:                   0,
-				ShutdownGracePeriodSeconds: 0,
-			}}
-			return conf
-		},
-		errMsg: "invalid configuration: Specifying shutdownGracePeriodByPodPriority requires feature gate GracefulNodeShutdownBasedOnPodPriority",
-	}, {
-		name: "enableSystemLogQuery is enabled without NodeLogQuery feature gate",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.EnableSystemLogQuery = true
-			return conf
-		},
-		errMsg: "invalid configuration: NodeLogQuery feature gate is required for enableSystemLogHandler",
-	}, {
-		name: "enableSystemLogQuery is enabled without enableSystemLogHandler",
-		configure: func(conf *kubeletconfig.KubeletConfiguration) *kubeletconfig.KubeletConfiguration {
-			conf.FeatureGates = map[string]bool{"NodeLogQuery": true}
-			conf.EnableSystemLogHandler = false
-			conf.EnableSystemLogQuery = true
-			return conf
-		},
-		errMsg: "invalid configuration: enableSystemLogHandler is required for enableSystemLogQuery",
-	}}
+	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

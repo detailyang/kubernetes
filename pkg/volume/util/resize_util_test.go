@@ -25,18 +25,16 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	"k8s.io/kubernetes/pkg/features"
 )
 
 type conditionMergeTestCase struct {
-	description     string
-	pvc             *v1.PersistentVolumeClaim
-	newConditions   []v1.PersistentVolumeClaimCondition
-	finalConditions []v1.PersistentVolumeClaimCondition
+	description             string
+	pvc                     *v1.PersistentVolumeClaim
+	keepOldResizeConditions bool
+	newConditions           []v1.PersistentVolumeClaimCondition
+	finalConditions         []v1.PersistentVolumeClaimCondition
 }
 
 func TestMergeResizeCondition(t *testing.T) {
@@ -132,10 +130,34 @@ func TestMergeResizeCondition(t *testing.T) {
 				},
 			},
 		},
+		{
+			description:             "when adding new condition with existing resize conditions",
+			pvc:                     pvc.DeepCopy(),
+			keepOldResizeConditions: true,
+			newConditions: []v1.PersistentVolumeClaimCondition{
+				{
+					Type:               v1.PersistentVolumeClaimNodeResizeError,
+					Status:             v1.ConditionTrue,
+					LastTransitionTime: currentTime,
+				},
+			},
+			finalConditions: []v1.PersistentVolumeClaimCondition{
+				{
+					Type:               v1.PersistentVolumeClaimResizing,
+					Status:             v1.ConditionTrue,
+					LastTransitionTime: currentTime,
+				},
+				{
+					Type:               v1.PersistentVolumeClaimNodeResizeError,
+					Status:             v1.ConditionTrue,
+					LastTransitionTime: currentTime,
+				},
+			},
+		},
 	}
 
 	for _, testcase := range testCases {
-		updatePVC := MergeResizeConditionOnPVC(testcase.pvc, testcase.newConditions)
+		updatePVC := MergeResizeConditionOnPVC(testcase.pvc, testcase.newConditions, testcase.keepOldResizeConditions)
 
 		updateConditions := updatePVC.Status.Conditions
 		if !reflect.DeepEqual(updateConditions, testcase.finalConditions) {
@@ -149,7 +171,6 @@ func TestMergeResizeCondition(t *testing.T) {
 
 func TestResizeFunctions(t *testing.T) {
 	basePVC := makePVC([]v1.PersistentVolumeClaimCondition{})
-
 	tests := []struct {
 		name        string
 		pvc         *v1.PersistentVolumeClaim
@@ -166,8 +187,8 @@ func TestResizeFunctions(t *testing.T) {
 		},
 		{
 			name: "mark fs resize, when other resource statuses are present",
-			pvc:  basePVC.withResourceStatus(v1.ResourceCPU, v1.PersistentVolumeClaimControllerResizeFailed).get(),
-			expectedPVC: basePVC.withResourceStatus(v1.ResourceCPU, v1.PersistentVolumeClaimControllerResizeFailed).
+			pvc:  basePVC.withResourceStatus(v1.ResourceCPU, v1.PersistentVolumeClaimControllerResizeInfeasible).get(),
+			expectedPVC: basePVC.withResourceStatus(v1.ResourceCPU, v1.PersistentVolumeClaimControllerResizeInfeasible).
 				withStorageResourceStatus(v1.PersistentVolumeClaimNodeResizePending).get(),
 			testFunc: func(pvc *v1.PersistentVolumeClaim, c clientset.Interface, _ resource.Quantity) (*v1.PersistentVolumeClaim, error) {
 				return MarkForFSResize(pvc, c)
@@ -183,9 +204,9 @@ func TestResizeFunctions(t *testing.T) {
 		},
 		{
 			name: "mark resize finished",
-			pvc: basePVC.withResourceStatus(v1.ResourceCPU, v1.PersistentVolumeClaimControllerResizeFailed).
+			pvc: basePVC.withResourceStatus(v1.ResourceCPU, v1.PersistentVolumeClaimControllerResizeInfeasible).
 				withStorageResourceStatus(v1.PersistentVolumeClaimNodeResizePending).get(),
-			expectedPVC: basePVC.withResourceStatus(v1.ResourceCPU, v1.PersistentVolumeClaimControllerResizeFailed).
+			expectedPVC: basePVC.withResourceStatus(v1.ResourceCPU, v1.PersistentVolumeClaimControllerResizeInfeasible).
 				withStorageResourceStatus("").get(),
 			testFunc: func(pvc *v1.PersistentVolumeClaim, i clientset.Interface, q resource.Quantity) (*v1.PersistentVolumeClaim, error) {
 				return MarkFSResizeFinished(pvc, q, i)
@@ -193,10 +214,8 @@ func TestResizeFunctions(t *testing.T) {
 		},
 	}
 
-	for _, test := range tests {
-		tc := test
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RecoverVolumeExpansionFailure, true)()
 			pvc := tc.pvc
 			kubeClient := fake.NewSimpleClientset(pvc)
 

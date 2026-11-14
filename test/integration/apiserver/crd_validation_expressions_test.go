@@ -22,63 +22,26 @@ import (
 	"strings"
 	"testing"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
-	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	"time"
+
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	apiextensionsv1beta1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1beta1"
+	"k8s.io/apiextensions-api/pkg/client/clientset/clientset"
 	"k8s.io/apiextensions-apiserver/test/integration/fixtures"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/json"
-	genericfeatures "k8s.io/apiserver/pkg/features"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/storage/names"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/dynamic"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
-
 	apiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
-// TestCustomResourceValidatorsWithDisabledFeatureGate test that x-kubernetes-validations work as expected when the
-// feature gate is disabled.
-func TestCustomResourceValidatorsWithDisabledFeatureGate(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CustomResourceValidationExpressions, false)()
-
-	server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), nil, framework.SharedEtcd())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer server.TearDownFn()
-	config := server.ClientConfig
-
-	apiExtensionClient, err := clientset.NewForConfig(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dynamicClient, err := dynamic.NewForConfig(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Run("x-kubernetes-validations fields MUST be dropped from CRDs that are created when feature gate is disabled", func(t *testing.T) {
-		schemaWithFeatureGateOff := crdWithSchema(t, "WithFeatureGateOff", structuralSchemaWithValidators)
-		crdWithFeatureGateOff, err := fixtures.CreateNewV1CustomResourceDefinition(schemaWithFeatureGateOff, apiExtensionClient, dynamicClient)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s := crdWithFeatureGateOff.Spec.Versions[0].Schema.OpenAPIV3Schema
-		if len(s.XValidations) != 0 {
-			t.Errorf("Expected CRD to have no x-kubernetes-validatons rules but got: %v", s.XValidations)
-		}
-	})
-}
-
 // TestCustomResourceValidators tests x-kubernetes-validations compile and validate as expected when the feature gate
 // is enabled.
 func TestCustomResourceValidators(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CustomResourceValidationExpressions, true)()
-
 	server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), nil, framework.SharedEtcd())
 	if err != nil {
 		t.Fatal(err)
@@ -301,6 +264,13 @@ func TestCustomResourceValidators(t *testing.T) {
 			t.Error("Unexpected error creating custom resource but metadata validation rule")
 		}
 	})
+	t.Run("CRD creation MUST pass for an CRD with empty field", func(t *testing.T) {
+		structuralWithValidators := crdWithSchema(t, "WithEmptyObject", structuralSchemaWithEmptyObject)
+		_, err := fixtures.CreateNewV1CustomResourceDefinition(structuralWithValidators, apiExtensionClient, dynamicClient)
+		if err != nil {
+			t.Errorf("unexpected error creating CRD with empty field: %v", err)
+		}
+	})
 	t.Run("CR creation MUST fail if a x-kubernetes-validations rule exceeds the runtime cost limit", func(t *testing.T) {
 		structuralWithValidators := crdWithSchema(t, "RuntimeCostLimit", structuralSchemaWithCostLimit)
 		crd, err := fixtures.CreateNewV1CustomResourceDefinition(structuralWithValidators, apiExtensionClient, dynamicClient)
@@ -453,8 +423,6 @@ func TestCustomResourceValidators(t *testing.T) {
 // TestCustomResourceValidatorsWithBlockingErrors tests x-kubernetes-validations is skipped when
 // blocking errors occurred.
 func TestCustomResourceValidatorsWithBlockingErrors(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CustomResourceValidationExpressions, true)()
-
 	server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), nil, framework.SharedEtcd())
 	if err != nil {
 		t.Fatal(err)
@@ -685,6 +653,115 @@ func TestCustomResourceValidatorsWithBlockingErrors(t *testing.T) {
 	})
 }
 
+// TestCustomResourceValidatorsWithSchemaConversion tests CRD replacement with schema conversion issue should not panic.
+func TestCustomResourceValidatorsWithSchemaConversion(t *testing.T) {
+	server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), nil, framework.SharedEtcd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.TearDownFn()
+	config := server.ClientConfig
+
+	apiExtensionClient, err := clientset.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create CRD with normal items+array schema
+	structuralWithValidators := crdWithSchema(t, "Structural", structuralSchemaWithItemsUnderArray)
+	crd, err := fixtures.CreateNewV1CustomResourceDefinition(structuralWithValidators, apiExtensionClient, dynamicClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    crd.Spec.Group,
+		Version:  crd.Spec.Versions[0].Name,
+		Resource: crd.Spec.Names.Plural,
+	}
+	crClient := dynamicClient.Resource(gvr)
+
+	// Create a valid CR instance
+	name1 := names.SimpleNameGenerator.GenerateName("cr-1")
+	_, err = crClient.Create(context.TODO(), &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": gvr.Group + "/" + gvr.Version,
+		"kind":       crd.Spec.Names.Kind,
+		"metadata": map[string]interface{}{
+			"name": name1,
+		},
+		"spec": map[string]interface{}{
+			"backend": []interface{}{
+				map[string]interface{}{
+					"replicas": 8,
+				},
+			},
+		},
+	}}, metav1.CreateOptions{})
+	if err != nil {
+		t.Errorf("Failed to create custom resource: %v", err)
+	}
+	crd, err = apiExtensionClient.ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), crd.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	structuralSchemaWithItemsUnderObject := crdWithSchema(t, "Structural", structuralSchemaWithItemsUnderObject)
+	structuralSchemaWithItemsUnderObject.SetResourceVersion(crd.GetResourceVersion())
+	// Update CRD with invalid schema items under object
+	crd, err = apiExtensionClient.ApiextensionsV1().CustomResourceDefinitions().Update(context.TODO(), structuralSchemaWithItemsUnderObject, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Make an unrelated update to the previous persisted CR instance to make sure CRD handler doesn't panic
+	// It may take some time for the CRD schema update to be processed by the API Server's internal validation cache.
+	var lastErr error
+	err = wait.PollUntilContextTimeout(context.TODO(), 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		oldCR, err := crClient.Get(ctx, name1, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+
+		oldCR.Object["metadata"].(map[string]interface{})["labels"] = map[string]interface{}{"key": "value"}
+		_, err = crClient.Update(ctx, oldCR, metav1.UpdateOptions{})
+		lastErr = err
+
+		if err != nil && strings.Contains(err.Error(), "rule compiler initialization error: failed to convert to declType for CEL validation rules") {
+			return true, nil
+		}
+
+		return false, nil
+	})
+	if err != nil {
+		t.Fatalf("expect error to contain \"rule compiler initialization error: failed to convert to declType for CEL validation rules\" but get: %v", lastErr)
+	}
+	// Create another CR instance with an array and be rejected
+	name2 := names.SimpleNameGenerator.GenerateName("cr-2")
+	_, err = crClient.Create(context.TODO(), &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": gvr.Group + "/" + gvr.Version,
+		"kind":       crd.Spec.Names.Kind,
+		"metadata": map[string]interface{}{
+			"name": name2,
+		},
+		"spec": map[string]interface{}{
+			"backend": []interface{}{
+				map[string]interface{}{
+					"replicas": 7,
+				},
+			},
+		},
+	}}, metav1.CreateOptions{})
+	if err == nil || !strings.Contains(err.Error(), "Invalid value: \"array\": spec.backend in body must be of type object: \"array\"") {
+		t.Fatalf("expect error to contain \"Invalid value: \"array\": spec.backend in body must be of type object: \"array\"\" but get: %v", err)
+	}
+	// Delete the CRD
+	err = fixtures.DeleteV1CustomResourceDefinition(structuralWithValidators, apiExtensionClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func nonStructuralCrdWithValidations() *apiextensionsv1beta1.CustomResourceDefinition {
 	return &apiextensionsv1beta1.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
@@ -712,7 +789,7 @@ func nonStructuralCrdWithValidations() *apiextensionsv1beta1.CustomResourceDefin
 
 func genLargeArray(n, x int64) []int64 {
 	arr := make([]int64, n)
-	for i := int64(0); i < n; i++ {
+	for i := range n {
 		arr[i] = x
 	}
 	return arr
@@ -915,6 +992,76 @@ var structuralSchemaWithBlockingErr = []byte(`
   }
 }`)
 
+var structuralSchemaWithItemsUnderArray = []byte(`
+{
+  "openAPIV3Schema": {
+    "description": "CRD with CEL validators",
+    "type": "object",
+    "properties": {
+      "spec": {
+        "type": "object",
+        "properties": {
+          "backend": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "properties": {
+                "replicas": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "replicas"
+              ],
+              "x-kubernetes-validations": [
+                {
+                  "rule": "0 <= self.replicas && self.replicas <= 10"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}`)
+
+var structuralSchemaWithItemsUnderObject = []byte(`
+{
+  "openAPIV3Schema": {
+    "description": "CRD with CEL validators",
+    "type": "object",
+    "properties": {
+      "spec": {
+        "type": "object",
+        "properties": {
+          "backend": {
+            "type": "object",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "properties": {
+                "replicas": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "replicas"
+              ],
+              "x-kubernetes-validations": [
+                {
+                  "rule": "0 <= self.replicas && self.replicas <= 10"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}`)
+
 var structuralSchemaWithValidMetadataValidators = []byte(`
 {
   "openAPIV3Schema": {
@@ -1101,3 +1248,26 @@ var structuralSchemaWithCostLimit = []byte(`
     }
   }
 }`)
+
+var structuralSchemaWithEmptyObject = []byte(`
+{
+  "openAPIV3Schema": {
+    "description": "weird CRD with empty spec, unstructured status. designed to fit test fixtures.",
+    "type": "object",
+    "x-kubernetes-validations": [
+      {
+        "rule": "[has(self.spec), has(self.status)].exists_one(x, x)"
+      }
+    ],
+    "properties": {
+      "spec": {
+        "type": "object"
+      },
+      "status": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    }
+  }
+}
+`)

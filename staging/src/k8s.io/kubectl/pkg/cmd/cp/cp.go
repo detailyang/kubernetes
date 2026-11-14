@@ -18,12 +18,13 @@ package cp
 
 import (
 	"archive/tar"
-	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -75,6 +76,7 @@ type CopyOptions struct {
 	ClientConfig      *restclient.Config
 	Clientset         kubernetes.Interface
 	ExecParentCmdName string
+	Executor          exec.RemoteExecutor
 
 	args []string
 
@@ -203,6 +205,7 @@ func (o *CopyOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []str
 	if cmd.Parent() != nil {
 		o.ExecParentCmdName = cmd.Parent().CommandPath()
 	}
+	o.Executor = &exec.DefaultRemoteExecutor{}
 
 	var err error
 	o.Namespace, _, err = f.ToRawKubeConfigLoader().Namespace()
@@ -267,8 +270,8 @@ func (o *CopyOptions) checkDestinationIsDir(dest fileSpec) error {
 	options := &exec.ExecOptions{
 		StreamOptions: exec.StreamOptions{
 			IOStreams: genericiooptions.IOStreams{
-				Out:    bytes.NewBuffer([]byte{}),
-				ErrOut: bytes.NewBuffer([]byte{}),
+				Out:    io.Discard,
+				ErrOut: io.Discard,
 			},
 
 			Namespace: dest.PodNamespace,
@@ -276,10 +279,24 @@ func (o *CopyOptions) checkDestinationIsDir(dest fileSpec) error {
 		},
 
 		Command:  []string{"test", "-d", dest.File.String()},
-		Executor: &exec.DefaultRemoteExecutor{},
+		Executor: o.Executor,
 	}
 
-	return o.execute(options)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	done := make(chan error)
+
+	go func() {
+		done <- o.execute(options)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
+		return err
+	}
 }
 
 func (o *CopyOptions) copyToPod(src, dest fileSpec, options *exec.ExecOptions) error {
@@ -295,6 +312,10 @@ func (o *CopyOptions) copyToPod(src, dest fileSpec, options *exec.ExecOptions) e
 		// If no error, dest.File was found to be a directory.
 		// Copy specified src into it
 		destFile = destFile.Join(srcFile.Base())
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		// we haven't decided destination is directory or not because context timeout is exceeded.
+		// That's why, we should shortcut the process in here.
+		return err
 	}
 
 	go func(src localPath, dest remotePath, writer io.WriteCloser) {
@@ -326,7 +347,7 @@ func (o *CopyOptions) copyToPod(src, dest fileSpec, options *exec.ExecOptions) e
 	}
 
 	options.Command = cmdArr
-	options.Executor = &exec.DefaultRemoteExecutor{}
+	options.Executor = o.Executor
 	return o.execute(options)
 }
 
@@ -372,10 +393,11 @@ func (t *TarPipe) initReadFrom(n uint64) {
 		},
 
 		Command:  []string{"tar", "cf", "-", t.src.File.String()},
-		Executor: &exec.DefaultRemoteExecutor{},
+		Executor: t.o.Executor,
 	}
 	if t.o.MaxTries != 0 {
-		options.Command = []string{"sh", "-c", fmt.Sprintf("tar cf - %s | tail -c+%d", t.src.File, n)}
+		escapedPath := strings.ReplaceAll(t.src.File.String(), "'", `'\''`)
+		options.Command = []string{"sh", "-c", fmt.Sprintf("tar cf - '%s' | tail -c+%d", escapedPath, n)}
 	}
 
 	go func() {
@@ -568,8 +590,5 @@ func (o *CopyOptions) execute(options *exec.ExecOptions) error {
 		return err
 	}
 
-	if err := options.Run(); err != nil {
-		return err
-	}
-	return nil
+	return options.Run()
 }

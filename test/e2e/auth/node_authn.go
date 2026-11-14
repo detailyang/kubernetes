@@ -23,7 +23,6 @@ import (
 	"strconv"
 
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/pkg/cluster/ports"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
@@ -35,12 +34,12 @@ import (
 	"github.com/onsi/gomega"
 )
 
-var _ = SIGDescribe("[Feature:NodeAuthenticator]", func() {
+var _ = SIGDescribe("NodeAuthenticator", func() {
 
 	f := framework.NewDefaultFramework("node-authn")
 	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 	var ns string
-	var nodeIPs []string
+	var nodeIP string
 	ginkgo.BeforeEach(func(ctx context.Context) {
 		ns = f.Namespace.Name
 
@@ -52,45 +51,30 @@ var _ = SIGDescribe("[Feature:NodeAuthenticator]", func() {
 			family = v1.IPv6Protocol
 		}
 
-		nodeIPs := e2enode.GetAddressesByTypeAndFamily(&nodes.Items[0], v1.NodeInternalIP, family)
-		framework.ExpectNotEqual(len(nodeIPs), 0)
+		nodeIP = e2enode.FirstAddressByTypeAndFamily(nodes, v1.NodeInternalIP, family)
+		gomega.Expect(nodeIP).NotTo(gomega.BeEmpty())
 	})
 
 	ginkgo.It("The kubelet's main port 10250 should reject requests with no credentials", func(ctx context.Context) {
 		pod := createNodeAuthTestPod(ctx, f)
-		for _, nodeIP := range nodeIPs {
-			// Anonymous authentication is disabled by default
-			host := net.JoinHostPort(nodeIP, strconv.Itoa(ports.KubeletPort))
-			result := e2eoutput.RunHostCmdOrDie(ns, pod.Name, fmt.Sprintf("curl -sIk -o /dev/null -w '%s' https://%s/metrics", "%{http_code}", host))
-			gomega.Expect(result).To(gomega.Or(gomega.Equal("401"), gomega.Equal("403")), "the kubelet's main port 10250 should reject requests with no credentials")
-		}
+
+		// Anonymous authentication is disabled by default
+		host := net.JoinHostPort(nodeIP, strconv.Itoa(ports.KubeletPort))
+		result := e2eoutput.RunHostCmdOrDie(ns, pod.Name, fmt.Sprintf("curl -sIk -o /dev/null -w '%s' https://%s/metrics", "%{http_code}", host))
+		gomega.Expect(result).To(gomega.Or(gomega.Equal("401"), gomega.Equal("403")), "the kubelet's main port 10250 should reject requests with no credentials")
 	})
 
 	ginkgo.It("The kubelet can delegate ServiceAccount tokens to the API server", func(ctx context.Context) {
-		ginkgo.By("create a new ServiceAccount for authentication")
-		trueValue := true
-		newSA := &v1.ServiceAccount{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: ns,
-				Name:      "node-auth-newsa",
-			},
-			AutomountServiceAccountToken: &trueValue,
-		}
-		_, err := f.ClientSet.CoreV1().ServiceAccounts(ns).Create(ctx, newSA, metav1.CreateOptions{})
-		framework.ExpectNoError(err, "failed to create service account (%s:%s)", ns, newSA.Name)
-
 		pod := createNodeAuthTestPod(ctx, f)
 
-		for _, nodeIP := range nodeIPs {
-			host := net.JoinHostPort(nodeIP, strconv.Itoa(ports.KubeletPort))
-			result := e2eoutput.RunHostCmdOrDie(ns,
-				pod.Name,
-				fmt.Sprintf("curl -sIk -o /dev/null -w '%s' --header \"Authorization: Bearer `%s`\" https://%s/metrics",
-					"%{http_code}",
-					"cat /var/run/secrets/kubernetes.io/serviceaccount/token",
-					host))
-			gomega.Expect(result).To(gomega.Or(gomega.Equal("401"), gomega.Equal("403")), "the kubelet can delegate ServiceAccount tokens to the API server")
-		}
+		host := net.JoinHostPort(nodeIP, strconv.Itoa(ports.KubeletPort))
+		result := e2eoutput.RunHostCmdOrDie(ns,
+			pod.Name,
+			fmt.Sprintf("curl -sIk -o /dev/null -w '%s' --header \"Authorization: Bearer `%s`\" https://%s/metrics",
+				"%{http_code}",
+				"cat /var/run/secrets/kubernetes.io/serviceaccount/token",
+				host))
+		gomega.Expect(result).To(gomega.Or(gomega.Equal("401"), gomega.Equal("403")), "the kubelet can delegate ServiceAccount tokens to the API server")
 	})
 })
 

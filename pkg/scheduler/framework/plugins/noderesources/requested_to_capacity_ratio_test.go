@@ -19,20 +19,24 @@ package noderesources
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/klog/v2/ktesting"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	plfeature "k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/runtime"
-	"k8s.io/kubernetes/pkg/scheduler/internal/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	tf "k8s.io/kubernetes/pkg/scheduler/testing/framework"
 )
 
 func TestRequestedToCapacityRatioScoringStrategy(t *testing.T) {
@@ -46,7 +50,7 @@ func TestRequestedToCapacityRatioScoringStrategy(t *testing.T) {
 		requestedPod   *v1.Pod
 		nodes          []*v1.Node
 		existingPods   []*v1.Pod
-		expectedScores framework.NodeScoreList
+		expectedScores fwk.NodeScoreList
 		resources      []config.ResourceSpec
 		shape          []config.UtilizationShapePoint
 		wantErrs       field.ErrorList
@@ -62,7 +66,7 @@ func TestRequestedToCapacityRatioScoringStrategy(t *testing.T) {
 				st.MakePod().Node("node1").Obj(),
 				st.MakePod().Node("node1").Obj(),
 			},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: framework.MaxNodeScore}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: fwk.MaxNodeScore}},
 			resources:      defaultResources,
 			shape:          shape,
 		},
@@ -80,7 +84,7 @@ func TestRequestedToCapacityRatioScoringStrategy(t *testing.T) {
 				st.MakePod().Node("node1").Obj(),
 				st.MakePod().Node("node1").Obj(),
 			},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 38}, {Name: "node2", Score: 50}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 38}, {Name: "node2", Score: 50}},
 			resources:      defaultResources,
 			shape:          shape,
 		},
@@ -95,7 +99,7 @@ func TestRequestedToCapacityRatioScoringStrategy(t *testing.T) {
 				st.MakePod().Node("node1").Req(map[v1.ResourceName]string{"cpu": "3000", "memory": "5000"}).Obj(),
 				st.MakePod().Node("node2").Req(map[v1.ResourceName]string{"cpu": "3000", "memory": "5000"}).Obj(),
 			},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 38}, {Name: "node2", Score: 50}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 38}, {Name: "node2", Score: 50}},
 			resources:      defaultResources,
 			shape:          shape,
 		},
@@ -111,7 +115,7 @@ func TestRequestedToCapacityRatioScoringStrategy(t *testing.T) {
 			snapshot := cache.NewSnapshot(test.existingPods, test.nodes)
 			fh, _ := runtime.NewFramework(ctx, nil, nil, runtime.WithSnapshotSharedLister(snapshot))
 
-			p, err := NewFit(&config.NodeResourcesFitArgs{
+			p, err := NewFit(ctx, &config.NodeResourcesFitArgs{
 				ScoringStrategy: &config.ScoringStrategy{
 					Type:      config.RequestedToCapacityRatio,
 					Resources: test.resources,
@@ -128,17 +132,21 @@ func TestRequestedToCapacityRatioScoringStrategy(t *testing.T) {
 				return
 			}
 
-			var gotScores framework.NodeScoreList
+			var gotScores fwk.NodeScoreList
 			for _, n := range test.nodes {
-				status := p.(framework.PreScorePlugin).PreScore(ctx, state, test.requestedPod, test.nodes)
+				status := p.(fwk.PreScorePlugin).PreScore(ctx, state, test.requestedPod, tf.BuildNodeInfos(test.nodes))
 				if !status.IsSuccess() {
 					t.Errorf("PreScore is expected to return success, but didn't. Got status: %v", status)
 				}
-				score, status := p.(framework.ScorePlugin).Score(ctx, state, test.requestedPod, n.Name)
+				nodeInfo, err := snapshot.Get(n.Name)
+				if err != nil {
+					t.Errorf("failed to get node %q from snapshot: %v", n.Name, err)
+				}
+				score, status := p.(fwk.ScorePlugin).Score(ctx, state, test.requestedPod, nodeInfo)
 				if !status.IsSuccess() {
 					t.Errorf("Score is expected to return success, but didn't. Got status: %v", status)
 				}
-				gotScores = append(gotScores, framework.NodeScore{Name: n.Name, Score: score})
+				gotScores = append(gotScores, fwk.NodeScore{Name: n.Name, Score: score})
 			}
 
 			if diff := cmp.Diff(test.expectedScores, gotScores); diff != "" {
@@ -232,14 +240,14 @@ func TestResourceBinPackingSingleExtended(t *testing.T) {
 		pod            *v1.Pod
 		pods           []*v1.Pod
 		nodes          []*v1.Node
-		expectedScores framework.NodeScoreList
+		expectedScores fwk.NodeScoreList
 		name           string
 	}{
 		{
 			//  Node1 Score = Node2 Score = 0 as the incoming Pod doesn't request extended resource.
 			pod:            st.MakePod().Obj(),
 			nodes:          []*v1.Node{makeNode("node1", 4000, 10000*1024*1024, extendedResource2), makeNode("node2", 4000, 10000*1024*1024, extendedResource1)},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: 0}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: 0}},
 			name:           "nothing scheduled, nothing requested",
 		},
 		{
@@ -256,7 +264,7 @@ func TestResourceBinPackingSingleExtended(t *testing.T) {
 			// Node2 Score: 5
 			pod:            st.MakePod().Req(extendedResource3).Obj(),
 			nodes:          []*v1.Node{makeNode("node1", 4000, 10000*1024*1024, extendedResource2), makeNode("node2", 4000, 10000*1024*1024, extendedResource1)},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 2}, {Name: "node2", Score: 5}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 2}, {Name: "node2", Score: 5}},
 			name:           "resources requested, pods scheduled with less resources",
 			pods:           []*v1.Pod{st.MakePod().Obj()},
 		},
@@ -274,7 +282,7 @@ func TestResourceBinPackingSingleExtended(t *testing.T) {
 			// Node2 Score: 10
 			pod:            st.MakePod().Req(extendedResource3).Obj(),
 			nodes:          []*v1.Node{makeNode("node1", 4000, 10000*1024*1024, extendedResource2), makeNode("node2", 4000, 10000*1024*1024, extendedResource1)},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 2}, {Name: "node2", Score: 10}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 2}, {Name: "node2", Score: 10}},
 			name:           "resources requested, pods scheduled with resources, on node with existing pod running ",
 			pods:           []*v1.Pod{st.MakePod().Req(extendedResource3).Node("node2").Obj()},
 		},
@@ -292,7 +300,7 @@ func TestResourceBinPackingSingleExtended(t *testing.T) {
 			// Node2 Score: 10
 			pod:            st.MakePod().Req(extendedResource4).Obj(),
 			nodes:          []*v1.Node{makeNode("node1", 4000, 10000*1024*1024, extendedResource2), makeNode("node2", 4000, 10000*1024*1024, extendedResource1)},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 5}, {Name: "node2", Score: 10}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 5}, {Name: "node2", Score: 10}},
 			name:           "resources requested, pods scheduled with more resources",
 			pods: []*v1.Pod{
 				st.MakePod().Obj(),
@@ -320,22 +328,26 @@ func TestResourceBinPackingSingleExtended(t *testing.T) {
 					},
 				},
 			}
-			p, err := NewFit(&args, fh, plfeature.Features{})
+			p, err := NewFit(ctx, &args, fh, plfeature.Features{})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			var gotList framework.NodeScoreList
+			var gotList fwk.NodeScoreList
 			for _, n := range test.nodes {
-				status := p.(framework.PreScorePlugin).PreScore(context.Background(), state, test.pod, test.nodes)
+				status := p.(fwk.PreScorePlugin).PreScore(ctx, state, test.pod, tf.BuildNodeInfos(test.nodes))
 				if !status.IsSuccess() {
 					t.Errorf("PreScore is expected to return success, but didn't. Got status: %v", status)
 				}
-				score, status := p.(framework.ScorePlugin).Score(context.Background(), state, test.pod, n.Name)
+				nodeInfo, err := snapshot.Get(n.Name)
+				if err != nil {
+					t.Errorf("failed to get node %q from snapshot: %v", n.Name, err)
+				}
+				score, status := p.(fwk.ScorePlugin).Score(ctx, state, test.pod, nodeInfo)
 				if !status.IsSuccess() {
 					t.Errorf("Score is expected to return success, but didn't. Got status: %v", status)
 				}
-				gotList = append(gotList, framework.NodeScore{Name: n.Name, Score: score})
+				gotList = append(gotList, fwk.NodeScore{Name: n.Name, Score: score})
 			}
 
 			if diff := cmp.Diff(test.expectedScores, gotList); diff != "" {
@@ -368,7 +380,7 @@ func TestResourceBinPackingMultipleExtended(t *testing.T) {
 		pod            *v1.Pod
 		pods           []*v1.Pod
 		nodes          []*v1.Node
-		expectedScores framework.NodeScoreList
+		expectedScores fwk.NodeScoreList
 		name           string
 	}{
 		{
@@ -401,7 +413,7 @@ func TestResourceBinPackingMultipleExtended(t *testing.T) {
 
 			pod:            st.MakePod().Obj(),
 			nodes:          []*v1.Node{makeNode("node1", 4000, 10000*1024*1024, extendedResources2), makeNode("node2", 4000, 10000*1024*1024, extendedResources1)},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: 0}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: 0}},
 			name:           "nothing scheduled, nothing requested",
 		},
 		{
@@ -434,7 +446,7 @@ func TestResourceBinPackingMultipleExtended(t *testing.T) {
 
 			pod:            st.MakePod().Req(extendedResourcePod1).Obj(),
 			nodes:          []*v1.Node{makeNode("node1", 4000, 10000*1024*1024, extendedResources2), makeNode("node2", 4000, 10000*1024*1024, extendedResources1)},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 4}, {Name: "node2", Score: 3}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 4}, {Name: "node2", Score: 3}},
 			name:           "resources requested, pods scheduled with less resources",
 			pods: []*v1.Pod{
 				st.MakePod().Obj(),
@@ -469,7 +481,7 @@ func TestResourceBinPackingMultipleExtended(t *testing.T) {
 
 			pod:            st.MakePod().Req(extendedResourcePod1).Obj(),
 			nodes:          []*v1.Node{makeNode("node1", 4000, 10000*1024*1024, extendedResources2), makeNode("node2", 4000, 10000*1024*1024, extendedResources1)},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 4}, {Name: "node2", Score: 7}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 4}, {Name: "node2", Score: 7}},
 			name:           "resources requested, pods scheduled with resources, on node with existing pod running ",
 			pods:           []*v1.Pod{st.MakePod().Req(extendedResourcePod2).Node("node2").Obj()},
 		},
@@ -517,7 +529,7 @@ func TestResourceBinPackingMultipleExtended(t *testing.T) {
 
 			pod:            st.MakePod().Req(extendedResourcePod2).Obj(),
 			nodes:          []*v1.Node{makeNode("node1", 4000, 10000*1024*1024, extendedResources2), makeNode("node2", 4000, 10000*1024*1024, extendedResources1)},
-			expectedScores: []framework.NodeScore{{Name: "node1", Score: 5}, {Name: "node2", Score: 5}},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 5}, {Name: "node2", Score: 5}},
 			name:           "resources requested, pods scheduled with more resources",
 			pods: []*v1.Pod{
 				st.MakePod().Obj(),
@@ -548,27 +560,173 @@ func TestResourceBinPackingMultipleExtended(t *testing.T) {
 				},
 			}
 
-			p, err := NewFit(&args, fh, plfeature.Features{})
+			p, err := NewFit(ctx, &args, fh, plfeature.Features{})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			status := p.(framework.PreScorePlugin).PreScore(context.Background(), state, test.pod, test.nodes)
+			status := p.(fwk.PreScorePlugin).PreScore(ctx, state, test.pod, tf.BuildNodeInfos(test.nodes))
 			if !status.IsSuccess() {
 				t.Errorf("PreScore is expected to return success, but didn't. Got status: %v", status)
 			}
 
-			var gotScores framework.NodeScoreList
+			var gotScores fwk.NodeScoreList
 			for _, n := range test.nodes {
-				score, status := p.(framework.ScorePlugin).Score(context.Background(), state, test.pod, n.Name)
+				nodeInfo, err := snapshot.Get(n.Name)
+				if err != nil {
+					t.Errorf("failed to get node %q from snapshot: %v", n.Name, err)
+				}
+				score, status := p.(fwk.ScorePlugin).Score(ctx, state, test.pod, nodeInfo)
 				if !status.IsSuccess() {
 					t.Errorf("Score is expected to return success, but didn't. Got status: %v", status)
 				}
-				gotScores = append(gotScores, framework.NodeScore{Name: n.Name, Score: score})
+				gotScores = append(gotScores, fwk.NodeScore{Name: n.Name, Score: score})
 			}
 
 			if diff := cmp.Diff(test.expectedScores, gotScores); diff != "" {
 				t.Errorf("Unexpected nodescore list (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestRequestedToCapacityRatioScorerOverflow(t *testing.T) {
+	linearScorer := buildRequestedToCapacityRatioScorerFunction(
+		[]helper.FunctionShapePoint{{Utilization: 0, Score: 0}, {Utilization: 100, Score: 100}},
+		[]config.ResourceSpec{{Name: string(v1.ResourceCPU), Weight: 1}},
+	)
+	// Steep shape: flat 0 for utilizations 0-99, full score only at 100.
+	// (Score values are passed in already-scaled form: 10 * MaxScore/10.)
+	steepScorer := buildRequestedToCapacityRatioScorerFunction(
+		[]helper.FunctionShapePoint{{Utilization: 0, Score: 0}, {Utilization: 99, Score: 0}, {Utilization: 100, Score: 100}},
+		[]config.ResourceSpec{{Name: string(v1.ResourceCPU), Weight: 1}},
+	)
+	tests := []struct {
+		name      string
+		scorer    func([]int64, []int64, []int64) int64
+		requested int64
+		capacity  int64
+		want      int64
+	}{
+		{
+			name:      "requested above the multiplication overflow threshold",
+			scorer:    linearScorer,
+			requested: math.MaxInt64/100 + 1,
+			capacity:  math.MaxInt64,
+			want:      1,
+		},
+		{
+			name:      "saturated requested and capacity",
+			scorer:    linearScorer,
+			requested: math.MaxInt64,
+			capacity:  math.MaxInt64,
+			want:      100,
+		},
+		{
+			name:      "no requested",
+			scorer:    linearScorer,
+			requested: 0,
+			capacity:  math.MaxInt64,
+			want:      0,
+		},
+		{
+			name:      "steep shape stays at 0 for utilization 99",
+			scorer:    steepScorer,
+			requested: 999999999999999999,
+			capacity:  1000000000000000000,
+			want:      0,
+		},
+		{
+			name:      "steep shape full score at utilization 100",
+			scorer:    steepScorer,
+			requested: 1000000000000000000,
+			capacity:  1000000000000000000,
+			want:      100,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.scorer([]int64{tt.requested}, nil, []int64{tt.capacity})
+			if got != tt.want {
+				t.Errorf("scorer() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestScaledFraction(t *testing.T) {
+	const max = int64(100)
+	tests := []struct {
+		name  string
+		part  int64
+		whole int64
+		want  int64
+	}{
+		{
+			name:  "negative part from wrapped totals",
+			part:  -500,
+			whole: 1000,
+			want:  0,
+		},
+		{
+			name:  "zero part",
+			part:  0,
+			whole: 1000,
+			want:  0,
+		},
+		{
+			name:  "zero whole",
+			part:  500,
+			whole: 0,
+			want:  0,
+		},
+		{
+			name:  "negative whole",
+			part:  500,
+			whole: -1000,
+			want:  0,
+		},
+		{
+			name:  "part at whole",
+			part:  1000,
+			whole: 1000,
+			want:  max,
+		},
+		{
+			name:  "part above whole",
+			part:  2000,
+			whole: 1000,
+			want:  max,
+		},
+		{
+			name:  "part far above whole avoids Div64 panic",
+			part:  math.MaxInt64,
+			whole: 1,
+			want:  max,
+		},
+		{
+			name:  "normal range",
+			part:  250,
+			whole: 1000,
+			want:  25,
+		},
+		{
+			name:  "exact in the math/bits path",
+			part:  999999999999999999,
+			whole: 1000000000000000000,
+			want:  99,
+		},
+		{
+			name:  "math/bits path just below whole",
+			part:  math.MaxInt64 - 1,
+			whole: math.MaxInt64,
+			want:  99,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := scaledFraction(tt.part, tt.whole, max); got != tt.want {
+				t.Errorf("scaledFraction(%d, %d, %d) = %d, want %d", tt.part, tt.whole, max, got, tt.want)
 			}
 		})
 	}

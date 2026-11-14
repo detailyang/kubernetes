@@ -21,6 +21,7 @@ package certificates
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -49,7 +50,7 @@ type CertificateController struct {
 
 	handler func(context.Context, *certificates.CertificateSigningRequest) error
 
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 }
 
 func NewCertificateController(
@@ -63,16 +64,22 @@ func NewCertificateController(
 	cc := &CertificateController{
 		name:       name,
 		kubeClient: kubeClient,
-		queue: workqueue.NewNamedRateLimitingQueue(workqueue.NewMaxOfRateLimiter(
-			workqueue.NewItemExponentialFailureRateLimiter(200*time.Millisecond, 1000*time.Second),
-			// 10 qps, 100 bucket size.  This is only for retry speed and its only the overall factor (not per item)
-			&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
-		), "certificate"),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.NewTypedMaxOfRateLimiter[string](
+				workqueue.NewTypedItemExponentialFailureRateLimiter[string](200*time.Millisecond, 1000*time.Second),
+				// 10 qps, 100 bucket size.  This is only for retry speed and its only the overall factor (not per item)
+				&workqueue.TypedBucketRateLimiter[string]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+			),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: &logger,
+				Name:   "certificate",
+			},
+		),
 		handler: handler,
 	}
 
 	// Manage the addition/update of certificate requests
-	csrInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = csrInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			csr := obj.(*certificates.CertificateSigningRequest)
 			logger.V(4).Info("Adding certificate request", "csr", csr.Name)
@@ -100,7 +107,7 @@ func NewCertificateController(
 			logger.V(4).Info("Deleting certificate request", "csr", csr.Name)
 			cc.enqueueCertificateRequest(obj)
 		},
-	})
+	}, cache.HandlerOptions{Logger: &logger})
 	cc.csrLister = csrInformer.Lister()
 	cc.csrsSynced = csrInformer.Informer().HasSynced
 	return cc
@@ -108,21 +115,27 @@ func NewCertificateController(
 
 // Run the main goroutine responsible for watching and syncing jobs.
 func (cc *CertificateController) Run(ctx context.Context, workers int) {
-	defer utilruntime.HandleCrash()
-	defer cc.queue.ShutDown()
+	defer utilruntime.HandleCrashWithContext(ctx)
 
 	logger := klog.FromContext(ctx)
 	logger.Info("Starting certificate controller", "name", cc.name)
-	defer logger.Info("Shutting down certificate controller", "name", cc.name)
 
-	if !cache.WaitForNamedCacheSync(fmt.Sprintf("certificate-%s", cc.name), ctx.Done(), cc.csrsSynced) {
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down certificate controller", "name", cc.name)
+		cc.queue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, cc.csrsSynced) {
 		return
 	}
 
 	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, cc.worker, time.Second)
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, cc.worker, time.Second)
+		})
 	}
-
 	<-ctx.Done()
 }
 
@@ -140,7 +153,7 @@ func (cc *CertificateController) processNextWorkItem(ctx context.Context) bool {
 	}
 	defer cc.queue.Done(cKey)
 
-	if err := cc.syncFunc(ctx, cKey.(string)); err != nil {
+	if err := cc.syncFunc(ctx, cKey); err != nil {
 		cc.queue.AddRateLimited(cKey)
 		if _, ignorable := err.(ignorableError); !ignorable {
 			utilruntime.HandleError(fmt.Errorf("Sync %v failed with : %v", cKey, err))

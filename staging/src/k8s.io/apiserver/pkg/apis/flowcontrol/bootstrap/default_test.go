@@ -19,7 +19,7 @@ package bootstrap
 import (
 	"testing"
 
-	flowcontrol "k8s.io/api/flowcontrol/v1beta3"
+	flowcontrol "k8s.io/api/flowcontrol/v1"
 )
 
 func TestBootstrapPriorityLevelConfigurationWithBorrowing(t *testing.T) {
@@ -89,11 +89,11 @@ func TestBootstrapPriorityLevelConfigurationWithBorrowing(t *testing.T) {
 			t.Errorf("bootstrap PriorityLevelConfiguration %q is not %q", test.name, flowcontrol.PriorityLevelEnablementLimited)
 			continue
 		}
-		if test.nominalSharesExpected != bootstrapPL.Spec.Limited.NominalConcurrencyShares {
-			t.Errorf("bootstrap PriorityLevelConfiguration %q: expected NominalConcurrencyShares: %d, but got: %d", test.name, test.nominalSharesExpected, bootstrapPL.Spec.Limited.NominalConcurrencyShares)
+		if test.nominalSharesExpected != *bootstrapPL.Spec.Limited.NominalConcurrencyShares {
+			t.Errorf("bootstrap PriorityLevelConfiguration %q: expected NominalConcurrencyShares: %d, but got: %d", test.name, test.nominalSharesExpected, *bootstrapPL.Spec.Limited.NominalConcurrencyShares)
 		}
 		if test.lendablePercentexpected != *bootstrapPL.Spec.Limited.LendablePercent {
-			t.Errorf("bootstrap PriorityLevelConfiguration %q: expected NominalConcurrencyShares: %d, but got: %d", test.name, test.lendablePercentexpected, bootstrapPL.Spec.Limited.LendablePercent)
+			t.Errorf("bootstrap PriorityLevelConfiguration %q: expected NominalConcurrencyShares: %d, but got: %d", test.name, test.lendablePercentexpected, *bootstrapPL.Spec.Limited.LendablePercent)
 		}
 		if bootstrapPL.Spec.Limited.BorrowingLimitPercent != nil {
 			t.Errorf("bootstrap PriorityLevelConfiguration %q: expected BorrowingLimitPercent to be nil, but got: %d", test.name, *bootstrapPL.Spec.Limited.BorrowingLimitPercent)

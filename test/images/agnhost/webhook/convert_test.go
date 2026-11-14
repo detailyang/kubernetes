@@ -23,7 +23,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	fuzz "github.com/google/gofuzz"
+	"sigs.k8s.io/randfill"
 
 	v1 "k8s.io/api/admission/v1"
 	"k8s.io/api/admission/v1beta1"
@@ -35,10 +35,10 @@ import (
 
 func TestConvertAdmissionRequestToV1(t *testing.T) {
 	f := fuzzer.FuzzerFor(admissionfuzzer.Funcs, rand.NewSource(rand.Int63()), serializer.NewCodecFactory(runtime.NewScheme()))
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		t.Run(fmt.Sprintf("Run %d/100", i), func(t *testing.T) {
 			orig := &v1beta1.AdmissionRequest{}
-			f.Fuzz(orig)
+			f.Fill(orig)
 			converted := convertAdmissionRequestToV1(orig)
 			rt := convertAdmissionRequestToV1beta1(converted)
 			if !reflect.DeepEqual(orig, rt) {
@@ -49,11 +49,11 @@ func TestConvertAdmissionRequestToV1(t *testing.T) {
 }
 
 func TestConvertAdmissionResponseToV1beta1(t *testing.T) {
-	f := fuzz.New()
-	for i := 0; i < 100; i++ {
+	f := randfill.New()
+	for i := range 100 {
 		t.Run(fmt.Sprintf("Run %d/100", i), func(t *testing.T) {
 			orig := &v1.AdmissionResponse{}
-			f.Fuzz(orig)
+			f.Fill(orig)
 			converted := convertAdmissionResponseToV1beta1(orig)
 			rt := convertAdmissionResponseToV1(converted)
 			if !reflect.DeepEqual(orig, rt) {

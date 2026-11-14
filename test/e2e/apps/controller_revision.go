@@ -22,12 +22,15 @@ import (
 	"time"
 
 	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/apimachinery/pkg/util/resourceversion"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -35,11 +38,12 @@ import (
 	extensionsinternal "k8s.io/kubernetes/pkg/apis/extensions"
 	"k8s.io/kubernetes/pkg/controller"
 	labelsutil "k8s.io/kubernetes/pkg/util/labels"
+	apimachineryutils "k8s.io/kubernetes/test/e2e/common/apimachinery"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2edaemonset "k8s.io/kubernetes/test/e2e/framework/daemonset"
 	e2eresource "k8s.io/kubernetes/test/e2e/framework/resource"
 	admissionapi "k8s.io/pod-security-admission/api"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -52,18 +56,18 @@ const (
 // happen.  In the future, running in parallel may work if we have an eviction
 // model which lets the DS controller kick out other pods to make room.
 // See https://issues.k8s.io/21767 for more details
-var _ = SIGDescribe("ControllerRevision [Serial]", func() {
+var _ = SIGDescribe("ControllerRevision", framework.WithSerial(), func() {
 	var f *framework.Framework
 
 	ginkgo.AfterEach(func(ctx context.Context) {
 		// Clean up
 		daemonsets, err := f.ClientSet.AppsV1().DaemonSets(f.Namespace.Name).List(ctx, metav1.ListOptions{})
-		framework.ExpectNoError(err, "unable to dump DaemonSets")
+		framework.ExpectNoError(err, "list DaemonSets in namespace %q", f.Namespace.Name)
 		if daemonsets != nil && len(daemonsets.Items) > 0 {
 			for _, ds := range daemonsets.Items {
 				ginkgo.By(fmt.Sprintf("Deleting DaemonSet %q", ds.Name))
-				framework.ExpectNoError(e2eresource.DeleteResourceAndWaitForGC(ctx, f.ClientSet, extensionsinternal.Kind("DaemonSet"), f.Namespace.Name, ds.Name))
-				err = wait.PollImmediateWithContext(ctx, dsRetryPeriod, dsRetryTimeout, checkRunningOnNoNodes(f, &ds))
+				framework.ExpectNoError(e2eresource.DeleteResourceAndWaitForGC(ctx, f.ClientSet, extensionsinternal.Kind("DaemonSet"), f.Namespace.Name, ds.Name), "delete DaemonSet %q in namespace %q and wait for garbage collection", ds.Name, f.Namespace.Name)
+				err = wait.PollUntilContextTimeout(ctx, dsRetryPeriod, dsRetryTimeout, true, checkRunningOnNoNodes(f, &ds))
 				framework.ExpectNoError(err, "error waiting for daemon pod to be reaped")
 			}
 		}
@@ -78,13 +82,13 @@ var _ = SIGDescribe("ControllerRevision [Serial]", func() {
 			framework.Logf("unable to dump pods: %v", err)
 		}
 		err = clearDaemonSetNodeLabels(ctx, f.ClientSet)
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "clear DaemonSet test labels from nodes during cleanup")
 	})
 
 	f = framework.NewDefaultFramework("controllerrevisions")
 	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 
-	image := WebserverImage
+	image := AgnhostImage
 	dsName := "e2e-" + utilrand.String(5) + "-daemon-set"
 
 	var ns string
@@ -96,12 +100,12 @@ var _ = SIGDescribe("ControllerRevision [Serial]", func() {
 		c = f.ClientSet
 
 		updatedNS, err := patchNamespaceAnnotations(ctx, c, ns)
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "clear node selector annotations on namespace %q", ns)
 
 		ns = updatedNS.Name
 
 		err = clearDaemonSetNodeLabels(ctx, c)
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "clear DaemonSet test labels from nodes during setup")
 	})
 
 	/*
@@ -129,27 +133,27 @@ var _ = SIGDescribe("ControllerRevision [Serial]", func() {
 
 		ginkgo.By(fmt.Sprintf("Creating DaemonSet %q", dsName))
 		testDaemonset, err := csAppsV1.DaemonSets(ns).Create(ctx, newDaemonSetWithLabel(dsName, image, dsLabel), metav1.CreateOptions{})
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "create DaemonSet %q in namespace %q", dsName, ns)
 
 		ginkgo.By("Check that daemon pods launch on every node of the cluster.")
-		err = wait.PollImmediateWithContext(ctx, dsRetryPeriod, dsRetryTimeout, checkRunningOnAllNodes(f, testDaemonset))
+		err = wait.PollUntilContextTimeout(ctx, dsRetryPeriod, dsRetryTimeout, true, checkRunningOnAllNodes(f, testDaemonset))
 		framework.ExpectNoError(err, "error waiting for daemon pod to start")
 		err = e2edaemonset.CheckDaemonStatus(ctx, f, dsName)
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "wait for DaemonSet %q in namespace %q to have all desired pods scheduled and ready", dsName, ns)
 
 		ginkgo.By(fmt.Sprintf("Confirm DaemonSet %q successfully created with %q label", dsName, dsLabelSelector))
 		dsList, err := csAppsV1.DaemonSets("").List(ctx, metav1.ListOptions{LabelSelector: dsLabelSelector})
-		framework.ExpectNoError(err, "failed to list Daemon Sets")
-		framework.ExpectEqual(len(dsList.Items), 1, "filtered list wasn't found")
+		framework.ExpectNoError(err, "list Daemon Sets")
+		gomega.Expect(dsList.Items).To(gomega.HaveLen(1), "filtered list wasn't found")
 
 		ds, err := c.AppsV1().DaemonSets(ns).Get(ctx, dsName, metav1.GetOptions{})
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "get DaemonSet %q in namespace %q", dsName, ns)
 
 		// Listing across all namespaces to verify api endpoint: listAppsV1ControllerRevisionForAllNamespaces
 		ginkgo.By(fmt.Sprintf("Listing all ControllerRevisions with label %q", dsLabelSelector))
 		revs, err := csAppsV1.ControllerRevisions("").List(ctx, metav1.ListOptions{LabelSelector: dsLabelSelector})
 		framework.ExpectNoError(err, "Failed to list ControllerRevision: %v", err)
-		framework.ExpectEqual(len(revs.Items), 1, "Failed to find any controllerRevisions")
+		gomega.Expect(revs.Items).To(gomega.HaveLen(1), "Failed to find any controllerRevisions")
 
 		// Locate the current ControllerRevision from the list
 		var initialRevision *appsv1.ControllerRevision
@@ -159,19 +163,21 @@ var _ = SIGDescribe("ControllerRevision [Serial]", func() {
 		if oref.Kind == "DaemonSet" && oref.UID == ds.UID {
 			framework.Logf("Located ControllerRevision: %q", rev.Name)
 			initialRevision, err = csAppsV1.ControllerRevisions(ns).Get(ctx, rev.Name, metav1.GetOptions{})
-			framework.ExpectNoError(err, "failed to lookup ControllerRevision: %v", err)
-			framework.ExpectNotEqual(initialRevision, nil, "failed to lookup ControllerRevision: %v", initialRevision)
+			framework.ExpectNoError(err, "lookup ControllerRevision: %v", err)
+			gomega.Expect(initialRevision).NotTo(gomega.BeNil(), "lookup ControllerRevision: %v", initialRevision)
 		}
+		gomega.Expect(&rev).To(apimachineryutils.HaveValidResourceVersion())
 
 		ginkgo.By(fmt.Sprintf("Patching ControllerRevision %q", initialRevision.Name))
 		payload := "{\"metadata\":{\"labels\":{\"" + initialRevision.Name + "\":\"patched\"}}}"
 		patchedControllerRevision, err := csAppsV1.ControllerRevisions(ns).Patch(ctx, initialRevision.Name, types.StrategicMergePatchType, []byte(payload), metav1.PatchOptions{})
-		framework.ExpectNoError(err, "failed to patch ControllerRevision %s in namespace %s", initialRevision.Name, ns)
-		framework.ExpectEqual(patchedControllerRevision.Labels[initialRevision.Name], "patched", "Did not find 'patched' label for this ControllerRevision. Current labels: %v", patchedControllerRevision.Labels)
+		framework.ExpectNoError(err, "patch ControllerRevision %s in namespace %s", initialRevision.Name, ns)
+		gomega.Expect(patchedControllerRevision.Labels).To(gomega.HaveKeyWithValue(initialRevision.Name, "patched"), "Did not find 'patched' label for this ControllerRevision. Current labels: %v", patchedControllerRevision.Labels)
+		gomega.Expect(resourceversion.CompareResourceVersion(rev.ResourceVersion, patchedControllerRevision.ResourceVersion)).To(gomega.BeNumerically("==", -1), "patched object should have a larger resource version")
 		framework.Logf("%s has been patched", patchedControllerRevision.Name)
 
 		ginkgo.By("Create a new ControllerRevision")
-		ds.Spec.Template.Spec.TerminationGracePeriodSeconds = pointer.Int64(1)
+		ds.Spec.Template.Spec.TerminationGracePeriodSeconds = ptr.To[int64](1)
 		newHash, newName := hashAndNameForDaemonSet(ds)
 		newRevision := &appsv1.ControllerRevision{
 			ObjectMeta: metav1.ObjectMeta{
@@ -189,16 +195,16 @@ var _ = SIGDescribe("ControllerRevision [Serial]", func() {
 		framework.Logf("Created ControllerRevision: %s", newControllerRevision.Name)
 
 		ginkgo.By("Confirm that there are two ControllerRevisions")
-		err = wait.PollImmediateWithContext(ctx, controllerRevisionRetryPeriod, controllerRevisionRetryTimeout, checkControllerRevisionListQuantity(f, dsLabelSelector, 2))
-		framework.ExpectNoError(err, "failed to count required ControllerRevisions")
+		err = wait.PollUntilContextTimeout(ctx, controllerRevisionRetryPeriod, controllerRevisionRetryTimeout, true, checkControllerRevisionListQuantity(f, dsLabelSelector, 2))
+		framework.ExpectNoError(err, "count required ControllerRevisions")
 
 		ginkgo.By(fmt.Sprintf("Deleting ControllerRevision %q", initialRevision.Name))
 		err = csAppsV1.ControllerRevisions(ns).Delete(ctx, initialRevision.Name, metav1.DeleteOptions{})
 		framework.ExpectNoError(err, "Failed to delete ControllerRevision: %v", err)
 
 		ginkgo.By("Confirm that there is only one ControllerRevision")
-		err = wait.PollImmediateWithContext(ctx, controllerRevisionRetryPeriod, controllerRevisionRetryTimeout, checkControllerRevisionListQuantity(f, dsLabelSelector, 1))
-		framework.ExpectNoError(err, "failed to count required ControllerRevisions")
+		err = wait.PollUntilContextTimeout(ctx, controllerRevisionRetryPeriod, controllerRevisionRetryTimeout, true, checkControllerRevisionListQuantity(f, dsLabelSelector, 1))
+		framework.ExpectNoError(err, "count required ControllerRevisions")
 
 		listControllerRevisions, err := csAppsV1.ControllerRevisions(ns).List(ctx, metav1.ListOptions{})
 		currentControllerRevision := listControllerRevisions.Items[0]
@@ -213,8 +219,8 @@ var _ = SIGDescribe("ControllerRevision [Serial]", func() {
 			updatedControllerRevision, err = csAppsV1.ControllerRevisions(ns).Update(ctx, updatedControllerRevision, metav1.UpdateOptions{})
 			return err
 		})
-		framework.ExpectNoError(err, "failed to update ControllerRevision in namespace: %s", ns)
-		framework.ExpectEqual(updatedControllerRevision.Labels[currentControllerRevision.Name], "updated", "Did not find 'updated' label for this ControllerRevision. Current labels: %v", currentControllerRevision.Labels)
+		framework.ExpectNoError(err, "update ControllerRevision in namespace: %s", ns)
+		gomega.Expect(updatedControllerRevision.Labels).To(gomega.HaveKeyWithValue(currentControllerRevision.Name, "updated"), "Did not find 'updated' label for this ControllerRevision. Current labels: %v", updatedControllerRevision.Labels)
 		framework.Logf("%s has been updated", updatedControllerRevision.Name)
 
 		ginkgo.By("Generate another ControllerRevision by patching the Daemonset")
@@ -224,8 +230,8 @@ var _ = SIGDescribe("ControllerRevision [Serial]", func() {
 		framework.ExpectNoError(err, "error patching daemon set")
 
 		ginkgo.By("Confirm that there are two ControllerRevisions")
-		err = wait.PollImmediateWithContext(ctx, controllerRevisionRetryPeriod, controllerRevisionRetryTimeout, checkControllerRevisionListQuantity(f, dsLabelSelector, 2))
-		framework.ExpectNoError(err, "failed to count required ControllerRevisions")
+		err = wait.PollUntilContextTimeout(ctx, controllerRevisionRetryPeriod, controllerRevisionRetryTimeout, true, checkControllerRevisionListQuantity(f, dsLabelSelector, 2))
+		framework.ExpectNoError(err, "count required ControllerRevisions")
 
 		updatedLabel := map[string]string{updatedControllerRevision.Name: "updated"}
 		updatedLabelSelector := labels.SelectorFromSet(updatedLabel).String()
@@ -235,12 +241,12 @@ var _ = SIGDescribe("ControllerRevision [Serial]", func() {
 		framework.ExpectNoError(err, "Failed to delete ControllerRevision: %v", err)
 
 		ginkgo.By("Confirm that there is only one ControllerRevision")
-		err = wait.PollImmediateWithContext(ctx, controllerRevisionRetryPeriod, controllerRevisionRetryTimeout, checkControllerRevisionListQuantity(f, dsLabelSelector, 1))
-		framework.ExpectNoError(err, "failed to count required ControllerRevisions")
+		err = wait.PollUntilContextTimeout(ctx, controllerRevisionRetryPeriod, controllerRevisionRetryTimeout, true, checkControllerRevisionListQuantity(f, dsLabelSelector, 1))
+		framework.ExpectNoError(err, "count required ControllerRevisions")
 
 		list, err := csAppsV1.ControllerRevisions(ns).List(ctx, metav1.ListOptions{})
-		framework.ExpectNoError(err, "failed to list ControllerRevision")
-		framework.ExpectEqual(list.Items[0].Revision, int64(3), "failed to find the expected revision for the Controller")
+		framework.ExpectNoError(err, "list ControllerRevision")
+		gomega.Expect(list.Items[0].Revision).To(gomega.Equal(int64(3)), "find the expected revision for the Controller")
 		framework.Logf("ControllerRevision %q has revision %d", list.Items[0].Name, list.Items[0].Revision)
 	})
 })

@@ -27,7 +27,10 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -35,31 +38,56 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	machineryutilnet "k8s.io/apimachinery/pkg/util/net"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistrytest "k8s.io/apiserver/pkg/registry/generic/testing"
 	"k8s.io/apiserver/pkg/registry/rest"
-	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	epstest "k8s.io/kubernetes/pkg/api/endpoints/testing"
 	svctest "k8s.io/kubernetes/pkg/api/service/testing"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/features"
-	endpointstore "k8s.io/kubernetes/pkg/registry/core/endpoint/storage"
+	"k8s.io/kubernetes/pkg/apis/discovery"
+	apisdiscoveryv1 "k8s.io/kubernetes/pkg/apis/discovery/v1"
 	podstore "k8s.io/kubernetes/pkg/registry/core/pod/storage"
 	"k8s.io/kubernetes/pkg/registry/core/service/ipallocator"
 	"k8s.io/kubernetes/pkg/registry/core/service/portallocator"
+	endpointslicestore "k8s.io/kubernetes/pkg/registry/discovery/endpointslice/storage"
 	"k8s.io/kubernetes/pkg/registry/registrytest"
 	netutils "k8s.io/utils/net"
+	"k8s.io/utils/ptr"
 )
 
+type cleanupFunc func()
+
+// storageEndpointSliceGetter wraps a discovery REST storage and converts its unversioned
+// EndpointSlices to discoveryv1.EndpointSlice.
+type storageEndpointSliceGetter struct {
+	rest *endpointslicestore.REST
+}
+
+func (sg *storageEndpointSliceGetter) GetEndpointSlices(namespaceName, serviceName string) ([]*discoveryv1.EndpointSlice, error) {
+	obj, err := sg.rest.List(context.TODO(), &metainternalversion.ListOptions{LabelSelector: labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: serviceName})})
+	if err != nil {
+		return nil, err
+	}
+	unversioned := obj.(*discovery.EndpointSliceList)
+
+	// (Using Convert_discovery_EndpointSliceList_To_v1_EndpointSliceList() would give
+	// us a []discoveryv1.EndpointSlice rather than a []*discoveryv1.EndpointSlice, so
+	// we'd still have to iterate over the result and build a new array anyway.)
+	v1Slices := make([]*discoveryv1.EndpointSlice, len(unversioned.Items))
+	for i := range unversioned.Items {
+		v1Slices[i] = new(discoveryv1.EndpointSlice)
+		if err := apisdiscoveryv1.Convert_discovery_EndpointSlice_To_v1_EndpointSlice(&unversioned.Items[i], v1Slices[i], nil); err != nil {
+			return nil, err
+		}
+	}
+	return v1Slices, nil
+}
+
 // Most tests will use this to create a registry to run tests against.
-func newStorage(t *testing.T, ipFamilies []api.IPFamily) (*wrapperRESTForTests, *StatusREST, *etcd3testing.EtcdTestServer) {
+func newStorage(t *testing.T, ipFamilies []api.IPFamily) (*wrapperRESTForTests, *StatusREST, cleanupFunc) {
 	return newStorageWithPods(t, ipFamilies, nil, nil)
 }
 
-func newStorageWithPods(t *testing.T, ipFamilies []api.IPFamily, pods []api.Pod, endpoints []*api.Endpoints) (*wrapperRESTForTests, *StatusREST, *etcd3testing.EtcdTestServer) {
+func newStorageWithPods(t *testing.T, ipFamilies []api.IPFamily, pods []api.Pod, endpointSlices []*discovery.EndpointSlice) (*wrapperRESTForTests, *StatusREST, cleanupFunc) {
 	etcdStorage, server := registrytest.NewEtcdStorage(t, "")
 	restOptions := generic.RESTOptions{
 		StorageConfig:           etcdStorage.ForResource(schema.GroupResource{Resource: "services"}),
@@ -90,12 +118,12 @@ func newStorageWithPods(t *testing.T, ipFamilies []api.IPFamily, pods []api.Pod,
 		Decorator:               generic.UndecoratedStorage,
 		DeleteCollectionWorkers: 3,
 		ResourcePrefix:          "pods",
-	}, nil, nil, nil)
+	}, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error from REST storage: %v", err)
 	}
 	if pods != nil && len(pods) > 0 {
-		ctx := genericapirequest.NewDefaultContext()
+		ctx := genericregistrytest.NewNamespaceScopeContext(podStorage.Pod.Store, metav1.NamespaceDefault)
 		for ix := range pods {
 			key, _ := podStorage.Pod.KeyFunc(ctx, pods[ix].Name)
 			if err := podStorage.Pod.Storage.Create(ctx, key, &pods[ix], nil, 0, false); err != nil {
@@ -104,29 +132,40 @@ func newStorageWithPods(t *testing.T, ipFamilies []api.IPFamily, pods []api.Pod,
 		}
 	}
 
-	endpointsStorage, err := endpointstore.NewREST(generic.RESTOptions{
-		StorageConfig:  etcdStorage,
+	etcdDiscoveryStorage, discoveryServer := registrytest.NewEtcdStorage(t, discovery.GroupName)
+	endpointSliceStorage, err := endpointslicestore.NewREST(generic.RESTOptions{
+		StorageConfig:  etcdDiscoveryStorage,
 		Decorator:      generic.UndecoratedStorage,
-		ResourcePrefix: "endpoints",
+		ResourcePrefix: "endpointslices",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error from REST storage: %v", err)
 	}
-	if endpoints != nil && len(endpoints) > 0 {
-		ctx := genericapirequest.NewDefaultContext()
-		for ix := range endpoints {
-			key, _ := endpointsStorage.KeyFunc(ctx, endpoints[ix].Name)
-			if err := endpointsStorage.Store.Storage.Create(ctx, key, endpoints[ix], nil, 0, false); err != nil {
-				t.Fatalf("Couldn't create endpoint: %v", err)
+	endpointSliceGetter := &storageEndpointSliceGetter{endpointSliceStorage}
+
+	if len(endpointSlices) > 0 {
+		ctx := genericregistrytest.NewNamespaceScopeContext(endpointSliceStorage.Store, metav1.NamespaceDefault)
+		for ix := range endpointSlices {
+			key, _ := endpointSliceStorage.KeyFunc(ctx, endpointSlices[ix].Name)
+			if err := endpointSliceStorage.Store.Storage.Create(ctx, key, endpointSlices[ix], nil, 0, false); err != nil {
+				t.Fatalf("Couldn't create endpointslice: %v", err)
 			}
 		}
 	}
 
-	serviceStorage, statusStorage, _, err := NewREST(restOptions, ipFamilies[0], ipAllocs, portAlloc, endpointsStorage, podStorage.Pod, nil)
+	serviceStorage, statusStorage, _, err := NewREST(restOptions, ipFamilies[0], ipAllocs, portAlloc, endpointSliceGetter, podStorage.Pod, nil)
 	if err != nil {
 		t.Fatalf("unexpected error from REST storage: %v", err)
 	}
-	return &wrapperRESTForTests{serviceStorage}, statusStorage, server
+
+	cleanup := func() {
+		server.Terminate(t)
+		discoveryServer.Terminate(t)
+		serviceStorage.Destroy()
+		endpointSliceStorage.Store.Destroy()
+	}
+
+	return &wrapperRESTForTests{serviceStorage}, statusStorage, cleanup
 }
 
 func makeIPAllocator(cidr *net.IPNet) ipallocator.Interface {
@@ -172,9 +211,8 @@ func validService() *api.Service {
 }
 
 func TestGenericCreate(t *testing.T) {
-	storage, _, server := newStorage(t, []api.IPFamily{api.IPv4Protocol})
-	defer server.Terminate(t)
-	defer storage.Store.DestroyFunc()
+	storage, _, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol})
+	defer cleanup()
 	test := genericregistrytest.New(t, storage.Store)
 	svc := validService()
 	svc.ObjectMeta = metav1.ObjectMeta{} // because genericregistrytest
@@ -191,9 +229,8 @@ func TestGenericCreate(t *testing.T) {
 func TestGenericUpdate(t *testing.T) {
 	clusterInternalTrafficPolicy := api.ServiceInternalTrafficPolicyCluster
 
-	storage, _, server := newStorage(t, []api.IPFamily{api.IPv4Protocol})
-	defer server.Terminate(t)
-	defer storage.Store.DestroyFunc()
+	storage, _, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol})
+	defer cleanup()
 	test := genericregistrytest.New(t, storage.Store).AllowCreateOnUpdate()
 	test.TestUpdate(
 		// valid
@@ -220,33 +257,29 @@ func TestGenericUpdate(t *testing.T) {
 }
 
 func TestGenericDelete(t *testing.T) {
-	storage, _, server := newStorage(t, []api.IPFamily{api.IPv4Protocol})
-	defer server.Terminate(t)
-	defer storage.Store.DestroyFunc()
+	storage, _, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol})
+	defer cleanup()
 	test := genericregistrytest.New(t, storage.Store).AllowCreateOnUpdate().ReturnDeletedObject()
 	test.TestDelete(validService())
 }
 
 func TestGenericGet(t *testing.T) {
-	storage, _, server := newStorage(t, []api.IPFamily{api.IPv4Protocol})
-	defer server.Terminate(t)
-	defer storage.Store.DestroyFunc()
+	storage, _, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol})
+	defer cleanup()
 	test := genericregistrytest.New(t, storage.Store).AllowCreateOnUpdate()
 	test.TestGet(validService())
 }
 
 func TestGenericList(t *testing.T) {
-	storage, _, server := newStorage(t, []api.IPFamily{api.IPv4Protocol})
-	defer server.Terminate(t)
-	defer storage.Store.DestroyFunc()
+	storage, _, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol})
+	defer cleanup()
 	test := genericregistrytest.New(t, storage.Store).AllowCreateOnUpdate()
 	test.TestList(validService())
 }
 
 func TestGenericWatch(t *testing.T) {
-	storage, _, server := newStorage(t, []api.IPFamily{api.IPv4Protocol})
-	defer server.Terminate(t)
-	defer storage.Store.DestroyFunc()
+	storage, _, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol})
+	defer cleanup()
 	test := genericregistrytest.New(t, storage.Store)
 	test.TestWatch(
 		validService(),
@@ -268,17 +301,15 @@ func TestGenericWatch(t *testing.T) {
 }
 
 func TestGenericShortNames(t *testing.T) {
-	storage, _, server := newStorage(t, []api.IPFamily{api.IPv4Protocol})
-	defer server.Terminate(t)
-	defer storage.Store.DestroyFunc()
+	storage, _, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol})
+	defer cleanup()
 	expected := []string{"svc"}
 	registrytest.AssertShortNames(t, storage, expected)
 }
 
 func TestGenericCategories(t *testing.T) {
-	storage, _, server := newStorage(t, []api.IPFamily{api.IPv4Protocol})
-	defer server.Terminate(t)
-	defer storage.Store.DestroyFunc()
+	storage, _, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol})
+	defer cleanup()
 	expected := []string{"all"}
 	registrytest.AssertCategories(t, storage, expected)
 }
@@ -502,6 +533,62 @@ func TestPatchAllocatedValues(t *testing.T) {
 		update: svctest.MakeService("foo",
 			svctest.SetTypeExternalName,
 			svctest.SetExternalTrafficPolicy(api.ServiceExternalTrafficPolicyLocal)),
+	}, {
+		name: "reset_NodePort",
+		before: svctest.MakeService("foo",
+			svctest.SetTypeLoadBalancer,
+			svctest.SetAllocateLoadBalancerNodePorts(false),
+			svctest.SetClusterIPs("10.0.0.93", "2000::76"),
+			svctest.SetUniqueNodePorts,
+			svctest.SetHealthCheckNodePort(31234)),
+		update: svctest.MakeService("foo",
+			svctest.SetTypeLoadBalancer,
+			svctest.SetAllocateLoadBalancerNodePorts(false),
+			svctest.SetClusterIPs("10.0.0.93", "2000::76"),
+			svctest.SetNodePorts(0)),
+		expectSameClusterIPs: true,
+		expectSameNodePort:   false,
+	}, {
+		name: "reset_partial_NodePorts",
+		before: svctest.MakeService("foo",
+			svctest.SetTypeLoadBalancer,
+			svctest.SetAllocateLoadBalancerNodePorts(false),
+			svctest.SetClusterIPs("10.0.0.93", "2000::76"),
+			svctest.SetPorts(
+				svctest.MakeServicePort("", 93, intstr.FromInt32(76), api.ProtocolTCP),
+				svctest.MakeServicePort("", 94, intstr.FromInt32(76), api.ProtocolTCP),
+			),
+			svctest.SetUniqueNodePorts,
+			svctest.SetHealthCheckNodePort(31234)),
+		update: svctest.MakeService("foo",
+			svctest.SetTypeLoadBalancer,
+			svctest.SetAllocateLoadBalancerNodePorts(false),
+			svctest.SetClusterIPs("10.0.0.93", "2000::76"),
+			svctest.SetPorts(
+				svctest.MakeServicePort("", 93, intstr.FromInt32(76), api.ProtocolTCP),
+				svctest.MakeServicePort("", 94, intstr.FromInt32(76), api.ProtocolTCP),
+			),
+			svctest.SetUniqueNodePorts,
+			func(service *api.Service) {
+				service.Spec.Ports[1].NodePort = 0
+			}),
+		expectSameClusterIPs: true,
+		expectSameNodePort:   false,
+	}, {
+		name: "keep_NodePort",
+		before: svctest.MakeService("foo",
+			svctest.SetTypeLoadBalancer,
+			svctest.SetAllocateLoadBalancerNodePorts(true),
+			svctest.SetClusterIPs("10.0.0.93", "2000::76"),
+			svctest.SetUniqueNodePorts,
+			svctest.SetHealthCheckNodePort(31234)),
+		update: svctest.MakeService("foo",
+			svctest.SetTypeLoadBalancer,
+			svctest.SetAllocateLoadBalancerNodePorts(true),
+			svctest.SetClusterIPs("10.0.0.93", "2000::76"),
+			svctest.SetNodePorts(0)),
+		expectSameClusterIPs: true,
+		expectSameNodePort:   true,
 	}}
 
 	for _, tc := range testCases {
@@ -532,10 +619,18 @@ func TestPatchAllocatedValues(t *testing.T) {
 			} else if cmp.Equal(beforeIPs, updateIPs) {
 				t.Errorf("expected clusterIPs to not be patched: %q == %q", beforeIPs, updateIPs)
 			}
-			if b, u := tc.before.Spec.Ports[0].NodePort, update.Spec.Ports[0].NodePort; tc.expectSameNodePort && b != u {
-				t.Errorf("expected nodePort to be patched: %d != %d", b, u)
-			} else if !tc.expectSameNodePort && b == u {
-				t.Errorf("expected nodePort to not be patched: %d == %d", b, u)
+
+			bNodePorts, uNodePorts := make([]int32, 0), make([]int32, 0)
+			for _, item := range tc.before.Spec.Ports {
+				bNodePorts = append(bNodePorts, item.NodePort)
+			}
+			for _, item := range update.Spec.Ports {
+				uNodePorts = append(uNodePorts, item.NodePort)
+			}
+			if tc.expectSameNodePort && !reflect.DeepEqual(bNodePorts, uNodePorts) {
+				t.Errorf("expected nodePort to be patched: %v != %v", bNodePorts, uNodePorts)
+			} else if !tc.expectSameNodePort && reflect.DeepEqual(bNodePorts, uNodePorts) {
+				t.Errorf("expected nodePort to not be patched: %v == %v", bNodePorts, uNodePorts)
 			}
 
 			if b, u := tc.before.Spec.HealthCheckNodePort, update.Spec.HealthCheckNodePort; tc.expectSameHCNP && b != u {
@@ -642,9 +737,8 @@ func TestServiceDefaultOnRead(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			storage, _, server := newStorage(t, []api.IPFamily{api.IPv4Protocol, api.IPv6Protocol})
-			defer server.Terminate(t)
-			defer storage.Store.DestroyFunc()
+			storage, _, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol, api.IPv6Protocol})
+			defer cleanup()
 
 			tmp := tc.input.DeepCopyObject()
 			storage.defaultOnRead(tmp)
@@ -729,9 +823,8 @@ func helpTestCreateUpdateDeleteWithFamilies(t *testing.T, testCases []cudTestCas
 	// NOTE: do not call t.Helper() here.  It's more useful for errors to be
 	// attributed to lines in this function than the caller of it.
 
-	storage, _, server := newStorage(t, ipFamilies)
-	defer server.Terminate(t)
-	defer storage.Store.DestroyFunc()
+	storage, _, cleanup := newStorage(t, ipFamilies)
+	defer cleanup()
 
 	for _, tc := range testCases {
 		name := tc.name
@@ -739,7 +832,7 @@ func helpTestCreateUpdateDeleteWithFamilies(t *testing.T, testCases []cudTestCas
 			name += "__@L" + tc.line
 		}
 		t.Run(name, func(t *testing.T) {
-			ctx := genericapirequest.NewDefaultContext()
+			ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 
 			// Create the object as specified and check the results.
 			obj, err := storage.Create(ctx, tc.create.svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
@@ -1328,9 +1421,8 @@ func TestCreateIgnoresIPsForExternalName(t *testing.T) {
 
 	for _, otc := range testCases {
 		t.Run(otc.name, func(t *testing.T) {
-			storage, _, server := newStorage(t, otc.clusterFamilies)
-			defer server.Terminate(t)
-			defer storage.Store.DestroyFunc()
+			storage, _, cleanup := newStorage(t, otc.clusterFamilies)
+			defer cleanup()
 
 			for _, itc := range otc.cases {
 				t.Run(itc.name, func(t *testing.T) {
@@ -1338,7 +1430,7 @@ func TestCreateIgnoresIPsForExternalName(t *testing.T) {
 					itc.svc.Spec.Type = api.ServiceTypeExternalName
 					itc.svc.Spec.ExternalName = "example.com"
 
-					ctx := genericapirequest.NewDefaultContext()
+					ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 					createdObj, err := storage.Create(ctx, itc.svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 					if itc.expectError && err != nil {
 						return
@@ -1417,11 +1509,10 @@ func TestCreateInitClusterIPsFromClusterIP(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			storage, _, server := newStorage(t, tc.clusterFamilies)
-			defer server.Terminate(t)
-			defer storage.Store.DestroyFunc()
+			storage, _, cleanup := newStorage(t, tc.clusterFamilies)
+			defer cleanup()
 
-			ctx := genericapirequest.NewDefaultContext()
+			ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 			createdObj, err := storage.Create(ctx, tc.svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 			if err != nil {
 				t.Fatalf("unexpected error creating service: %v", err)
@@ -5874,13 +5965,12 @@ func TestCreateInitIPFields(t *testing.T) {
 		t.Run(otc.name, func(t *testing.T) {
 
 			// Do this in the outer loop for performance.
-			storage, _, server := newStorage(t, otc.clusterFamilies)
-			defer server.Terminate(t)
-			defer storage.Store.DestroyFunc()
+			storage, _, cleanup := newStorage(t, otc.clusterFamilies)
+			defer cleanup()
 
 			for _, itc := range otc.cases {
 				t.Run(itc.name+"__@L"+itc.line, func(t *testing.T) {
-					ctx := genericapirequest.NewDefaultContext()
+					ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 					createdObj, err := storage.Create(ctx, itc.svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 					if itc.expectError && err != nil {
 						return
@@ -6026,11 +6116,10 @@ func TestCreateInvalidClusterIPInputs(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			storage, _, server := newStorage(t, tc.families)
-			defer server.Terminate(t)
-			defer storage.Store.DestroyFunc()
+			storage, _, cleanup := newStorage(t, tc.families)
+			defer cleanup()
 
-			ctx := genericapirequest.NewDefaultContext()
+			ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 			_, err := storage.Create(ctx, tc.svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 			if err == nil {
 				t.Fatalf("unexpected success creating service")
@@ -6065,11 +6154,10 @@ func TestCreateDeleteReuse(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			storage, _, server := newStorage(t, []api.IPFamily{api.IPv4Protocol, api.IPv6Protocol})
-			defer server.Terminate(t)
-			defer storage.Store.DestroyFunc()
+			storage, _, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol, api.IPv6Protocol})
+			defer cleanup()
 
-			ctx := genericapirequest.NewDefaultContext()
+			ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 
 			// Create it
 			createdObj, err := storage.Create(ctx, tc.svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
@@ -6318,13 +6406,12 @@ func TestCreateInitNodePorts(t *testing.T) {
 	}}
 
 	// Do this in the outer scope for performance.
-	storage, _, server := newStorage(t, []api.IPFamily{api.IPv4Protocol})
-	defer server.Terminate(t)
-	defer storage.Store.DestroyFunc()
+	storage, _, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol})
+	defer cleanup()
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := genericapirequest.NewDefaultContext()
+			ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 			createdObj, err := storage.Create(ctx, tc.svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 			if tc.expectError && err != nil {
 				return
@@ -6431,14 +6518,13 @@ func TestCreateSkipsAllocationsForHeadless(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			storage, _, server := newStorage(t, tc.clusterFamilies)
-			defer server.Terminate(t)
-			defer storage.Store.DestroyFunc()
+			storage, _, cleanup := newStorage(t, tc.clusterFamilies)
+			defer cleanup()
 
 			// This test is ONLY headless services.
 			tc.svc.Spec.ClusterIP = api.ClusterIPNone
 
-			ctx := genericapirequest.NewDefaultContext()
+			ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 			createdObj, err := storage.Create(ctx, tc.svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 			if tc.expectError && err != nil {
 				return
@@ -6503,11 +6589,10 @@ func TestCreateDryRun(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			storage, _, server := newStorage(t, tc.clusterFamilies)
-			defer server.Terminate(t)
-			defer storage.Store.DestroyFunc()
+			storage, _, cleanup := newStorage(t, tc.clusterFamilies)
+			defer cleanup()
 
-			ctx := genericapirequest.NewDefaultContext()
+			ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 			createdObj, err := storage.Create(ctx, tc.svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
 			if err != nil {
 				t.Fatalf("unexpected error creating service: %v", err)
@@ -6536,9 +6621,8 @@ func TestCreateDryRun(t *testing.T) {
 func TestDeleteWithFinalizer(t *testing.T) {
 	svcName := "foo"
 
-	storage, _, server := newStorage(t, []api.IPFamily{api.IPv4Protocol, api.IPv6Protocol})
-	defer server.Terminate(t)
-	defer storage.Store.DestroyFunc()
+	storage, _, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol, api.IPv6Protocol})
+	defer cleanup()
 
 	// This will allocate cluster IPs, NodePort, and HealthCheckNodePort.
 	svc := svctest.MakeService(svcName, svctest.SetTypeLoadBalancer,
@@ -6547,7 +6631,7 @@ func TestDeleteWithFinalizer(t *testing.T) {
 			s.Finalizers = []string{"example.com/test"}
 		})
 
-	ctx := genericapirequest.NewDefaultContext()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 
 	// Create it with finalizer.
 	obj, err := storage.Create(ctx, svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
@@ -6631,11 +6715,10 @@ func TestDeleteDryRun(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 
-			storage, _, server := newStorage(t, tc.svc.Spec.IPFamilies)
-			defer server.Terminate(t)
-			defer storage.Store.DestroyFunc()
+			storage, _, cleanup := newStorage(t, tc.svc.Spec.IPFamilies)
+			defer cleanup()
 
-			ctx := genericapirequest.NewDefaultContext()
+			ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 			createdObj, err := storage.Create(ctx, tc.svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 			if err != nil {
 				t.Fatalf("unexpected error creating service: %v", err)
@@ -6728,11 +6811,10 @@ func TestUpdateDryRun(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			storage, _, server := newStorage(t, tc.clusterFamilies)
-			defer server.Terminate(t)
-			defer storage.Store.DestroyFunc()
+			storage, _, cleanup := newStorage(t, tc.clusterFamilies)
+			defer cleanup()
 
-			ctx := genericapirequest.NewDefaultContext()
+			ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 			obj, err := storage.Create(ctx, tc.svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 			if err != nil {
 				t.Fatalf("unexpected error creating service: %v", err)
@@ -11559,37 +11641,90 @@ func TestServiceRegistryResourceLocation(t *testing.T) {
 		makePod("no-endpoints", "9.9.9.9"), // to prove this does not get chosen
 	}
 
-	endpoints := []*api.Endpoints{
-		epstest.MakeEndpoints("unnamed",
-			[]api.EndpointAddress{
-				epstest.MakeEndpointAddress("1.2.3.4", "unnamed"),
+	endpoints := []*discovery.EndpointSlice{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "unnamed-ep",
+				Namespace: metav1.NamespaceDefault,
+				Labels: map[string]string{
+					"kubernetes.io/service-name": "unnamed",
+				},
 			},
-			[]api.EndpointPort{
-				epstest.MakeEndpointPort("", 80),
-			}),
-		epstest.MakeEndpoints("unnamed2",
-			[]api.EndpointAddress{
-				epstest.MakeEndpointAddress("1.2.3.5", "unnamed"),
+			AddressType: discovery.AddressTypeIPv4,
+			Endpoints: []discovery.Endpoint{{
+				Addresses: []string{"1.2.3.4"},
+				TargetRef: &api.ObjectReference{
+					Name:      "unnamed",
+					Namespace: metav1.NamespaceDefault,
+				},
+			}},
+			Ports: []discovery.EndpointPort{{
+				Name: ptr.To(""),
+				Port: ptr.To[int32](80),
+			}},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "unnamed2-ep",
+				Namespace: metav1.NamespaceDefault,
+				Labels: map[string]string{
+					"kubernetes.io/service-name": "unnamed2",
+				},
 			},
-			[]api.EndpointPort{
-				epstest.MakeEndpointPort("", 80),
-			}),
-		epstest.MakeEndpoints("named",
-			[]api.EndpointAddress{
-				epstest.MakeEndpointAddress("1.2.3.6", "named"),
+			AddressType: discovery.AddressTypeIPv4,
+			Endpoints: []discovery.Endpoint{{
+				Addresses: []string{"1.2.3.5"},
+				TargetRef: &api.ObjectReference{
+					Name:      "unnamed",
+					Namespace: metav1.NamespaceDefault,
+				},
+			}},
+			Ports: []discovery.EndpointPort{{
+				Name: ptr.To(""),
+				Port: ptr.To[int32](80),
+			}},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "named-ep",
+				Namespace: metav1.NamespaceDefault,
+				Labels: map[string]string{
+					"kubernetes.io/service-name": "named",
+				},
 			},
-			[]api.EndpointPort{
-				epstest.MakeEndpointPort("p", 80),
-				epstest.MakeEndpointPort("q", 81),
-			}),
-		epstest.MakeEndpoints("no-endpoints", nil, nil), // to prove this does not get chosen
+			AddressType: discovery.AddressTypeIPv4,
+			Endpoints: []discovery.Endpoint{{
+				Addresses: []string{"1.2.3.6"},
+				TargetRef: &api.ObjectReference{
+					Name:      "named",
+					Namespace: metav1.NamespaceDefault,
+				},
+			}},
+			Ports: []discovery.EndpointPort{{
+				Name: ptr.To("p"),
+				Port: ptr.To[int32](80),
+			}, {
+				Name: ptr.To("q"),
+				Port: ptr.To[int32](81),
+			}},
+		},
+		// to prove this does not get chosen
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "no-endpoints-ep",
+				Namespace: metav1.NamespaceDefault,
+				Labels: map[string]string{
+					"kubernetes.io/service-name": "no-endpoints",
+				},
+			},
+			AddressType: discovery.AddressTypeIPv4,
+		},
 	}
 
-	storage, _, server := newStorageWithPods(t, []api.IPFamily{api.IPv4Protocol}, pods, endpoints)
-	defer server.Terminate(t)
-	defer storage.Store.DestroyFunc()
+	storage, _, cleanup := newStorageWithPods(t, []api.IPFamily{api.IPv4Protocol}, pods, endpoints)
+	defer cleanup()
 
-	ctx := genericapirequest.NewDefaultContext()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 	for _, name := range []string{"unnamed", "unnamed2", "no-endpoints"} {
 		_, err := storage.Create(ctx,
 			svctest.MakeService(name,
@@ -11671,7 +11806,7 @@ func TestServiceRegistryResourceLocation(t *testing.T) {
 			if tc.err == false && err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if tc.err == true && err == nil {
+			if tc.err && err == nil {
 				t.Fatalf("unexpected success")
 			}
 			if !tc.err {
@@ -11687,9 +11822,8 @@ func TestServiceRegistryResourceLocation(t *testing.T) {
 }
 
 func TestUpdateServiceLoadBalancerStatus(t *testing.T) {
-	storage, statusStorage, server := newStorage(t, []api.IPFamily{api.IPv4Protocol})
-	defer server.Terminate(t)
-	defer storage.Store.DestroyFunc()
+	storage, statusStorage, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol})
+	defer cleanup()
 	defer statusStorage.store.DestroyFunc()
 
 	ipModeVIP := api.LoadBalancerIPModeVIP
@@ -11698,132 +11832,14 @@ func TestUpdateServiceLoadBalancerStatus(t *testing.T) {
 
 	testCases := []struct {
 		name                   string
-		ipModeEnabled          bool
 		statusBeforeUpdate     api.ServiceStatus
 		newStatus              api.ServiceStatus
 		expectedStatus         api.ServiceStatus
 		expectErr              bool
 		expectedReasonForError metav1.StatusReason
 	}{
-		/*LoadBalancerIPMode disabled*/
 		{
-			name:               "LoadBalancerIPMode disabled, ipMode not used in old, not used in new",
-			ipModeEnabled:      false,
-			statusBeforeUpdate: api.ServiceStatus{},
-			newStatus: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP: "1.2.3.4",
-					}},
-				},
-			},
-			expectedStatus: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP: "1.2.3.4",
-					}},
-				},
-			},
-			expectErr: false,
-		}, {
-			name:          "LoadBalancerIPMode disabled, ipMode used in old and in new",
-			ipModeEnabled: false,
-			statusBeforeUpdate: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP:     "1.2.3.4",
-						IPMode: &ipModeVIP,
-					}},
-				},
-			},
-			newStatus: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP:     "1.2.3.4",
-						IPMode: &ipModeProxy,
-					}},
-				},
-			},
-			expectedStatus: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP:     "1.2.3.4",
-						IPMode: &ipModeProxy,
-					}},
-				},
-			},
-			expectErr: false,
-		}, {
-			name:          "LoadBalancerIPMode disabled, ipMode not used in old, used in new",
-			ipModeEnabled: false,
-			statusBeforeUpdate: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP: "1.2.3.4",
-					}},
-				},
-			},
-			newStatus: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP:     "1.2.3.4",
-						IPMode: &ipModeProxy,
-					}},
-				},
-			},
-			expectedStatus: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP: "1.2.3.4",
-					}},
-				},
-			},
-			expectErr: false,
-		}, {
-			name:          "LoadBalancerIPMode disabled, ipMode used in old, not used in new",
-			ipModeEnabled: false,
-			statusBeforeUpdate: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP:     "1.2.3.4",
-						IPMode: &ipModeVIP,
-					}},
-				},
-			},
-			newStatus: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP: "1.2.3.4",
-					}},
-				},
-			},
-			expectedStatus: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP: "1.2.3.4",
-					}},
-				},
-			},
-			expectErr: false,
-		},
-		/*LoadBalancerIPMode enabled*/
-		{
-			name:               "LoadBalancerIPMode enabled, ipMode not used in old, not used in new",
-			ipModeEnabled:      true,
-			statusBeforeUpdate: api.ServiceStatus{},
-			newStatus: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP: "1.2.3.4",
-					}},
-				},
-			},
-			expectedStatus:         api.ServiceStatus{},
-			expectErr:              true,
-			expectedReasonForError: metav1.StatusReasonInvalid,
-		}, {
-			name:          "LoadBalancerIPMode enabled, ipMode used in old and in new",
-			ipModeEnabled: true,
+			name: "ipMode used in old and in new",
 			statusBeforeUpdate: api.ServiceStatus{
 				LoadBalancer: api.LoadBalancerStatus{
 					Ingress: []api.LoadBalancerIngress{{
@@ -11850,35 +11866,7 @@ func TestUpdateServiceLoadBalancerStatus(t *testing.T) {
 			},
 			expectErr: false,
 		}, {
-			name:          "LoadBalancerIPMode enabled, ipMode not used in old, used in new",
-			ipModeEnabled: true,
-			statusBeforeUpdate: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP: "1.2.3.4",
-					}},
-				},
-			},
-			newStatus: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP:     "1.2.3.4",
-						IPMode: &ipModeProxy,
-					}},
-				},
-			},
-			expectedStatus: api.ServiceStatus{
-				LoadBalancer: api.LoadBalancerStatus{
-					Ingress: []api.LoadBalancerIngress{{
-						IP:     "1.2.3.4",
-						IPMode: &ipModeProxy,
-					}},
-				},
-			},
-			expectErr: false,
-		}, {
-			name:          "LoadBalancerIPMode enabled, ipMode used in old, not used in new",
-			ipModeEnabled: true,
+			name: "ipMode used in old, not used in new",
 			statusBeforeUpdate: api.ServiceStatus{
 				LoadBalancer: api.LoadBalancerStatus{
 					Ingress: []api.LoadBalancerIngress{{
@@ -11898,12 +11886,12 @@ func TestUpdateServiceLoadBalancerStatus(t *testing.T) {
 			expectErr:              true,
 			expectedReasonForError: metav1.StatusReasonInvalid,
 		}, {
-			name:          "LoadBalancerIPMode enabled, ipMode not used in old, invalid value used in new",
-			ipModeEnabled: true,
+			name: "ipMode used in old, invalid value used in new",
 			statusBeforeUpdate: api.ServiceStatus{
 				LoadBalancer: api.LoadBalancerStatus{
 					Ingress: []api.LoadBalancerIngress{{
-						IP: "1.2.3.4",
+						IP:     "1.2.3.4",
+						IPMode: &ipModeVIP,
 					}},
 				},
 			},
@@ -11925,25 +11913,21 @@ func TestUpdateServiceLoadBalancerStatus(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 
 			svc := svctest.MakeService("foo", svctest.SetTypeLoadBalancer)
-			ctx := genericapirequest.NewDefaultContext()
+			ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 			obj, err := storage.Create(ctx, svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 			if err != nil {
-				t.Errorf("created svc: %s", err)
+				t.Fatalf("created svc: %s", err)
 			}
 			defer storage.Delete(ctx, svc.Name, rest.ValidateAllObjectFunc, &metav1.DeleteOptions{})
 
 			// prepare status
-			if loadbalancerIPModeInUse(tc.statusBeforeUpdate) {
-				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.LoadBalancerIPMode, true)()
-			}
 			oldSvc := obj.(*api.Service).DeepCopy()
 			oldSvc.Status = tc.statusBeforeUpdate
 			obj, _, err = statusStorage.Update(ctx, oldSvc.Name, rest.DefaultUpdatedObjectInfo(oldSvc), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
 			if err != nil {
-				t.Errorf("updated status: %s", err)
+				t.Fatalf("updated status: %s", err)
 			}
 
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.LoadBalancerIPMode, tc.ipModeEnabled)()
 			newSvc := obj.(*api.Service).DeepCopy()
 			newSvc.Status = tc.newStatus
 			obj, _, err = statusStorage.Update(ctx, newSvc.Name, rest.DefaultUpdatedObjectInfo(newSvc), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
@@ -11951,7 +11935,7 @@ func TestUpdateServiceLoadBalancerStatus(t *testing.T) {
 				if tc.expectErr && tc.expectedReasonForError == errors.ReasonForError(err) {
 					return
 				}
-				t.Errorf("updated status: %s", err)
+				t.Fatalf("updated status: %s", err)
 			}
 
 			updated := obj.(*api.Service)
@@ -11962,11 +11946,76 @@ func TestUpdateServiceLoadBalancerStatus(t *testing.T) {
 	}
 }
 
-func loadbalancerIPModeInUse(status api.ServiceStatus) bool {
-	for _, ing := range status.LoadBalancer.Ingress {
-		if ing.IPMode != nil {
-			return true
-		}
+func TestStatusDefaultOnRead(t *testing.T) {
+	storage, statusStorage, cleanup := newStorage(t, []api.IPFamily{api.IPv4Protocol})
+	defer cleanup()
+
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
+
+	// Store a legacy Service directly in underlying storage without ClusterIPs, IPFamilies, or IPFamilyPolicy.
+	legacySvc := &api.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "legacy-svc",
+			Namespace: metav1.NamespaceDefault,
+		},
+		Spec: api.ServiceSpec{
+			ClusterIP:       "10.0.0.10",
+			SessionAffinity: api.ServiceAffinityNone,
+			Type:            api.ServiceTypeLoadBalancer,
+			Ports: []api.ServicePort{{
+				Port:       80,
+				Protocol:   api.ProtocolTCP,
+				TargetPort: intstr.FromInt32(80),
+			}},
+		},
 	}
-	return false
+	key, err := storage.KeyFunc(ctx, legacySvc.Name)
+	if err != nil {
+		t.Fatalf("KeyFunc failed: %v", err)
+	}
+	out := &api.Service{}
+	if err := storage.Storage.Create(ctx, key, legacySvc, out, 0, false); err != nil {
+		t.Fatalf("Storage.Create failed: %v", err)
+	}
+
+	// Verify StatusREST.Get decorates the legacy Service.
+	gotObj, err := statusStorage.Get(ctx, legacySvc.Name, &metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("statusStorage.Get failed: %v", err)
+	}
+	gotSvc := gotObj.(*api.Service)
+	if want, got := []string{"10.0.0.10"}, gotSvc.Spec.ClusterIPs; !reflect.DeepEqual(want, got) {
+		t.Errorf("statusStorage.Get clusterIPs: expected %v, got %v", want, got)
+	}
+	if want, got := []api.IPFamily{api.IPv4Protocol}, gotSvc.Spec.IPFamilies; !reflect.DeepEqual(want, got) {
+		t.Errorf("statusStorage.Get ipFamilies: expected %v, got %v", want, got)
+	}
+	if gotSvc.Spec.IPFamilyPolicy == nil || *gotSvc.Spec.IPFamilyPolicy != api.IPFamilyPolicySingleStack {
+		t.Errorf("statusStorage.Get ipFamilyPolicy: expected %v, got %v", api.IPFamilyPolicySingleStack, gotSvc.Spec.IPFamilyPolicy)
+	}
+
+	// Verify StatusREST.Update decorates the returned legacy Service.
+	toUpdate := out.DeepCopy()
+	toUpdate.Status = api.ServiceStatus{
+		LoadBalancer: api.LoadBalancerStatus{
+			Ingress: []api.LoadBalancerIngress{{
+				IP:     "1.2.3.4",
+				IPMode: ptr.To(api.LoadBalancerIPModeVIP),
+			}},
+		},
+	}
+	updatedObj, _, err := statusStorage.Update(ctx, toUpdate.Name, rest.DefaultUpdatedObjectInfo(toUpdate), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("statusStorage.Update failed: %v", err)
+	}
+	updatedSvc := updatedObj.(*api.Service)
+	if want, got := []string{"10.0.0.10"}, updatedSvc.Spec.ClusterIPs; !reflect.DeepEqual(want, got) {
+		t.Errorf("statusStorage.Update clusterIPs: expected %v, got %v", want, got)
+	}
+	if want, got := []api.IPFamily{api.IPv4Protocol}, updatedSvc.Spec.IPFamilies; !reflect.DeepEqual(want, got) {
+		t.Errorf("statusStorage.Update ipFamilies: expected %v, got %v", want, got)
+	}
+	if updatedSvc.Spec.IPFamilyPolicy == nil || *updatedSvc.Spec.IPFamilyPolicy != api.IPFamilyPolicySingleStack {
+		t.Errorf("statusStorage.Update ipFamilyPolicy: expected %v, got %v", api.IPFamilyPolicySingleStack, updatedSvc.Spec.IPFamilyPolicy)
+	}
 }

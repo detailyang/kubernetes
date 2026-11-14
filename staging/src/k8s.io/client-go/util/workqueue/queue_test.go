@@ -17,15 +17,35 @@ limitations under the License.
 package workqueue_test
 
 import (
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/onsi/gomega"
+
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/workqueue"
 )
+
+// traceQueue traces whether items are touched
+type traceQueue struct {
+	workqueue.Queue[any]
+
+	touched map[interface{}]struct{}
+}
+
+func (t *traceQueue) Touch(item interface{}) {
+	t.Queue.Touch(item)
+	if t.touched == nil {
+		t.touched = make(map[interface{}]struct{})
+	}
+	t.touched[item] = struct{}{}
+}
+
+var _ workqueue.Queue[any] = &traceQueue{}
 
 func TestBasic(t *testing.T) {
 	tests := []struct {
@@ -197,6 +217,88 @@ func TestReinsert(t *testing.T) {
 	}
 }
 
+func TestCollapse(t *testing.T) {
+	tq := &traceQueue{Queue: workqueue.DefaultQueue[any]()}
+	q := workqueue.NewWithConfig(workqueue.QueueConfig{
+		Name:  "",
+		Queue: tq,
+	})
+	// Add a new one twice
+	q.Add("bar")
+	q.Add("bar")
+
+	// It should get the new one
+	i, _ := q.Get()
+	if i != "bar" {
+		t.Errorf("Expected %v, got %v", "bar", i)
+	}
+
+	// Finish that one up
+	q.Done(i)
+
+	// There should be no more objects in the queue
+	if a := q.Len(); a != 0 {
+		t.Errorf("Expected queue to be empty. Has %v items", a)
+	}
+
+	if _, ok := tq.touched["bar"]; !ok {
+		t.Errorf("Expected bar to be Touched")
+	}
+}
+
+func TestCollapseWhileProcessing(t *testing.T) {
+	tq := &traceQueue{Queue: workqueue.DefaultQueue[any]()}
+	q := workqueue.NewWithConfig(workqueue.QueueConfig{
+		Name:  "",
+		Queue: tq,
+	})
+	q.Add("foo")
+
+	// Start processing
+	i, _ := q.Get()
+	if i != "foo" {
+		t.Errorf("Expected %v, got %v", "foo", i)
+	}
+
+	// Add the same one twice
+	q.Add("foo")
+	q.Add("foo")
+
+	waitCh := make(chan struct{})
+	// simulate another worker consuming the queue
+	go func() {
+		defer close(waitCh)
+		i, _ := q.Get()
+		if i != "foo" {
+			t.Errorf("Expected %v, got %v", "foo", i)
+		}
+		// Finish that one up
+		q.Done(i)
+	}()
+
+	// give the worker some head start to avoid races
+	// on the select statement that cause flakiness
+	time.Sleep(100 * time.Millisecond)
+	// Finish the first one to unblock the other worker
+	select {
+	case <-waitCh:
+		t.Errorf("worker should be blocked until we are done")
+	default:
+		q.Done("foo")
+	}
+
+	// wait for the worker to consume the new object
+	// There should be no more objects in the queue
+	<-waitCh
+	if a := q.Len(); a != 0 {
+		t.Errorf("Expected queue to be empty. Has %v items", a)
+	}
+
+	if _, ok := tq.touched["foo"]; ok {
+		t.Errorf("Unexpected Touch")
+	}
+}
+
 func TestQueueDrainageUsingShutDownWithDrain(t *testing.T) {
 
 	q := workqueue.New()
@@ -352,12 +454,262 @@ func mustGarbageCollect(t *testing.T, i interface{}) {
 		atomic.StoreInt32(&collected, 1)
 	})
 	t.Cleanup(func() {
-		if err := wait.PollImmediate(time.Millisecond*100, wait.ForeverTestTimeout, func() (done bool, err error) {
+		// The test context is canceled before cleanup callbacks run.
+		gomega.NewWithT(t).Eventually(func() int32 {
 			// Trigger GC explicitly, otherwise we may need to wait a long time for it to run
 			runtime.GC()
-			return atomic.LoadInt32(&collected) == 1, nil
-		}); err != nil {
-			t.Errorf("object was not garbage collected")
+			return atomic.LoadInt32(&collected)
+		}).WithTimeout(wait.ForeverTestTimeout).WithPolling(100*time.Millisecond).Should(gomega.Equal(int32(1)), "object was not garbage collected")
+	})
+}
+
+func BenchmarkQueue(b *testing.B) {
+	keys := make([]string, 100)
+	for idx := range keys {
+		keys[idx] = fmt.Sprintf("key-%d", idx)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		q := workqueue.NewTypedWithConfig(workqueue.TypedQueueConfig[string]{})
+		b.StartTimer()
+		for j := 0; j < 100; j++ {
+			q.Add(keys[j])
+			key, _ := q.Get()
+			q.Done(key)
+		}
+	}
+}
+
+// notPausable hides the Pause and Resume methods of the queue it wraps.
+type notPausable[T comparable] struct {
+	workqueue.TypedInterface[T]
+}
+
+func TestQueuePauseAndResume(t *testing.T) {
+	t.Run("Get blocks while paused and unblocks on Resume, Add and Done work while paused", func(t *testing.T) {
+		q := workqueue.NewTyped[string]()
+		defer q.ShutDown()
+
+		// Dequeue an item before pausing so we can call Done while paused.
+		q.Add("in-flight")
+		inFlight, shutdown := q.Get()
+		if shutdown || inFlight != "in-flight" {
+			t.Fatalf("expected in-flight, got %q (shutdown=%v)", inFlight, shutdown)
+		}
+
+		q.Pause()
+
+		// Re-add in-flight item and add a new item while paused.
+		q.Add("in-flight")
+		q.Done(inFlight)
+		q.Add("queued-while-paused")
+
+		if q.Len() != 2 {
+			t.Fatalf("expected queue length 2 while paused, got %d", q.Len())
+		}
+
+		gotCh := make(chan string, 2)
+		go func() {
+			item1, quit := q.Get()
+			if quit {
+				return
+			}
+			q.Done(item1)
+			gotCh <- item1
+
+			item2, quit := q.Get()
+			if quit {
+				return
+			}
+			q.Done(item2)
+			gotCh <- item2
+		}()
+
+		select {
+		case item := <-gotCh:
+			t.Fatalf("Get returned %q while queue was paused", item)
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		q.Resume()
+
+		for _, want := range []string{"in-flight", "queued-while-paused"} {
+			select {
+			case got := <-gotCh:
+				if got != want {
+					t.Fatalf("expected %q, got %q", want, got)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("timed out waiting for %q after Resume", want)
+			}
+		}
+	})
+
+	t.Run("ShutDown unblocks a paused Get", func(t *testing.T) {
+		q := workqueue.NewTyped[string]()
+		q.Add("item-1")
+		q.Pause()
+
+		shutdownCh := make(chan bool, 1)
+		go func() {
+			_, shutdown := q.Get()
+			shutdownCh <- shutdown
+		}()
+
+		select {
+		case <-shutdownCh:
+			t.Fatalf("Get returned before ShutDown while paused")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		q.ShutDown()
+
+		select {
+		case shutdown := <-shutdownCh:
+			if !shutdown {
+				t.Fatalf("expected shutdown=true from paused Get after ShutDown")
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for paused Get to unblock on ShutDown")
+		}
+	})
+
+	t.Run("ShutDownWithDrain on a paused queue waits for in-flight items and does not hand out queued ones", func(t *testing.T) {
+		q := workqueue.NewTyped[string]()
+		q.Add("in-flight")
+		inFlight, shutdown := q.Get()
+		if shutdown || inFlight != "in-flight" {
+			t.Fatalf("expected in-flight, got %q (shutdown=%v)", inFlight, shutdown)
+		}
+		q.Pause()
+		q.Add("queued-while-paused")
+
+		workerCh := make(chan bool, 1)
+		go func() {
+			_, shutdown := q.Get()
+			workerCh <- shutdown
+		}()
+
+		drained := make(chan struct{})
+		go func() {
+			q.ShutDownWithDrain()
+			close(drained)
+		}()
+
+		// The worker is told to exit without receiving the queued item.
+		select {
+		case shutdown := <-workerCh:
+			if !shutdown {
+				t.Fatalf("expected shutdown=true from paused Get after ShutDownWithDrain")
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for paused Get to unblock on ShutDownWithDrain")
+		}
+
+		// Drain waits for the in-flight item to be marked Done.
+		select {
+		case <-drained:
+			t.Fatalf("ShutDownWithDrain returned while an item was still in flight")
+		case <-time.After(50 * time.Millisecond):
+		}
+		q.Done(inFlight)
+		select {
+		case <-drained:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for ShutDownWithDrain to return after Done")
+		}
+	})
+
+	t.Run("Resume wakes every worker blocked in Get", func(t *testing.T) {
+		q := workqueue.NewTyped[string]()
+		defer q.ShutDown()
+
+		const workers = 3
+		gotCh := make(chan string, workers)
+		for range workers {
+			go func() {
+				item, quit := q.Get()
+				if !quit {
+					gotCh <- item
+				}
+			}()
+		}
+		// Let the workers park in Get on the empty queue, then pause and add
+		// one item per worker. Add wakes the workers, who park again because
+		// the queue is paused; let that settle before Resume so the test
+		// proves Resume itself wakes all of them.
+		time.Sleep(50 * time.Millisecond)
+		q.Pause()
+		for i := range workers {
+			q.Add(fmt.Sprintf("item-%d", i))
+		}
+		time.Sleep(50 * time.Millisecond)
+
+		q.Resume()
+		for i := range workers {
+			select {
+			case <-gotCh:
+			case <-time.After(time.Second):
+				t.Fatalf("worker %d was not woken by Resume", i)
+			}
+		}
+	})
+
+	t.Run("delaying and rate limiting queues are Pausable only when the wrapped queue is", func(t *testing.T) {
+		if _, ok := workqueue.TypedInterface[string](workqueue.NewTypedDelayingQueue[string]()).(workqueue.Pausable); !ok {
+			t.Errorf("expected a delaying queue over the default queue to implement Pausable")
+		}
+		if _, ok := workqueue.TypedInterface[string](workqueue.NewTypedRateLimitingQueue[string](workqueue.DefaultTypedControllerRateLimiter[string]())).(workqueue.Pausable); !ok {
+			t.Errorf("expected a rate limiting queue over the default queue to implement Pausable")
+		}
+
+		// A wrapper over a queue that cannot pause must not claim it can.
+		inner := notPausable[string]{TypedInterface: workqueue.NewTyped[string]()}
+		dq := workqueue.NewTypedDelayingQueueWithConfig(workqueue.TypedDelayingQueueConfig[string]{Queue: inner})
+		if _, ok := workqueue.TypedInterface[string](dq).(workqueue.Pausable); ok {
+			t.Errorf("delaying queue over a non-Pausable queue must not implement Pausable")
+		}
+		rq := workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.DefaultTypedControllerRateLimiter[string](), workqueue.TypedRateLimitingQueueConfig[string]{DelayingQueue: dq})
+		if _, ok := workqueue.TypedInterface[string](rq).(workqueue.Pausable); ok {
+			t.Errorf("rate limiting queue over a non-Pausable delaying queue must not implement Pausable")
+		}
+		rq.ShutDown()
+	})
+
+	t.Run("rate limiting and delaying queues forward Pause and Resume", func(t *testing.T) {
+		q := workqueue.NewTypedRateLimitingQueue[string](workqueue.DefaultTypedControllerRateLimiter[string]())
+		defer q.ShutDown()
+		p, ok := workqueue.TypedInterface[string](q).(workqueue.Pausable)
+		if !ok {
+			t.Fatalf("expected rate limiting queue to implement Pausable")
+		}
+
+		q.Add("item")
+		p.Pause()
+
+		gotCh := make(chan string, 1)
+		go func() {
+			item, quit := q.Get()
+			if !quit {
+				q.Done(item)
+				gotCh <- item
+			}
+		}()
+		select {
+		case item := <-gotCh:
+			t.Fatalf("Get returned %q while the rate limiting queue was paused", item)
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		p.Resume()
+		select {
+		case got := <-gotCh:
+			if got != "item" {
+				t.Fatalf("expected item, got %q", got)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for Get after Resume")
 		}
 	})
 }

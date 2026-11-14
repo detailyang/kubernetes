@@ -17,6 +17,7 @@ limitations under the License.
 package batch
 
 import (
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	api "k8s.io/kubernetes/pkg/apis/core"
@@ -51,6 +52,9 @@ const (
 	// to the pod, which don't count towards the backoff limit, according to the
 	// pod failure policy. When the annotation is absent zero is implied.
 	JobIndexIgnoredFailureCountAnnotation = labelPrefix + "job-index-ignored-failure-count"
+	// JobControllerName reserved value for the managedBy field for the built-in
+	// Job controller.
+	JobControllerName = "kubernetes.io/job-controller"
 )
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -129,7 +133,6 @@ const (
 	// This is an action which might be taken on a pod failure - mark the
 	// Job's index as failed to avoid restarts within this index. This action
 	// can only be used when backoffLimitPerIndex is set.
-	// This value is alpha-level.
 	PodFailurePolicyActionFailIndex PodFailurePolicyAction = "FailIndex"
 
 	// This is an action which might be taken on a pod failure - the counter towards
@@ -210,6 +213,7 @@ type PodFailurePolicyOnPodConditionsPattern struct {
 	// Specifies the required Pod condition status. To match a pod condition
 	// it is required that the specified status equals the pod condition status.
 	// Defaults to True.
+	// +optional
 	Status api.ConditionStatus
 }
 
@@ -223,8 +227,6 @@ type PodFailurePolicyRule struct {
 	//   running pods are terminated.
 	// - FailIndex: indicates that the pod's index is marked as Failed and will
 	//   not be restarted.
-	//   This value is alpha-level. It can be used when the
-	//   `JobBackoffLimitPerIndex` feature gate is enabled (disabled by default).
 	// - Ignore: indicates that the counter towards the .backoffLimit is not
 	//   incremented and a replacement pod is created.
 	// - Count: indicates that the pod is handled in the default way - the
@@ -243,6 +245,19 @@ type PodFailurePolicyRule struct {
 	// +listType=atomic
 	// +optional
 	OnPodConditions []PodFailurePolicyOnPodConditionsPattern
+
+	// Name of the pod failure policy rule. When a rule with the FailJob action
+	// fails the Job, its name is included in the Job failure condition message.
+	// The condition reason remains PodFailurePolicy. Unnamed rules are identified
+	// by their zero-based index in the message.
+	// The name must be a non-empty DNS label of at most 63 characters, containing
+	// only lowercase alphanumeric characters or hyphens, starting and ending with
+	// an alphanumeric character, and must be unique within the Job.
+	// This field is alpha-level and is only honored by servers that enable the
+	// PodFailurePolicyName feature gate.
+	// +featureGate=PodFailurePolicyName
+	// +optional
+	Name *string
 }
 
 // PodFailurePolicy describes how failed pods influence the backoffLimit.
@@ -254,6 +269,51 @@ type PodFailurePolicy struct {
 	// the backoffLimit. At most 20 elements are allowed.
 	// +listType=atomic
 	Rules []PodFailurePolicyRule
+}
+
+// SuccessPolicy describes when a Job can be declared as succeeded based on the success of some indexes.
+type SuccessPolicy struct {
+	// rules represents the list of alternative rules for the declaring the Jobs
+	// as successful before `.status.succeeded >= .spec.completions`. Once any of the rules are met,
+	// the "SuccessCriteriaMet" condition is added, and the lingering pods are removed.
+	// The terminal state for such a Job has the "Complete" condition.
+	// Additionally, these rules are evaluated in order; Once the Job meets one of the rules,
+	// other rules are ignored. At most 20 elements are allowed.
+	// +listType=atomic
+	Rules []SuccessPolicyRule
+}
+
+// SuccessPolicyRule describes rule for declaring a Job as succeeded.
+// Each rule must have at least one of the "succeededIndexes" or "succeededCount" specified.
+type SuccessPolicyRule struct {
+	// succeededIndexes specifies the set of indexes
+	// which need to be contained in the actual set of the succeeded indexes for the Job.
+	// The list of indexes must be within 0 to ".spec.completions-1" and
+	// must not contain duplicates. At least one element is required.
+	// The indexes are represented as intervals separated by commas.
+	// The intervals can be a decimal integer or a pair of decimal integers separated by a hyphen.
+	// The number are listed in represented by the first and last element of the series,
+	// separated by a hyphen.
+	// For example, if the completed indexes are 1, 3, 4, 5 and 7, they are
+	// represented as "1,3-5,7".
+	// When this field is null, this field doesn't default to any value
+	// and is never evaluated at any time.
+	//
+	// +optional
+	SucceededIndexes *string
+
+	// succeededCount specifies the minimal required size of the actual set of the succeeded indexes
+	// for the Job. When succeededCount is used along with succeededIndexes, the check is
+	// constrained only to the set of indexes specified by succeededIndexes.
+	// For example, given that succeededIndexes is "1-4", succeededCount is "3",
+	// and completed indexes are "1", "3", and "5", the Job isn't declared as succeeded
+	// because only "1" and "3" indexes are considered in that rules.
+	// When this field is null, this doesn't default to any value and
+	// is never evaluated at any time.
+	// When specified it needs to be a positive integer.
+	//
+	// +optional
+	SucceededCount *int32
 }
 
 // JobSpec describes how the job execution will look like.
@@ -274,19 +334,6 @@ type JobSpec struct {
 	// +optional
 	Completions *int32
 
-	// Specifies the policy of handling failed pods. In particular, it allows to
-	// specify the set of actions and conditions which need to be
-	// satisfied to take the associated action.
-	// If empty, the default behaviour applies - the counter of failed pods,
-	// represented by the jobs's .status.failed field, is incremented and it is
-	// checked against the backoffLimit. This field cannot be used in combination
-	// with .spec.podTemplate.spec.restartPolicy=OnFailure.
-	//
-	// This field is beta-level. It can be used when the `JobPodFailurePolicy`
-	// feature gate is enabled (enabled by default).
-	// +optional
-	PodFailurePolicy *PodFailurePolicy
-
 	// Specifies the duration in seconds relative to the startTime that the job
 	// may be continuously active before the system tries to terminate it; value
 	// must be positive integer. If a Job is suspended (at creation or through an
@@ -295,8 +342,29 @@ type JobSpec struct {
 	// +optional
 	ActiveDeadlineSeconds *int64
 
-	// Optional number of retries before marking this job failed.
-	// Defaults to 6
+	// Specifies the policy of handling failed pods. In particular, it allows to
+	// specify the set of actions and conditions which need to be
+	// satisfied to take the associated action.
+	// If empty, the default behaviour applies - the counter of failed pods,
+	// represented by the jobs's .status.failed field, is incremented and it is
+	// checked against the backoffLimit. This field cannot be used in combination
+	// with .spec.podTemplate.spec.restartPolicy=OnFailure.
+	//
+	// +optional
+	PodFailurePolicy *PodFailurePolicy
+
+	// successPolicy specifies the policy when the Job can be declared as succeeded.
+	// If empty, the default behavior applies - the Job is declared as succeeded
+	// only when the number of succeeded pods equals to the completions.
+	// When the field is specified, it must be immutable and works only for the Indexed Jobs.
+	// Once the Job meets the SuccessPolicy, the lingering pods are terminated.
+	//
+	// +optional
+	SuccessPolicy *SuccessPolicy
+
+	// Specifies the number of retries before marking this job failed.
+	// Defaults to 6, unless backoffLimitPerIndex (only Indexed Job) is specified.
+	// When backoffLimitPerIndex is specified, backoffLimit defaults to 2147483647.
 	// +optional
 	BackoffLimit *int32
 
@@ -306,8 +374,6 @@ type JobSpec struct {
 	// batch.kubernetes.io/job-index-failure-count annotation. It can only
 	// be set when Job's completionMode=Indexed, and the Pod's restart
 	// policy is Never. The field is immutable.
-	// This field is alpha-level. It can be used when the `JobBackoffLimitPerIndex`
-	// feature gate is enabled (disabled by default).
 	// +optional
 	BackoffLimitPerIndex *int32
 
@@ -319,8 +385,6 @@ type JobSpec struct {
 	// It can only be specified when backoffLimitPerIndex is set.
 	// It can be null or up to completions. It is required and must be
 	// less than or equal to 10^4 when is completions greater than 10^5.
-	// This field is alpha-level. It can be used when the `JobBackoffLimitPerIndex`
-	// feature gate is enabled (disabled by default).
 	// +optional
 	MaxFailedIndexes *int32
 
@@ -405,9 +469,68 @@ type JobSpec struct {
 	//
 	// When using podFailurePolicy, Failed is the the only allowed value.
 	// TerminatingOrFailed and Failed are allowed values when podFailurePolicy is not in use.
-	// This is an alpha field. Enable JobPodReplacementPolicy to be able to use this field.
 	// +optional
 	PodReplacementPolicy *PodReplacementPolicy
+
+	// ManagedBy field indicates the controller that manages a Job. The k8s Job
+	// controller reconciles jobs which don't have this field at all or the field
+	// value is the reserved string `kubernetes.io/job-controller`, but skips
+	// reconciling Jobs with a custom value for this field.
+	// The value must be a valid domain-prefixed path (e.g. acme.io/foo) -
+	// all characters before the first "/" must be a valid subdomain as defined
+	// by RFC 1123. All characters trailing the first "/" must be valid HTTP Path
+	// characters as defined by RFC 3986. The value cannot exceed 63 characters.
+	// This field is immutable.
+	// +optional
+	ManagedBy *string
+
+	// scheduling defines the Workload-aware Scheduling configuration for this Job.
+	// When set, it specifies the scheduling policy (basic or gang), topology
+	// constraints, disruption mode, and shared resource claims.
+	// When omitted, the Job defaults to the basic scheduling policy, which behaves
+	// as standard pod-by-pod scheduling. This field is gated by the WorkloadWithJob
+	// feature gate. Once set, this field is immutable except for the
+	// policy.gang.minCount.
+	//
+	// +featureGate=WorkloadWithJob
+	// +optional
+	Scheduling *JobSchedulingConfiguration
+}
+
+// JobSchedulingConfiguration composes the reusable scheduling building blocks
+// from scheduling.k8s.io for use on a Job.
+type JobSchedulingConfiguration struct {
+	// SchedulingPolicy defines the scheduling policy for this Job.
+	// Exactly one of Basic or Gang must be set.
+	//
+	// +optional
+	SchedulingPolicy *schedulingv1.WorkloadPodGroupSchedulingPolicy
+
+	// SchedulingConstraints defines optional scheduling constraints (e.g. topology)
+	// for the Job's pods.
+	//
+	// +optional
+	SchedulingConstraints *schedulingv1.WorkloadPodGroupSchedulingConstraints
+
+	// DisruptionMode defines the mode in which the Job's pods can be disrupted.
+	// One of Single, All.
+	//
+	// +optional
+	DisruptionMode *schedulingv1.WorkloadPodGroupDisruptionMode
+
+	// ResourceClaims defines which ResourceClaims may be shared among Pods in
+	// the Job. Pods consume the devices allocated to a PodGroup's claim by
+	// defining a claim in its own Spec.ResourceClaims that matches the
+	// PodGroup's claim exactly. The claim must have the same name and refer to
+	// the same ResourceClaim or ResourceClaimTemplate.
+	// At most 4 claims may be set, matching the limit on the resulting PodGroup.
+	//
+	// +optional
+	// +patchMergeKey=name
+	// +patchStrategy=merge
+	// +listType=map
+	// +listMapKey=name
+	ResourceClaims []schedulingv1.WorkloadPodGroupResourceClaim
 }
 
 // JobStatus represents the current state of a Job.
@@ -419,6 +542,12 @@ type JobStatus struct {
 	// status true; when the Job is resumed, the status of this condition will
 	// become false. When a Job is completed, one of the conditions will have
 	// type "Complete" and status true.
+	//
+	// A job is considered finished when it is in a terminal condition, either
+	// "Complete" or "Failed". A Job cannot have both the "Complete" and "Failed" conditions.
+	// Additionally, it cannot be in the "Complete" and "FailureTarget" conditions.
+	// The "Complete", "Failed" and "FailureTarget" conditions cannot be disabled.
+	//
 	// +optional
 	Conditions []JobCondition
 
@@ -426,42 +555,43 @@ type JobStatus struct {
 	// Job is created in the suspended state, this field is not set until the
 	// first time it is resumed. This field is reset every time a Job is resumed
 	// from suspension. It is represented in RFC3339 form and is in UTC.
+	//
+	// Once set, the field can only be removed when the job is suspended.
+	// The field cannot be modified while the job is unsuspended or finished.
+	//
 	// +optional
 	StartTime *metav1.Time
 
 	// Represents time when the job was completed. It is not guaranteed to
 	// be set in happens-before order across separate operations.
 	// It is represented in RFC3339 form and is in UTC.
-	// The completion time is only set when the job finishes successfully.
+	// The completion time is set when the job finishes successfully, and only then.
+	// The value cannot be updated or removed. The value indicates the same or
+	// later point in time as the startTime field.
 	// +optional
 	CompletionTime *metav1.Time
 
-	// The number of pending and running pods.
+	// The number of pending and running pods which are not terminating (without
+	// a deletionTimestamp).
+	// The value is zero for finished jobs.
 	// +optional
 	Active int32
 
-	// The number of pods which are terminating (in phase Pending or Running
-	// and have a deletionTimestamp).
-	//
-	// This field is alpha-level. The job controller populates the field when
-	// the feature gate JobPodReplacementPolicy is enabled (disabled by default).
-	// +optional
-	Terminating *int32
-
-	// The number of active pods which have a Ready condition.
-	//
-	// This field is beta-level. The job controller populates the field when
-	// the feature gate JobReadyPods is enabled (enabled by default).
-	// +optional
-	Ready *int32
-
 	// The number of pods which reached phase Succeeded.
+	// The value increases monotonically for a given spec. However, it may
+	// decrease in reaction to scale down of elastic indexed jobs.
 	// +optional
 	Succeeded int32
 
 	// The number of pods which reached phase Failed.
+	// The value increases monotonically.
 	// +optional
 	Failed int32
+
+	// The number of pods which are terminating (in phase Pending or Running
+	// and have a deletionTimestamp).
+	// +optional
+	Terminating *int32
 
 	// completedIndexes holds the completed indexes when .spec.completionMode =
 	// "Indexed" in a text format. The indexes are represented as decimal integers
@@ -473,7 +603,7 @@ type JobStatus struct {
 	// +optional
 	CompletedIndexes string
 
-	// FailedIndexes holds the failed indexes when backoffLimitPerIndex=true.
+	// FailedIndexes holds the failed indexes when spec.backoffLimitPerIndex is set.
 	// The indexes are represented in the text format analogous as for the
 	// `completedIndexes` field, ie. they are kept as decimal integers
 	// separated by commas. The numbers are listed in increasing order. Three or
@@ -481,8 +611,8 @@ type JobStatus struct {
 	// last element of the series, separated by a hyphen.
 	// For example, if the failed indexes are 1, 3, 4, 5 and 7, they are
 	// represented as "1,3-5,7".
-	// This field is alpha-level. It can be used when the `JobBackoffLimitPerIndex`
-	// feature gate is enabled (disabled by default).
+	// The set of failed indexes cannot overlap with the set of completed indexes.
+	//
 	// +optional
 	FailedIndexes *string
 
@@ -500,8 +630,14 @@ type JobStatus struct {
 	//
 	// Old jobs might not be tracked using this field, in which case the field
 	// remains null.
+	// The structure is empty for finished jobs.
 	// +optional
 	UncountedTerminatedPods *UncountedTerminatedPods
+
+	// The number of active pods which have a Ready condition and are not
+	// terminating (without a deletionTimestamp).
+	// +optional
+	Ready *int32
 }
 
 // UncountedTerminatedPods holds UIDs of Pods that have terminated but haven't
@@ -531,6 +667,12 @@ const (
 	JobFailed JobConditionType = "Failed"
 	// FailureTarget means the job is about to fail its execution.
 	JobFailureTarget JobConditionType = "FailureTarget"
+	// JobSuccessCriteriaMet means the Job has reached a success state and will be marked as Completed
+	JobSuccessCriteriaMet JobConditionType = "SuccessCriteriaMet"
+	// JobSchedulingBlocked means the controller cannot safely create pods because
+	// the scheduling objects for the Job are missing or have an unsupported
+	// structure.
+	JobSchedulingBlocked JobConditionType = "SchedulingBlocked"
 )
 
 // JobCondition describes current state of a job.

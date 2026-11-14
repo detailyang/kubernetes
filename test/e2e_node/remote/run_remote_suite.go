@@ -17,32 +17,29 @@ limitations under the License.
 package remote
 
 import (
-	"flag"
 	"fmt"
 	"log"
-	"math/rand"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
-	"time"
 
 	"k8s.io/klog/v2"
 )
 
-var mode = flag.String("mode", "gce", "Mode to operate in. One of gce|ssh. Defaults to gce")
-var testArgs = flag.String("test_args", "", "Space-separated list of arguments to pass to Ginkgo test runner.")
-var instanceNamePrefix = flag.String("instance-name-prefix", "", "prefix for instance names")
-var imageConfigFile = flag.String("image-config-file", "", "yaml file describing images to run")
-var imageConfigDir = flag.String("image-config-dir", "", "(optional) path to image config files")
-var images = flag.String("images", "", "images to test")
-var hosts = flag.String("hosts", "", "hosts to test")
-var cleanup = flag.Bool("cleanup", true, "If true remove files from remote hosts and delete temporary instances")
-var deleteInstances = flag.Bool("delete-instances", true, "If true, delete any instances created")
-var buildOnly = flag.Bool("build-only", false, "If true, build e2e_node_test.tar.gz and exit.")
-var gubernator = flag.Bool("gubernator", false, "If true, output Gubernator link to view logs")
-var ginkgoFlags = flag.String("ginkgo-flags", "", "Passed to ginkgo to specify additional flags such as --skip=.")
+var mode = CommandLine.String("mode", "gce", "Mode to operate in. One of gce|ssh. Defaults to gce")
+var testArgs = CommandLine.String("test_args", "", "Space-separated list of arguments to pass to Ginkgo test runner.")
+var instanceNamePrefix = CommandLine.String("instance-name-prefix", "", "prefix for instance names")
+var imageConfigFile = CommandLine.String("image-config-file", "", "yaml file describing images to run")
+var imageConfigDir = CommandLine.String("image-config-dir", "", "(optional) path to image config files")
+var images = CommandLine.String("images", "", "images to test")
+var hosts = CommandLine.String("hosts", "", "hosts to test")
+var cleanup = CommandLine.Bool("cleanup", true, "If true remove files from remote hosts and delete temporary instances")
+var deleteInstances = CommandLine.Bool("delete-instances", true, "If true, delete any instances created")
+var buildOnly = CommandLine.Bool("build-only", false, "If true, build e2e_node_test.tar.gz and exit.")
+var gubernator = CommandLine.Bool("gubernator", false, "If true, output Gubernator link to view logs")
+var ginkgoFlags = CommandLine.String("ginkgo-flags", "", "Passed to ginkgo to specify additional flags such as --skip=.")
 var (
 	arc Archive
 )
@@ -55,7 +52,7 @@ type Archive struct {
 }
 
 func getFlag(name string) string {
-	lookup := flag.Lookup(name)
+	lookup := CommandLine.Lookup(name)
 	if lookup == nil {
 		return ""
 	}
@@ -77,7 +74,6 @@ func RunRemoteTestSuite(testSuite TestSuite) {
 		os.Exit(1)
 	}()
 
-	rand.Seed(time.Now().UnixNano())
 	if *buildOnly {
 		// Build the archive and exit
 		CreateTestArchive(testSuite,
@@ -88,7 +84,7 @@ func RunRemoteTestSuite(testSuite TestSuite) {
 
 	// Append some default ginkgo flags. We use similar defaults here as hack/ginkgo-e2e.sh
 	allGinkgoFlags := fmt.Sprintf("%s --no-color -v", *ginkgoFlags)
-	fmt.Printf("Will use ginkgo flags as: %s", allGinkgoFlags)
+	klog.Infof("Will use ginkgo flags as: %s", allGinkgoFlags)
 
 	var runner Runner
 	cfg := Config{

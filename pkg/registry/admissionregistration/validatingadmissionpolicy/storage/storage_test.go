@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistrytest "k8s.io/apiserver/pkg/registry/generic/testing"
@@ -201,10 +202,10 @@ func newValidatingAdmissionPolicy(name string) *admissionregistration.Validating
 }
 
 func newInsecureStorage(t *testing.T) (*REST, *etcd3testing.EtcdTestServer) {
-	return newStorage(t, nil, nil)
+	return newStorage(t, nil, resolver.ResourceResolverFunc(replicaLimitsResolver))
 }
 
-func newStorage(t *testing.T, authorizer authorizer.Authorizer, resourceResolver resolver.ResourceResolver) (*REST, *etcd3testing.EtcdTestServer) {
+func newStorage(t *testing.T, authorizer authorizer.UnconditionalAuthorizer, resourceResolver resolver.ResourceResolver) (*REST, *etcd3testing.EtcdTestServer) {
 	etcdStorage, server := registrytest.NewEtcdStorageForResource(t, admissionregistration.Resource("validatingadmissionpolicies"))
 	restOptions := generic.RESTOptions{
 		StorageConfig:           etcdStorage,
@@ -224,4 +225,12 @@ func TestCategories(t *testing.T) {
 	defer storage.Store.DestroyFunc()
 	expected := []string{"api-extensions"}
 	registrytest.AssertCategories(t, storage, expected)
+}
+
+func replicaLimitsResolver(gvk schema.GroupVersionKind) (schema.GroupVersionResource, error) {
+	return schema.GroupVersionResource{
+		Group:    "rules.example.com",
+		Version:  "v1",
+		Resource: "replicalimits",
+	}, nil
 }

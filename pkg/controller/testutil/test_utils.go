@@ -48,7 +48,7 @@ import (
 	"k8s.io/utils/clock"
 	testingclock "k8s.io/utils/clock/testing"
 
-	jsonpatch "github.com/evanphx/json-patch"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 )
 
 var (
@@ -91,9 +91,7 @@ func (m *FakeNodeHandler) GetUpdatedNodesCopy() []*v1.Node {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 	updatedNodesCopy := make([]*v1.Node, len(m.UpdatedNodes), len(m.UpdatedNodes))
-	for i, ptr := range m.UpdatedNodes {
-		updatedNodesCopy[i] = ptr
-	}
+	copy(updatedNodesCopy, m.UpdatedNodes)
 	return updatedNodesCopy
 }
 
@@ -205,6 +203,11 @@ func (m *FakeNodeHandler) Delete(_ context.Context, id string, opt metav1.Delete
 	return nil
 }
 
+// DeleteWithResult deletes the status of a Node from the fake store.
+func (m *FakeNodeHandler) DeleteWithResult(_ context.Context, name string, _ metav1.DeleteOptions) (metav1.APIResult, error) {
+	return nil, nil
+}
+
 // DeleteCollection deletes a collection of Nodes from the fake store.
 func (m *FakeNodeHandler) DeleteCollection(_ context.Context, opt metav1.DeleteOptions, listOpts metav1.ListOptions) error {
 	return nil
@@ -282,8 +285,9 @@ func (m *FakeNodeHandler) PatchStatus(ctx context.Context, nodeName string, data
 }
 
 // Watch watches Nodes in a fake store.
-func (m *FakeNodeHandler) Watch(_ context.Context, opts metav1.ListOptions) (watch.Interface, error) {
-	return watch.NewFake(), nil
+func (m *FakeNodeHandler) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+	logger := klog.FromContext(ctx)
+	return watch.NewFakeWithOptions(watch.FakeOptions{Logger: &logger}), nil
 }
 
 // Patch patches a Node in the fake store.

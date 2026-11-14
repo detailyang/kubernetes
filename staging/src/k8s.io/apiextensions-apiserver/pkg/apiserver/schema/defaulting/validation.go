@@ -21,9 +21,6 @@ import (
 	"fmt"
 	"reflect"
 
-	"k8s.io/kube-openapi/pkg/validation/strfmt"
-	kubeopenapivalidate "k8s.io/kube-openapi/pkg/validation/validate"
-
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
 	schemaobjectmeta "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/objectmeta"
@@ -74,7 +71,7 @@ func validate(ctx context.Context, pth *field.Path, s *structuralschema.Structur
 	isResourceRoot := s == rootSchema
 
 	if s.Default.Object != nil {
-		validator := kubeopenapivalidate.NewSchemaValidator(s.ToKubeOpenAPI(), nil, "", strfmt.Default)
+		validator := apiservervalidation.NewSchemaValidatorFromOpenAPI(s.ToKubeOpenAPI())
 
 		if insideMeta {
 			obj, _, err := f(runtime.DeepCopyJSONValue(s.Default.Object))
@@ -88,14 +85,32 @@ func validate(ctx context.Context, pth *field.Path, s *structuralschema.Structur
 			// check ObjectMeta/TypeMeta and everything else
 			if err := schemaobjectmeta.Coerce(nil, obj, rootSchema, true, false); err != nil {
 				allErrs = append(allErrs, field.Invalid(pth.Child("default"), s.Default.Object, fmt.Sprintf("must result in valid metadata: %v", err)))
-			} else if errs := schemaobjectmeta.Validate(nil, obj, rootSchema, true); len(errs) > 0 {
+			} else if errs := schemaobjectmeta.Validate(ctx, nil, obj, rootSchema, true); len(errs) > 0 {
 				allErrs = append(allErrs, field.Invalid(pth.Child("default"), s.Default.Object, fmt.Sprintf("must result in valid metadata: %v", errs.ToAggregate())))
 			} else if errs := apiservervalidation.ValidateCustomResource(pth.Child("default"), s.Default.Object, validator); len(errs) > 0 {
 				allErrs = append(allErrs, errs...)
 			} else if celValidator := cel.NewValidator(s, isResourceRoot, celconfig.PerCallLimit); celValidator != nil {
 				celErrs, rmCost := celValidator.Validate(ctx, pth.Child("default"), s, s.Default.Object, s.Default.Object, remainingCost)
-				remainingCost = rmCost
 				allErrs = append(allErrs, celErrs...)
+
+				if len(celErrs) == 0 {
+					// Some CEL rules may use optionalOldSelf. For such rules the above
+					// validation is not sufficient for determining if the default value
+					// is a valid value to introduce via create or uncorrelated update.
+					//
+					// Validate an update from nil to the default value to ensure
+					// that the default value pass
+					celErrs, rmCostWithoutOldObject := celValidator.Validate(ctx, pth.Child("default"), s, s.Default.Object, nil, remainingCost)
+					allErrs = append(allErrs, celErrs...)
+
+					// capture the cost of both types of runs and take whichever
+					// leaves less remaining cost
+					if rmCostWithoutOldObject < rmCost {
+						rmCost = rmCostWithoutOldObject
+					}
+				}
+
+				remainingCost = rmCost
 				if remainingCost < 0 {
 					return allErrs, nil, remainingCost
 				}
@@ -113,14 +128,32 @@ func validate(ctx context.Context, pth *field.Path, s *structuralschema.Structur
 			// check ObjectMeta/TypeMeta and everything else
 			if err := schemaobjectmeta.Coerce(pth.Child("default"), s.Default.Object, s, s.XEmbeddedResource, false); err != nil {
 				allErrs = append(allErrs, err)
-			} else if errs := schemaobjectmeta.Validate(pth.Child("default"), s.Default.Object, s, s.XEmbeddedResource); len(errs) > 0 {
+			} else if errs := schemaobjectmeta.Validate(ctx, pth.Child("default"), s.Default.Object, s, s.XEmbeddedResource); len(errs) > 0 {
 				allErrs = append(allErrs, errs...)
 			} else if errs := apiservervalidation.ValidateCustomResource(pth.Child("default"), s.Default.Object, validator); len(errs) > 0 {
 				allErrs = append(allErrs, errs...)
 			} else if celValidator := cel.NewValidator(s, isResourceRoot, celconfig.PerCallLimit); celValidator != nil {
 				celErrs, rmCost := celValidator.Validate(ctx, pth.Child("default"), s, s.Default.Object, s.Default.Object, remainingCost)
-				remainingCost = rmCost
 				allErrs = append(allErrs, celErrs...)
+
+				if len(celErrs) == 0 {
+					// Some CEL rules may use optionalOldSelf. For such rules the above
+					// validation is not sufficient for determining if the default value
+					// is a valid value to introduce via create or uncorrelated update.
+					//
+					// Validate an update from nil to the default value to ensure
+					// that the default value pass
+					celErrs, rmCostWithoutOldObject := celValidator.Validate(ctx, pth.Child("default"), s, s.Default.Object, nil, remainingCost)
+					allErrs = append(allErrs, celErrs...)
+
+					// capture the cost of both types of runs and take whichever
+					// leaves less remaining cost
+					if rmCostWithoutOldObject < rmCost {
+						rmCost = rmCostWithoutOldObject
+					}
+				}
+
+				remainingCost = rmCost
 				if remainingCost < 0 {
 					return allErrs, nil, remainingCost
 				}

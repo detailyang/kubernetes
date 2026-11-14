@@ -26,15 +26,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/admission"
-	"k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/apiserver/pkg/admission/initializer"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/cmd/kube-controller-manager/names"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/controller/nodelifecycle"
-	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/controller/tainteviction"
 	"k8s.io/kubernetes/plugin/pkg/admission/defaulttolerationseconds"
 	"k8s.io/kubernetes/plugin/pkg/admission/podtolerationrestriction"
 	pluginapi "k8s.io/kubernetes/plugin/pkg/admission/podtolerationrestriction/apis/podtolerationrestriction"
@@ -49,20 +49,23 @@ func TestEvictionForNoExecuteTaintAddedByUser(t *testing.T) {
 	nodeIndex := 1 // the exact node doesn't matter, pick one
 
 	tests := map[string]struct {
-		enablePodDisruptionConditions bool
+		startStandaloneTaintEvictionController bool
+		wantPodEvicted                         bool
 	}{
-		"Test eviciton for NoExecute taint added by user; pod condition added when PodDisruptionConditions enabled": {
-			enablePodDisruptionConditions: true,
+		"Test eviction for NoExecute taint added by user; separate taint eviction controller not started": {
+			startStandaloneTaintEvictionController: false,
+			wantPodEvicted:                         false,
 		},
-		"Test eviciton for NoExecute taint added by user; no pod condition added when PodDisruptionConditions disabled": {
-			enablePodDisruptionConditions: false,
+		"Test eviction for NoExecute taint added by user; separate taint eviction controller started": {
+			startStandaloneTaintEvictionController: true,
+			wantPodEvicted:                         true,
 		},
 	}
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			var nodes []*v1.Node
-			for i := 0; i < nodeCount; i++ {
+			for i := range nodeCount {
 				node := &v1.Node{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:   fmt.Sprintf("testnode-%d", i),
@@ -100,8 +103,6 @@ func TestEvictionForNoExecuteTaintAddedByUser(t *testing.T) {
 					},
 				},
 			}
-
-			defer featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.PodDisruptionConditions, test.enablePodDisruptionConditions)()
 			testCtx := testutils.InitTestAPIServer(t, "taint-no-execute", nil)
 			cs := testCtx.ClientSet
 
@@ -138,6 +139,18 @@ func TestEvictionForNoExecuteTaintAddedByUser(t *testing.T) {
 			// Run all controllers
 			go nc.Run(testCtx.Ctx)
 
+			// Start TaintManager
+			if test.startStandaloneTaintEvictionController {
+				tm, _ := tainteviction.New(
+					testCtx.Ctx,
+					testCtx.ClientSet,
+					externalInformers.Core().V1().Pods(),
+					externalInformers.Core().V1().Nodes(),
+					names.TaintEvictionController,
+				)
+				go tm.Run(testCtx.Ctx)
+			}
+
 			for index := range nodes {
 				nodes[index], err = cs.CoreV1().Nodes().Create(testCtx.Ctx, nodes[index], metav1.CreateOptions{})
 				if err != nil {
@@ -155,17 +168,20 @@ func TestEvictionForNoExecuteTaintAddedByUser(t *testing.T) {
 			}
 
 			err = wait.PollUntilContextTimeout(testCtx.Ctx, time.Second, time.Second*20, true, testutils.PodIsGettingEvicted(cs, testPod.Namespace, testPod.Name))
-			if err != nil {
-				t.Fatalf("Error %q in test %q when waiting for terminating pod: %q", err, name, klog.KObj(testPod))
+			if err != nil && test.wantPodEvicted {
+				t.Fatalf("Test Failed: error %v while waiting for pod %q to be evicted", err, klog.KObj(testPod))
+			} else if !wait.Interrupted(err) && !test.wantPodEvicted {
+				t.Fatalf("Test Failed: unexpected eviction of pod %q", klog.KObj(testPod))
 			}
+
 			testPod, err = cs.CoreV1().Pods(testCtx.NS.Name).Get(testCtx.Ctx, testPod.Name, metav1.GetOptions{})
 			if err != nil {
 				t.Fatalf("Test Failed: error: %q, while getting updated pod", err)
 			}
 			_, cond := podutil.GetPodCondition(&testPod.Status, v1.DisruptionTarget)
-			if test.enablePodDisruptionConditions == true && cond == nil {
+			if test.wantPodEvicted && cond == nil {
 				t.Errorf("Pod %q does not have the expected condition: %q", klog.KObj(testPod), v1.DisruptionTarget)
-			} else if test.enablePodDisruptionConditions == false && cond != nil {
+			} else if !test.wantPodEvicted && cond != nil {
 				t.Errorf("Pod %q has an unexpected condition: %q", klog.KObj(testPod), v1.DisruptionTarget)
 			}
 		})
@@ -243,9 +259,13 @@ func TestTaintBasedEvictions(t *testing.T) {
 
 	// Build admission chain handler.
 	podTolerations := podtolerationrestriction.NewPodTolerationsPlugin(&pluginapi.Configuration{})
+	defaultTolerationSeconds, err := newHandlerForTest()
+	if err != nil {
+		t.Errorf("unexpected error initializing handler: %v", err)
+	}
 	admission := admission.NewChainHandler(
 		podTolerations,
-		defaulttolerationseconds.NewDefaultTolerationSeconds(),
+		defaultTolerationSeconds,
 	)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -288,6 +308,16 @@ func TestTaintBasedEvictions(t *testing.T) {
 			// Run the controller
 			go nc.Run(testCtx.Ctx)
 
+			// Start TaintEvictionController
+			tm, _ := tainteviction.New(
+				testCtx.Ctx,
+				testCtx.ClientSet,
+				externalInformers.Core().V1().Pods(),
+				externalInformers.Core().V1().Nodes(),
+				names.TaintEvictionController,
+			)
+			go tm.Run(testCtx.Ctx)
+
 			nodeRes := v1.ResourceList{
 				v1.ResourceCPU:    resource.MustParse("4000m"),
 				v1.ResourceMemory: resource.MustParse("16Gi"),
@@ -295,7 +325,7 @@ func TestTaintBasedEvictions(t *testing.T) {
 			}
 
 			var nodes []*v1.Node
-			for i := 0; i < nodeCount; i++ {
+			for i := range nodeCount {
 				node := &v1.Node{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: fmt.Sprintf("node-%d", i),
@@ -338,7 +368,7 @@ func TestTaintBasedEvictions(t *testing.T) {
 				}
 			}
 
-			if err := testutils.WaitForNodeTaints(cs, nodes[nodeIndex], test.nodeTaints); err != nil {
+			if err := testutils.WaitForNodeTaints(testCtx.Ctx, cs, nodes[nodeIndex], test.nodeTaints); err != nil {
 				t.Errorf("Failed to taint node %q, err: %v", klog.KObj(nodes[nodeIndex]), err)
 			}
 
@@ -367,4 +397,12 @@ func TestTaintBasedEvictions(t *testing.T) {
 			testutils.CleanupNodes(cs, t)
 		})
 	}
+}
+
+// newHandlerForTest returns a handler configured for testing.
+func newHandlerForTest() (*defaulttolerationseconds.Plugin, error) {
+	handler := defaulttolerationseconds.NewDefaultTolerationSeconds()
+	pluginInitializer := initializer.New(nil, nil, nil, nil, nil, nil, nil, nil)
+	pluginInitializer.Initialize(handler)
+	return handler, admission.ValidateInitialization(handler)
 }

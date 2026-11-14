@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -33,10 +34,10 @@ import (
 	"k8s.io/kube-openapi/pkg/handler"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	informers "k8s.io/apiextensions-api/pkg/client/informers/externalversions/apiextensions/v1"
+	listers "k8s.io/apiextensions-api/pkg/client/listers/apiextensions/v1"
 	apiextensionshelpers "k8s.io/apiextensions-apiserver/pkg/apihelpers"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	informers "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions/apiextensions/v1"
-	listers "k8s.io/apiextensions-apiserver/pkg/client/listers/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/controller/openapi/builder"
 )
 
@@ -48,9 +49,9 @@ type Controller struct {
 	// To allow injection for testing.
 	syncFn func(string) error
 
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 
-	staticSpec *spec.Swagger
+	staticSpecSource cached.Value[*spec.Swagger]
 
 	openAPIService *handler.OpenAPIService
 
@@ -66,42 +67,43 @@ type Controller struct {
 // changed. crdCache is a cached.Replaceable and updates are thread
 // safe. Thus, no lock is needed to protect this struct.
 type specCache struct {
-	crdCache          cached.Replaceable[*apiextensionsv1.CustomResourceDefinition]
-	mergedVersionSpec cached.Data[*spec.Swagger]
+	crdCache          cached.LastSuccess[*apiextensionsv1.CustomResourceDefinition]
+	mergedVersionSpec cached.Value[*spec.Swagger]
 }
 
 func (s *specCache) update(crd *apiextensionsv1.CustomResourceDefinition) {
-	s.crdCache.Replace(cached.NewResultOK(crd, generateCRDHash(crd)))
+	s.crdCache.Store(cached.Static(crd, generateCRDHash(crd)))
 }
 
 func createSpecCache(crd *apiextensionsv1.CustomResourceDefinition) *specCache {
 	s := specCache{}
 	s.update(crd)
 
-	s.mergedVersionSpec = cached.NewTransformer[*apiextensionsv1.CustomResourceDefinition](func(result cached.Result[*apiextensionsv1.CustomResourceDefinition]) cached.Result[*spec.Swagger] {
-		if result.Err != nil {
+	s.mergedVersionSpec = cached.Transform[*apiextensionsv1.CustomResourceDefinition](func(crd *apiextensionsv1.CustomResourceDefinition, etag string, err error) (*spec.Swagger, string, error) {
+		if err != nil {
 			// This should never happen, but return the err if it does.
-			return cached.NewResultErr[*spec.Swagger](result.Err)
+			return nil, "", err
 		}
-		crd := result.Data
 		mergeSpec := &spec.Swagger{}
 		for _, v := range crd.Spec.Versions {
 			if !v.Served {
 				continue
 			}
-			s, err := builder.BuildOpenAPIV2(crd, v.Name, builder.Options{V2: true})
+			s, err := builder.BuildOpenAPIV2(crd, v.Name, builder.Options{
+				V2: true,
+			})
 			// Defaults must be pruned here for CRDs to cleanly merge with the static
 			// spec that already has defaults pruned
 			if err != nil {
-				return cached.NewResultErr[*spec.Swagger](err)
+				return nil, "", err
 			}
 			s.Definitions = handler.PruneDefaults(s.Definitions)
 			mergeSpec, err = builder.MergeSpecs(mergeSpec, s)
 			if err != nil {
-				return cached.NewResultErr[*spec.Swagger](err)
+				return nil, "", err
 			}
 		}
-		return cached.NewResultOK(mergeSpec, generateCRDHash(crd))
+		return mergeSpec, generateCRDHash(crd), nil
 	}, &s.crdCache)
 	return &s
 }
@@ -109,9 +111,12 @@ func createSpecCache(crd *apiextensionsv1.CustomResourceDefinition) *specCache {
 // NewController creates a new Controller with input CustomResourceDefinition informer
 func NewController(crdInformer informers.CustomResourceDefinitionInformer) *Controller {
 	c := &Controller{
-		crdLister:   crdInformer.Lister(),
-		crdsSynced:  crdInformer.Informer().HasSynced,
-		queue:       workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "crd_openapi_controller"),
+		crdLister:  crdInformer.Lister(),
+		crdsSynced: crdInformer.Informer().HasSynced,
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "crd_openapi_controller"},
+		),
 		specsByName: map[string]*specCache{},
 	}
 
@@ -125,15 +130,18 @@ func NewController(crdInformer informers.CustomResourceDefinitionInformer) *Cont
 	return c
 }
 
-// Run sets openAPIAggregationManager and starts workers
-func (c *Controller) Run(staticSpec *spec.Swagger, openAPIService *handler.OpenAPIService, stopCh <-chan struct{}) {
+// Run sets openAPIAggregationManager and starts workers. staticSpecSource is
+// the base spec that CRD specs are merged into; it may build the spec on first
+// use, as the generic apiserver's does when the OpenAPIV2LazyBuild feature gate
+// is enabled, and an error from it makes the merged spec unavailable (503).
+func (c *Controller) Run(staticSpecSource cached.Value[*spec.Swagger], openAPIService *handler.OpenAPIService, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 	defer klog.Infof("Shutting down OpenAPI controller")
 
 	klog.Infof("Starting OpenAPI controller")
 
-	c.staticSpec = staticSpec
+	c.staticSpecSource = staticSpecSource
 	c.openAPIService = openAPIService
 
 	if !cache.WaitForCacheSync(stopCh, c.crdsSynced) {
@@ -178,11 +186,11 @@ func (c *Controller) processNextWorkItem() bool {
 	defer func() {
 		elapsed := time.Since(start)
 		if elapsed > time.Second {
-			klog.Warningf("slow openapi aggregation of %q: %s", key.(string), elapsed)
+			klog.Warningf("slow openapi aggregation of %q: %s", key, elapsed)
 		}
 	}()
 
-	err := c.syncFn(key.(string))
+	err := c.syncFn(key)
 	if err == nil {
 		c.queue.Forget(key)
 		return true
@@ -234,27 +242,31 @@ func (c *Controller) sync(name string) error {
 
 // updateSpecLocked updates the cached spec graph.
 func (c *Controller) updateSpecLocked() {
-	specList := make([]cached.Data[*spec.Swagger], 0, len(c.specsByName))
+	specList := make([]cached.Value[*spec.Swagger], 0, len(c.specsByName))
 	for crd := range c.specsByName {
 		specList = append(specList, c.specsByName[crd].mergedVersionSpec)
 	}
 
-	cache := cached.NewListMerger(func(results []cached.Result[*spec.Swagger]) cached.Result[*spec.Swagger] {
+	cache := cached.MergeList(func(results []cached.Result[*spec.Swagger]) (*spec.Swagger, string, error) {
 		localCRDSpec := make([]*spec.Swagger, 0, len(results))
 		for k := range results {
 			if results[k].Err == nil {
-				localCRDSpec = append(localCRDSpec, results[k].Data)
+				localCRDSpec = append(localCRDSpec, results[k].Value)
 			}
 		}
-		mergedSpec, err := builder.MergeSpecs(c.staticSpec, localCRDSpec...)
+		staticSpec, _, err := c.staticSpecSource.Get()
 		if err != nil {
-			return cached.NewResultErr[*spec.Swagger](fmt.Errorf("failed to merge specs: %v", err))
+			return nil, "", fmt.Errorf("failed to get base spec: %w", err)
+		}
+		mergedSpec, err := builder.MergeSpecs(staticSpec, localCRDSpec...)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to merge specs: %v", err)
 		}
 		// A UUID is returned for the etag because we will only
 		// create a new merger when a CRD has changed. A hash based
 		// etag is more expensive because the CRDs are not
 		// premarshalled.
-		return cached.NewResultOK(mergedSpec, uuid.New().String())
+		return mergedSpec, uuid.New().String(), nil
 	}, specList)
 	c.openAPIService.UpdateSpecLazy(cache)
 }

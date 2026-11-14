@@ -23,10 +23,13 @@ import (
 	"github.com/google/go-cmp/cmp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	componentbaseconfig "k8s.io/component-base/config"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	configv1 "k8s.io/kubernetes/pkg/scheduler/apis/config/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 func TestValidateKubeSchedulerConfigurationV1(t *testing.T) {
@@ -56,7 +59,7 @@ func TestValidateKubeSchedulerConfigurationV1(t *testing.T) {
 		PodMaxBackoffSeconds:     podMaxBackoffSeconds,
 		Profiles: []config.KubeSchedulerProfile{{
 			SchedulerName:            "me",
-			PercentageOfNodesToScore: pointer.Int32(35),
+			PercentageOfNodesToScore: ptr.To[int32](35),
 			Plugins: &config.Plugins{
 				QueueSort: config.PluginSet{
 					Enabled: []config.Plugin{{Name: "CustomSort"}},
@@ -71,7 +74,7 @@ func TestValidateKubeSchedulerConfigurationV1(t *testing.T) {
 			}},
 		}, {
 			SchedulerName:            "other",
-			PercentageOfNodesToScore: pointer.Int32(35),
+			PercentageOfNodesToScore: ptr.To[int32](35),
 			Plugins: &config.Plugins{
 				QueueSort: config.PluginSet{
 					Enabled: []config.Plugin{{Name: "CustomSort"}},
@@ -103,17 +106,41 @@ func TestValidateKubeSchedulerConfigurationV1(t *testing.T) {
 	enableContentProfilingSetWithoutEnableProfiling.EnableProfiling = false
 	enableContentProfilingSetWithoutEnableProfiling.EnableContentionProfiling = true
 
-	metricsBindAddrInvalid := validConfig.DeepCopy()
-	metricsBindAddrInvalid.MetricsBindAddress = "0.0.0.0:9090"
-
-	healthzBindAddrInvalid := validConfig.DeepCopy()
-	healthzBindAddrInvalid.HealthzBindAddress = "0.0.0.0:9090"
-
 	percentageOfNodesToScore101 := validConfig.DeepCopy()
-	percentageOfNodesToScore101.PercentageOfNodesToScore = pointer.Int32(101)
+	percentageOfNodesToScore101.PercentageOfNodesToScore = ptr.To[int32](101)
 
 	percentageOfNodesToScoreNegative := validConfig.DeepCopy()
-	percentageOfNodesToScoreNegative.PercentageOfNodesToScore = pointer.Int32(-1)
+	percentageOfNodesToScoreNegative.PercentageOfNodesToScore = ptr.To[int32](-1)
+
+	percentageOfPlacementsToScore50 := validConfig.DeepCopy()
+	percentageOfPlacementsToScore50.PercentageOfPlacementsToScore = ptr.To[int32](50)
+
+	percentageOfPlacementsToScore0 := validConfig.DeepCopy()
+	percentageOfPlacementsToScore0.PercentageOfPlacementsToScore = ptr.To[int32](0)
+
+	percentageOfPlacementsToScore100 := validConfig.DeepCopy()
+	percentageOfPlacementsToScore100.PercentageOfPlacementsToScore = ptr.To[int32](100)
+
+	percentageOfPlacementsToScore101 := validConfig.DeepCopy()
+	percentageOfPlacementsToScore101.PercentageOfPlacementsToScore = ptr.To[int32](101)
+
+	percentageOfPlacementsToScoreNegative := validConfig.DeepCopy()
+	percentageOfPlacementsToScoreNegative.PercentageOfPlacementsToScore = ptr.To[int32](-1)
+
+	profilePercentageOfPlacementsToScore50 := validConfig.DeepCopy()
+	profilePercentageOfPlacementsToScore50.Profiles[0].PercentageOfPlacementsToScore = ptr.To[int32](50)
+
+	profilePercentageOfPlacementsToScore0 := validConfig.DeepCopy()
+	profilePercentageOfPlacementsToScore0.Profiles[0].PercentageOfPlacementsToScore = ptr.To[int32](0)
+
+	profilePercentageOfPlacementsToScore100 := validConfig.DeepCopy()
+	profilePercentageOfPlacementsToScore100.Profiles[0].PercentageOfPlacementsToScore = ptr.To[int32](100)
+
+	profilePercentageOfPlacementsToScore101 := validConfig.DeepCopy()
+	profilePercentageOfPlacementsToScore101.Profiles[0].PercentageOfPlacementsToScore = ptr.To[int32](101)
+
+	profilePercentageOfPlacementsToScoreNegative := validConfig.DeepCopy()
+	profilePercentageOfPlacementsToScoreNegative.Profiles[0].PercentageOfPlacementsToScore = ptr.To[int32](-1)
 
 	schedulerNameNotSet := validConfig.DeepCopy()
 	schedulerNameNotSet.Profiles[1].SchedulerName = ""
@@ -122,10 +149,10 @@ func TestValidateKubeSchedulerConfigurationV1(t *testing.T) {
 	repeatedSchedulerName.Profiles[0].SchedulerName = "other"
 
 	profilePercentageOfNodesToScore101 := validConfig.DeepCopy()
-	profilePercentageOfNodesToScore101.Profiles[1].PercentageOfNodesToScore = pointer.Int32(101)
+	profilePercentageOfNodesToScore101.Profiles[1].PercentageOfNodesToScore = ptr.To[int32](101)
 
 	profilePercentageOfNodesToScoreNegative := validConfig.DeepCopy()
-	profilePercentageOfNodesToScoreNegative.Profiles[1].PercentageOfNodesToScore = pointer.Int32(-1)
+	profilePercentageOfNodesToScoreNegative.Profiles[1].PercentageOfNodesToScore = ptr.To[int32](-1)
 
 	differentQueueSort := validConfig.DeepCopy()
 	differentQueueSort.Profiles[1].Plugins.QueueSort.Enabled[0].Name = "AnotherSort"
@@ -195,9 +222,16 @@ func TestValidateKubeSchedulerConfigurationV1(t *testing.T) {
 	validPlugins := validConfig.DeepCopy()
 	validPlugins.Profiles[0].Plugins.Score.Enabled = append(validPlugins.Profiles[0].Plugins.Score.Enabled, config.Plugin{Name: "PodTopologySpread", Weight: 2})
 
+	invalidPlugins := validConfig.DeepCopy()
+	invalidPlugins.Profiles[0].Plugins.Score.Enabled = append(invalidPlugins.Profiles[0].Plugins.Score.Enabled, config.Plugin{Name: "AzureDiskLimits"})
+	invalidPlugins.Profiles[0].Plugins.Score.Enabled = append(invalidPlugins.Profiles[0].Plugins.Score.Enabled, config.Plugin{Name: "CinderLimits"})
+	invalidPlugins.Profiles[0].Plugins.Score.Enabled = append(invalidPlugins.Profiles[0].Plugins.Score.Enabled, config.Plugin{Name: "EBSLimits"})
+	invalidPlugins.Profiles[0].Plugins.Score.Enabled = append(invalidPlugins.Profiles[0].Plugins.Score.Enabled, config.Plugin{Name: "GCEPDLimits"})
+
 	scenarios := map[string]struct {
-		config   *config.KubeSchedulerConfiguration
-		wantErrs field.ErrorList
+		featureOverrides featuregatetesting.FeatureOverrides
+		config           *config.KubeSchedulerConfiguration
+		wantErrs         field.ErrorList
 	}{
 		"good": {
 			config: validConfig,
@@ -215,7 +249,7 @@ func TestValidateKubeSchedulerConfigurationV1(t *testing.T) {
 			config: resourceNameNotSet,
 			wantErrs: field.ErrorList{
 				&field.Error{
-					Type:  field.ErrorTypeInvalid,
+					Type:  field.ErrorTypeRequired,
 					Field: "leaderElection.resourceName",
 				},
 			},
@@ -224,7 +258,7 @@ func TestValidateKubeSchedulerConfigurationV1(t *testing.T) {
 			config: resourceNamespaceNotSet,
 			wantErrs: field.ErrorList{
 				&field.Error{
-					Type:  field.ErrorTypeInvalid,
+					Type:  field.ErrorTypeRequired,
 					Field: "leaderElection.resourceNamespace",
 				},
 			},
@@ -235,24 +269,6 @@ func TestValidateKubeSchedulerConfigurationV1(t *testing.T) {
 				&field.Error{
 					Type:  field.ErrorTypeInvalid,
 					Field: "leaderElection.resourceLock",
-				},
-			},
-		},
-		"non-empty-metrics-bind-addr": {
-			config: metricsBindAddrInvalid,
-			wantErrs: field.ErrorList{
-				&field.Error{
-					Type:  field.ErrorTypeInvalid,
-					Field: "metricsBindAddress",
-				},
-			},
-		},
-		"non-empty-healthz-bind-addr": {
-			config: healthzBindAddrInvalid,
-			wantErrs: field.ErrorList{
-				&field.Error{
-					Type:  field.ErrorTypeInvalid,
-					Field: "healthzBindAddress",
 				},
 			},
 		},
@@ -271,6 +287,110 @@ func TestValidateKubeSchedulerConfigurationV1(t *testing.T) {
 				&field.Error{
 					Type:  field.ErrorTypeInvalid,
 					Field: "percentageOfNodesToScore",
+				},
+			},
+		},
+		"percentage-of-placements-to-score-forbidden-with-tas-disabled": {
+			featureOverrides: featuregatetesting.FeatureOverrides{
+				features.TopologyAwareWorkloadScheduling: false,
+			},
+			config: percentageOfPlacementsToScore50,
+			wantErrs: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: "percentageOfPlacementsToScore",
+				},
+			},
+		},
+		"percentage-of-placements-to-score-lower-bound": {
+			featureOverrides: featuregatetesting.FeatureOverrides{
+				features.GenericWorkload:                 true,
+				features.TopologyAwareWorkloadScheduling: true,
+			},
+			config: percentageOfPlacementsToScore0,
+		},
+		"percentage-of-placements-to-score-upper-bound": {
+			featureOverrides: featuregatetesting.FeatureOverrides{
+				features.GenericWorkload:                 true,
+				features.TopologyAwareWorkloadScheduling: true,
+			},
+			config: percentageOfPlacementsToScore100,
+		},
+		"percentage-of-placements-to-score-greater-than-100": {
+			featureOverrides: featuregatetesting.FeatureOverrides{
+				features.GenericWorkload:                 true,
+				features.TopologyAwareWorkloadScheduling: true,
+			},
+			config: percentageOfPlacementsToScore101,
+			wantErrs: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: "percentageOfPlacementsToScore",
+				},
+			},
+		},
+		"percentage-of-placements-to-score-less-than-0": {
+			featureOverrides: featuregatetesting.FeatureOverrides{
+				features.GenericWorkload:                 true,
+				features.TopologyAwareWorkloadScheduling: true,
+			},
+			config: percentageOfPlacementsToScoreNegative,
+			wantErrs: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: "percentageOfPlacementsToScore",
+				},
+			},
+		},
+		"profile-percentage-of-placements-to-score-forbidden-with-tas-disabled": {
+			featureOverrides: featuregatetesting.FeatureOverrides{
+				features.TopologyAwareWorkloadScheduling: false,
+			},
+			config: profilePercentageOfPlacementsToScore50,
+			wantErrs: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: "profiles[0].percentageOfPlacementsToScore",
+				},
+			},
+		},
+		"profile-percentage-of-placements-to-score-lower-bound": {
+			featureOverrides: featuregatetesting.FeatureOverrides{
+				features.GenericWorkload:                 true,
+				features.TopologyAwareWorkloadScheduling: true,
+			},
+			config: profilePercentageOfPlacementsToScore0,
+		},
+		"profile-percentage-of-placements-to-score-upper-bound": {
+			featureOverrides: featuregatetesting.FeatureOverrides{
+				features.GenericWorkload:                 true,
+				features.TopologyAwareWorkloadScheduling: true,
+			},
+			config: profilePercentageOfPlacementsToScore100,
+		},
+		"profile-percentage-of-placements-to-score-greater-than-100": {
+			featureOverrides: featuregatetesting.FeatureOverrides{
+				features.GenericWorkload:                 true,
+				features.TopologyAwareWorkloadScheduling: true,
+			},
+			config: profilePercentageOfPlacementsToScore101,
+			wantErrs: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: "profiles[0].percentageOfPlacementsToScore",
+				},
+			},
+		},
+		"profile-percentage-of-placements-to-score-less-than-0": {
+			featureOverrides: featuregatetesting.FeatureOverrides{
+				features.GenericWorkload:                 true,
+				features.TopologyAwareWorkloadScheduling: true,
+			},
+			config: profilePercentageOfPlacementsToScoreNegative,
+			wantErrs: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: "profiles[0].percentageOfPlacementsToScore",
 				},
 			},
 		},
@@ -391,6 +511,27 @@ func TestValidateKubeSchedulerConfigurationV1(t *testing.T) {
 				},
 			},
 		},
+		"invalid-plugins": {
+			config: invalidPlugins,
+			wantErrs: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: "profiles[0].plugins.score.enabled[0]",
+				},
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: "profiles[0].plugins.score.enabled[1]",
+				},
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: "profiles[0].plugins.score.enabled[2]",
+				},
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: "profiles[0].plugins.score.enabled[3]",
+				},
+			},
+		},
 		"valid-plugins": {
 			config: validPlugins,
 		},
@@ -398,6 +539,7 @@ func TestValidateKubeSchedulerConfigurationV1(t *testing.T) {
 
 	for name, scenario := range scenarios {
 		t.Run(name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, scenario.featureOverrides)
 			errs := ValidateKubeSchedulerConfiguration(scenario.config)
 			diff := cmp.Diff(scenario.wantErrs.ToAggregate(), errs, ignoreBadValueDetail)
 			if diff != "" {

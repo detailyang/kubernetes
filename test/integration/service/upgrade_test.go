@@ -31,7 +31,7 @@ import (
 
 func Test_UpgradeService(t *testing.T) {
 	etcdOptions := framework.SharedEtcd()
-	s := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, etcdOptions)
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), etcdOptions)
 	defer s.TearDownFn()
 	serviceName := "test-old-service"
 	ns := "old-service-ns"
@@ -71,6 +71,18 @@ func Test_UpgradeService(t *testing.T) {
 		t.Error(err)
 	}
 	t.Logf("Service stored in etcd %v", string(svcJSON))
+
+	// Try to update the service status first (before spec is upgraded in storage)
+	statusUpdated, err := kubeclient.CoreV1().Services(ns).UpdateStatus(context.TODO(), svc, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("Failed updating service status: %v", err)
+	}
+	if len(statusUpdated.Spec.ClusterIPs) == 0 || statusUpdated.Spec.ClusterIPs[0] != "10.0.0.1" {
+		t.Errorf("Expected status update response to have ClusterIPs=[10.0.0.1], got %v", statusUpdated.Spec.ClusterIPs)
+	}
+	if len(statusUpdated.Spec.IPFamilies) == 0 || statusUpdated.Spec.IPFamilies[0] != v1.IPv4Protocol {
+		t.Errorf("Expected status update response to have IPFamilies=[IPv4], got %v", statusUpdated.Spec.IPFamilies)
+	}
 
 	// Try to update the service
 	_, err = kubeclient.CoreV1().Services(ns).Update(context.TODO(), svc, metav1.UpdateOptions{})

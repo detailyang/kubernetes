@@ -21,27 +21,31 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 
-	utiltesting "k8s.io/client-go/util/testing"
-
 	"github.com/google/go-cmp/cmp"
 	"github.com/lithammer/dedent"
-	"github.com/pkg/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/version"
+	utiltesting "k8s.io/client-go/util/testing"
+	criapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/utils/exec"
 	fakeexec "k8s.io/utils/exec/testing"
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
-	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
+	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 	utilruntime "k8s.io/kubernetes/cmd/kubeadm/app/util/runtime"
 )
 
@@ -384,12 +388,22 @@ func TestDirAvailableCheck(t *testing.T) {
 	}
 }
 
+// mockNetListener is a minimal implementation of net.Listener used for testing
+// PortOpenCheck without relying on real network sockets.
+type mockNetListener struct{}
+
+func (m *mockNetListener) Accept() (net.Conn, error) { return nil, nil }
+func (m *mockNetListener) Close() error              { return nil }
+func (m *mockNetListener) Addr() net.Addr            { return nil }
+
 func TestPortOpenCheck(t *testing.T) {
-	ln, err := net.Listen("tcp", ":0")
-	if err != nil {
-		t.Fatalf("could not listen on local network: %v", err)
+	mockListenSuccess := func(string, string) (net.Listener, error) {
+		return &mockNetListener{}, nil
 	}
-	defer ln.Close()
+	mockListenFail := func(string, string) (net.Listener, error) {
+		return nil, fmt.Errorf("address already in use")
+	}
+
 	var tests = []struct {
 		name          string
 		check         PortOpenCheck
@@ -397,25 +411,74 @@ func TestPortOpenCheck(t *testing.T) {
 	}{
 		{
 			name:          "Port is available",
-			check:         PortOpenCheck{port: 0},
+			check:         PortOpenCheck{port: 6443, listenFunc: mockListenSuccess},
 			expectedError: false,
 		},
 		{
 			name:          "Port is not available",
-			check:         PortOpenCheck{port: ln.Addr().(*net.TCPAddr).Port},
+			check:         PortOpenCheck{port: 6443, listenFunc: mockListenFail},
+			expectedError: true,
+		},
+		{
+			name:          "Port bound on 127.0.0.1 is available on 127.0.0.2",
+			check:         PortOpenCheck{port: 6443, address: "127.0.0.2", listenFunc: mockListenSuccess},
+			expectedError: false,
+		},
+		{
+			name:          "Port bound on 127.0.0.1 is not available on 127.0.0.1",
+			check:         PortOpenCheck{port: 6443, address: "127.0.0.1", listenFunc: mockListenFail},
 			expectedError: true,
 		},
 	}
+
 	for _, rt := range tests {
-		_, output := rt.check.Check()
-		if (output != nil) != rt.expectedError {
-			t.Errorf(
-				"Failed PortOpenCheck:%v\n\texpectedError: %t\n\t  actual: %t",
-				rt.name,
-				rt.expectedError,
-				(output != nil),
-			)
-		}
+		t.Run(rt.name, func(t *testing.T) {
+			_, output := rt.check.Check()
+			if (output != nil) != rt.expectedError {
+				t.Errorf(
+					"Failed PortOpenCheck:%v\n\texpectedError: %t\n\t  actual: %t",
+					rt.name,
+					rt.expectedError,
+					(output != nil),
+				)
+			}
+		})
+	}
+}
+
+func TestPortOpenCheckName(t *testing.T) {
+	var tests = []struct {
+		name     string
+		check    PortOpenCheck
+		expected string
+	}{
+		{
+			name:     "Port only",
+			check:    PortOpenCheck{port: 6443},
+			expected: "Port-6443",
+		},
+		{
+			name:     "Port with label",
+			check:    PortOpenCheck{port: 6443, label: "MyLabel"},
+			expected: "MyLabel",
+		},
+		{
+			name:     "Port with address",
+			check:    PortOpenCheck{port: 6443, address: "10.0.0.1"},
+			expected: "Port-6443",
+		},
+		{
+			name:     "Port with address and label",
+			check:    PortOpenCheck{port: 6443, address: "10.0.0.1", label: "MyLabel"},
+			expected: "MyLabel",
+		},
+	}
+	for _, rt := range tests {
+		t.Run(rt.name, func(t *testing.T) {
+			if rt.check.Name() != rt.expected {
+				t.Errorf("expected name %q, got %q", rt.expected, rt.check.Name())
+			}
+		})
 	}
 }
 
@@ -427,16 +490,16 @@ func TestRunChecks(t *testing.T) {
 	}{
 		{[]Checker{}, true, ""},
 		{[]Checker{preflightCheckTest{"warning"}}, true, "\t[WARNING preflightCheckTest]: warning\n"}, // should just print warning
-		{[]Checker{preflightCheckTest{"error"}}, false, ""},
-		{[]Checker{preflightCheckTest{"test"}}, false, ""},
+		{[]Checker{preflightCheckTest{"error"}}, false, "[preflight] Some fatal errors occurred:\n\t[ERROR preflightCheckTest]: fake error\n[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`\n"},
+		{[]Checker{preflightCheckTest{"test"}}, false, "[preflight] Some fatal errors occurred:\n\t[ERROR preflightCheckTest]: fake error\n[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`\n"},
 		{[]Checker{DirAvailableCheck{Path: "/does/not/exist"}}, true, ""},
-		{[]Checker{DirAvailableCheck{Path: "/"}}, false, ""},
+		{[]Checker{DirAvailableCheck{Path: "/"}}, false, "[preflight] Some fatal errors occurred:\n\t[ERROR DirAvailable--]: / is not empty\n[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`\n"},
 		{[]Checker{FileAvailableCheck{Path: "/does/not/exist"}}, true, ""},
-		{[]Checker{FileContentCheck{Path: "/does/not/exist"}}, false, ""},
+		{[]Checker{FileContentCheck{Path: "/does/not/exist"}}, false, "[preflight] Some fatal errors occurred:\n\t[ERROR FileContent--does-not-exist]: /does/not/exist does not exist\n[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`\n"},
 		{[]Checker{FileContentCheck{Path: "/"}}, true, ""},
-		{[]Checker{FileContentCheck{Path: "/", Content: []byte("does not exist")}}, false, ""},
+		{[]Checker{FileContentCheck{Path: "/", Content: []byte("content can not be read")}}, false, "[preflight] Some fatal errors occurred:\n\t[ERROR FileContent--]: / could not be read\n[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`\n"},
 		{[]Checker{InPathCheck{executable: "foobarbaz", exec: exec.New()}}, true, "\t[WARNING FileExisting-foobarbaz]: foobarbaz not found in system path\n"},
-		{[]Checker{InPathCheck{executable: "foobarbaz", mandatory: true, exec: exec.New()}}, false, ""},
+		{[]Checker{InPathCheck{executable: "foobarbaz", mandatory: true, exec: exec.New()}}, false, "[preflight] Some fatal errors occurred:\n\t[ERROR FileExisting-foobarbaz]: foobarbaz not found in system path\n[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`\n"},
 		{[]Checker{InPathCheck{executable: "foobar", mandatory: false, exec: exec.New(), suggestion: "install foobar"}}, true, "\t[WARNING FileExisting-foobar]: foobar not found in system path\nSuggestion: install foobar\n"},
 	}
 	for _, rt := range tokenTest {
@@ -605,10 +668,13 @@ func TestKubernetesVersionCheck(t *testing.T) {
 
 func TestHTTPProxyCIDRCheck(t *testing.T) {
 	var tests = []struct {
+		name           string
 		check          HTTPProxyCIDRCheck
 		expectWarnings bool
+		expectErrors   bool
 	}{
 		{
+			name: "loopback is never proxied",
 			check: HTTPProxyCIDRCheck{
 				Proto: "https",
 				CIDR:  "127.0.0.0/8",
@@ -616,6 +682,7 @@ func TestHTTPProxyCIDRCheck(t *testing.T) {
 			expectWarnings: false,
 		},
 		{
+			name: "IPv4 range listed in NO_PROXY is accessed directly",
 			check: HTTPProxyCIDRCheck{
 				Proto: "https",
 				CIDR:  "10.96.0.0/12",
@@ -623,6 +690,7 @@ func TestHTTPProxyCIDRCheck(t *testing.T) {
 			expectWarnings: false,
 		},
 		{
+			name: "IPv4 range not listed in NO_PROXY goes through the proxy",
 			check: HTTPProxyCIDRCheck{
 				Proto: "https",
 				CIDR:  "192.168.0.0/16",
@@ -630,6 +698,7 @@ func TestHTTPProxyCIDRCheck(t *testing.T) {
 			expectWarnings: true,
 		},
 		{
+			name: "IPv6 range listed in NO_PROXY is accessed directly",
 			check: HTTPProxyCIDRCheck{
 				Proto: "https",
 				CIDR:  "2001:db8::/56",
@@ -637,25 +706,63 @@ func TestHTTPProxyCIDRCheck(t *testing.T) {
 			expectWarnings: false,
 		},
 		{
+			name: "IPv6 range not listed in NO_PROXY goes through the proxy",
 			check: HTTPProxyCIDRCheck{
 				Proto: "https",
 				CIDR:  "2001:db8:1::/56",
 			}, // Expected to go via proxy, range is not in 2001:db8::/48
 			expectWarnings: true,
 		},
+		{
+			name:  "empty CIDR is skipped",
+			check: HTTPProxyCIDRCheck{Proto: "https"},
+		},
+		{
+			name: "CIDR with an indexed IP in NO_PROXY is accessed directly",
+			check: HTTPProxyCIDRCheck{
+				Proto: "https",
+				CIDR:  "10.0.0.1/24",
+			},
+		},
+		{
+			name: "unparsable CIDR",
+			check: HTTPProxyCIDRCheck{
+				Proto: "https",
+				CIDR:  "not-a-cidr",
+			},
+			expectErrors: true,
+		},
+		{
+			name: "CIDR without room for an indexed IP",
+			check: HTTPProxyCIDRCheck{
+				Proto: "https",
+				CIDR:  "10.0.0.1/32",
+			},
+			expectErrors: true,
+		},
 	}
 
 	resetProxyEnv(t)
 
 	for _, rt := range tests {
-		warning, _ := rt.check.Check()
+		warning, errs := rt.check.Check()
 		if (warning != nil) != rt.expectWarnings {
 			t.Errorf(
-				"failed HTTPProxyCIDRCheck:\n\texpected: %t\n\t  actual: %t (CIDR:%s). Warnings: %v",
+				"%s failed HTTPProxyCIDRCheck:\n\texpected: %t\n\t  actual: %t (CIDR:%s). Warnings: %v",
+				rt.name,
 				rt.expectWarnings,
 				(warning != nil),
 				rt.check.CIDR,
 				warning,
+			)
+		}
+		if (len(errs) > 0) != rt.expectErrors {
+			t.Errorf(
+				"%s failed HTTPProxyCIDRCheck:\n\texpected errors: %t\n\t  actual: %v (CIDR:%s)",
+				rt.name,
+				rt.expectErrors,
+				errs,
+				rt.check.CIDR,
 			)
 		}
 	}
@@ -666,6 +773,7 @@ func TestHTTPProxyCheck(t *testing.T) {
 		name           string
 		check          HTTPProxyCheck
 		expectWarnings bool
+		expectErrors   bool
 	}{
 		{
 			name: "Loopback address",
@@ -723,12 +831,20 @@ func TestHTTPProxyCheck(t *testing.T) {
 			}, // Expected to go via proxy, range is not in 2001:db8::/48
 			expectWarnings: true,
 		},
+		{
+			name: "Invalid host",
+			check: HTTPProxyCheck{
+				Proto: "https",
+				Host:  "invalid host",
+			},
+			expectErrors: true,
+		},
 	}
 
 	resetProxyEnv(t)
 
 	for _, rt := range tests {
-		warning, _ := rt.check.Check()
+		warning, errs := rt.check.Check()
 		if (warning != nil) != rt.expectWarnings {
 			t.Errorf(
 				"%s failed HTTPProxyCheck:\n\texpected: %t\n\t  actual: %t (Host:%s). Warnings: %v",
@@ -737,6 +853,15 @@ func TestHTTPProxyCheck(t *testing.T) {
 				(warning != nil),
 				rt.check.Host,
 				warning,
+			)
+		}
+		if (len(errs) > 0) != rt.expectErrors {
+			t.Errorf(
+				"%s failed HTTPProxyCheck:\n\texpected errors: %t\n\t  actual: %v (Host:%s)",
+				rt.name,
+				rt.expectErrors,
+				errs,
+				rt.check.Host,
 			)
 		}
 	}
@@ -851,100 +976,6 @@ func TestSetHasItemOrAll(t *testing.T) {
 	}
 }
 
-func TestImagePullCheck(t *testing.T) {
-	fcmd := fakeexec.FakeCmd{
-		RunScript: []fakeexec.FakeAction{
-			// Test case 1: img1 and img2 exist, img3 doesn't exist
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			func() ([]byte, []byte, error) { return nil, nil, &fakeexec.FakeExitError{Status: 1} },
-
-			// Test case 2: images don't exist
-			func() ([]byte, []byte, error) { return nil, nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return nil, nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return nil, nil, &fakeexec.FakeExitError{Status: 1} },
-		},
-		CombinedOutputScript: []fakeexec.FakeAction{
-			// Test case1: pull only img3
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			// Test case 2: fail to pull image2 and image3
-			// If the pull fails, it will be retried 5 times (see PullImageRetry in constants/constants.go)
-			func() ([]byte, []byte, error) { return nil, nil, nil },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
-		},
-	}
-
-	fexec := &fakeexec.FakeExec{
-		CommandScript: []fakeexec.FakeCommandAction{
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
-		},
-		LookPathFunc: func(cmd string) (string, error) { return "/usr/bin/crictl", nil },
-	}
-
-	containerRuntime, err := utilruntime.NewContainerRuntime(fexec, constants.DefaultCRISocket)
-	if err != nil {
-		t.Errorf("unexpected NewContainerRuntime error: %v", err)
-	}
-
-	check := ImagePullCheck{
-		runtime:         containerRuntime,
-		imageList:       []string{"img1", "img2", "img3"},
-		imagePullPolicy: corev1.PullIfNotPresent,
-	}
-	warnings, errors := check.Check()
-	if len(warnings) != 0 {
-		t.Fatalf("did not expect any warnings but got %q", warnings)
-	}
-	if len(errors) != 0 {
-		t.Fatalf("expected 1 errors but got %d: %q", len(errors), errors)
-	}
-
-	warnings, errors = check.Check()
-	if len(warnings) != 0 {
-		t.Fatalf("did not expect any warnings but got %q", warnings)
-	}
-	if len(errors) != 2 {
-		t.Fatalf("expected 2 errors but got %d: %q", len(errors), errors)
-	}
-
-	// Test with unknown policy
-	check = ImagePullCheck{
-		runtime:         containerRuntime,
-		imageList:       []string{"img1", "img2", "img3"},
-		imagePullPolicy: "",
-	}
-	_, errors = check.Check()
-	if len(errors) != 1 {
-		t.Fatalf("expected 1 error but got %d: %q", len(errors), errors)
-	}
-}
-
 func TestNumCPUCheck(t *testing.T) {
 	var tests = []struct {
 		numCPU      int
@@ -998,11 +1029,6 @@ func TestInitIPCheck(t *testing.T) {
 	// skip this test, if OS in not Linux, since it will ONLY pass on Linux.
 	if runtime.GOOS != "linux" {
 		t.Skip("unsupported OS")
-	}
-	// should be a privileged user for the `init` command, otherwise just skip it.
-	isPrivileged := IsPrivilegedUserCheck{}
-	if _, err := isPrivileged.Check(); err != nil {
-		t.Skip("not a privileged user")
 	}
 	internalcfg, err := configutil.DefaultedStaticInitConfiguration()
 	if err != nil {
@@ -1066,15 +1092,12 @@ func TestJoinIPCheck(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("unsupported OS")
 	}
-	// should be a privileged user for the `join` command, otherwise just skip it.
-	isPrivileged := IsPrivilegedUserCheck{}
-	if _, err := isPrivileged.Check(); err != nil {
-		t.Skip("not a privileged user")
+
+	opts := configutil.LoadOrDefaultConfigurationOptions{
+		SkipCRIDetect: true,
 	}
+
 	internalcfg, err := configutil.DefaultedJoinConfiguration(&kubeadmapiv1.JoinConfiguration{
-		NodeRegistration: kubeadmapiv1.NodeRegistrationOptions{
-			CRISocket: constants.UnknownCRISocket,
-		},
 		Discovery: kubeadmapiv1.Discovery{
 			BootstrapToken: &kubeadmapiv1.BootstrapTokenDiscovery{
 				Token:                    configutil.PlaceholderToken.Token.String(),
@@ -1082,7 +1105,7 @@ func TestJoinIPCheck(t *testing.T) {
 				UnsafeSkipCAVerification: true,
 			},
 		},
-	})
+	}, opts)
 	if err != nil {
 		t.Fatalf("unexpected failure when defaulting JoinConfiguration: %v", err)
 	}
@@ -1126,4 +1149,541 @@ func TestJoinIPCheck(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestContainerRuntimeCheck(t *testing.T) {
+	tests := []struct {
+		name           string
+		prepare        func(*utilruntime.FakeImpl)
+		expectErrors   int
+		expectWarnings int
+	}{
+		{
+			name: "ok",
+		},
+		{
+			name: "container runtime is not running",
+			prepare: func(mock *utilruntime.FakeImpl) {
+				mock.StatusReturns(nil, errors.New("not running"))
+			},
+			expectErrors: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mock := &utilruntime.FakeImpl{}
+			if test.prepare != nil {
+				test.prepare(mock)
+			}
+
+			warnings, errors := ContainerRuntimeCheck{impl: mock}.Check()
+			if len(warnings) != test.expectWarnings {
+				t.Errorf("expected %d warning(s) but got %d: %q", test.expectWarnings, len(warnings), warnings)
+			}
+			if len(errors) != test.expectErrors {
+				t.Errorf("expected %d error(s) but got %d: %q", test.expectErrors, len(errors), errors)
+			}
+		})
+	}
+}
+
+func TestContainerRuntimeVersionCheck(t *testing.T) {
+	tests := []struct {
+		name           string
+		prepare        func(*utilruntime.FakeImpl)
+		expectErrors   int
+		expectWarnings int
+	}{
+		{
+			name: "ok",
+		},
+		{
+			name: "runtime config not implemented",
+			prepare: func(mock *utilruntime.FakeImpl) {
+				mock.RuntimeConfigReturns(nil, status.New(codes.Unimplemented, "not implemented").Err())
+			},
+			expectWarnings: 1,
+		},
+		{
+			name: "call RuntimeConfig fails",
+			prepare: func(mock *utilruntime.FakeImpl) {
+				mock.RuntimeConfigReturns(nil, status.New(codes.DeadlineExceeded, "deadline exceeded").Err())
+			},
+			expectErrors: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mock := &utilruntime.FakeImpl{}
+			if test.prepare != nil {
+				test.prepare(mock)
+			}
+
+			warnings, errors := ContainerRuntimeVersionCheck{impl: mock}.Check()
+			if len(warnings) != test.expectWarnings {
+				t.Errorf("expected %d warning(s) but got %d: %q", test.expectWarnings, len(warnings), warnings)
+			}
+			if len(errors) != test.expectErrors {
+				t.Errorf("expected %d error(s) but got %d: %q", test.expectErrors, len(errors), errors)
+			}
+		})
+	}
+}
+
+func TestCheckerNames(t *testing.T) {
+	tests := []struct {
+		checker  Checker
+		expected string
+	}{
+		{ContainerRuntimeCheck{}, "CRI"},
+		{ContainerRuntimeVersionCheck{}, "ContainerRuntimeVersion"},
+		{ServiceCheck{Service: "kubelet"}, "Service-kubelet"},
+		{ServiceCheck{Service: "kubelet", Label: "Custom"}, "Custom"},
+		{FirewalldCheck{}, "Firewalld"},
+		{PortOpenCheck{port: 6443}, "Port-6443"},
+		{IsPrivilegedUserCheck{}, "IsPrivilegedUser"},
+		{DirAvailableCheck{Path: "/var/lib/etcd"}, "DirAvailable--var-lib-etcd"},
+		{DirAvailableCheck{Path: "/var/lib/etcd", Label: "Custom"}, "Custom"},
+		{FileAvailableCheck{Path: "/etc/kubernetes/manifests/kube-apiserver.yaml"}, "FileAvailable--etc-kubernetes-manifests-kube-apiserver.yaml"},
+		{FileAvailableCheck{Path: "/etc/kubernetes/manifests/kube-apiserver.yaml", Label: "Custom"}, "Custom"},
+		{FileExistingCheck{Path: "/etc/kubernetes/pki/ca.crt"}, "FileExisting--etc-kubernetes-pki-ca.crt"},
+		{FileExistingCheck{Path: "/etc/kubernetes/pki/ca.crt", Label: "Custom"}, "Custom"},
+		{FileContentCheck{Path: "/proc/sys/net/ipv4/ip_forward"}, "FileContent--proc-sys-net-ipv4-ip_forward"},
+		{FileContentCheck{Path: "/proc/sys/net/ipv4/ip_forward", Label: "Custom"}, "Custom"},
+		{InPathCheck{executable: "kubelet"}, "FileExisting-kubelet"},
+		{InPathCheck{executable: "kubelet", label: "Custom"}, "Custom"},
+		{HostnameCheck{}, "Hostname"},
+		{HTTPProxyCheck{}, "HTTPProxy"},
+		{HTTPProxyCIDRCheck{}, "HTTPProxyCIDR"},
+		{SystemVerificationCheck{}, "SystemVerification"},
+		{KubernetesVersionCheck{}, "KubernetesVersion"},
+		{KubeletVersionCheck{}, "KubeletVersion"},
+		{SwapCheck{}, "Swap"},
+		{ExternalEtcdVersionCheck{}, "ExternalEtcdVersion"},
+		{ImagePullCheck{}, "ImagePull"},
+		{NumCPUCheck{}, "NumCPU"},
+		{MemCheck{}, "Mem"},
+	}
+	for _, rt := range tests {
+		if name := rt.checker.Name(); name != rt.expected {
+			t.Errorf("expected name %q, got %q", rt.expected, name)
+		}
+	}
+}
+
+func TestServiceCheck(t *testing.T) {
+	warnings, _ := ServiceCheck{Service: "kubeadm-preflight-nonexistent"}.Check()
+	if len(warnings) == 0 {
+		t.Error("expected a warning for a non-existent service, got none")
+	}
+}
+
+func TestHostnameCheck(t *testing.T) {
+	tests := []struct {
+		name           string
+		nodeName       string
+		expectWarnings bool
+	}{
+		{name: "valid and reachable", nodeName: "localhost"},
+		{name: "invalid format and unreachable", nodeName: "INVALID HOSTNAME", expectWarnings: true},
+	}
+	for _, rt := range tests {
+		t.Run(rt.name, func(t *testing.T) {
+			warnings, errs := HostnameCheck{nodeName: rt.nodeName}.Check()
+			if len(errs) != 0 {
+				t.Errorf("expected no errors, got %v", errs)
+			}
+			if (len(warnings) > 0) != rt.expectWarnings {
+				t.Errorf("expected warnings=%t, got %v", rt.expectWarnings, warnings)
+			}
+		})
+	}
+}
+
+func TestExternalEtcdVersionCheck(t *testing.T) {
+	withEndpoint := func(endpoint string) ExternalEtcdVersionCheck {
+		return ExternalEtcdVersionCheck{
+			Etcd: kubeadmapi.Etcd{
+				External: &kubeadmapi.ExternalEtcd{HTTPEndpoints: []string{endpoint}},
+			},
+		}
+	}
+
+	tests := []struct {
+		name         string
+		check        ExternalEtcdVersionCheck
+		expectErrors int
+	}{
+		{
+			name: "no external endpoints",
+			check: ExternalEtcdVersionCheck{
+				Etcd: kubeadmapi.Etcd{External: &kubeadmapi.ExternalEtcd{}},
+			},
+		},
+		{
+			name: "missing CA file",
+			check: ExternalEtcdVersionCheck{
+				Etcd: kubeadmapi.Etcd{External: &kubeadmapi.ExternalEtcd{
+					HTTPEndpoints: []string{"https://127.0.0.1:2379"},
+					CAFile:        "/does/not/exist/ca.crt",
+				}},
+			},
+			expectErrors: 1,
+		},
+		{
+			name: "missing cert and key files",
+			check: ExternalEtcdVersionCheck{
+				Etcd: kubeadmapi.Etcd{External: &kubeadmapi.ExternalEtcd{
+					HTTPEndpoints: []string{"https://127.0.0.1:2379"},
+					CertFile:      "/does/not/exist/client.crt",
+					KeyFile:       "/does/not/exist/client.key",
+				}},
+			},
+			expectErrors: 1,
+		},
+		{
+			name:         "unparsable endpoint",
+			check:        withEndpoint("://bad"),
+			expectErrors: 1,
+		},
+	}
+
+	for _, rt := range tests {
+		t.Run(rt.name, func(t *testing.T) {
+			_, errs := rt.check.Check()
+			if len(errs) != rt.expectErrors {
+				t.Errorf("expected %d error(s), got %d: %v", rt.expectErrors, len(errs), errs)
+			}
+		})
+	}
+
+	newServer := func(statusCode int, body string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(statusCode)
+			if _, err := fmt.Fprint(w, body); err != nil {
+				t.Errorf("failed to write response body: %v", err)
+			}
+		}))
+	}
+
+	serverTests := []struct {
+		name             string
+		body             string
+		withCAFile       bool
+		duplicateSlashes bool
+		expectErrors     int
+	}{
+		{name: "supported version", body: `{"etcdserver":"3.5.24","etcdcluster":"3.5.0"}`},
+		{name: "supported version with CA file", body: `{"etcdserver":"3.5.24","etcdcluster":"3.5.0"}`, withCAFile: true},
+		{name: "supported version with duplicate slashes in endpoint", body: `{"etcdserver":"3.5.24","etcdcluster":"3.5.0"}`, duplicateSlashes: true},
+		{name: "unsupported version", body: `{"etcdserver":"3.4.0","etcdcluster":"3.4.0"}`, expectErrors: 1},
+		{name: "unparsable version", body: `{"etcdserver":"not-a-version"}`, expectErrors: 1},
+		{name: "malformed response", body: `not json`, expectErrors: 1},
+	}
+
+	for _, rt := range serverTests {
+		t.Run(rt.name, func(t *testing.T) {
+			server := newServer(http.StatusOK, rt.body)
+			defer server.Close()
+
+			endpoint := server.URL
+			if rt.duplicateSlashes {
+				endpoint += "//"
+			}
+			check := withEndpoint(endpoint)
+			if rt.withCAFile {
+				caFile := filepath.Join(t.TempDir(), "ca.crt")
+				if err := os.WriteFile(caFile, []byte(externalEtcdRootCAFileContent), 0600); err != nil {
+					t.Fatalf("failed to write CA file: %v", err)
+				}
+				check.Etcd.External.CAFile = caFile
+			}
+
+			_, errs := check.Check()
+			if len(errs) != rt.expectErrors {
+				t.Errorf("expected %d error(s), got %d: %v", rt.expectErrors, len(errs), errs)
+			}
+		})
+	}
+}
+
+func TestImagePullCheck(t *testing.T) {
+	images := []string{"registry.k8s.io/kube-apiserver:v1.35.0", "registry.k8s.io/etcd:3.5.24-0"}
+	tests := []struct {
+		name         string
+		check        ImagePullCheck
+		prepare      func(*utilruntime.FakeImpl)
+		expectErrors int
+	}{
+		{
+			name:  "pull policy never skips pulling",
+			check: ImagePullCheck{imageList: images, imagePullPolicy: corev1.PullNever},
+		},
+		{
+			name:         "unsupported pull policy",
+			check:        ImagePullCheck{imageList: images, imagePullPolicy: corev1.PullPolicy("Sometimes")},
+			expectErrors: 1,
+		},
+		{
+			name:  "connect fails",
+			check: ImagePullCheck{imageList: images, imagePullPolicy: corev1.PullIfNotPresent},
+			prepare: func(mock *utilruntime.FakeImpl) {
+				mock.NewRemoteRuntimeServiceReturns(nil, errors.New("dial failed"))
+			},
+			expectErrors: 1,
+		},
+		{
+			name:  "serial pull, images missing",
+			check: ImagePullCheck{imageList: images, imagePullPolicy: corev1.PullIfNotPresent, imagePullSerial: true},
+		},
+		{
+			name:  "serial pull, images present",
+			check: ImagePullCheck{imageList: images, imagePullPolicy: corev1.PullIfNotPresent, imagePullSerial: true},
+			prepare: func(mock *utilruntime.FakeImpl) {
+				mock.ImageStatusReturns(&criapi.ImageStatusResponse{Image: &criapi.Image{Id: "sha256:deadbeef"}}, nil)
+			},
+		},
+		{
+			name:  "serial pull always",
+			check: ImagePullCheck{imageList: images, imagePullPolicy: corev1.PullAlways, imagePullSerial: true},
+		},
+		{
+			name:  "serial pull failure",
+			check: ImagePullCheck{imageList: images, imagePullPolicy: corev1.PullAlways, imagePullSerial: true},
+			prepare: func(mock *utilruntime.FakeImpl) {
+				mock.PullImageReturns("", errors.New("pull failed"))
+			},
+			expectErrors: len(images),
+		},
+		{
+			name:  "parallel pull",
+			check: ImagePullCheck{imageList: images, imagePullPolicy: corev1.PullIfNotPresent, imagePullSerial: false},
+		},
+		{
+			name:  "sandbox image mismatch is only logged",
+			check: ImagePullCheck{sandboxImage: "registry.k8s.io/pause:3.9", imagePullPolicy: corev1.PullIfNotPresent, imagePullSerial: true},
+			prepare: func(mock *utilruntime.FakeImpl) {
+				mock.StatusReturns(&criapi.StatusResponse{Info: map[string]string{
+					"config": `{"sandboxImage":"registry.k8s.io/pause:3.10"}`,
+				}}, nil)
+			},
+		},
+	}
+
+	for _, rt := range tests {
+		t.Run(rt.name, func(t *testing.T) {
+			mock := &utilruntime.FakeImpl{}
+			if rt.prepare != nil {
+				rt.prepare(mock)
+			}
+			rt.check.impl = mock
+
+			warnings, errs := rt.check.Check()
+			if len(warnings) != 0 {
+				t.Errorf("expected no warnings, got %v", warnings)
+			}
+			if len(errs) != rt.expectErrors {
+				t.Errorf("expected %d error(s), got %d: %v", rt.expectErrors, len(errs), errs)
+			}
+		})
+	}
+}
+
+func TestInitNodeChecks(t *testing.T) {
+	newConfig := func() *kubeadmapi.InitConfiguration {
+		return &kubeadmapi.InitConfiguration{
+			ClusterConfiguration: kubeadmapi.ClusterConfiguration{
+				KubernetesVersion: "v1.35.0",
+				Networking: kubeadmapi.Networking{
+					ServiceSubnet: "10.96.0.0/12",
+					PodSubnet:     "10.244.0.0/16",
+				},
+				APIServer: kubeadmapi.APIServer{
+					ControlPlaneComponent: kubeadmapi.ControlPlaneComponent{
+						ExtraArgs: []kubeadmapi.Arg{
+							{Name: "bind-address", Value: "10.0.0.5"},
+							{Name: "advertise-address", Value: "10.0.0.6"},
+						},
+					},
+				},
+				Scheduler: kubeadmapi.ControlPlaneComponent{
+					ExtraArgs: []kubeadmapi.Arg{{Name: "bind-address", Value: "10.0.0.7"}},
+				},
+				ControllerManager: kubeadmapi.ControlPlaneComponent{
+					ExtraArgs: []kubeadmapi.Arg{{Name: "bind-address", Value: "10.0.0.8"}},
+				},
+				Etcd: kubeadmapi.Etcd{Local: &kubeadmapi.LocalEtcd{DataDir: "/var/lib/etcd"}},
+			},
+			LocalAPIEndpoint: kubeadmapi.APIEndpoint{AdvertiseAddress: "10.0.0.10", BindPort: 6443},
+			NodeRegistration: kubeadmapi.NodeRegistrationOptions{
+				Name:      "node-1",
+				CRISocket: "/run/containerd/containerd.sock",
+			},
+		}
+	}
+
+	externalEtcd := &kubeadmapi.ExternalEtcd{
+		HTTPEndpoints: []string{"https://127.0.0.1:2379"},
+		CAFile:        "/etc/kubernetes/pki/etcd/ca.crt",
+		CertFile:      "/etc/kubernetes/pki/etcd/client.crt",
+		KeyFile:       "/etc/kubernetes/pki/etcd/client.key",
+	}
+
+	commonNames := []string{"CRI", "ContainerRuntimeVersion", "SystemVerification", "Hostname", "KubeletVersion", "Service-kubelet",
+		fmt.Sprintf("Port-%d", kubeadmconstants.KubeletPort)}
+
+	tests := []struct {
+		name                    string
+		mutate                  func(*kubeadmapi.InitConfiguration)
+		isSecondaryControlPlane bool
+		downloadCerts           bool
+		want                    []string
+		wantNot                 []string
+	}{
+		{
+			name:   "primary control plane with local etcd",
+			mutate: func(cfg *kubeadmapi.InitConfiguration) {},
+			want: append(append([]string{},
+				"NumCPU", "Mem", "KubernetesVersion", "Firewalld", "HTTPProxy", "HTTPProxyCIDR",
+				fmt.Sprintf("Port-%d", kubeadmconstants.KubeAPIServerPort),
+				fmt.Sprintf("Port-%d", kubeadmconstants.KubeSchedulerPort),
+				fmt.Sprintf("Port-%d", kubeadmconstants.KubeControllerManagerPort),
+				fmt.Sprintf("Port-%d", kubeadmconstants.EtcdListenClientPort),
+				fmt.Sprintf("Port-%d", kubeadmconstants.EtcdListenPeerPort),
+				"DirAvailable--var-lib-etcd"),
+				commonNames...),
+			wantNot: []string{"ExternalEtcdVersion"},
+		},
+		{
+			name:                    "secondary control plane skips common and external etcd checks",
+			mutate:                  func(cfg *kubeadmapi.InitConfiguration) {},
+			isSecondaryControlPlane: true,
+			want: []string{
+				"HTTPProxyCIDR",
+				fmt.Sprintf("Port-%d", kubeadmconstants.EtcdListenClientPort),
+				fmt.Sprintf("Port-%d", kubeadmconstants.EtcdListenPeerPort),
+			},
+			wantNot: append([]string{"ExternalEtcdVersion"}, commonNames...),
+		},
+		{
+			name: "external etcd with client certificates",
+			mutate: func(cfg *kubeadmapi.InitConfiguration) {
+				cfg.Etcd = kubeadmapi.Etcd{External: externalEtcd}
+			},
+			want: []string{"ExternalEtcdVersion", "ExternalEtcdClientCertificates"},
+			wantNot: []string{
+				fmt.Sprintf("Port-%d", kubeadmconstants.EtcdListenClientPort),
+			},
+		},
+		{
+			name: "secondary control plane downloading certificates skips external etcd checks",
+			mutate: func(cfg *kubeadmapi.InitConfiguration) {
+				cfg.Etcd = kubeadmapi.Etcd{External: externalEtcd}
+			},
+			isSecondaryControlPlane: true,
+			downloadCerts:           true,
+			wantNot:                 []string{"ExternalEtcdVersion", "ExternalEtcdClientCertificates"},
+		},
+	}
+	for _, rt := range tests {
+		t.Run(rt.name, func(t *testing.T) {
+			cfg := newConfig()
+			rt.mutate(cfg)
+
+			checks, err := InitNodeChecks(exec.New(), cfg, sets.New[string](), rt.isSecondaryControlPlane, rt.downloadCerts)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			names := checkerNames(checks)
+			for _, want := range rt.want {
+				if !names.Has(want) {
+					t.Errorf("expected check %q to be present, got %v", want, sets.List(names))
+				}
+			}
+			for _, wantNot := range rt.wantNot {
+				if names.Has(wantNot) {
+					t.Errorf("expected check %q to be absent, got %v", wantNot, sets.List(names))
+				}
+			}
+		})
+	}
+}
+
+func TestJoinNodeChecks(t *testing.T) {
+	newConfig := func() *kubeadmapi.JoinConfiguration {
+		return &kubeadmapi.JoinConfiguration{
+			NodeRegistration: kubeadmapi.NodeRegistrationOptions{
+				Name:      "node-1",
+				CRISocket: "/run/containerd/containerd.sock",
+			},
+			CACertPath: "/etc/kubernetes/pki/ca.crt",
+			Discovery: kubeadmapi.Discovery{
+				BootstrapToken: &kubeadmapi.BootstrapTokenDiscovery{APIServerEndpoint: "10.0.0.1:6443"},
+			},
+		}
+	}
+
+	caCertCheckName := "FileAvailable--etc-kubernetes-pki-ca.crt"
+	tests := []struct {
+		name    string
+		mutate  func(*kubeadmapi.JoinConfiguration)
+		want    []string
+		wantNot []string
+	}{
+		{
+			name:   "worker node with bootstrap token discovery",
+			mutate: func(cfg *kubeadmapi.JoinConfiguration) {},
+			want: []string{
+				caCertCheckName, "HTTPProxy", "CRI", "ContainerRuntimeVersion", "SystemVerification",
+				"Hostname", "KubeletVersion", "Service-kubelet", fmt.Sprintf("Port-%d", kubeadmconstants.KubeletPort),
+			},
+		},
+		{
+			name: "control plane node does not check the CA cert path",
+			mutate: func(cfg *kubeadmapi.JoinConfiguration) {
+				cfg.ControlPlane = &kubeadmapi.JoinControlPlane{}
+			},
+			wantNot: []string{caCertCheckName},
+		},
+		{
+			name: "endpoint without a port has no proxy check",
+			mutate: func(cfg *kubeadmapi.JoinConfiguration) {
+				cfg.Discovery.BootstrapToken.APIServerEndpoint = "kube-apiserver"
+			},
+			wantNot: []string{"HTTPProxy"},
+		},
+	}
+	for _, rt := range tests {
+		t.Run(rt.name, func(t *testing.T) {
+			cfg := newConfig()
+			rt.mutate(cfg)
+
+			checks, err := JoinNodeChecks(exec.New(), cfg, sets.New[string]())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			names := checkerNames(checks)
+			for _, want := range rt.want {
+				if !names.Has(want) {
+					t.Errorf("expected check %q to be present, got %v", want, sets.List(names))
+				}
+			}
+			for _, wantNot := range rt.wantNot {
+				if names.Has(wantNot) {
+					t.Errorf("expected check %q to be absent, got %v", wantNot, sets.List(names))
+				}
+			}
+		})
+	}
+}
+
+// checkerNames returns the set of names of the given checks.
+func checkerNames(checks []Checker) sets.Set[string] {
+	names := sets.New[string]()
+	for _, c := range checks {
+		names.Insert(c.Name())
+	}
+	return names
 }

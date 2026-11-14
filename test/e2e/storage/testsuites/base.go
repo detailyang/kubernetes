@@ -19,6 +19,7 @@ package testsuites
 import (
 	"context"
 	"flag"
+	"fmt"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,7 +30,6 @@ import (
 	csitrans "k8s.io/csi-translation-lib"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2emetrics "k8s.io/kubernetes/test/e2e/framework/metrics"
-	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
 )
 
@@ -68,20 +68,31 @@ var BaseSuites = []func() storageframework.TestSuite{
 	InitTopologyTestSuite,
 	InitVolumeStressTestSuite,
 	InitFsGroupChangePolicyTestSuite,
+	InitVolumeGroupSnapshottableTestSuite,
+	InitVolumeGroupSnapshotClassTestSuite,
 	func() storageframework.TestSuite {
 		return InitCustomEphemeralTestSuite(GenericEphemeralTestPatterns())
 	},
 }
 
-// CSISuites is a list of storage test suites that work only for CSI drivers
+// CSISuites is a list of storage test suites that work only for CSI drivers.
 var CSISuites = append(BaseSuites,
+	// The following tests suites must not be already in BaseSuites,
+	// otherwise the same configuration gets tested multiple times.
 	func() storageframework.TestSuite {
 		return InitCustomEphemeralTestSuite(CSIEphemeralTestPatterns())
 	},
 	InitSnapshottableTestSuite,
+	InitSnapshotMetadataTestSuite,
+	InitSnapshotMetadataStressTestSuite,
 	InitSnapshottableStressTestSuite,
 	InitVolumePerformanceTestSuite,
+	InitPvcDeletionPerformanceTestSuite,
 	InitReadWriteOncePodTestSuite,
+	InitVolumeModifyTestSuite,
+	InitVolumeModifyStressTestSuite,
+	InitSELinuxMountTestSuite,
+	InitVolumeGroupSnapshottableStressTestSuite,
 )
 
 func getVolumeOpsFromMetricsForPlugin(ms testutil.Metrics, pluginName string) opCounts {
@@ -109,13 +120,13 @@ func getVolumeOpsFromMetricsForPlugin(ms testutil.Metrics, pluginName string) op
 }
 
 func getVolumeOpCounts(ctx context.Context, c clientset.Interface, config *rest.Config, pluginName string) opCounts {
-	if !framework.ProviderIs("gce", "gke", "aws") {
+	if !framework.ProviderIs("gce", "aws") {
 		return opCounts{}
 	}
 
 	nodeLimit := 25
 
-	metricsGrabber, err := e2emetrics.NewMetricsGrabber(ctx, c, nil, config, true, false, true, false, false, false)
+	metricsGrabber, err := e2emetrics.NewMetricsGrabber(ctx, c, config, true, false, true, false, false, false)
 
 	if err != nil {
 		framework.ExpectNoError(err, "Error creating metrics grabber: %v", err)
@@ -244,9 +255,10 @@ func (moc *migrationOpCheck) validateMigrationVolumeOpCounts(ctx context.Context
 }
 
 // Skip skipVolTypes patterns if the driver supports dynamic provisioning
-func skipVolTypePatterns(pattern storageframework.TestPattern, driver storageframework.TestDriver, skipVolTypes map[storageframework.TestVolType]bool) {
+func checkVolTypePatterns(pattern storageframework.TestPattern, driver storageframework.TestDriver, skipVolTypes map[storageframework.TestVolType]bool) string {
 	_, supportsProvisioning := driver.(storageframework.DynamicPVTestDriver)
 	if supportsProvisioning && skipVolTypes[pattern.VolType] {
-		e2eskipper.Skipf("Driver supports dynamic provisioning, skipping %s pattern", pattern.VolType)
+		return fmt.Sprintf("Driver supports dynamic provisioning, skipping %s pattern", pattern.VolType)
 	}
+	return ""
 }

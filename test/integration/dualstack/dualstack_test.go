@@ -19,46 +19,52 @@ package dualstack
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	jsonpatch "github.com/evanphx/json-patch"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
-
-	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/ktesting"
+	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration/framework"
-	"k8s.io/kubernetes/test/utils/ktesting"
 	netutils "k8s.io/utils/net"
 )
 
 // TestCreateServiceSingleStackIPv4 test the Service dualstackness in an IPv4 SingleStack cluster
 func TestCreateServiceSingleStackIPv4(t *testing.T) {
 	// Create an IPv4 single stack control-plane
-	serviceCIDR := "10.0.0.0/16"
+	tCtx := ktesting.Init(t)
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	flags := []string{
+		"--service-cluster-ip-range=10.0.0.0/16",
+		"--advertise-address=10.1.1.1",
+		"--disable-admission-plugins=ServiceAccount",
+	}
+	s := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		flags,
+		etcdOptions)
+	defer s.TearDownFn()
 
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	client, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.ServiceClusterIPRanges = serviceCIDR
-		},
-	})
-	defer tearDownFn()
+	client, err := kubernetes.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	// Wait until the default "kubernetes" service is created.
-	if err := wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
+	if err := wait.PollUntilContextTimeout(tCtx, 250*time.Millisecond, time.Minute, false, func(ctx context.Context) (bool, error) {
 		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
@@ -223,7 +229,6 @@ func TestCreateServiceSingleStackIPv4(t *testing.T) {
 	}
 
 	for i, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 
 			svc := &v1.Service{
@@ -252,7 +257,7 @@ func TestCreateServiceSingleStackIPv4(t *testing.T) {
 			}
 
 			// create the service
-			_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svc, metav1.CreateOptions{})
+			_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, svc, metav1.CreateOptions{})
 			if (err != nil) != tc.expectError {
 				t.Errorf("Test failed expected result: %v received %v ", tc.expectError, err)
 			}
@@ -261,7 +266,7 @@ func TestCreateServiceSingleStackIPv4(t *testing.T) {
 				return
 			}
 			// validate the service was created correctly if it was not expected to fail
-			svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+			svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 			if err != nil {
 				t.Errorf("Unexpected error to get the service %s %v", svc.Name, err)
 			}
@@ -272,25 +277,30 @@ func TestCreateServiceSingleStackIPv4(t *testing.T) {
 	}
 }
 
-// TestCreateServiceDualStackIPv6 test the Service dualstackness in an IPv6 only DualStack cluster
-func TestCreateServiceDualStackIPv6(t *testing.T) {
-	// Create an IPv6 only dual stack control-plane
-	serviceCIDR := "2001:db8:1::/112"
+// TestCreateServiceSingleStackIPv6 test the Service dualstackness in an IPv6 only DualStack cluster
+func TestCreateServiceSingleStackIPv6(t *testing.T) {
+	// Create an IPv6 only control-plane
+	tCtx := ktesting.Init(t)
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	flags := []string{
+		"--service-cluster-ip-range=2001:db8:1::/108",
+		"--advertise-address=2001:db8::10",
+		"--disable-admission-plugins=ServiceAccount",
+	}
+	s := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		flags,
+		etcdOptions)
+	defer s.TearDownFn()
 
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	client, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.ServiceClusterIPRanges = serviceCIDR
-			opts.GenericServerRunOptions.AdvertiseAddress = netutils.ParseIPSloppy("2001:db8::10")
-		},
-	})
-	defer tearDownFn()
+	client, err := kubernetes.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	// Wait until the default "kubernetes" service is created.
-	if err := wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
+	if err := wait.PollUntilContextTimeout(tCtx, 250*time.Millisecond, time.Minute, false, func(ctx context.Context) (bool, error) {
 		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
@@ -447,7 +457,6 @@ func TestCreateServiceDualStackIPv6(t *testing.T) {
 	}
 
 	for i, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 
 			svc := &v1.Service{
@@ -471,7 +480,7 @@ func TestCreateServiceDualStackIPv6(t *testing.T) {
 			}
 
 			// create the service
-			_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svc, metav1.CreateOptions{})
+			_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, svc, metav1.CreateOptions{})
 			if (err != nil) != tc.expectError {
 				t.Errorf("Test failed expected result: %v received %v ", tc.expectError, err)
 			}
@@ -480,7 +489,7 @@ func TestCreateServiceDualStackIPv6(t *testing.T) {
 				return
 			}
 			// validate the service was created correctly if it was not expected to fail
-			svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+			svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 			if err != nil {
 				t.Errorf("Unexpected error to get the service %s %v", svc.Name, err)
 			}
@@ -494,22 +503,27 @@ func TestCreateServiceDualStackIPv6(t *testing.T) {
 // TestCreateServiceDualStackIPv4IPv6 test the Service dualstackness in a IPv4IPv6 DualStack cluster
 func TestCreateServiceDualStackIPv4IPv6(t *testing.T) {
 	// Create an IPv4IPv6 dual stack control-plane
-	serviceCIDR := "10.0.0.0/16"
-	secondaryServiceCIDR := "2001:db8:1::/112"
+	tCtx := ktesting.Init(t)
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	flags := []string{
+		"--service-cluster-ip-range=10.0.0.0/16,2001:db8:1::/108",
+		"--advertise-address=10.0.0.1",
+		"--disable-admission-plugins=ServiceAccount",
+	}
+	s := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		flags,
+		etcdOptions)
+	defer s.TearDownFn()
 
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	client, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.ServiceClusterIPRanges = fmt.Sprintf("%s,%s", serviceCIDR, secondaryServiceCIDR)
-		},
-	})
-	defer tearDownFn()
+	client, err := kubernetes.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	// Wait until the default "kubernetes" service is created.
-	if err := wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
+	if err := wait.PollUntilContextTimeout(tCtx, 250*time.Millisecond, time.Minute, false, func(ctx context.Context) (bool, error) {
 		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
@@ -708,7 +722,6 @@ func TestCreateServiceDualStackIPv4IPv6(t *testing.T) {
 	}
 
 	for i, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 
 			svc := &v1.Service{
@@ -737,7 +750,7 @@ func TestCreateServiceDualStackIPv4IPv6(t *testing.T) {
 			}
 
 			// create a service
-			_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svc, metav1.CreateOptions{})
+			_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, svc, metav1.CreateOptions{})
 			if (err != nil) != tc.expectError {
 				t.Errorf("Test failed expected result: %v received %v ", tc.expectError, err)
 			}
@@ -746,7 +759,7 @@ func TestCreateServiceDualStackIPv4IPv6(t *testing.T) {
 				return
 			}
 			// validate the service was created correctly if it was not expected to fail
-			svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+			svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 			if err != nil {
 				t.Errorf("Unexpected error to get the service %s %v", svc.Name, err)
 			}
@@ -761,23 +774,27 @@ func TestCreateServiceDualStackIPv4IPv6(t *testing.T) {
 // TestCreateServiceDualStackIPv6IPv4 test the Service dualstackness in a IPv6IPv4 DualStack cluster
 func TestCreateServiceDualStackIPv6IPv4(t *testing.T) {
 	// Create an IPv6IPv4 dual stack control-plane
-	serviceCIDR := "2001:db8:1::/112"
-	secondaryServiceCIDR := "10.0.0.0/16"
+	tCtx := ktesting.Init(t)
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	flags := []string{
+		"--service-cluster-ip-range=2001:db8:1::/108,10.0.0.0/16",
+		"--advertise-address=2001:db8::10",
+		"--disable-admission-plugins=ServiceAccount",
+	}
+	s := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		flags,
+		etcdOptions)
+	defer s.TearDownFn()
 
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	client, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.ServiceClusterIPRanges = fmt.Sprintf("%s,%s", serviceCIDR, secondaryServiceCIDR)
-			opts.GenericServerRunOptions.AdvertiseAddress = netutils.ParseIPSloppy("2001:db8::10")
-		},
-	})
-	defer tearDownFn()
+	client, err := kubernetes.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	// Wait until the default "kubernetes" service is created.
-	if err := wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
+	if err := wait.PollUntilContextTimeout(tCtx, 250*time.Millisecond, time.Minute, false, func(ctx context.Context) (bool, error) {
 		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
@@ -788,7 +805,7 @@ func TestCreateServiceDualStackIPv6IPv4(t *testing.T) {
 	}
 
 	// verify client is working
-	if err := wait.PollImmediate(5*time.Second, 2*time.Minute, func() (bool, error) {
+	if err := wait.PollUntilContextTimeout(tCtx, 5*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		_, err := client.CoreV1().Endpoints("default").Get(ctx, "kubernetes", metav1.GetOptions{})
 		if err != nil {
 			t.Logf("error fetching endpoints: %v", err)
@@ -938,7 +955,6 @@ func TestCreateServiceDualStackIPv6IPv4(t *testing.T) {
 	}
 
 	for i, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 
 			svc := &v1.Service{
@@ -960,7 +976,7 @@ func TestCreateServiceDualStackIPv6IPv4(t *testing.T) {
 			}
 
 			// create a service
-			_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svc, metav1.CreateOptions{})
+			_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, svc, metav1.CreateOptions{})
 			if (err != nil) != tc.expectError {
 				t.Errorf("Test failed expected result: %v received %v ", tc.expectError, err)
 			}
@@ -969,7 +985,7 @@ func TestCreateServiceDualStackIPv6IPv4(t *testing.T) {
 				return
 			}
 			// validate the service was created correctly if it was not expected to fail
-			svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+			svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 			if err != nil {
 				t.Errorf("Unexpected error to get the service %s %v", svc.Name, err)
 			}
@@ -984,23 +1000,27 @@ func TestCreateServiceDualStackIPv6IPv4(t *testing.T) {
 // TestUpgradeDowngrade tests upgrading and downgrading a service from/to dual-stack
 func TestUpgradeDowngrade(t *testing.T) {
 	// Create an IPv4IPv6 dual stack control-plane
-	serviceCIDR := "10.0.0.0/16"
-	secondaryServiceCIDR := "2001:db8:1::/112"
-
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	client, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.ServiceClusterIPRanges = fmt.Sprintf("%s,%s", serviceCIDR, secondaryServiceCIDR)
+	tCtx := ktesting.Init(t)
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	s := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		[]string{
+			"--service-cluster-ip-range=10.0.0.0/16,2001:db8:1::/108",
+			"--advertise-address=10.0.0.1",
+			"--disable-admission-plugins=ServiceAccount",
 		},
-	})
-	defer tearDownFn()
+		etcdOptions)
+	defer s.TearDownFn()
+
+	client, err := kubernetes.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	// Wait until the default "kubernetes" service is created.
 	if err := wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
-		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
+		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
@@ -1027,12 +1047,12 @@ func TestUpgradeDowngrade(t *testing.T) {
 	}
 
 	// create a service
-	_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svc, metav1.CreateOptions{})
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, svc, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error while creating service:%v", err)
 	}
 	// validate the service was created correctly if it was not expected to fail
-	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Unexpected error to get the service %s %v", svc.Name, err)
 	}
@@ -1044,7 +1064,7 @@ func TestUpgradeDowngrade(t *testing.T) {
 	// upgrade it
 	requireDualStack := v1.IPFamilyPolicyRequireDualStack
 	svc.Spec.IPFamilyPolicy = &requireDualStack
-	upgraded, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(ctx, svc, metav1.UpdateOptions{})
+	upgraded, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(tCtx, svc, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error upgrading service to dual stack. %v", err)
 	}
@@ -1057,7 +1077,7 @@ func TestUpgradeDowngrade(t *testing.T) {
 	upgraded.Spec.IPFamilyPolicy = &singleStack
 	upgraded.Spec.ClusterIPs = upgraded.Spec.ClusterIPs[0:1]
 	upgraded.Spec.IPFamilies = upgraded.Spec.IPFamilies[0:1]
-	downgraded, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(ctx, upgraded, metav1.UpdateOptions{})
+	downgraded, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(tCtx, upgraded, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error downgrading service to single stack. %v", err)
 	}
@@ -1067,7 +1087,7 @@ func TestUpgradeDowngrade(t *testing.T) {
 
 	// run test again this time without removing secondary IPFamily or ClusterIP
 	downgraded.Spec.IPFamilyPolicy = &requireDualStack
-	upgradedAgain, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(ctx, downgraded, metav1.UpdateOptions{})
+	upgradedAgain, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(tCtx, downgraded, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error upgrading service to dual stack. %v", err)
 	}
@@ -1078,7 +1098,7 @@ func TestUpgradeDowngrade(t *testing.T) {
 	upgradedAgain.Spec.IPFamilyPolicy = &singleStack
 	// api-server automatically  removes the secondary ClusterIP and IPFamily
 	// when a servie is downgraded.
-	downgradedAgain, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(ctx, upgradedAgain, metav1.UpdateOptions{})
+	downgradedAgain, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(tCtx, upgradedAgain, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error downgrading service to single stack. %v", err)
 	}
@@ -1091,23 +1111,27 @@ func TestUpgradeDowngrade(t *testing.T) {
 // may not clear ClusterIPs
 func TestConvertToFromExternalName(t *testing.T) {
 	// Create an IPv4IPv6 dual stack control-plane
-	serviceCIDR := "10.0.0.0/16"
-	secondaryServiceCIDR := "2001:db8:1::/112"
-
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	client, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.ServiceClusterIPRanges = fmt.Sprintf("%s,%s", serviceCIDR, secondaryServiceCIDR)
+	tCtx := ktesting.Init(t)
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	s := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		[]string{
+			"--service-cluster-ip-range=10.0.0.0/16,2001:db8:1::/108",
+			"--advertise-address=10.0.0.1",
+			"--disable-admission-plugins=ServiceAccount",
 		},
-	})
-	defer tearDownFn()
+		etcdOptions)
+	defer s.TearDownFn()
+
+	client, err := kubernetes.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	// Wait until the default "kubernetes" service is created.
 	if err := wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
-		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
+		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
@@ -1133,12 +1157,12 @@ func TestConvertToFromExternalName(t *testing.T) {
 	}
 
 	// create a service
-	_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svc, metav1.CreateOptions{})
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, svc, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error while creating service:%v", err)
 	}
 	// validate the service was created correctly if it was not expected to fail
-	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Unexpected error to get the service %s %v", svc.Name, err)
 	}
@@ -1152,7 +1176,7 @@ func TestConvertToFromExternalName(t *testing.T) {
 	svc.Spec.ClusterIP = "" // not clearing ClusterIPs
 	svc.Spec.ExternalName = "something.somewhere"
 
-	externalNameSvc, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(ctx, svc, metav1.UpdateOptions{})
+	externalNameSvc, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(tCtx, svc, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error converting service to external name. %v", err)
 	}
@@ -1164,7 +1188,7 @@ func TestConvertToFromExternalName(t *testing.T) {
 	// convert to a ClusterIP service
 	externalNameSvc.Spec.Type = v1.ServiceTypeClusterIP
 	externalNameSvc.Spec.ExternalName = ""
-	clusterIPSvc, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(ctx, externalNameSvc, metav1.UpdateOptions{})
+	clusterIPSvc, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(tCtx, externalNameSvc, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error converting service to ClusterIP. %v", err)
 	}
@@ -1176,23 +1200,27 @@ func TestConvertToFromExternalName(t *testing.T) {
 // TestPreferDualStack preferDualstack on create and update
 func TestPreferDualStack(t *testing.T) {
 	// Create an IPv4IPv6 dual stack control-plane
-	serviceCIDR := "10.0.0.0/16"
-	secondaryServiceCIDR := "2001:db8:1::/112"
-
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	client, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.ServiceClusterIPRanges = fmt.Sprintf("%s,%s", serviceCIDR, secondaryServiceCIDR)
+	tCtx := ktesting.Init(t)
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	s := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		[]string{
+			"--service-cluster-ip-range=10.0.0.0/16,2001:db8:1::/108",
+			"--advertise-address=10.0.0.1",
+			"--disable-admission-plugins=ServiceAccount",
 		},
-	})
-	defer tearDownFn()
+		etcdOptions)
+	defer s.TearDownFn()
+
+	client, err := kubernetes.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	// Wait until the default "kubernetes" service is created.
 	if err := wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
-		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
+		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
@@ -1222,12 +1250,12 @@ func TestPreferDualStack(t *testing.T) {
 	}
 
 	// create a service
-	_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svc, metav1.CreateOptions{})
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, svc, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error while creating service:%v", err)
 	}
 	// validate the service was created correctly if it was not expected to fail
-	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Unexpected error to get the service %s %v", svc.Name, err)
 	}
@@ -1238,7 +1266,7 @@ func TestPreferDualStack(t *testing.T) {
 
 	// update it
 	svc.Spec.Selector = map[string]string{"foo": "bar"}
-	upgraded, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(ctx, svc, metav1.UpdateOptions{})
+	upgraded, err := client.CoreV1().Services(metav1.NamespaceDefault).Update(tCtx, svc, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error upgrading service to dual stack. %v", err)
 	}
@@ -1254,22 +1282,27 @@ type labelsForMergePatch struct {
 // tests an update service while dualstack flag is off
 func TestServiceUpdate(t *testing.T) {
 	// Create an IPv4 single stack control-plane
-	serviceCIDR := "10.0.0.0/16"
-
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	client, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.ServiceClusterIPRanges = serviceCIDR
+	tCtx := ktesting.Init(t)
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	s := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		[]string{
+			"--service-cluster-ip-range=10.0.0.0/16",
+			"--advertise-address=10.0.0.1",
+			"--disable-admission-plugins=ServiceAccount",
 		},
-	})
-	defer tearDownFn()
+		etcdOptions)
+	defer s.TearDownFn()
+
+	client, err := kubernetes.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	// Wait until the default "kubernetes" service is created.
 	if err := wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
-		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
+		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
@@ -1295,26 +1328,26 @@ func TestServiceUpdate(t *testing.T) {
 	}
 
 	// create the service
-	_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svc, metav1.CreateOptions{})
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, svc, metav1.CreateOptions{})
 	// if no error was expected validate the service otherwise return
 	if err != nil {
 		t.Errorf("unexpected error creating service:%v", err)
 		return
 	}
 
-	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("Unexpected error to get the service %s %v", svc.Name, err)
 	}
 
 	// update using put
 	svc.Labels = map[string]string{"x": "y"}
-	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Update(ctx, svc, metav1.UpdateOptions{})
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Update(tCtx, svc, metav1.UpdateOptions{})
 	if err != nil {
 		t.Errorf("Unexpected error updating the service %s %v", svc.Name, err)
 	}
 
-	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Unexpected error to get the service %s %v", svc.Name, err)
 	}
@@ -1329,12 +1362,12 @@ func TestServiceUpdate(t *testing.T) {
 		t.Fatalf("failed to json.Marshal labels: %v", err)
 	}
 
-	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Patch(ctx, svc.Name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Patch(tCtx, svc.Name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error patching service using strategic merge patch. %v", err)
 	}
 
-	current, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+	current, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Unexpected error to get the service %s %v", svc.Name, err)
 	}
@@ -1356,13 +1389,13 @@ func TestServiceUpdate(t *testing.T) {
 		t.Fatalf("unexpected error creating json patch. %v", err)
 	}
 
-	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Patch(ctx, svc.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Patch(tCtx, svc.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error patching service using merge patch. %v", err)
 	}
 
 	// validate the service was created correctly if it was not expected to fail
-	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Unexpected error to get the service %s %v", svc.Name, err)
 	}
@@ -1409,7 +1442,7 @@ func validateServiceAndClusterIPFamily(svc *v1.Service, expectedIPFamilies []v1.
 
 	if len(errstrings) > 0 {
 		errstrings = append(errstrings, fmt.Sprintf("Error validating Service: %s, ClusterIPs: %v Expected IPFamilies %v", svc.Name, svc.Spec.ClusterIPs, expectedIPFamilies))
-		return fmt.Errorf(strings.Join(errstrings, "\n"))
+		return errors.New(strings.Join(errstrings, "\n"))
 	}
 
 	return nil
@@ -1417,24 +1450,27 @@ func validateServiceAndClusterIPFamily(svc *v1.Service, expectedIPFamilies []v1.
 
 func TestUpgradeServicePreferToDualStack(t *testing.T) {
 	sharedEtcd := framework.SharedEtcd()
+	tCtx := ktesting.Init(t)
 
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// Create an IPv4 only dual stack control-plane
-	serviceCIDR := "192.168.0.0/24"
-
-	client, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.Etcd.StorageConfig = *sharedEtcd
-			opts.ServiceClusterIPRanges = serviceCIDR
+	// Create an IPv4 only control-plane
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	s := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		[]string{
+			"--service-cluster-ip-range=192.168.0.0/24",
+			"--advertise-address=10.0.0.1",
+			"--disable-admission-plugins=ServiceAccount",
 		},
-	})
+		sharedEtcd)
+
+	client, err := kubernetes.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	// Wait until the default "kubernetes" service is created.
 	if err := wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
-		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
+		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
@@ -1464,13 +1500,17 @@ func TestUpgradeServicePreferToDualStack(t *testing.T) {
 		},
 	}
 
+	// create a copy of the service so we can test creating it again after reconfiguring the control plane
+	svcDual := svc.DeepCopy()
+	svcDual.Name = "svc-dual"
+
 	// create the service
-	_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svc, metav1.CreateOptions{})
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, svc, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	// validate the service was created correctly if it was not expected to fail
-	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Unexpected error to get the service %s %v", svc.Name, err)
 	}
@@ -1479,21 +1519,25 @@ func TestUpgradeServicePreferToDualStack(t *testing.T) {
 	}
 
 	// reconfigure the apiserver to be dual-stack
-	tearDownFn()
+	s.TearDownFn()
 
-	secondaryServiceCIDR := "2001:db8:1::/112"
-
-	client, _, tearDownFn = framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.Etcd.StorageConfig = *sharedEtcd
-			opts.ServiceClusterIPRanges = fmt.Sprintf("%s,%s", serviceCIDR, secondaryServiceCIDR)
+	s = kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		[]string{
+			"--service-cluster-ip-range=192.168.0.0/24,2001:db8:1::/108",
+			"--disable-admission-plugins=ServiceAccount",
 		},
-	})
-	defer tearDownFn()
+		sharedEtcd)
+	defer s.TearDownFn()
+
+	client, err = kubernetes.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	// Wait until the default "kubernetes" service is created.
 	if err = wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
-		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
+		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
@@ -1502,7 +1546,7 @@ func TestUpgradeServicePreferToDualStack(t *testing.T) {
 		t.Fatalf("creating kubernetes service timed out")
 	}
 	// validate the service was created correctly if it was not expected to fail
-	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Unexpected error to get the service %s %v", svc.Name, err)
 	}
@@ -1510,29 +1554,47 @@ func TestUpgradeServicePreferToDualStack(t *testing.T) {
 	if err = validateServiceAndClusterIPFamily(svc, []v1.IPFamily{v1.IPv4Protocol}); err != nil {
 		t.Fatalf("Unexpected error validating the service %s %v", svc.Name, err)
 	}
+	// validate that new services created with prefer dual are now dual stack
+
+	// create the service
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, svcDual, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	// validate the service was created correctly
+	svcDual, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svcDual.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Unexpected error to get the service %s %v", svcDual.Name, err)
+	}
+	// service should be dual stack
+	if err = validateServiceAndClusterIPFamily(svcDual, []v1.IPFamily{v1.IPv4Protocol, v1.IPv6Protocol}); err != nil {
+		t.Fatalf("Unexpected error validating the service %s %v", svcDual.Name, err)
+	}
 }
 
-func TestDowngradeServicePreferToDualStack(t *testing.T) {
-	sharedEtcd := framework.SharedEtcd()
-
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+func TestDowngradeServicePreferFromDualStack(t *testing.T) {
+	tCtx := ktesting.Init(t)
 
 	// Create a dual stack control-plane
-	serviceCIDR := "192.168.0.0/24"
-	secondaryServiceCIDR := "2001:db8:1::/112"
-
-	client, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.Etcd.StorageConfig = *sharedEtcd
-			opts.ServiceClusterIPRanges = fmt.Sprintf("%s,%s", serviceCIDR, secondaryServiceCIDR)
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	s := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		[]string{
+			"--service-cluster-ip-range=192.168.0.0/24,2001:db8:1::/108",
+			"--advertise-address=10.0.0.1",
+			"--disable-admission-plugins=ServiceAccount",
 		},
-	})
+		etcdOptions)
+
+	client, err := kubernetes.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	// Wait until the default "kubernetes" service is created.
 	if err := wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
-		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
+		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
@@ -1560,34 +1622,45 @@ func TestDowngradeServicePreferToDualStack(t *testing.T) {
 			},
 		},
 	}
+
+	// create a copy of the service so we can test creating it again after reconfiguring the control plane
+	svcSingle := svc.DeepCopy()
+	svcSingle.Name = "svc-single"
+
 	// create the service
-	_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svc, metav1.CreateOptions{})
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, svc, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	// validate the service was created correctly if it was not expected to fail
-	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Unexpected error to get the service %s %v", svc.Name, err)
 	}
 	if err := validateServiceAndClusterIPFamily(svc, []v1.IPFamily{v1.IPv4Protocol, v1.IPv6Protocol}); err != nil {
 		t.Fatalf("Unexpected error validating the service %s %v", svc.Name, err)
 	}
-	// reconfigure the apiserver to be sinlge stack
-	tearDownFn()
+	// reconfigure the apiserver to be single stack
+	s.TearDownFn()
 
 	// reset secondary
-	client, _, tearDownFn = framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.Etcd.StorageConfig = *sharedEtcd
-			opts.ServiceClusterIPRanges = serviceCIDR
+	s = kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		[]string{
+			"--service-cluster-ip-range=192.168.0.0/24",
+			"--advertise-address=10.0.0.1",
+			"--disable-admission-plugins=ServiceAccount",
 		},
-	})
-	defer tearDownFn()
+		etcdOptions)
+	defer s.TearDownFn()
 
+	client, err = kubernetes.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 	// Wait until the default "kubernetes" service is created.
 	if err = wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
-		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
+		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
@@ -1596,13 +1669,30 @@ func TestDowngradeServicePreferToDualStack(t *testing.T) {
 		t.Fatalf("creating kubernetes service timed out")
 	}
 	// validate the service is still there.
-	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, svc.Name, metav1.GetOptions{})
+	svc, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svc.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Unexpected error to get the service %s %v", svc.Name, err)
 	}
 	// service should remain dual stack
 	if err = validateServiceAndClusterIPFamily(svc, []v1.IPFamily{v1.IPv4Protocol, v1.IPv6Protocol}); err != nil {
 		t.Fatalf("Unexpected error validating the service %s %v", svc.Name, err)
+	}
+
+	// validate that new services created with prefer dual are now single stack
+
+	// create the service
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, svcSingle, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	// validate the service was created correctly
+	svcSingle, err = client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, svcSingle.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Unexpected error to get the service %s %v", svcSingle.Name, err)
+	}
+	// service should be single stack
+	if err = validateServiceAndClusterIPFamily(svcSingle, []v1.IPFamily{v1.IPv4Protocol}); err != nil {
+		t.Fatalf("Unexpected error validating the service %s %v", svcSingle.Name, err)
 	}
 }
 
@@ -1616,12 +1706,23 @@ type specMergePatch struct {
 
 // tests success when converting ClusterIP:Headless service to ExternalName
 func Test_ServiceChangeTypeHeadlessToExternalNameWithPatch(t *testing.T) {
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	tCtx := ktesting.Init(t)
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	s := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		[]string{
+			"--service-cluster-ip-range=192.168.0.0/24",
+			"--advertise-address=10.0.0.1",
+			"--disable-admission-plugins=ServiceAccount",
+		},
+		etcdOptions)
+	defer s.TearDownFn()
 
-	client, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{})
-	defer tearDownFn()
+	client, err := kubernetes.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	ns := framework.CreateNamespaceOrDie(client, "test-service-allocate-node-ports", t)
 	defer framework.DeleteNamespaceOrDie(client, ns, t)
@@ -1637,8 +1738,7 @@ func Test_ServiceChangeTypeHeadlessToExternalNameWithPatch(t *testing.T) {
 		},
 	}
 
-	var err error
-	service, err = client.CoreV1().Services(ns.Name).Create(ctx, service, metav1.CreateOptions{})
+	service, err = client.CoreV1().Services(ns.Name).Create(tCtx, service, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("Error creating test service: %v", err)
 	}
@@ -1654,7 +1754,7 @@ func Test_ServiceChangeTypeHeadlessToExternalNameWithPatch(t *testing.T) {
 		t.Fatalf("failed to json.Marshal ports: %v", err)
 	}
 
-	_, err = client.CoreV1().Services(ns.Name).Patch(ctx, service.Name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
+	_, err = client.CoreV1().Services(ns.Name).Patch(tCtx, service.Name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error patching service using strategic merge patch. %v", err)
 	}

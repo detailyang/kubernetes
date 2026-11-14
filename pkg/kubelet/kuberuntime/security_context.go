@@ -17,15 +17,19 @@ limitations under the License.
 package kuberuntime
 
 import (
+	"context"
+	"fmt"
+
 	v1 "k8s.io/api/core/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/kubernetes/pkg/features"
 	runtimeutil "k8s.io/kubernetes/pkg/kubelet/kuberuntime/util"
-	"k8s.io/kubernetes/pkg/security/apparmor"
 	"k8s.io/kubernetes/pkg/securitycontext"
 )
 
 // determineEffectiveSecurityContext gets container's security context from v1.Pod and v1.Container.
-func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Pod, container *v1.Container, uid *int64, username string) (*runtimeapi.LinuxContainerSecurityContext, error) {
+func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(ctx context.Context, pod *v1.Pod, container *v1.Container, uid *int64, username string) (*runtimeapi.LinuxContainerSecurityContext, error) {
 	effectiveSc := securitycontext.DetermineEffectiveSecurityContext(pod, container)
 	synthesized := convertToRuntimeSecurityContext(effectiveSc)
 	if synthesized == nil {
@@ -42,7 +46,10 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 	}
 
 	// set ApparmorProfile.
-	synthesized.ApparmorProfile = apparmor.GetProfileNameFromPodAnnotations(pod.Annotations, container.Name)
+	synthesized.Apparmor, synthesized.ApparmorProfile, err = getAppArmorProfile(pod, container)
+	if err != nil {
+		return nil, err
+	}
 
 	// set RunAsUser.
 	if synthesized.RunAsUser == nil {
@@ -53,7 +60,7 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 	}
 
 	// set namespace options and supplemental groups.
-	namespaceOptions, err := runtimeutil.NamespacesForPod(pod, m.runtimeHelper)
+	namespaceOptions, err := runtimeutil.NamespacesForPod(ctx, pod, m.runtimeHelper, m.runtimeClassManager)
 	if err != nil {
 		return nil, err
 	}
@@ -69,6 +76,14 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 				synthesized.SupplementalGroups = append(synthesized.SupplementalGroups, int64(sg))
 			}
 		}
+
+		if podSc.SupplementalGroupsPolicy != nil {
+			policyValue, ok := runtimeapi.SupplementalGroupsPolicy_value[string(*podSc.SupplementalGroupsPolicy)]
+			if !ok {
+				return nil, fmt.Errorf("unsupported supplementalGroupsPolicy: %s", string(*podSc.SupplementalGroupsPolicy))
+			}
+			synthesized.SupplementalGroupsPolicy = runtimeapi.SupplementalGroupsPolicy(policyValue)
+		}
 	}
 	if groups := m.runtimeHelper.GetExtraSupplementalGroupsForPod(pod); len(groups) > 0 {
 		synthesized.SupplementalGroups = append(synthesized.SupplementalGroups, groups...)
@@ -79,7 +94,36 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 	synthesized.MaskedPaths = securitycontext.ConvertToRuntimeMaskedPaths(effectiveSc.ProcMount)
 	synthesized.ReadonlyPaths = securitycontext.ConvertToRuntimeReadonlyPaths(effectiveSc.ProcMount)
 
+	if utilfeature.DefaultFeatureGate.Enabled(features.CgroupOptions) &&
+		effectiveSc.CgroupOptions != nil && effectiveSc.CgroupOptions.MountMode != nil {
+		switch *effectiveSc.CgroupOptions.MountMode {
+		case v1.CgroupMountModeReadWrite:
+			if err := m.checkWritableCgroupNodeRequirements(); err != nil {
+				return nil, err
+			}
+			synthesized.CgroupMountMode = runtimeapi.CgroupMountMode_CGROUP_MOUNT_MODE_READ_WRITE
+		case v1.CgroupMountModeReadOnly:
+			synthesized.CgroupMountMode = runtimeapi.CgroupMountMode_CGROUP_MOUNT_MODE_READ_ONLY
+		default:
+			return nil, fmt.Errorf("unsupported cgroup mount mode: %s", string(*effectiveSc.CgroupOptions.MountMode))
+		}
+	}
+
 	return synthesized, nil
+}
+
+func (m *kubeGenericRuntimeManager) checkWritableCgroupNodeRequirements() error {
+	nodeConfig := m.containerManager.GetNodeConfig()
+	if nodeConfig.CgroupVersion != 2 {
+		return fmt.Errorf("writable cgroups require cgroup v2")
+	}
+	if !nodeConfig.CgroupNsdelegate {
+		return fmt.Errorf("writable cgroups require the cgroup filesystem to be mounted with nsdelegate")
+	}
+	if !nodeConfig.CgroupsPerQOS {
+		return fmt.Errorf("writable cgroups require the kubelet to manage a cgroup per pod (--cgroups-per-qos)")
+	}
+	return nil
 }
 
 // convertToRuntimeSecurityContext converts v1.SecurityContext to runtimeapi.SecurityContext.

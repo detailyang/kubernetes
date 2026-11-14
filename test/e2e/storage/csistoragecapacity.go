@@ -24,13 +24,16 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	types "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/resourceversion"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
+	apimachineryutils "k8s.io/kubernetes/test/e2e/common/apimachinery"
 	"k8s.io/kubernetes/test/e2e/framework"
 	"k8s.io/kubernetes/test/e2e/storage/utils"
 	admissionapi "k8s.io/pod-security-admission/api"
 
 	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
 var _ = utils.SIGDescribe("CSIStorageCapacity", func() {
@@ -46,7 +49,7 @@ var _ = utils.SIGDescribe("CSIStorageCapacity", func() {
 		The csistoragecapacities resource MUST exist in the /apis/storage.k8s.io/v1 discovery document.
 		The csistoragecapacities resource must support create, get, list, watch, update, patch, delete, and deletecollection.
 	*/
-	framework.ConformanceIt(" should support CSIStorageCapacities API operations", func(ctx context.Context) {
+	framework.ConformanceIt("should support CSIStorageCapacities API operations", func(ctx context.Context) {
 		// Setup
 		cscVersion := "v1"
 		cscClient := f.ClientSet.StorageV1().CSIStorageCapacities(f.Namespace.Name)
@@ -152,29 +155,31 @@ var _ = utils.SIGDescribe("CSIStorageCapacity", func() {
 		ginkgo.By("getting")
 		gottenCSC, err := cscClient.Get(ctx, csc.Name, metav1.GetOptions{})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(gottenCSC.UID, createdCSC.UID)
+		gomega.Expect(gottenCSC.UID).To(gomega.Equal(createdCSC.UID))
+		gomega.Expect(gottenCSC).To(apimachineryutils.HaveValidResourceVersion())
 
 		ginkgo.By("listing in namespace")
 		cscs, err := cscClient.List(ctx, metav1.ListOptions{LabelSelector: "test=" + f.UniqueName})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(len(cscs.Items), 3, "filtered list should have 3 items, got: %s", cscs)
+		gomega.Expect(cscs.Items).To(gomega.HaveLen(3), "filtered list should have 3 items, got: %s", cscs)
 
 		ginkgo.By("listing across namespaces")
 		cscs, err = cscClientNoNamespace.List(ctx, metav1.ListOptions{LabelSelector: "test=" + f.UniqueName})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(len(cscs.Items), 3, "filtered list should have 3 items, got: %s", cscs)
+		gomega.Expect(cscs.Items).To(gomega.HaveLen(3), "filtered list should have 3 items, got: %s", cscs)
 
 		ginkgo.By("patching")
 		patchedCSC, err := cscClient.Patch(ctx, createdCSC.Name, types.MergePatchType, []byte(`{"metadata":{"annotations":{"patched":"true"}}}`), metav1.PatchOptions{})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(patchedCSC.Annotations["patched"], "true", "patched object should have the applied annotation")
+		gomega.Expect(patchedCSC.Annotations).To(gomega.HaveKeyWithValue("patched", "true"), "patched object should have the applied annotation")
+		gomega.Expect(resourceversion.CompareResourceVersion(createdCSC.ResourceVersion, patchedCSC.ResourceVersion)).To(gomega.BeNumerically("==", -1), "patched object should have a larger resource version")
 
 		ginkgo.By("updating")
 		csrToUpdate := patchedCSC.DeepCopy()
 		csrToUpdate.Annotations["updated"] = "true"
 		updatedCSC, err := cscClient.Update(ctx, csrToUpdate, metav1.UpdateOptions{})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(updatedCSC.Annotations["updated"], "true", "updated object should have the applied annotation")
+		gomega.Expect(updatedCSC.Annotations).To(gomega.HaveKeyWithValue("updated", "true"), "updated object should have the applied annotation")
 
 		expectWatchResult := func(kind string, w watch.Interface) {
 			framework.Logf("waiting for watch events with expected annotations %s", kind)

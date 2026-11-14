@@ -23,11 +23,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	auditinternal "k8s.io/apiserver/pkg/apis/audit"
@@ -52,7 +54,9 @@ func findServicePort(svc *v1.Service, port int32) (*v1.ServicePort, error) {
 }
 
 // ResolveEndpoint returns a URL to which one can send traffic for the specified service.
-func ResolveEndpoint(services listersv1.ServiceLister, endpoints listersv1.EndpointsLister, namespace, id string, port int32) (*url.URL, error) {
+// If the service is dual-stack, the URL will preferentially point to an endpoint of the
+// service's primary IP family.
+func ResolveEndpoint(services listersv1.ServiceLister, endpointSlices EndpointSliceGetter, namespace, id string, port int32) (*url.URL, error) {
 	svc, err := services.Services(namespace).Get(id)
 	if err != nil {
 		return nil, err
@@ -70,36 +74,79 @@ func ResolveEndpoint(services listersv1.ServiceLister, endpoints listersv1.Endpo
 		return nil, err
 	}
 
-	eps, err := endpoints.Endpoints(namespace).Get(svc.Name)
+	if endpointSlices == nil {
+		return nil, errors.NewServiceUnavailable(fmt.Sprintf("no endpoints available for service %q", svc.Name))
+	}
+	slices, err := endpointSlices.GetEndpointSlices(namespace, svc.Name)
 	if err != nil {
 		return nil, err
 	}
-	if len(eps.Subsets) == 0 {
-		return nil, errors.NewServiceUnavailable(fmt.Sprintf("no endpoints available for service %q", svc.Name))
+	preferredIPFamily := v1.IPFamilyUnknown
+	if len(svc.Spec.IPFamilies) > 0 {
+		preferredIPFamily = svc.Spec.IPFamilies[0]
+	}
+	hostPort, err := RandomEndpoint(svc.Name, slices, svcPort.Name, preferredIPFamily, nil)
+	if err != nil {
+		return nil, err
 	}
 
-	// Pick a random Subset to start searching from.
-	ssSeed := rand.Intn(len(eps.Subsets))
+	return &url.URL{
+		Scheme: "https",
+		Host:   hostPort,
+	}, nil
+}
 
-	// Find a Subset that has the port.
-	for ssi := 0; ssi < len(eps.Subsets); ssi++ {
-		ss := &eps.Subsets[(ssSeed+ssi)%len(eps.Subsets)]
-		if len(ss.Addresses) == 0 {
-			continue
-		}
-		for i := range ss.Ports {
-			if ss.Ports[i].Name == svcPort.Name {
-				// Pick a random address.
-				ip := ss.Addresses[rand.Intn(len(ss.Addresses))].IP
-				port := int(ss.Ports[i].Port)
-				return &url.URL{
-					Scheme: "https",
-					Host:   net.JoinHostPort(ip, strconv.Itoa(port)),
-				}, nil
+// RandomEndpoint returns an "IPv4:port"/"[IPv6]:port" from a randomly-selected endpoint
+// in slices that serves svcPortName, preferably of preferredIPFamily. If validEndpoint is
+// non-nil then it must also accept the selected endpoint.
+func RandomEndpoint(svcName string, slices []*discoveryv1.EndpointSlice, svcPortName string, preferredIPFamily v1.IPFamily, validEndpoint func(*discoveryv1.Endpoint) bool) (string, error) {
+	if len(slices) > 1 {
+		// If there are multiple slices, we want to look at them in a random
+		// order, but we need to look at all of the slices of the preferred IP
+		// family first.
+		preferredAddressType := discoveryv1.AddressType(preferredIPFamily)
+		randomOrder := rand.Perm(len(slices))
+		sort.Slice(slices, func(i, j int) bool {
+			if slices[i].AddressType != slices[j].AddressType {
+				return slices[i].AddressType == preferredAddressType
+			}
+			return randomOrder[i] < randomOrder[j]
+		})
+	}
+
+	// Find a slice that has the port.
+	for _, slice := range slices {
+		for i := range slice.Ports {
+			if slice.Ports[i].Name == nil || *slice.Ports[i].Name != svcPortName {
+				continue
+			}
+			if slice.Ports[i].Port == nil {
+				continue
+			}
+			if len(slice.Endpoints) == 0 {
+				continue
+			}
+
+			// Starting from a random index, find a Ready endpoint
+			offset := rand.Intn(len(slice.Endpoints))
+			for epi := range slice.Endpoints {
+				ep := &slice.Endpoints[(epi+offset)%len(slice.Endpoints)]
+				if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+					continue
+				}
+				if validEndpoint != nil && !validEndpoint(ep) {
+					continue
+				}
+
+				// (Addresses is an array but only Addresses[0] is used.)
+				ip := ep.Addresses[0]
+				port := int(*slice.Ports[i].Port)
+				return net.JoinHostPort(ip, strconv.Itoa(port)), nil
 			}
 		}
 	}
-	return nil, errors.NewServiceUnavailable(fmt.Sprintf("no endpoints available for service %q", id))
+
+	return "", errors.NewServiceUnavailable(fmt.Sprintf("no endpoints available for service %q", svcName))
 }
 
 func ResolveCluster(services listersv1.ServiceLister, namespace, id string, port int32) (*url.URL, error) {

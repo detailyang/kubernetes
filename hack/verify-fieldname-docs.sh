@@ -28,19 +28,13 @@ source "${KUBE_ROOT}/hack/lib/util.sh"
 
 kube::golang::setup_env
 
-make -C "${KUBE_ROOT}" WHAT=cmd/fieldnamedocscheck
-
-# Find binary
-fieldnamedocscheck=$(kube::util::find-binary "fieldnamedocscheck")
-
-result=0
+GOPROXY=off go install ./cmd/fieldnamedocscheck
 
 find_files() {
   find . -not \( \
       \( \
-        -wholename './output' \
+        -wholename '.git' \
         -o -wholename './_output' \
-        -o -wholename './_gopath' \
         -o -wholename './release' \
         -o -wholename './target' \
         -o -wholename '*/third_party/*' \
@@ -50,16 +44,17 @@ find_files() {
     \) \
     \( -wholename './staging/src/k8s.io/api/*/v*/types.go' \
        -o -wholename './staging/src/k8s.io/kube-aggregator/pkg/apis/*/v*/types.go' \
-       -o -wholename './staging/src/k8s.io/apiextensions-apiserver/pkg/apis/*/v*/types.go' \
+       -o -wholename './staging/src/k8s.io/apiextensions-api/pkg/apis/*/v*/types.go' \
     \)
 }
 
 versioned_api_files=$(find_files) || true
 
+result=0
 for file in ${versioned_api_files}; do
   package="${file%"/types.go"}"
   echo "Checking ${package}"
-  ${fieldnamedocscheck} -s "${file}" || result=$?
+  fieldnamedocscheck -s "${file}" || result=$?
 done
 
 exit ${result}

@@ -19,6 +19,7 @@ package apps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -93,7 +94,7 @@ func (t *CassandraUpgradeTest) Setup(ctx context.Context, f *framework.Framework
 	cassandraKubectlCreate(ns, "tester.yaml")
 
 	ginkgo.By("Getting the ingress IPs from the services")
-	err := wait.PollImmediateWithContext(ctx, statefulsetPoll, statefulsetTimeout, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, statefulsetPoll, statefulsetTimeout, true, func(ctx context.Context) (bool, error) {
 		if t.ip = t.getServiceIP(ctx, f, ns, "test-server"); t.ip == "" {
 			return false, nil
 		}
@@ -103,20 +104,20 @@ func (t *CassandraUpgradeTest) Setup(ctx context.Context, f *framework.Framework
 		}
 		return true, nil
 	})
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "list stored users in Cassandra")
 	framework.Logf("Service endpoint is up")
 
 	ginkgo.By("Adding 2 dummy users")
 	err = t.addUser("Alice")
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "add user %q to Cassandra", "Alice")
 	err = t.addUser("Bob")
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "add user %q to Cassandra", "Bob")
 	t.successfulWrites = 2
 
 	ginkgo.By("Verifying that the users exist")
 	users, err := t.listUsers()
-	framework.ExpectNoError(err)
-	framework.ExpectEqual(len(users), 2)
+	framework.ExpectNoError(err, "list stored users in Cassandra")
+	gomega.Expect(users).To(gomega.HaveLen(2))
 }
 
 // listUsers gets a list of users from the db via the tester service.
@@ -131,13 +132,14 @@ func (t *CassandraUpgradeTest) listUsers() ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf(string(b))
+		return nil, errors.New(string(b))
 	}
 	var names []string
 	if err := json.NewDecoder(r.Body).Decode(&names); err != nil {
 		return nil, err
 	}
 	return names, nil
+
 }
 
 // addUser adds a user to the db via the tester services.
@@ -153,7 +155,7 @@ func (t *CassandraUpgradeTest) addUser(name string) error {
 		if err != nil {
 			return err
 		}
-		return fmt.Errorf(string(b))
+		return errors.New(string(b))
 	}
 	return nil
 }
@@ -161,7 +163,7 @@ func (t *CassandraUpgradeTest) addUser(name string) error {
 // getServiceIP is a helper method to extract the Ingress IP from the service.
 func (t *CassandraUpgradeTest) getServiceIP(ctx context.Context, f *framework.Framework, ns, svcName string) string {
 	svc, err := f.ClientSet.CoreV1().Services(ns).Get(ctx, svcName, metav1.GetOptions{})
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "get Service %q in namespace %q", svcName, ns)
 	ingress := svc.Status.LoadBalancer.Ingress
 	if len(ingress) == 0 {
 		return ""
@@ -221,6 +223,6 @@ func (t *CassandraUpgradeTest) Test(ctx context.Context, f *framework.Framework,
 // Teardown does one final check of the data's availability.
 func (t *CassandraUpgradeTest) Teardown(ctx context.Context, f *framework.Framework) {
 	users, err := t.listUsers()
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "list stored users in Cassandra")
 	gomega.Expect(len(users)).To(gomega.BeNumerically(">=", t.successfulWrites), "len(users) is too small")
 }

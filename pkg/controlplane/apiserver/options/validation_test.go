@@ -17,15 +17,17 @@ limitations under the License.
 package options
 
 import (
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
 	kubeapiserveradmission "k8s.io/apiserver/pkg/admission"
+	genericfeatures "k8s.io/apiserver/pkg/features"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/component-base/featuregate"
+	basecompatibility "k8s.io/component-base/compatibility"
 	basemetrics "k8s.io/component-base/metrics"
-	"k8s.io/kubernetes/pkg/features"
 
 	peerreconcilers "k8s.io/apiserver/pkg/reconcilers"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
@@ -33,7 +35,7 @@ import (
 )
 
 func TestValidateAPIPriorityAndFairness(t *testing.T) {
-	const conflict = "conflicts with --enable-priority-and-fairness=true and --feature-gates=APIPriorityAndFairness=true"
+	const conflict = "conflicts with --enable-priority-and-fairness=true"
 	tests := []struct {
 		runtimeConfig    string
 		errShouldContain string
@@ -44,7 +46,15 @@ func TestValidateAPIPriorityAndFairness(t *testing.T) {
 		},
 		{
 			runtimeConfig:    "api/beta=false",
+			errShouldContain: "",
+		},
+		{
+			runtimeConfig:    "api/ga=false",
 			errShouldContain: conflict,
+		},
+		{
+			runtimeConfig:    "api/ga=true",
+			errShouldContain: "",
 		},
 		{
 			runtimeConfig:    "flowcontrol.apiserver.k8s.io/v1beta1=false",
@@ -56,18 +66,30 @@ func TestValidateAPIPriorityAndFairness(t *testing.T) {
 		},
 		{
 			runtimeConfig:    "flowcontrol.apiserver.k8s.io/v1beta3=false",
-			errShouldContain: conflict,
+			errShouldContain: "",
 		},
 		{
 			runtimeConfig:    "flowcontrol.apiserver.k8s.io/v1beta3=true",
 			errShouldContain: "",
+		},
+		{
+			runtimeConfig:    "flowcontrol.apiserver.k8s.io/v1=true",
+			errShouldContain: "",
+		},
+		{
+			runtimeConfig:    "flowcontrol.apiserver.k8s.io/v1=false",
+			errShouldContain: conflict,
+		},
+		{
+			runtimeConfig:    "flowcontrol.apiserver.k8s.io/v1beta3=true,flowcontrol.apiserver.k8s.io/v1=false",
+			errShouldContain: conflict,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.runtimeConfig, func(t *testing.T) {
 			options := &Options{
-				GenericServerRunOptions: &genericoptions.ServerRunOptions{
+				Features: &genericoptions.FeatureOptions{
 					EnablePriorityAndFairness: true,
 				},
 				APIEnablement: genericoptions.NewAPIEnablementOptions(),
@@ -78,8 +100,16 @@ func TestValidateAPIPriorityAndFairness(t *testing.T) {
 			if errs := validateAPIPriorityAndFairness(options); len(errs) > 0 {
 				errMessageGot = errs[0].Error()
 			}
-			if !strings.Contains(errMessageGot, test.errShouldContain) {
-				t.Errorf("Expected error message to contain: %q, but got: %q", test.errShouldContain, errMessageGot)
+
+			switch {
+			case len(test.errShouldContain) == 0:
+				if len(errMessageGot) > 0 {
+					t.Errorf("Expected no error, but got: %q", errMessageGot)
+				}
+			default:
+				if !strings.Contains(errMessageGot, test.errShouldContain) {
+					t.Errorf("Expected error message to contain: %q, but got: %q", test.errShouldContain, errMessageGot)
+				}
 			}
 		})
 	}
@@ -119,9 +149,7 @@ func TestValidateUnknownVersionInteroperabilityProxy(t *testing.T) {
 				PeerCAFile:           test.peerCAFile,
 				PeerAdvertiseAddress: test.peerAdvertiseAddress,
 			}
-			if test.featureEnabled {
-				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.UnknownVersionInteroperabilityProxy, true)()
-			}
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.UnknownVersionInteroperabilityProxy, test.featureEnabled)
 			var errMessageGot string
 			if errs := validateUnknownVersionInteroperabilityProxyFlags(options); len(errs) > 0 {
 				errMessageGot = errs[0].Error()
@@ -130,34 +158,6 @@ func TestValidateUnknownVersionInteroperabilityProxy(t *testing.T) {
 				t.Errorf("Expected error message to contain: %q, but got: %q", test.errShouldContain, errMessageGot)
 			}
 
-		})
-	}
-}
-
-func TestValidateUnknownVersionInteroperabilityProxyFeature(t *testing.T) {
-	const conflict = "UnknownVersionInteroperabilityProxy feature requires StorageVersionAPI feature flag to be enabled"
-	tests := []struct {
-		name            string
-		featuresEnabled []featuregate.Feature
-	}{
-		{
-			name:            "enabled: UnknownVersionInteroperabilityProxy, disabled: StorageVersionAPI",
-			featuresEnabled: []featuregate.Feature{features.UnknownVersionInteroperabilityProxy},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			for _, feature := range test.featuresEnabled {
-				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, feature, true)()
-			}
-			var errMessageGot string
-			if errs := validateUnknownVersionInteroperabilityProxyFeature(); len(errs) > 0 {
-				errMessageGot = errs[0].Error()
-			}
-			if !strings.Contains(errMessageGot, conflict) {
-				t.Errorf("Expected error message to contain: %q, but got: %q", conflict, errMessageGot)
-			}
 		})
 	}
 }
@@ -172,7 +172,7 @@ func TestValidateOptions(t *testing.T) {
 			name:         "validate master count equal 0",
 			expectErrors: true,
 			options: &Options{
-				GenericServerRunOptions: &genericoptions.ServerRunOptions{},
+				GenericServerRunOptions: &genericoptions.ServerRunOptions{ComponentGlobalsRegistry: basecompatibility.NewComponentGlobalsRegistry()},
 				Etcd:                    &genericoptions.EtcdOptions{},
 				SecureServing:           &genericoptions.SecureServingOptionsWithLoopback{},
 				Audit:                   &genericoptions.AuditOptions{},
@@ -192,13 +192,14 @@ func TestValidateOptions(t *testing.T) {
 				APIEnablement:                genericoptions.NewAPIEnablementOptions(),
 				Metrics:                      &basemetrics.Options{},
 				ServiceAccountSigningKeyFile: "",
+				Features:                     &genericoptions.FeatureOptions{},
 			},
 		},
 		{
 			name:         "validate token request enable not attempted",
 			expectErrors: true,
 			options: &Options{
-				GenericServerRunOptions: &genericoptions.ServerRunOptions{},
+				GenericServerRunOptions: &genericoptions.ServerRunOptions{ComponentGlobalsRegistry: basecompatibility.NewComponentGlobalsRegistry()},
 				Etcd:                    &genericoptions.EtcdOptions{},
 				SecureServing:           &genericoptions.SecureServingOptionsWithLoopback{},
 				Audit:                   &genericoptions.AuditOptions{},
@@ -215,6 +216,7 @@ func TestValidateOptions(t *testing.T) {
 				APIEnablement:                genericoptions.NewAPIEnablementOptions(),
 				Metrics:                      &basemetrics.Options{},
 				ServiceAccountSigningKeyFile: "",
+				Features:                     &genericoptions.FeatureOptions{},
 			},
 		},
 	}
@@ -228,6 +230,207 @@ func TestValidateOptions(t *testing.T) {
 
 			if len(errs) == 0 && tc.expectErrors {
 				t.Errorf("expected errors, no errors found")
+			}
+		})
+	}
+}
+
+func TestValidateServiceAccountTokenSigningConfig(t *testing.T) {
+	tests := []struct {
+		name           string
+		options        *Options
+		expectedErrors []error
+	}{
+		{
+			name: "Signing keys file provided while external signer endpoint is provided",
+			expectedErrors: []error{
+				fmt.Errorf("can't set `--service-account-signing-key-file` and/or `--service-account-key-file` with `--service-account-signing-endpoint` (They are mutually exclusive)"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@ebc.eng.hij",
+				ServiceAccountSigningKeyFile:  "/abc/efg",
+			},
+		},
+		{
+			name: "Verification keys file provided while external signer endpoint is provided",
+			expectedErrors: []error{
+				fmt.Errorf("can't set `--service-account-signing-key-file` and/or `--service-account-key-file` with `--service-account-signing-endpoint` (They are mutually exclusive)"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@ebc.eng.hij",
+				Authentication: &kubeoptions.BuiltInAuthenticationOptions{
+					ServiceAccounts: &kubeoptions.ServiceAccountAuthenticationOptions{
+						KeyFiles: []string{
+							"abc",
+							"efg",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Verification key  and signing key file provided while external signer endpoint is provided",
+			expectedErrors: []error{
+				fmt.Errorf("can't set `--service-account-signing-key-file` and/or `--service-account-key-file` with `--service-account-signing-endpoint` (They are mutually exclusive)"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@ebc.eng.hij",
+				ServiceAccountSigningKeyFile:  "/abc/efg",
+				Authentication: &kubeoptions.BuiltInAuthenticationOptions{
+					ServiceAccounts: &kubeoptions.ServiceAccountAuthenticationOptions{
+						KeyFiles: []string{
+							"/abc/efg",
+							"/abc/xyz",
+						},
+					},
+				},
+			},
+		},
+		{
+			name:           "relative external signer endpoint provided",
+			expectedErrors: []error{},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "abc",
+			},
+		},
+		{
+			name: "invalid external signer endpoint provided - 2",
+			expectedErrors: []error{
+				fmt.Errorf("invalid value \"@abc@\" passed for `--service-account-signing-endpoint`, when prefixed with @ must be a valid abstract socket name"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@abc@",
+			},
+		},
+		{
+			name: "invalid external signer endpoint provided - 3",
+			expectedErrors: []error{
+				fmt.Errorf("invalid value \"@abc.abc  .ae\" passed for `--service-account-signing-endpoint`, when prefixed with @ must be a valid abstract socket name"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@abc.abc  .ae",
+			},
+		},
+		{
+			name:           "valid external signer endpoint provided - 1",
+			expectedErrors: []error{},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "/e/an_b-d/efg",
+			},
+		},
+		{
+			name:           "valid external signer endpoint provided - 2",
+			expectedErrors: []error{},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@ebc.sock",
+			},
+		},
+		{
+			name:           "valid external signer endpoint provided - 3",
+			expectedErrors: []error{},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@ebc.eng.hij",
+			},
+		},
+		{
+			name: "All errors at once",
+			expectedErrors: []error{
+				fmt.Errorf("can't set `--service-account-signing-key-file` and/or `--service-account-key-file` with `--service-account-signing-endpoint` (They are mutually exclusive)"),
+				fmt.Errorf("invalid value \"@a@\" passed for `--service-account-signing-endpoint`, when prefixed with @ must be a valid abstract socket name"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@a@",
+				ServiceAccountSigningKeyFile:  "/abc/efg",
+				Authentication: &kubeoptions.BuiltInAuthenticationOptions{
+					ServiceAccounts: &kubeoptions.ServiceAccountAuthenticationOptions{
+						KeyFiles: []string{
+							"/abc/xyz",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+
+			if test.options.Authentication == nil {
+				test.options.Authentication = &kubeoptions.BuiltInAuthenticationOptions{
+					ServiceAccounts: &kubeoptions.ServiceAccountAuthenticationOptions{
+						KeyFiles: []string{},
+					},
+				}
+			}
+
+			errs := validateServiceAccountTokenSigningConfig(test.options)
+			if !reflect.DeepEqual(errs, test.expectedErrors) {
+				t.Errorf("Expected errors message: %v \n but got: %v", test.expectedErrors, errs)
+			}
+		})
+	}
+}
+
+func TestValidateCoordinatedLeadershipFlags(t *testing.T) {
+	tests := []struct {
+		name           string
+		options        *Options
+		expectedErrors map[string]bool
+	}{
+		{
+			name: "no errors",
+			options: &Options{
+				CoordinatedLeadershipLeaseDuration: 10,
+				CoordinatedLeadershipRenewDeadline: 5,
+				CoordinatedLeadershipRetryPeriod:   2,
+			},
+		},
+		{
+			name: "invalid lease duration",
+			options: &Options{
+				CoordinatedLeadershipLeaseDuration: 5,
+				CoordinatedLeadershipRenewDeadline: 5,
+				CoordinatedLeadershipRetryPeriod:   2,
+			},
+			expectedErrors: map[string]bool{
+				"--coordinated-leadership-lease-duration must be greater than --coordinated-leadership-renew-deadline": true,
+			},
+		},
+		{
+			name: "invalid retry period",
+			options: &Options{
+				CoordinatedLeadershipLeaseDuration: 10,
+				CoordinatedLeadershipRenewDeadline: 5,
+				CoordinatedLeadershipRetryPeriod:   5,
+			},
+			expectedErrors: map[string]bool{
+				"--coordinated-leadership-renew-deadline must be greater than --coordinated-leadership-retry-period": true,
+			},
+		},
+		{
+			name: "all errors",
+			options: &Options{
+				CoordinatedLeadershipLeaseDuration: 5,
+				CoordinatedLeadershipRenewDeadline: 5,
+				CoordinatedLeadershipRetryPeriod:   5,
+			},
+			expectedErrors: map[string]bool{
+				"--coordinated-leadership-lease-duration must be greater than --coordinated-leadership-renew-deadline": true,
+				"--coordinated-leadership-renew-deadline must be greater than --coordinated-leadership-retry-period":   true,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			errs := validateCoordinatedLeadershipFlags(test.options)
+			if len(errs) != len(test.expectedErrors) {
+				t.Errorf("Expected %d errors, but got %d", len(test.expectedErrors), len(errs))
+			}
+			for _, err := range errs {
+				if _, ok := test.expectedErrors[err.Error()]; !ok {
+					t.Errorf("Unexpected error: %v", err)
+				}
 			}
 		})
 	}

@@ -23,8 +23,10 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
@@ -185,11 +187,11 @@ var _ = utils.SIGDescribe("EmptyDir wrapper volumes", func() {
 		Testname: EmptyDir Wrapper Volume, ConfigMap volumes, no race
 		Description: Create 50 ConfigMaps Volumes and 5 replicas of pod with these ConfigMapvolumes mounted. Pod MUST NOT fail waiting for Volumes.
 	*/
-	framework.ConformanceIt("should not cause race condition when used for configmaps [Serial]", func(ctx context.Context) {
+	framework.ConformanceIt("should not cause race condition when used for configmaps", f.WithSerial(), func(ctx context.Context) {
 		configMapNames := createConfigmapsForRace(ctx, f)
 		ginkgo.DeferCleanup(deleteConfigMaps, f, configMapNames)
 		volumes, volumeMounts := makeConfigMapVolumes(configMapNames)
-		for i := 0; i < wrappedVolumeRaceConfigMapIterationCount; i++ {
+		for range wrappedVolumeRaceConfigMapIterationCount {
 			testNoWrappedVolumeRace(ctx, f, volumes, volumeMounts, wrappedVolumeRaceConfigMapPodCount)
 		}
 	})
@@ -198,11 +200,11 @@ var _ = utils.SIGDescribe("EmptyDir wrapper volumes", func() {
 	// This test uses deprecated GitRepo VolumeSource so it MUST not be promoted to Conformance.
 	// To provision a container with a git repo, mount an EmptyDir into an InitContainer that clones the repo using git, then mount the EmptyDir into the Pod's container.
 	// This projected volume maps approach can also be tested with secrets and downwardapi VolumeSource but are less prone to the race problem.
-	ginkgo.It("should not cause race condition when used for git_repo [Serial] [Slow]", func(ctx context.Context) {
+	f.It("should not cause race condition when used for git_repo", f.WithFeatureGate(features.GitRepoVolumeDriver), f.WithSerial(), f.WithSlow(), func(ctx context.Context) {
 		gitURL, gitRepo, cleanup := createGitServer(ctx, f)
 		defer cleanup()
 		volumes, volumeMounts := makeGitRepoVolumes(gitURL, gitRepo)
-		for i := 0; i < wrappedVolumeRaceGitRepoIterationCount; i++ {
+		for range wrappedVolumeRaceGitRepoIterationCount {
 			testNoWrappedVolumeRace(ctx, f, volumes, volumeMounts, wrappedVolumeRaceGitRepoPodCount)
 		}
 	})
@@ -255,7 +257,7 @@ func createGitServer(ctx context.Context, f *framework.Framework) (gitURL string
 }
 
 func makeGitRepoVolumes(gitURL, gitRepo string) (volumes []v1.Volume, volumeMounts []v1.VolumeMount) {
-	for i := 0; i < wrappedVolumeRaceGitRepoVolumeCount; i++ {
+	for i := range wrappedVolumeRaceGitRepoVolumeCount {
 		volumeName := fmt.Sprintf("racey-git-repo-%d", i)
 		volumes = append(volumes, v1.Volume{
 			Name: volumeName,
@@ -276,7 +278,7 @@ func makeGitRepoVolumes(gitURL, gitRepo string) (volumes []v1.Volume, volumeMoun
 
 func createConfigmapsForRace(ctx context.Context, f *framework.Framework) (configMapNames []string) {
 	ginkgo.By(fmt.Sprintf("Creating %d configmaps", wrappedVolumeRaceConfigMapVolumeCount))
-	for i := 0; i < wrappedVolumeRaceConfigMapVolumeCount; i++ {
+	for i := range wrappedVolumeRaceConfigMapVolumeCount {
 		configMapName := fmt.Sprintf("racey-configmap-%d", i)
 		configMapNames = append(configMapNames, configMapName)
 		configMap := &v1.ConfigMap{
@@ -333,6 +335,9 @@ func testNoWrappedVolumeRace(ctx context.Context, f *framework.Framework, volume
 	const nodeHostnameLabelKey = "kubernetes.io/hostname"
 
 	rcName := wrappedVolumeRaceRCNamePrefix + string(uuid.NewUUID())
+	rcLabels := map[string]string{
+		"name": rcName,
+	}
 	targetNode, err := e2enode.GetRandomReadySchedulableNode(ctx, f.ClientSet)
 	framework.ExpectNoError(err)
 
@@ -361,12 +366,10 @@ func testNoWrappedVolumeRace(ctx context.Context, f *framework.Framework, volume
 		},
 		Spec: v1.ReplicationControllerSpec{
 			Replicas: &podCount,
-			Selector: map[string]string{
-				"name": rcName,
-			},
+			Selector: rcLabels,
 			Template: &v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{"name": rcName},
+					Labels: rcLabels,
 				},
 				Spec: v1.PodSpec{
 					Containers: []v1.Container{
@@ -388,7 +391,7 @@ func testNoWrappedVolumeRace(ctx context.Context, f *framework.Framework, volume
 
 	ginkgo.DeferCleanup(e2erc.DeleteRCAndWaitForGC, f.ClientSet, f.Namespace.Name, rcName)
 
-	pods, err := e2epod.PodsCreated(ctx, f.ClientSet, f.Namespace.Name, rcName, podCount)
+	pods, err := e2epod.PodsCreatedByLabel(ctx, f.ClientSet, f.Namespace.Name, rcName, podCount, labels.SelectorFromSet(rcLabels))
 	framework.ExpectNoError(err, "error creating pods")
 
 	ginkgo.By("Ensuring each pod is running")

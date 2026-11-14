@@ -26,7 +26,7 @@ import (
 // DefaultPreemptionArgs holds arguments used to configure the
 // DefaultPreemption plugin.
 type DefaultPreemptionArgs struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 
 	// MinCandidateNodesPercentage is the minimum number of candidates to
 	// shortlist when dry running preemption as a percentage of number of nodes.
@@ -47,7 +47,7 @@ type DefaultPreemptionArgs struct {
 
 // InterPodAffinityArgs holds arguments used to configure the InterPodAffinity plugin.
 type InterPodAffinityArgs struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 
 	// HardPodAffinityWeight is the scoring weight for existing pods with a
 	// matching hard affinity to the incoming pod.
@@ -62,7 +62,7 @@ type InterPodAffinityArgs struct {
 
 // NodeResourcesFitArgs holds arguments used to configure the NodeResourcesFit plugin.
 type NodeResourcesFitArgs struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 
 	// IgnoredResources is the list of resources that NodeResources fit filter
 	// should ignore. This doesn't apply to scoring.
@@ -95,7 +95,7 @@ const (
 
 // PodTopologySpreadArgs holds arguments used to configure the PodTopologySpread plugin.
 type PodTopologySpreadArgs struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 
 	// DefaultConstraints defines topology spread constraints to be applied to
 	// Pods that don't define any in `pod.spec.topologySpreadConstraints`.
@@ -123,7 +123,7 @@ type PodTopologySpreadArgs struct {
 
 // NodeResourcesBalancedAllocationArgs holds arguments used to configure NodeResourcesBalancedAllocation plugin.
 type NodeResourcesBalancedAllocationArgs struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 
 	// Resources to be managed, the default is "cpu" and "memory" if not specified.
 	// +listType=map
@@ -151,7 +151,7 @@ type ResourceSpec struct {
 
 // VolumeBindingArgs holds arguments used to configure the VolumeBinding plugin.
 type VolumeBindingArgs struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 
 	// BindTimeoutSeconds is the timeout in seconds in volume binding operation.
 	// Value must be non-negative integer. The value zero indicates no waiting.
@@ -159,17 +159,17 @@ type VolumeBindingArgs struct {
 	BindTimeoutSeconds *int64 `json:"bindTimeoutSeconds,omitempty"`
 
 	// Shape specifies the points defining the score function shape, which is
-	// used to score nodes based on the utilization of statically provisioned
-	// PVs. The utilization is calculated by dividing the total requested
+	// used to score nodes based on the utilization of provisioned PVs.
+	// The utilization is calculated by dividing the total requested
 	// storage of the pod by the total capacity of feasible PVs on each node.
 	// Each point contains utilization (ranges from 0 to 100) and its
 	// associated score (ranges from 0 to 10). You can turn the priority by
 	// specifying different scores for different utilization numbers.
 	// The default shape points are:
-	// 1) 0 for 0 utilization
-	// 2) 10 for 100 utilization
+	// 1) 10 for 0 utilization
+	// 2) 0 for 100 utilization
 	// All points must be sorted in increasing order by utilization.
-	// +featureGate=VolumeCapacityPriority
+	// +featureGate=StorageCapacityScoring
 	// +optional
 	// +listType=atomic
 	Shape []UtilizationShapePoint `json:"shape,omitempty"`
@@ -179,7 +179,7 @@ type VolumeBindingArgs struct {
 
 // NodeAffinityArgs holds arguments to configure the NodeAffinity plugin.
 type NodeAffinityArgs struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 
 	// AddedAffinity is applied to all Pods additionally to the NodeAffinity
 	// specified in the PodSpec. That is, Nodes need to satisfy AddedAffinity

@@ -26,6 +26,12 @@ import (
 	"strings"
 	"time"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
+	netutils "k8s.io/utils/net"
+
+	apiv1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -36,9 +42,11 @@ import (
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/apiserver/pkg/warning"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	podutil "k8s.io/kubernetes/pkg/api/pod"
@@ -47,19 +55,17 @@ import (
 	corevalidation "k8s.io/kubernetes/pkg/apis/core/validation"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/client"
-	netutils "k8s.io/utils/net"
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 // podStrategy implements behavior for Pods
 type podStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating Pod
 // objects via the REST API.
-var Strategy = podStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = podStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 // NamespaceScoped is true for pods.
 func (podStrategy) NamespaceScoped() bool {
@@ -81,14 +87,21 @@ func (podStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
 // PrepareForCreate clears fields that are not allowed to be set by end users on creation.
 func (podStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	pod := obj.(*api.Pod)
+	pod.Generation = 1
+
 	pod.Status = api.PodStatus{
-		Phase:    api.PodPending,
-		QOSClass: qos.GetPodQOS(pod),
+		Phase: api.PodPending,
 	}
 
 	podutil.DropDisabledPodFields(pod, nil)
 
-	applyWaitingForSchedulingGatesCondition(pod)
+	applySchedulingGatedCondition(pod)
+	mutatePodAffinity(pod)
+	mutateTopologySpreadConstraints(pod)
+	applyAppArmorVersionSkew(ctx, pod)
+	podutil.DefaultPodLevelResources(pod)
+
+	pod.Status.QOSClass = qos.GetPodQOS(pod)
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
@@ -97,21 +110,21 @@ func (podStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object
 	oldPod := old.(*api.Pod)
 	newPod.Status = oldPod.Status
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
-		// With support for in-place pod resizing, container resources are now mutable.
-		// If container resources are updated with new resource requests values, a pod resize is
-		// desired. The status of this request is reflected by setting Resize field to "Proposed"
-		// as a signal to the caller that the request is being considered.
-		podutil.MarkPodProposedForResize(oldPod, newPod)
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourcesFixDefaulting) {
+		if newPod.Spec.Resources == nil && oldPod.Spec.Resources != nil {
+			// preserve existing PLR for requests from potentially PLR-unaware clients that completely dropped the field
+			newPod.Spec.Resources = oldPod.Spec.Resources.DeepCopy()
+		}
 	}
 
 	podutil.DropDisabledPodFields(newPod, oldPod)
+	updatePodGeneration(newPod, oldPod)
 }
 
 // Validate validates a new pod.
 func (podStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	pod := obj.(*api.Pod)
-	opts := podutil.GetValidationOptionsFromPodSpecAndMeta(&pod.Spec, nil, &pod.ObjectMeta, nil)
+	opts := corevalidation.GetValidationOptionsFromPodSpecAndMeta(&pod.Spec, nil, &pod.ObjectMeta, nil)
 	opts.ResourceIsPod = true
 	return corevalidation.ValidatePodCreate(pod, opts)
 }
@@ -132,7 +145,7 @@ func (podStrategy) Canonicalize(obj runtime.Object) {
 }
 
 // AllowCreateOnUpdate is false for pods.
-func (podStrategy) AllowCreateOnUpdate() bool {
+func (podStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -141,7 +154,7 @@ func (podStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) 
 	// Allow downward api usage of hugepages on pod update if feature is enabled or if the old pod already had used them.
 	pod := obj.(*api.Pod)
 	oldPod := old.(*api.Pod)
-	opts := podutil.GetValidationOptionsFromPodSpecAndMeta(&pod.Spec, &oldPod.Spec, &pod.ObjectMeta, &oldPod.ObjectMeta)
+	opts := corevalidation.GetValidationOptionsFromPodSpecAndMeta(&pod.Spec, &oldPod.Spec, &pod.ObjectMeta, &oldPod.ObjectMeta)
 	opts.ResourceIsPod = true
 	return corevalidation.ValidatePodUpdate(obj.(*api.Pod), old.(*api.Pod), opts)
 }
@@ -154,7 +167,7 @@ func (podStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object
 }
 
 // AllowUnconditionalUpdate allows pods to be overwritten
-func (podStrategy) AllowUnconditionalUpdate() bool {
+func (podStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }
 
@@ -221,12 +234,61 @@ func (podStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.
 	// don't allow the pods/status endpoint to touch owner references since old kubelets corrupt them in a way
 	// that breaks garbage collection
 	newPod.OwnerReferences = oldPod.OwnerReferences
+	// the Pod QoS is immutable and populated at creation time by the kube-apiserver.
+	// we need to backfill it for backward compatibility because the old kubelet dropped this field when the pod was rejected.
+	if newPod.Status.QOSClass == "" {
+		newPod.Status.QOSClass = oldPod.Status.QOSClass
+	}
+
+	// Preserve DRA-related status fields when an old or misbehaving client
+	// strips fields that it does not know about during a pods/status update.
+	// For the slice fields, a non-nil empty slice can still clear the field.
+	if newPod.Status.ResourceClaimStatuses == nil && oldPod.Status.ResourceClaimStatuses != nil {
+		newPod.Status.ResourceClaimStatuses = oldPod.Status.ResourceClaimStatuses
+	}
+	if newPod.Status.ExtendedResourceClaimStatus == nil && oldPod.Status.ExtendedResourceClaimStatus != nil {
+		newPod.Status.ExtendedResourceClaimStatus = oldPod.Status.ExtendedResourceClaimStatus
+	}
+	if newPod.Status.NodeAllocatableResourceClaimStatuses == nil && oldPod.Status.NodeAllocatableResourceClaimStatuses != nil {
+		newPod.Status.NodeAllocatableResourceClaimStatuses = oldPod.Status.NodeAllocatableResourceClaimStatuses
+	}
+
+	preserveOldObservedGeneration(newPod, oldPod)
+	podutil.DropDisabledPodFields(newPod, oldPod)
+}
+
+// If a client request tries to clear `observedGeneration`, in the pod status or
+// conditions, we preserve the original value.
+func preserveOldObservedGeneration(newPod, oldPod *api.Pod) {
+	if newPod.Status.ObservedGeneration == 0 {
+		newPod.Status.ObservedGeneration = oldPod.Status.ObservedGeneration
+	}
+
+	// Remember observedGeneration values from old status conditions.
+	// This is a list per type because validation permits multiple conditions with the same type.
+	oldConditionGenerations := map[api.PodConditionType][]int64{}
+	for _, oldCondition := range oldPod.Status.Conditions {
+		oldConditionGenerations[oldCondition.Type] = append(oldConditionGenerations[oldCondition.Type], oldCondition.ObservedGeneration)
+	}
+
+	// For any conditions in the new status without observedGeneration set, preserve the old value.
+	for i, newCondition := range newPod.Status.Conditions {
+		oldGeneration := int64(0)
+		if oldGenerations, ok := oldConditionGenerations[newCondition.Type]; ok && len(oldGenerations) > 0 {
+			oldGeneration = oldGenerations[0]
+			oldConditionGenerations[newCondition.Type] = oldGenerations[1:]
+		}
+
+		if newCondition.ObservedGeneration == 0 {
+			newPod.Status.Conditions[i].ObservedGeneration = oldGeneration
+		}
+	}
 }
 
 func (podStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	pod := obj.(*api.Pod)
 	oldPod := old.(*api.Pod)
-	opts := podutil.GetValidationOptionsFromPodSpecAndMeta(&pod.Spec, &oldPod.Spec, &pod.ObjectMeta, &oldPod.ObjectMeta)
+	opts := corevalidation.GetValidationOptionsFromPodSpecAndMeta(&pod.Spec, &oldPod.Spec, &pod.ObjectMeta, &oldPod.ObjectMeta)
 	opts.ResourceIsPod = true
 
 	return corevalidation.ValidatePodStatusUpdate(obj.(*api.Pod), old.(*api.Pod), opts)
@@ -234,25 +296,41 @@ func (podStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Ob
 
 // WarningsOnUpdate returns warnings for the given update.
 func (podStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
-	return nil
+	pod := obj.(*api.Pod)
+	var warnings []string
+
+	for i, podIP := range pod.Status.PodIPs {
+		warnings = append(warnings, utilvalidation.GetWarningsForIP(field.NewPath("status", "podIPs").Index(i).Child("ip"), podIP.IP)...)
+	}
+	for i, hostIP := range pod.Status.HostIPs {
+		warnings = append(warnings, utilvalidation.GetWarningsForIP(field.NewPath("status", "hostIPs").Index(i).Child("ip"), hostIP.IP)...)
+	}
+
+	return warnings
 }
 
 type podEphemeralContainersStrategy struct {
 	podStrategy
+
+	resetFieldsFilter fieldpath.Filter
 }
 
 // EphemeralContainersStrategy wraps and exports the used podStrategy for the storage package.
-var EphemeralContainersStrategy = podEphemeralContainersStrategy{Strategy}
+var EphemeralContainersStrategy = podEphemeralContainersStrategy{
+	podStrategy: Strategy,
+	resetFieldsFilter: fieldpath.NewIncludeMatcherFilter(
+		fieldpath.MakePrefixMatcherOrDie("spec", "ephemeralContainers"),
+	),
+}
 
 // dropNonEphemeralContainerUpdates discards all changes except for pod.Spec.EphemeralContainers and certain metadata
 func dropNonEphemeralContainerUpdates(newPod, oldPod *api.Pod) *api.Pod {
-	pod := oldPod.DeepCopy()
-	pod.Name = newPod.Name
-	pod.Namespace = newPod.Namespace
-	pod.ResourceVersion = newPod.ResourceVersion
-	pod.UID = newPod.UID
-	pod.Spec.EphemeralContainers = newPod.Spec.EphemeralContainers
-	return pod
+	newEphemeralContainerSpec := newPod.Spec.EphemeralContainers
+	newPod.Spec = oldPod.Spec
+	newPod.Status = oldPod.Status
+	metav1.ResetObjectMetaForStatus(&newPod.ObjectMeta, &oldPod.ObjectMeta)
+	newPod.Spec.EphemeralContainers = newEphemeralContainerSpec
+	return newPod
 }
 
 func (podEphemeralContainersStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
@@ -261,18 +339,195 @@ func (podEphemeralContainersStrategy) PrepareForUpdate(ctx context.Context, obj,
 
 	*newPod = *dropNonEphemeralContainerUpdates(newPod, oldPod)
 	podutil.DropDisabledPodFields(newPod, oldPod)
+	updatePodGeneration(newPod, oldPod)
 }
 
 func (podEphemeralContainersStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newPod := obj.(*api.Pod)
 	oldPod := old.(*api.Pod)
-	opts := podutil.GetValidationOptionsFromPodSpecAndMeta(&newPod.Spec, &oldPod.Spec, &newPod.ObjectMeta, &oldPod.ObjectMeta)
+	opts := corevalidation.GetValidationOptionsFromPodSpecAndMeta(&newPod.Spec, &oldPod.Spec, &newPod.ObjectMeta, &oldPod.ObjectMeta)
 	opts.ResourceIsPod = true
 	return corevalidation.ValidatePodEphemeralContainersUpdate(newPod, oldPod, opts)
 }
 
 // WarningsOnUpdate returns warnings for the given update.
 func (podEphemeralContainersStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
+// GetResetFieldsFilter returns a set of fields filter reset by the strategy
+// and should not be modified by the user.
+func (p podEphemeralContainersStrategy) GetResetFieldsFilter() map[fieldpath.APIVersion]fieldpath.Filter {
+	return map[fieldpath.APIVersion]fieldpath.Filter{
+		"v1": p.resetFieldsFilter,
+	}
+}
+
+type podResizeStrategy struct {
+	podStrategy
+
+	resetFieldsFilter fieldpath.Filter
+}
+
+// ResizeStrategy wraps and exports the used podStrategy for the storage package.
+var ResizeStrategy = podResizeStrategy{
+	podStrategy: Strategy,
+	resetFieldsFilter: fieldpath.NewIncludeMatcherFilter(
+		fieldpath.MakePrefixMatcherOrDie("spec", "containers", fieldpath.MatchAnyPathElement(), "resources"),
+		fieldpath.MakePrefixMatcherOrDie("spec", "containers", fieldpath.MatchAnyPathElement(), "resizePolicy"),
+		fieldpath.MakePrefixMatcherOrDie("spec", "initContainers", fieldpath.MatchAnyPathElement(), "resources"),
+		fieldpath.MakePrefixMatcherOrDie("spec", "initContainers", fieldpath.MatchAnyPathElement(), "resizePolicy"),
+	),
+}
+
+// dropNonResizeUpdates discards all changes except for
+// pod.Spec.Containers[*].Resources, pod.Spec.InitContainers[*].Resources,
+// ResizePolicy and certain metadata. If InPlacePodLevelResourcesVerticalScaling
+// feature is enabled, pod-level resources are also preserved.
+func dropNonResizeUpdates(newPod, oldPod *api.Pod) *api.Pod {
+	// Containers are not allowed to be added, removed, re-ordered, or renamed.
+	// If we detect any of these changes, we will return new podspec as-is and
+	// allow the validation to catch the error and drop the update.
+	if len(newPod.Spec.Containers) != len(oldPod.Spec.Containers) || len(newPod.Spec.InitContainers) != len(oldPod.Spec.InitContainers) {
+		return newPod
+	}
+
+	// Preserve the incoming pod-level resource from the new pod object.
+	newPodResources := newPod.Spec.Resources
+
+	newVolumes := dropNonResizeUpdatesForVolumes(newPod.Spec.Volumes, oldPod.Spec.Volumes)
+
+	containers := dropNonResizeUpdatesForContainers(newPod.Spec.Containers, oldPod.Spec.Containers)
+	initContainers := dropNonResizeUpdatesForContainers(newPod.Spec.InitContainers, oldPod.Spec.InitContainers)
+
+	newPod.Spec = oldPod.Spec
+	// If PodLevelResources and InPlacePodLevelResourcesVerticalScaling feature gates is enabled,
+	// restore the saved pod-level resource requests to the new pod's spec.
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) {
+		newPod.Spec.Resources = newPodResources
+	}
+
+	newPod.Status = oldPod.Status
+	metav1.ResetObjectMetaForStatus(&newPod.ObjectMeta, &oldPod.ObjectMeta)
+
+	newPod.Spec.Containers = containers
+	newPod.Spec.InitContainers = initContainers
+	newPod.Spec.Volumes = newVolumes
+
+	return newPod
+}
+
+func dropNonResizeUpdatesForContainers(new, old []api.Container) []api.Container {
+	if len(new) == 0 {
+		return new
+	}
+
+	oldCopyWithMergedResources := make([]api.Container, len(old))
+	copy(oldCopyWithMergedResources, old)
+
+	for i, ctr := range new {
+		if oldCopyWithMergedResources[i].Name != new[i].Name {
+			// This is an attempt to reorder or rename a container, which is not allowed.
+			// Allow validation to catch this error.
+			return new
+		}
+		oldCopyWithMergedResources[i].Resources = ctr.Resources
+		oldCopyWithMergedResources[i].ResizePolicy = ctr.ResizePolicy
+	}
+
+	return oldCopyWithMergedResources
+}
+
+func dropNonResizeUpdatesForVolumes(new, old []api.Volume) []api.Volume {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScalingMemoryBackedVolumes) {
+		return old
+	}
+	return new
+}
+
+func (podResizeStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newPod := obj.(*api.Pod)
+	oldPod := old.(*api.Pod)
+
+	*newPod = *dropNonResizeUpdates(newPod, oldPod)
+
+	// When pod-level resources are set or updated via resize, apply defaulting
+	// so any unmanaged resources (e.g. memory when only CPU existed) are complete and consistent.
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourcesFixDefaulting) {
+		if newPod.Spec.Resources == nil && oldPod.Spec.Resources != nil {
+			// preserve existing PLR for requests from potentially PLR-unaware clients that completely dropped the field
+			newPod.Spec.Resources = oldPod.Spec.Resources.DeepCopy()
+		}
+
+		if newPod.Spec.Resources != nil {
+			podutil.DefaultPodLevelResources(newPod)
+		}
+	}
+
+	podutil.DropDisabledPodFields(newPod, oldPod)
+	updatePodGeneration(newPod, oldPod)
+}
+
+func (podResizeStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	newPod := obj.(*api.Pod)
+	oldPod := old.(*api.Pod)
+	opts := corevalidation.GetValidationOptionsFromPodSpecAndMeta(&newPod.Spec, &oldPod.Spec, &newPod.ObjectMeta, &oldPod.ObjectMeta)
+	opts.ResourceIsPod = true
+	return corevalidation.ValidatePodResize(newPod, oldPod, opts)
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (podResizeStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
+// GetResetFieldsFilter returns a set of fields filter reset by the strategy
+// and should not be modified by the user.
+func (p podResizeStrategy) GetResetFieldsFilter() map[fieldpath.APIVersion]fieldpath.Filter {
+	return map[fieldpath.APIVersion]fieldpath.Filter{
+		"v1": p.resetFieldsFilter,
+	}
+}
+
+// podDynamicStrategy is the strategy for the pods/dynamic subresource, which
+// allows an expanded set of mutations.
+type podDynamicStrategy struct {
+	podStrategy
+}
+
+// DynamicStrategy wraps and exports the used podStrategy for the storage package.
+var DynamicStrategy = podDynamicStrategy{Strategy}
+
+func (podDynamicStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newPod := obj.(*api.Pod)
+	oldPod := old.(*api.Pod)
+	newPod.Status = oldPod.Status
+
+	// Pod-level resources are defaulted the same way as for a resize.
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourcesFixDefaulting) {
+		if newPod.Spec.Resources == nil && oldPod.Spec.Resources != nil {
+			// preserve existing PLR for requests from potentially PLR-unaware clients that completely dropped the field
+			newPod.Spec.Resources = oldPod.Spec.Resources.DeepCopy()
+		}
+		if newPod.Spec.Resources != nil {
+			podutil.DefaultPodLevelResources(newPod)
+		}
+	}
+
+	podutil.DropDisabledPodFields(newPod, oldPod)
+	updatePodGeneration(newPod, oldPod)
+}
+
+func (podDynamicStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	newPod := obj.(*api.Pod)
+	oldPod := old.(*api.Pod)
+	opts := corevalidation.GetValidationOptionsFromPodSpecAndMeta(&newPod.Spec, &oldPod.Spec, &newPod.ObjectMeta, &oldPod.ObjectMeta)
+	opts.ResourceIsPod = true
+	return corevalidation.ValidatePodDynamicUpdate(newPod, oldPod, opts)
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (podDynamicStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
 	return nil
 }
 
@@ -328,12 +583,7 @@ func ToSelectableFields(pod *api.Pod) fields.Set {
 	podSpecificFieldsSet["spec.restartPolicy"] = string(pod.Spec.RestartPolicy)
 	podSpecificFieldsSet["spec.schedulerName"] = string(pod.Spec.SchedulerName)
 	podSpecificFieldsSet["spec.serviceAccountName"] = string(pod.Spec.ServiceAccountName)
-	if pod.Spec.SecurityContext != nil {
-		podSpecificFieldsSet["spec.hostNetwork"] = strconv.FormatBool(pod.Spec.SecurityContext.HostNetwork)
-	} else {
-		// default to false
-		podSpecificFieldsSet["spec.hostNetwork"] = strconv.FormatBool(false)
-	}
+	podSpecificFieldsSet["spec.hostNetwork"] = strconv.FormatBool(pod.Spec.HostNetwork)
 	podSpecificFieldsSet["status.phase"] = string(pod.Status.Phase)
 	// TODO: add podIPs as a downward API value(s) with proper format
 	podIP := ""
@@ -435,7 +685,7 @@ func LogLocation(
 	// Try to figure out a container
 	// If a container was provided, it must be valid
 	container := opts.Container
-	container, err = validateContainer(container, pod)
+	container, err = validateContainer(container, pod, true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -469,6 +719,10 @@ func LogLocation(
 	}
 	if opts.LimitBytes != nil {
 		params.Add("limitBytes", strconv.FormatInt(*opts.LimitBytes, 10))
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLogsQuerySplitStreams) {
+		// With defaulters, We can be confident that opts.Stream is not nil here.
+		params.Add("stream", string(*opts.Stream))
 	}
 	loc := &url.URL{
 		Scheme:   nodeInfo.Scheme,
@@ -548,7 +802,7 @@ func AttachLocation(
 	connInfo client.ConnectionInfoGetter,
 	name string,
 	opts *api.PodAttachOptions,
-) (*url.URL, http.RoundTripper, error) {
+) (*url.URL, *client.ConnectionInfo, error) {
 	return streamLocation(ctx, getter, connInfo, name, opts, opts.Container, "attach")
 }
 
@@ -560,7 +814,7 @@ func ExecLocation(
 	connInfo client.ConnectionInfoGetter,
 	name string,
 	opts *api.PodExecOptions,
-) (*url.URL, http.RoundTripper, error) {
+) (*url.URL, *client.ConnectionInfo, error) {
 	return streamLocation(ctx, getter, connInfo, name, opts, opts.Container, "exec")
 }
 
@@ -572,7 +826,7 @@ func streamLocation(
 	opts runtime.Object,
 	container,
 	path string,
-) (*url.URL, http.RoundTripper, error) {
+) (*url.URL, *client.ConnectionInfo, error) {
 	pod, err := getPod(ctx, getter, name)
 	if err != nil {
 		return nil, nil, err
@@ -580,7 +834,7 @@ func streamLocation(
 
 	// Try to figure out a container
 	// If a container was provided, it must be valid
-	container, err = validateContainer(container, pod)
+	container, err = validateContainer(container, pod, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -604,7 +858,7 @@ func streamLocation(
 		Path:     fmt.Sprintf("/%s/%s/%s/%s", path, pod.Namespace, pod.Name, container),
 		RawQuery: params.Encode(),
 	}
-	return loc, nodeInfo.Transport, nil
+	return loc, nodeInfo, nil
 }
 
 // PortForwardLocation returns the port-forward URL for a pod.
@@ -614,7 +868,7 @@ func PortForwardLocation(
 	connInfo client.ConnectionInfoGetter,
 	name string,
 	opts *api.PodPortForwardOptions,
-) (*url.URL, http.RoundTripper, error) {
+) (*url.URL, *client.ConnectionInfo, error) {
 	pod, err := getPod(ctx, getter, name)
 	if err != nil {
 		return nil, nil, err
@@ -639,11 +893,12 @@ func PortForwardLocation(
 		Path:     fmt.Sprintf("/portForward/%s/%s", pod.Namespace, pod.Name),
 		RawQuery: params.Encode(),
 	}
-	return loc, nodeInfo.Transport, nil
+	return loc, nodeInfo, nil
 }
 
-// validateContainer validate container is valid for pod, return valid container
-func validateContainer(container string, pod *api.Pod) (string, error) {
+// validateContainer validate container is valid for pod, return valid container. If allowRemoved
+// is set, a regular container removed through pods/dynamic that still has a status is also valid.
+func validateContainer(container string, pod *api.Pod, allowRemoved bool) (string, error) {
 	if len(container) == 0 {
 		switch len(pod.Spec.Containers) {
 		case 1:
@@ -659,8 +914,11 @@ func validateContainer(container string, pod *api.Pod) (string, error) {
 			errStr := fmt.Sprintf("a container name must be specified for pod %s, choose one of: %s", pod.Name, containerNames)
 			return "", errors.NewBadRequest(errStr)
 		}
-	} else {
-		if !podHasContainerWithName(pod, container) {
+	} else if !podHasContainerWithName(pod, container) {
+		// A container removed through pods/dynamic keeps its status until the kubelet has cleaned
+		// it up, and can be inspected until then.
+		_, hasStatus := podutil.GetContainerStatus(pod.Status.ContainerStatuses, container)
+		if !allowRemoved || !utilfeature.DefaultFeatureGate.Enabled(features.DynamicContainers) || !hasStatus {
 			return "", errors.NewBadRequest(fmt.Sprintf("container %s is not valid for pod %s", container, pod.Name))
 		}
 	}
@@ -668,11 +926,79 @@ func validateContainer(container string, pod *api.Pod) (string, error) {
 	return container, nil
 }
 
-// applyWaitingForSchedulingGatesCondition adds a {type:PodScheduled, reason:WaitingForGates} condition
+// applyLabelKeysToLabelSelector obtains the label value from the given label set by the key in labelKeys,
+// and merge to LabelSelector with the given operator:
+func applyLabelKeysToLabelSelector(labelSelector *metav1.LabelSelector, labelKeys []string, operator metav1.LabelSelectorOperator, podLabels map[string]string) {
+	for _, key := range labelKeys {
+		if value, ok := podLabels[key]; ok {
+			labelSelector.MatchExpressions = append(labelSelector.MatchExpressions, metav1.LabelSelectorRequirement{
+				Key:      key,
+				Operator: operator,
+				Values:   []string{value},
+			})
+		}
+	}
+}
+
+// applyMatchLabelKeysAndMismatchLabelKeys obtains the labels from the pod labels by the key in matchLabelKeys or mismatchLabelKeys,
+// and merge to LabelSelector of PodAffinityTerm depending on field:
+// - If matchLabelKeys, key in (value) is merged with LabelSelector.
+// - If mismatchLabelKeys, key notin (value) is merged with LabelSelector.
+func applyMatchLabelKeysAndMismatchLabelKeys(term *api.PodAffinityTerm, label map[string]string) {
+	if (len(term.MatchLabelKeys) == 0 && len(term.MismatchLabelKeys) == 0) || term.LabelSelector == nil {
+		// If LabelSelector is nil, we don't need to apply label keys to it because nil-LabelSelector is match none.
+		return
+	}
+
+	applyLabelKeysToLabelSelector(term.LabelSelector, term.MatchLabelKeys, metav1.LabelSelectorOpIn, label)
+	applyLabelKeysToLabelSelector(term.LabelSelector, term.MismatchLabelKeys, metav1.LabelSelectorOpNotIn, label)
+}
+
+func mutatePodAffinity(pod *api.Pod) {
+	if pod.Spec.Affinity == nil {
+		return
+	}
+	if affinity := pod.Spec.Affinity.PodAffinity; affinity != nil {
+		for i := range affinity.PreferredDuringSchedulingIgnoredDuringExecution {
+			applyMatchLabelKeysAndMismatchLabelKeys(&affinity.PreferredDuringSchedulingIgnoredDuringExecution[i].PodAffinityTerm, pod.Labels)
+		}
+		for i := range affinity.RequiredDuringSchedulingIgnoredDuringExecution {
+			applyMatchLabelKeysAndMismatchLabelKeys(&affinity.RequiredDuringSchedulingIgnoredDuringExecution[i], pod.Labels)
+		}
+	}
+	if affinity := pod.Spec.Affinity.PodAntiAffinity; affinity != nil {
+		for i := range affinity.PreferredDuringSchedulingIgnoredDuringExecution {
+			applyMatchLabelKeysAndMismatchLabelKeys(&affinity.PreferredDuringSchedulingIgnoredDuringExecution[i].PodAffinityTerm, pod.Labels)
+		}
+		for i := range affinity.RequiredDuringSchedulingIgnoredDuringExecution {
+			applyMatchLabelKeysAndMismatchLabelKeys(&affinity.RequiredDuringSchedulingIgnoredDuringExecution[i], pod.Labels)
+		}
+	}
+}
+
+func applyMatchLabelKeys(constraint *api.TopologySpreadConstraint, labels map[string]string) {
+	if len(constraint.MatchLabelKeys) == 0 || constraint.LabelSelector == nil {
+		// If LabelSelector is nil, we don't need to apply label keys to it because nil-LabelSelector is match none.
+		return
+	}
+
+	applyLabelKeysToLabelSelector(constraint.LabelSelector, constraint.MatchLabelKeys, metav1.LabelSelectorOpIn, labels)
+}
+
+func mutateTopologySpreadConstraints(pod *api.Pod) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.MatchLabelKeysInPodTopologySpread) || !utilfeature.DefaultFeatureGate.Enabled(features.MatchLabelKeysInPodTopologySpreadSelectorMerge) || pod.Spec.TopologySpreadConstraints == nil {
+		return
+	}
+	topologySpreadConstraints := pod.Spec.TopologySpreadConstraints
+	for i := range topologySpreadConstraints {
+		applyMatchLabelKeys(&topologySpreadConstraints[i], pod.Labels)
+	}
+}
+
+// applySchedulingGatedCondition adds a {type:PodScheduled, reason:SchedulingGated} condition
 // to a new-created Pod if necessary.
-func applyWaitingForSchedulingGatesCondition(pod *api.Pod) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.PodSchedulingReadiness) ||
-		len(pod.Spec.SchedulingGates) == 0 {
+func applySchedulingGatedCondition(pod *api.Pod) {
+	if len(pod.Spec.SchedulingGates) == 0 {
 		return
 	}
 
@@ -683,10 +1009,76 @@ func applyWaitingForSchedulingGatesCondition(pod *api.Pod) {
 		}
 	}
 
-	pod.Status.Conditions = append(pod.Status.Conditions, api.PodCondition{
+	podutil.UpdatePodCondition(&pod.Status, &api.PodCondition{
 		Type:    api.PodScheduled,
 		Status:  api.ConditionFalse,
-		Reason:  api.PodReasonSchedulingGated,
+		Reason:  apiv1.PodReasonSchedulingGated,
 		Message: "Scheduling is blocked due to non-empty scheduling gates",
 	})
+}
+
+// applyAppArmorVersionSkew implements the version skew behavior described in:
+// https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/24-apparmor#version-skew-strategy
+func applyAppArmorVersionSkew(ctx context.Context, pod *api.Pod) {
+	if pod.Spec.OS != nil && pod.Spec.OS.Name == api.Windows {
+		return
+	}
+
+	var podProfile *api.AppArmorProfile
+	if pod.Spec.SecurityContext != nil {
+		podProfile = pod.Spec.SecurityContext.AppArmorProfile
+	}
+
+	// Handle the containers of the pod
+	podutil.VisitContainers(&pod.Spec, podutil.AllFeatureEnabledContainers(),
+		func(ctr *api.Container, _ podutil.ContainerType) bool {
+			// get possible annotation and field
+			key := api.DeprecatedAppArmorAnnotationKeyPrefix + ctr.Name
+			annotation, hasAnnotation := pod.Annotations[key]
+
+			var containerProfile *api.AppArmorProfile
+			if ctr.SecurityContext != nil {
+				containerProfile = ctr.SecurityContext.AppArmorProfile
+			}
+
+			// Sync deprecated AppArmor annotations to fields
+			if hasAnnotation && containerProfile == nil {
+				newField := podutil.ApparmorFieldForAnnotation(annotation)
+				if errs := corevalidation.ValidateAppArmorProfileField(newField, &field.Path{}); len(errs) > 0 {
+					// Skip copying invalid value.
+					newField = nil
+				}
+
+				// warn if we had an annotation that we couldn't derive a valid field from
+				deprecationWarning := newField == nil
+
+				// Only copy the annotation to the field if it is different from the pod-level profile.
+				if newField != nil && !apiequality.Semantic.DeepEqual(newField, podProfile) {
+					if ctr.SecurityContext == nil {
+						ctr.SecurityContext = &api.SecurityContext{}
+					}
+					ctr.SecurityContext.AppArmorProfile = newField
+					// warn if there was an annotation without a corresponding field
+					deprecationWarning = true
+				}
+
+				if deprecationWarning {
+					// Note: annotation deprecation warning must be added here rather than the
+					// typical WarningsOnCreate path to emit the warning before syncing the
+					// annotations & fields.
+					fldPath := field.NewPath("metadata", "annotations").Key(key)
+					warning.AddWarning(ctx, "", fmt.Sprintf(`%s: deprecated since v1.30; use the "appArmorProfile" field instead`, fldPath))
+				}
+			}
+
+			return true
+		})
+}
+
+// updatePodGeneration bumps metadata.generation if needed for any updates
+// to the podspec.
+func updatePodGeneration(newPod, oldPod *api.Pod) {
+	if !apiequality.Semantic.DeepEqual(newPod.Spec, oldPod.Spec) {
+		newPod.Generation++
+	}
 }

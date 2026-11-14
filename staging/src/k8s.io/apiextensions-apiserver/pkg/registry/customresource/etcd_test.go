@@ -41,8 +41,8 @@ import (
 	"k8s.io/apiserver/pkg/registry/rest"
 	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
 
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
 	apiextensionsinternal "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver"
 	"k8s.io/apiextensions-apiserver/pkg/crdserverscheme"
 	"k8s.io/apiextensions-apiserver/pkg/registry/customresource"
@@ -92,7 +92,7 @@ func newStorage(t *testing.T) (customresource.CustomResourceStorage, *etcd3testi
 	}
 	table, _ := tableconvertor.New(headers)
 
-	storage := customresource.NewStorage(
+	storage, err := customresource.NewStorage(
 		groupResource,
 		groupResource,
 		kind,
@@ -106,12 +106,16 @@ func newStorage(t *testing.T) (customresource.CustomResourceStorage, *etcd3testi
 			nil,
 			status,
 			scale,
+			nil,
 		),
 		restOptions,
 		[]string{"all"},
 		table,
 		managedfields.ResourcePathMappings{},
 	)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
 
 	return storage, server
 }

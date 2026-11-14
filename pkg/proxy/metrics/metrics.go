@@ -17,11 +17,16 @@ limitations under the License.
 package metrics
 
 import (
+	"strings"
 	"sync"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
+	"k8s.io/kubernetes/pkg/features"
+	kubeproxyconfig "k8s.io/kubernetes/pkg/proxy/apis/config"
 )
 
 const kubeProxySubsystem = "kubeproxy"
@@ -29,7 +34,7 @@ const kubeProxySubsystem = "kubeproxy"
 var (
 	// SyncProxyRulesLatency is the latency of one round of kube-proxy syncing proxy
 	// rules. (With the iptables proxy, this includes both full and partial syncs.)
-	SyncProxyRulesLatency = metrics.NewHistogram(
+	SyncProxyRulesLatency = metrics.NewHistogramVec(
 		&metrics.HistogramOpts{
 			Subsystem:      kubeProxySubsystem,
 			Name:           "sync_proxy_rules_duration_seconds",
@@ -37,10 +42,11 @@ var (
 			Buckets:        metrics.ExponentialBuckets(0.001, 2, 15),
 			StabilityLevel: metrics.ALPHA,
 		},
+		[]string{"ip_family"},
 	)
 
 	// SyncFullProxyRulesLatency is the latency of one round of full rule syncing.
-	SyncFullProxyRulesLatency = metrics.NewHistogram(
+	SyncFullProxyRulesLatency = metrics.NewHistogramVec(
 		&metrics.HistogramOpts{
 			Subsystem:      kubeProxySubsystem,
 			Name:           "sync_full_proxy_rules_duration_seconds",
@@ -48,10 +54,11 @@ var (
 			Buckets:        metrics.ExponentialBuckets(0.001, 2, 15),
 			StabilityLevel: metrics.ALPHA,
 		},
+		[]string{"ip_family"},
 	)
 
 	// SyncPartialProxyRulesLatency is the latency of one round of partial rule syncing.
-	SyncPartialProxyRulesLatency = metrics.NewHistogram(
+	SyncPartialProxyRulesLatency = metrics.NewHistogramVec(
 		&metrics.HistogramOpts{
 			Subsystem:      kubeProxySubsystem,
 			Name:           "sync_partial_proxy_rules_duration_seconds",
@@ -59,17 +66,19 @@ var (
 			Buckets:        metrics.ExponentialBuckets(0.001, 2, 15),
 			StabilityLevel: metrics.ALPHA,
 		},
+		[]string{"ip_family"},
 	)
 
 	// SyncProxyRulesLastTimestamp is the timestamp proxy rules were last
 	// successfully synced.
-	SyncProxyRulesLastTimestamp = metrics.NewGauge(
+	SyncProxyRulesLastTimestamp = metrics.NewGaugeVec(
 		&metrics.GaugeOpts{
 			Subsystem:      kubeProxySubsystem,
 			Name:           "sync_proxy_rules_last_timestamp_seconds",
 			Help:           "The last time proxy rules were successfully synced",
 			StabilityLevel: metrics.ALPHA,
 		},
+		[]string{"ip_family"},
 	)
 
 	// NetworkProgrammingLatency is defined as the time it took to program the network - from the time
@@ -79,7 +88,7 @@ var (
 	// Note that the metrics is partially based on the time exported by the endpoints controller on
 	// the master machine. The measurement may be inaccurate if there is a clock drift between the
 	// node and master machine.
-	NetworkProgrammingLatency = metrics.NewHistogram(
+	NetworkProgrammingLatency = metrics.NewHistogramVec(
 		&metrics.HistogramOpts{
 			Subsystem: kubeProxySubsystem,
 			Name:      "network_programming_duration_seconds",
@@ -92,6 +101,7 @@ var (
 			),
 			StabilityLevel: metrics.ALPHA,
 		},
+		[]string{"ip_family"},
 	)
 
 	// EndpointChangesPending is the number of pending endpoint changes that
@@ -138,50 +148,84 @@ var (
 		},
 	)
 
-	// IptablesRestoreFailuresTotal is the number of iptables restore failures that the proxy has
+	// iptablesCTStateInvalidDroppedPacketsDescription describe the metrics for the number of packets dropped
+	// by iptables which were marked INVALID by conntrack.
+	iptablesCTStateInvalidDroppedPacketsDescription = metrics.NewDesc(
+		"kubeproxy_iptables_ct_state_invalid_dropped_packets_total",
+		"packets dropped by iptables to work around conntrack problems",
+		nil, nil, metrics.ALPHA, "")
+	IPTablesCTStateInvalidDroppedNFAcctCounter = "ct_state_invalid_dropped_pkts"
+
+	// IPTablesRestoreFailuresTotal is the number of iptables restore failures that the proxy has
 	// seen.
-	IptablesRestoreFailuresTotal = metrics.NewCounter(
+	IPTablesRestoreFailuresTotal = metrics.NewCounterVec(
 		&metrics.CounterOpts{
 			Subsystem:      kubeProxySubsystem,
 			Name:           "sync_proxy_rules_iptables_restore_failures_total",
 			Help:           "Cumulative proxy iptables restore failures",
 			StabilityLevel: metrics.ALPHA,
 		},
+		[]string{"ip_family"},
 	)
 
-	// IptablesPartialRestoreFailuresTotal is the number of iptables *partial* restore
+	// IPTablesPartialRestoreFailuresTotal is the number of iptables *partial* restore
 	// failures (resulting in a fall back to a full restore) that the proxy has seen.
-	IptablesPartialRestoreFailuresTotal = metrics.NewCounter(
+	IPTablesPartialRestoreFailuresTotal = metrics.NewCounterVec(
 		&metrics.CounterOpts{
 			Subsystem:      kubeProxySubsystem,
 			Name:           "sync_proxy_rules_iptables_partial_restore_failures_total",
 			Help:           "Cumulative proxy iptables partial restore failures",
 			StabilityLevel: metrics.ALPHA,
 		},
+		[]string{"ip_family"},
 	)
 
-	// IptablesRulesTotal is the total number of iptables rules that the iptables
+	// IPTablesRulesTotal is the total number of iptables rules that the iptables
 	// proxy has installed.
-	IptablesRulesTotal = metrics.NewGaugeVec(
+	IPTablesRulesTotal = metrics.NewGaugeVec(
 		&metrics.GaugeOpts{
 			Subsystem:      kubeProxySubsystem,
 			Name:           "sync_proxy_rules_iptables_total",
 			Help:           "Total number of iptables rules owned by kube-proxy",
 			StabilityLevel: metrics.ALPHA,
 		},
-		[]string{"table"},
+		[]string{"table", "ip_family"},
 	)
 
-	// IptablesRulesLastSync is the number of iptables rules that the iptables proxy
+	// IPTablesRulesLastSync is the number of iptables rules that the iptables proxy
 	// updated in the last sync.
-	IptablesRulesLastSync = metrics.NewGaugeVec(
+	IPTablesRulesLastSync = metrics.NewGaugeVec(
 		&metrics.GaugeOpts{
 			Subsystem:      kubeProxySubsystem,
 			Name:           "sync_proxy_rules_iptables_last",
 			Help:           "Number of iptables rules written by kube-proxy in last sync",
 			StabilityLevel: metrics.ALPHA,
 		},
-		[]string{"table"},
+		[]string{"table", "ip_family"},
+	)
+
+	// NFTablesSyncFailuresTotal is the number of nftables sync failures that the
+	// proxy has seen.
+	NFTablesSyncFailuresTotal = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      kubeProxySubsystem,
+			Name:           "sync_proxy_rules_nftables_sync_failures_total",
+			Help:           "Cumulative proxy nftables sync failures",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"ip_family"},
+	)
+
+	// NFTablesCleanupFailuresTotal is the number of nftables stale chain cleanup
+	// failures that the proxy has seen.
+	NFTablesCleanupFailuresTotal = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      kubeProxySubsystem,
+			Name:           "sync_proxy_rules_nftables_cleanup_failures_total",
+			Help:           "Cumulative proxy nftables cleanup failures",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"ip_family"},
 	)
 
 	// ProxyHealthzTotal is the number of returned HTTP Status for each
@@ -211,13 +255,14 @@ var (
 	// SyncProxyRulesLastQueuedTimestamp is the last time a proxy sync was
 	// requested. If this is much larger than
 	// kubeproxy_sync_proxy_rules_last_timestamp_seconds, then something is hung.
-	SyncProxyRulesLastQueuedTimestamp = metrics.NewGauge(
+	SyncProxyRulesLastQueuedTimestamp = metrics.NewGaugeVec(
 		&metrics.GaugeOpts{
 			Subsystem:      kubeProxySubsystem,
 			Name:           "sync_proxy_rules_last_queued_timestamp_seconds",
 			Help:           "The last time a sync of proxy rules was queued",
 			StabilityLevel: metrics.ALPHA,
 		},
+		[]string{"ip_family"},
 	)
 
 	// SyncProxyRulesNoLocalEndpointsTotal is the total number of rules that do
@@ -230,33 +275,193 @@ var (
 			Help:           "Number of services with a Local traffic policy and no endpoints",
 			StabilityLevel: metrics.ALPHA,
 		},
-		[]string{"traffic_policy"},
+		[]string{"traffic_policy", "ip_family"},
+	)
+
+	// WinKernelLBCreateFailure is the number of winkernel lb create failures that the proxy has seen.
+	WinKernelLBCreateFailure = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      kubeProxySubsystem,
+			Name:           "sync_proxy_rules_winkernel_lb_create_failures_total",
+			Help:           "Cumulative proxy winkernel lb create failures",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"ip_family", "lb_type", "error"},
+	)
+
+	// WinKernelLBUpdateFailure is the number of winkernel lb update failures that the proxy has seen.
+	WinKernelLBUpdateFailure = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      kubeProxySubsystem,
+			Name:           "sync_proxy_rules_winkernel_lb_update_failures_total",
+			Help:           "Cumulative proxy winkernel lb update failures",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"ip_family", "lb_type", "error"},
+	)
+
+	// WinKernelLBDeleteFailure is the number of winkernel lb delete failures that the proxy has seen.
+	WinKernelLBDeleteFailure = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      kubeProxySubsystem,
+			Name:           "sync_proxy_rules_winkernel_lb_delete_failures_total",
+			Help:           "Cumulative proxy winkernel lb delete failures",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"ip_family", "lb_type", "error"},
+	)
+
+	// localhostNodePortsAcceptedPacketsDescription describe the metrics for the number of packets accepted
+	// by iptables which were destined for nodeports on loopback interface.
+	localhostNodePortsAcceptedPacketsDescription = metrics.NewDesc(
+		"kubeproxy_iptables_localhost_nodeports_accepted_packets_total",
+		"Number of packets accepted on nodeports of loopback interface",
+		nil, nil, metrics.ALPHA, "")
+	LocalhostNodePortAcceptedNFAcctCounter = "localhost_nps_accepted_pkts"
+
+	// LocalhostNodePortListeners is the number of active localhost NodePort
+	// userspace proxy listeners currently bound by kube-proxy.
+	LocalhostNodePortListeners = metrics.NewGaugeVec(
+		&metrics.GaugeOpts{
+			Subsystem:      kubeProxySubsystem,
+			Name:           "nftables_localhost_nodeport_listeners",
+			Help:           "Number of active localhost NodePort userspace proxy listeners.",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"ip_family"},
+	)
+
+	// LocalhostNodePortListenerCreationFailuresTotal is the number of times
+	// kube-proxy failed to bind a localhost NodePort userspace proxy listener.
+	LocalhostNodePortListenerCreationFailuresTotal = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      kubeProxySubsystem,
+			Name:           "nftables_localhost_nodeport_listener_creation_failures_total",
+			Help:           "Number of localhost NodePort userspace proxy listener creation failures.",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"ip_family"},
+	)
+
+	// localhostNodePortRejectedPacketsDescription describes the counter for packets
+	// rejected on localhost NodePorts.
+	localhostNodePortRejectedPacketsDescription = metrics.NewDesc(
+		"kubeproxy_nftables_localhost_nodeport_rejected_packets_total",
+		"Number of packets rejected on localhost NodePorts. UDP and SCTP are always rejected; TCP is rejected when the localhost NodePort proxy is not running",
+		[]string{"ip_family", "protocol"}, nil, metrics.ALPHA, "")
+
+	// ReconcileConntrackFlowsLatency is the latency of one round of kube-proxy conntrack flows reconciliation.
+	ReconcileConntrackFlowsLatency = metrics.NewHistogramVec(
+		&metrics.HistogramOpts{
+			Subsystem:      kubeProxySubsystem,
+			Name:           "conntrack_reconciler_sync_duration_seconds",
+			Help:           "ReconcileConntrackFlowsLatency latency in seconds",
+			Buckets:        metrics.ExponentialBuckets(0.001, 2, 15),
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"ip_family"},
+	)
+
+	// ReconcileConntrackFlowsDeletedEntriesTotal is the number of entries deleted by conntrack reconciler.
+	ReconcileConntrackFlowsDeletedEntriesTotal = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      kubeProxySubsystem,
+			Name:           "conntrack_reconciler_deleted_entries_total",
+			Help:           "Cumulative conntrack flows deleted by conntrack reconciler",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"ip_family"},
 	)
 )
+
+// LocalhostNodePortRejectedProtocols are the NodePort protocols the userspace
+// proxy cannot serve; localhost traffic for them is rejected and counted.
+var LocalhostNodePortRejectedProtocols = []v1.Protocol{v1.ProtocolUDP, v1.ProtocolSCTP}
+
+// LocalhostNodePortRejectableProtocols are all NodePort protocols whose localhost
+// traffic kube-proxy may reject and count. UDP / SCTP are always rejected, TCP
+// is rejected when the localhost NodePort proxy is not running.
+var LocalhostNodePortRejectableProtocols = []v1.Protocol{v1.ProtocolTCP, v1.ProtocolUDP, v1.ProtocolSCTP}
+
+// LocalhostNodePortRejectedCounterName returns the name of the nftables named
+// counter that the kube-proxy table increments for localhost NodePort packets
+// rejected because their protocol is unsupported.
+func LocalhostNodePortRejectedCounterName(protocol v1.Protocol) string {
+	return "localhost-nodeport-rejected-" + strings.ToLower(string(protocol))
+}
 
 var registerMetricsOnce sync.Once
 
 // RegisterMetrics registers kube-proxy metrics.
-func RegisterMetrics() {
+func RegisterMetrics(mode kubeproxyconfig.ProxyMode) {
 	registerMetricsOnce.Do(func() {
+		// Core kube-proxy metrics for all backends
 		legacyregistry.MustRegister(SyncProxyRulesLatency)
-		legacyregistry.MustRegister(SyncFullProxyRulesLatency)
-		legacyregistry.MustRegister(SyncPartialProxyRulesLatency)
+		legacyregistry.MustRegister(SyncProxyRulesLastQueuedTimestamp)
 		legacyregistry.MustRegister(SyncProxyRulesLastTimestamp)
-		legacyregistry.MustRegister(NetworkProgrammingLatency)
 		legacyregistry.MustRegister(EndpointChangesPending)
 		legacyregistry.MustRegister(EndpointChangesTotal)
 		legacyregistry.MustRegister(ServiceChangesPending)
 		legacyregistry.MustRegister(ServiceChangesTotal)
-		legacyregistry.MustRegister(IptablesRulesTotal)
-		legacyregistry.MustRegister(IptablesRulesLastSync)
-		legacyregistry.MustRegister(IptablesRestoreFailuresTotal)
-		legacyregistry.MustRegister(IptablesPartialRestoreFailuresTotal)
-		legacyregistry.MustRegister(SyncProxyRulesLastQueuedTimestamp)
-		legacyregistry.MustRegister(SyncProxyRulesNoLocalEndpointsTotal)
 		legacyregistry.MustRegister(ProxyHealthzTotal)
 		legacyregistry.MustRegister(ProxyLivezTotal)
 
+		// FIXME: winkernel does not implement these
+		legacyregistry.MustRegister(NetworkProgrammingLatency)
+		legacyregistry.MustRegister(SyncProxyRulesNoLocalEndpointsTotal)
+
+		switch mode {
+		case kubeproxyconfig.ProxyModeIPTables:
+			iptablesCTStateInvalidDroppedMetricCollector := newNFAcctMetricCollector(IPTablesCTStateInvalidDroppedNFAcctCounter, iptablesCTStateInvalidDroppedPacketsDescription)
+			if iptablesCTStateInvalidDroppedMetricCollector != nil {
+				legacyregistry.CustomMustRegister(iptablesCTStateInvalidDroppedMetricCollector)
+			}
+			localhostNodePortsAcceptedMetricsCollector := newNFAcctMetricCollector(LocalhostNodePortAcceptedNFAcctCounter, localhostNodePortsAcceptedPacketsDescription)
+			if localhostNodePortsAcceptedMetricsCollector != nil {
+				legacyregistry.CustomMustRegister(localhostNodePortsAcceptedMetricsCollector)
+			}
+			legacyregistry.MustRegister(SyncFullProxyRulesLatency)
+			legacyregistry.MustRegister(SyncPartialProxyRulesLatency)
+			legacyregistry.MustRegister(IPTablesRestoreFailuresTotal)
+			legacyregistry.MustRegister(IPTablesPartialRestoreFailuresTotal)
+			legacyregistry.MustRegister(IPTablesRulesTotal)
+			legacyregistry.MustRegister(IPTablesRulesLastSync)
+			legacyregistry.MustRegister(ReconcileConntrackFlowsLatency)
+			legacyregistry.MustRegister(ReconcileConntrackFlowsDeletedEntriesTotal)
+
+		case kubeproxyconfig.ProxyModeIPVS:
+			legacyregistry.MustRegister(IPTablesRestoreFailuresTotal)
+			legacyregistry.MustRegister(ReconcileConntrackFlowsLatency)
+			legacyregistry.MustRegister(ReconcileConntrackFlowsDeletedEntriesTotal)
+
+		case kubeproxyconfig.ProxyModeNFTables:
+			legacyregistry.MustRegister(SyncFullProxyRulesLatency)
+			legacyregistry.MustRegister(SyncPartialProxyRulesLatency)
+			legacyregistry.MustRegister(NFTablesSyncFailuresTotal)
+			legacyregistry.MustRegister(NFTablesCleanupFailuresTotal)
+			if utilfeature.DefaultFeatureGate.Enabled(features.KubeProxyNFTablesLocalhostNodePorts) {
+				legacyregistry.MustRegister(LocalhostNodePortListeners)
+				legacyregistry.MustRegister(LocalhostNodePortListenerCreationFailuresTotal)
+				rejectedCounters := make(map[string]string, len(LocalhostNodePortRejectableProtocols))
+				for _, protocol := range LocalhostNodePortRejectableProtocols {
+					rejectedCounters[LocalhostNodePortRejectedCounterName(protocol)] = string(protocol)
+				}
+				if c := newNFTablesCounterMetricCollector(rejectedCounters, localhostNodePortRejectedPacketsDescription); c != nil {
+					legacyregistry.CustomMustRegister(c)
+				}
+			}
+			legacyregistry.MustRegister(ReconcileConntrackFlowsLatency)
+			legacyregistry.MustRegister(ReconcileConntrackFlowsDeletedEntriesTotal)
+
+		case kubeproxyconfig.ProxyModeKernelspace:
+			// Winkernel prometheus metrics.
+			// Cardinality for WinKernelLBCreateFailure, WinKernelLBUpdateFailure, and WinKernelLBDeleteFailure:
+			// ip_family(2) x lb_type(5) x error(5) = 50 max; in practice much lower
+			// since a proxier uses a single ip_family and most error/lb_type combos never fire.
+			legacyregistry.MustRegister(WinKernelLBCreateFailure)
+			legacyregistry.MustRegister(WinKernelLBUpdateFailure)
+			legacyregistry.MustRegister(WinKernelLBDeleteFailure)
+		}
 	})
 }
 

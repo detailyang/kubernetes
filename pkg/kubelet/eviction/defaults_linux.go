@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 /*
 Copyright 2018 The Kubernetes Authors.
@@ -21,8 +20,9 @@ package eviction
 
 // DefaultEvictionHard includes default options for hard eviction.
 var DefaultEvictionHard = map[string]string{
-	"memory.available":  "100Mi",
-	"nodefs.available":  "10%",
-	"nodefs.inodesFree": "5%",
-	"imagefs.available": "15%",
+	"memory.available":   "100Mi",
+	"nodefs.available":   "10%",
+	"nodefs.inodesFree":  "5%",
+	"imagefs.available":  "15%",
+	"imagefs.inodesFree": "5%",
 }

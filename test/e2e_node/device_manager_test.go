@@ -23,7 +23,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 
@@ -32,18 +31,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
-	"k8s.io/klog/v2"
-	kubeletpodresourcesv1 "k8s.io/kubelet/pkg/apis/podresources/v1"
-	"k8s.io/kubernetes/pkg/kubelet/apis/podresources"
-	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
-	"k8s.io/kubernetes/pkg/kubelet/cm/devicemanager/checkpoint"
-	"k8s.io/kubernetes/pkg/kubelet/util"
 	admissionapi "k8s.io/pod-security-admission/api"
 
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
-	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	e2etestfiles "k8s.io/kubernetes/test/e2e/framework/testfiles"
 	testutils "k8s.io/kubernetes/test/utils"
 
@@ -55,226 +48,12 @@ import (
 
 const (
 	devicePluginDir = "/var/lib/kubelet/device-plugins"
-	checkpointName  = "kubelet_internal_checkpoint"
 )
 
 // Serial because the test updates kubelet configuration.
-var _ = SIGDescribe("Device Manager  [Serial] [Feature:DeviceManager][NodeFeature:DeviceManager]", func() {
-	checkpointFullPath := filepath.Join(devicePluginDir, checkpointName)
+var _ = SIGDescribe("Device Manager", framework.WithSerial(), feature.DeviceManager, func() {
 	f := framework.NewDefaultFramework("devicemanager-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
-
-	ginkgo.Context("With SRIOV devices in the system", func() {
-		// this test wants to reproduce what happened in https://github.com/kubernetes/kubernetes/issues/102880
-		ginkgo.It("should be able to recover V1 (aka pre-1.20) checkpoint data and reject pods before device re-registration", func(ctx context.Context) {
-			if sriovdevCount, err := countSRIOVDevices(); err != nil || sriovdevCount == 0 {
-				e2eskipper.Skipf("this test is meant to run on a system with at least one configured VF from SRIOV device")
-			}
-
-			configMap := getSRIOVDevicePluginConfigMap(framework.TestContext.SriovdpConfigMapFile)
-			sd := setupSRIOVConfigOrFail(ctx, f, configMap)
-
-			waitForSRIOVResources(ctx, f, sd)
-
-			cntName := "gu-container"
-			// we create and delete a pod to make sure the internal device manager state contains a pod allocation
-			ginkgo.By(fmt.Sprintf("Successfully admit one guaranteed pod with 1 core, 1 %s device", sd.resourceName))
-			var initCtnAttrs []tmCtnAttribute
-			ctnAttrs := []tmCtnAttribute{
-				{
-					ctnName:       cntName,
-					cpuRequest:    "1000m",
-					cpuLimit:      "1000m",
-					deviceName:    sd.resourceName,
-					deviceRequest: "1",
-					deviceLimit:   "1",
-				},
-			}
-
-			podName := "gu-pod-rec-pre-1"
-			framework.Logf("creating pod %s attrs %v", podName, ctnAttrs)
-			pod := makeTopologyManagerTestPod(podName, ctnAttrs, initCtnAttrs)
-			pod = e2epod.NewPodClient(f).CreateSync(ctx, pod)
-
-			// now we need to simulate a node drain, so we remove all the pods, including the sriov device plugin.
-
-			ginkgo.By("deleting the pod")
-			// note we delete right now because we know the current implementation of devicemanager will NOT
-			// clean up on pod deletion. When this changes, the deletion needs to be done after the test is done.
-			deletePodSyncByName(ctx, f, pod.Name)
-			waitForAllContainerRemoval(ctx, pod.Name, pod.Namespace)
-
-			ginkgo.By("teardown the sriov device plugin")
-			// since we will NOT be recreating the plugin, we clean up everything now
-			teardownSRIOVConfigOrFail(ctx, f, sd)
-
-			ginkgo.By("stopping the kubelet")
-			killKubelet("SIGSTOP")
-
-			ginkgo.By("rewriting the kubelet checkpoint file as v1")
-			err := rewriteCheckpointAsV1(devicePluginDir, checkpointName)
-			// make sure we remove any leftovers
-			defer os.Remove(checkpointFullPath)
-			framework.ExpectNoError(err)
-
-			// this mimics a kubelet restart after the upgrade
-			// TODO: is SIGTERM (less brutal) good enough?
-			ginkgo.By("killing the kubelet")
-			killKubelet("SIGKILL")
-
-			ginkgo.By("waiting for the kubelet to be ready again")
-			// Wait for the Kubelet to be ready.
-			gomega.Eventually(ctx, func(ctx context.Context) bool {
-				nodes, err := e2enode.TotalReady(ctx, f.ClientSet)
-				framework.ExpectNoError(err)
-				return nodes == 1
-			}, time.Minute, time.Second).Should(gomega.BeTrue())
-
-			// note we DO NOT start the sriov device plugin. This is intentional.
-			// issue#102880 reproduces because of a race on startup caused by corrupted device manager
-			// state which leads to v1.Node object not updated on apiserver.
-			// So to hit the issue we need to receive the pod *before* the device plugin registers itself.
-			// The simplest and safest way to reproduce is just avoid to run the device plugin again
-
-			podName = "gu-pod-rec-post-2"
-			framework.Logf("creating pod %s attrs %v", podName, ctnAttrs)
-			pod = makeTopologyManagerTestPod(podName, ctnAttrs, initCtnAttrs)
-
-			pod = e2epod.NewPodClient(f).Create(ctx, pod)
-			err = e2epod.WaitForPodCondition(ctx, f.ClientSet, f.Namespace.Name, pod.Name, "Failed", 30*time.Second, func(pod *v1.Pod) (bool, error) {
-				if pod.Status.Phase != v1.PodPending {
-					return true, nil
-				}
-				return false, nil
-			})
-			framework.ExpectNoError(err)
-			pod, err = e2epod.NewPodClient(f).Get(ctx, pod.Name, metav1.GetOptions{})
-			framework.ExpectNoError(err)
-
-			if pod.Status.Phase != v1.PodFailed {
-				framework.Failf("pod %s not failed: %v", pod.Name, pod.Status)
-			}
-
-			framework.Logf("checking pod %s status reason (%s)", pod.Name, pod.Status.Reason)
-			if !isUnexpectedAdmissionError(pod) {
-				framework.Failf("pod %s failed for wrong reason: %q", pod.Name, pod.Status.Reason)
-			}
-
-			deletePodSyncByName(ctx, f, pod.Name)
-		})
-
-		ginkgo.It("should be able to recover V1 (aka pre-1.20) checkpoint data and update topology info on device re-registration", func(ctx context.Context) {
-			if sriovdevCount, err := countSRIOVDevices(); err != nil || sriovdevCount == 0 {
-				e2eskipper.Skipf("this test is meant to run on a system with at least one configured VF from SRIOV device")
-			}
-
-			endpoint, err := util.LocalEndpoint(defaultPodResourcesPath, podresources.Socket)
-			framework.ExpectNoError(err)
-
-			configMap := getSRIOVDevicePluginConfigMap(framework.TestContext.SriovdpConfigMapFile)
-
-			sd := setupSRIOVConfigOrFail(ctx, f, configMap)
-			waitForSRIOVResources(ctx, f, sd)
-
-			cli, conn, err := podresources.GetV1Client(endpoint, defaultPodResourcesTimeout, defaultPodResourcesMaxSize)
-			framework.ExpectNoError(err)
-
-			resp, err := cli.GetAllocatableResources(ctx, &kubeletpodresourcesv1.AllocatableResourcesRequest{})
-			conn.Close()
-			framework.ExpectNoError(err)
-
-			suitableDevs := 0
-			for _, dev := range resp.GetDevices() {
-				for _, node := range dev.GetTopology().GetNodes() {
-					if node.GetID() != 0 {
-						suitableDevs++
-					}
-				}
-			}
-			if suitableDevs == 0 {
-				teardownSRIOVConfigOrFail(ctx, f, sd)
-				e2eskipper.Skipf("no devices found on NUMA Cell other than 0")
-			}
-
-			cntName := "gu-container"
-			// we create and delete a pod to make sure the internal device manager state contains a pod allocation
-			ginkgo.By(fmt.Sprintf("Successfully admit one guaranteed pod with 1 core, 1 %s device", sd.resourceName))
-			var initCtnAttrs []tmCtnAttribute
-			ctnAttrs := []tmCtnAttribute{
-				{
-					ctnName:       cntName,
-					cpuRequest:    "1000m",
-					cpuLimit:      "1000m",
-					deviceName:    sd.resourceName,
-					deviceRequest: "1",
-					deviceLimit:   "1",
-				},
-			}
-
-			podName := "gu-pod-rec-pre-1"
-			framework.Logf("creating pod %s attrs %v", podName, ctnAttrs)
-			pod := makeTopologyManagerTestPod(podName, ctnAttrs, initCtnAttrs)
-			pod = e2epod.NewPodClient(f).CreateSync(ctx, pod)
-
-			// now we need to simulate a node drain, so we remove all the pods, including the sriov device plugin.
-
-			ginkgo.By("deleting the pod")
-			// note we delete right now because we know the current implementation of devicemanager will NOT
-			// clean up on pod deletion. When this changes, the deletion needs to be done after the test is done.
-			deletePodSyncByName(ctx, f, pod.Name)
-			waitForAllContainerRemoval(ctx, pod.Name, pod.Namespace)
-
-			ginkgo.By("teardown the sriov device plugin")
-			// no need to delete the config now (speed up later)
-			deleteSRIOVPodOrFail(ctx, f, sd)
-
-			ginkgo.By("stopping the kubelet")
-			killKubelet("SIGSTOP")
-
-			ginkgo.By("rewriting the kubelet checkpoint file as v1")
-			err = rewriteCheckpointAsV1(devicePluginDir, checkpointName)
-			// make sure we remove any leftovers
-			defer os.Remove(checkpointFullPath)
-			framework.ExpectNoError(err)
-
-			// this mimics a kubelet restart after the upgrade
-			// TODO: is SIGTERM (less brutal) good enough?
-			ginkgo.By("killing the kubelet")
-			killKubelet("SIGKILL")
-
-			ginkgo.By("waiting for the kubelet to be ready again")
-			// Wait for the Kubelet to be ready.
-			gomega.Eventually(ctx, func(ctx context.Context) bool {
-				nodes, err := e2enode.TotalReady(ctx, f.ClientSet)
-				framework.ExpectNoError(err)
-				return nodes == 1
-			}, time.Minute, time.Second).Should(gomega.BeTrue())
-
-			sd2 := &sriovData{
-				configMap:      sd.configMap,
-				serviceAccount: sd.serviceAccount,
-			}
-			sd2.pod = createSRIOVPodOrFail(ctx, f)
-			ginkgo.DeferCleanup(teardownSRIOVConfigOrFail, f, sd2)
-			waitForSRIOVResources(ctx, f, sd2)
-
-			compareSRIOVResources(sd, sd2)
-
-			cli, conn, err = podresources.GetV1Client(endpoint, defaultPodResourcesTimeout, defaultPodResourcesMaxSize)
-			framework.ExpectNoError(err)
-			defer conn.Close()
-
-			resp2, err := cli.GetAllocatableResources(ctx, &kubeletpodresourcesv1.AllocatableResourcesRequest{})
-			framework.ExpectNoError(err)
-
-			cntDevs := stringifyContainerDevices(resp.GetDevices())
-			cntDevs2 := stringifyContainerDevices(resp2.GetDevices())
-			if cntDevs != cntDevs2 {
-				framework.Failf("different allocatable resources expected %v got %v", cntDevs, cntDevs2)
-			}
-		})
-
-	})
 
 	/*
 		This end to end test is to simulate a scenario where after kubelet restart/node
@@ -319,7 +98,7 @@ var _ = SIGDescribe("Device Manager  [Serial] [Feature:DeviceManager][NodeFeatur
 		   12. Delete the sample device plugin pod.
 		   13. Remove `/var/lib/kubelet/device-plugins/sample/` and its content, the directory created to control registration
 	*/
-	ginkgo.Context("With sample device plugin [Serial] [Disruptive]", func() {
+	f.Context("With sample device plugin", f.WithSerial(), f.WithDisruptive(), func() {
 		var deviceCount int = 2
 		var devicePluginPod *v1.Pod
 		var triggerPathFile, triggerPathDir string
@@ -332,41 +111,92 @@ var _ = SIGDescribe("Device Manager  [Serial] [Feature:DeviceManager][NodeFeatur
 				WithTimeout(time.Minute).
 				Should(gomega.BeEquivalentTo(1))
 
-			ginkgo.By("Setting up the directory and file for controlling registration")
-			triggerPathDir = filepath.Join(devicePluginDir, "sample")
-			if _, err := os.Stat(triggerPathDir); errors.Is(err, os.ErrNotExist) {
-				err := os.Mkdir(triggerPathDir, os.ModePerm)
+			// Before we run the device plugin test, we need to ensure
+			// that the cluster is in a clean state and there are no
+			// pods running on this node.
+			// This is done in a gomega.Eventually with retries since a prior test in a different test suite could've run and the deletion of it's resources may still be in progress.
+			// xref: https://issue.k8s.io/115381
+			gomega.Eventually(ctx, func(ctx context.Context) error {
+				v1PodResources, err := getV1NodeDevices(ctx)
 				if err != nil {
-					klog.Errorf("Directory creation %s failed: %v ", triggerPathDir, err)
-					panic(err)
+					return fmt.Errorf("failed to get node local podresources by accessing the (v1) podresources API endpoint: %w", err)
 				}
-				klog.InfoS("Directory created successfully")
 
-				triggerPathFile = filepath.Join(triggerPathDir, "registration")
-				if _, err := os.Stat(triggerPathFile); errors.Is(err, os.ErrNotExist) {
-					_, err = os.Create(triggerPathFile)
-					if err != nil {
-						klog.Errorf("File creation %s failed: %v ", triggerPathFile, err)
-						panic(err)
-					}
+				if len(v1PodResources.PodResources) > 0 {
+					return fmt.Errorf("expected v1 pod resources to be empty, but got non-empty resources: %+v", v1PodResources.PodResources)
 				}
+				return nil
+			}, f.Timeouts.SystemDaemonsetStartup, f.Timeouts.Poll).Should(gomega.Succeed())
+
+			ginkgo.By("Setting up the directory for controlling registration")
+			triggerPathDir = filepath.Join(devicePluginDir, "sample")
+			if _, err := os.Stat(triggerPathDir); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					if err := os.Mkdir(triggerPathDir, os.ModePerm); err != nil {
+						framework.Fail(fmt.Sprintf("registration control directory %q creation failed: %v ", triggerPathDir, err))
+					}
+					framework.Logf("registration control directory created successfully")
+				} else {
+					framework.Fail(fmt.Sprintf("unexpected error checking %q: %v", triggerPathDir, err))
+				}
+			} else {
+				framework.Logf("registration control directory %q already present", triggerPathDir)
+			}
+
+			ginkgo.By("Setting up the file trigger for controlling registration")
+			triggerPathFile = filepath.Join(triggerPathDir, "registration")
+			if _, err := os.Stat(triggerPathFile); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					if _, err = os.Create(triggerPathFile); err != nil {
+						framework.Fail(fmt.Sprintf("registration control file %q creation failed: %v", triggerPathFile, err))
+					}
+					framework.Logf("registration control file created successfully")
+				} else {
+					framework.Fail(fmt.Sprintf("unexpected error creating %q: %v", triggerPathFile, err))
+				}
+			} else {
+				framework.Logf("registration control file %q already present", triggerPathFile)
 			}
 
 			ginkgo.By("Scheduling a sample device plugin pod")
-			data, err := e2etestfiles.Read(SampleDevicePluginControlRegistrationDSYAML)
+			data, err := e2etestfiles.Read(e2enode.SampleDevicePluginControlRegistrationDSYAML)
 			if err != nil {
-				framework.Fail(err.Error())
+				framework.Fail(fmt.Sprintf("error reading test data %q: %v", e2enode.SampleDevicePluginControlRegistrationDSYAML, err))
 			}
 			ds := readDaemonSetV1OrDie(data)
 
 			dp := &v1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: SampleDevicePluginName,
+					Name: e2enode.SampleDevicePluginName,
 				},
 				Spec: ds.Spec.Template.Spec,
 			}
 
 			devicePluginPod = e2epod.NewPodClient(f).CreateSync(ctx, dp)
+
+			ginkgo.By("making sure all the pods are ready")
+
+			err = e2epod.WaitForPodCondition(ctx, f.ClientSet, devicePluginPod.Namespace, devicePluginPod.Name, "Ready", 120*time.Second, testutils.PodRunningReady)
+			framework.ExpectNoError(err, "pod %s/%s did not go running", devicePluginPod.Namespace, devicePluginPod.Name)
+			framework.Logf("pod %s/%s running", devicePluginPod.Namespace, devicePluginPod.Name)
+
+			ginkgo.By("Verifying the devicePluginPod handleRegistrationProcess entered twice in the loop before we delete the registration file to trigger manual registration")
+			gomega.Eventually(ctx, func() bool {
+				logs, err := e2epod.GetPodLogs(ctx, f.ClientSet, devicePluginPod.Namespace, devicePluginPod.Name, devicePluginPod.Spec.Containers[0].Name)
+				if err != nil {
+					framework.Logf("error getting logs for pod %q: %v", devicePluginPod.Name, err)
+					return false // Returning false to continue trying
+				}
+				framework.Logf("got pod logs: %v", logs)
+				regex := regexp.MustCompile("Starting watching routine(.?)")
+				matches := regex.Find([]byte(logs))
+				if matches == nil {
+					framework.Logf("handleRegistrationProcess not started for pod %q", devicePluginPod.Name)
+					return false // Returning false to continue trying
+				}
+				framework.Logf("handleRegistrationProcess started: %s", matches)
+				return true
+			}, 60*time.Second, framework.Poll).Should(gomega.BeTrueBecause("expected watching routine"))
 
 			go func() {
 				// Since autoregistration is disabled for the device plugin (as REGISTER_CONTROL_FILE
@@ -399,13 +229,13 @@ var _ = SIGDescribe("Device Manager  [Serial] [Feature:DeviceManager][NodeFeatur
 				Should(HaveAllocatableDevices())
 		})
 
-		ginkgo.It("should deploy pod consuming devices first but fail with admission error after kubelet restart in case device plugin hasn't re-registered", func(ctx context.Context) {
+		framework.It("should deploy pod consuming devices first but fail with admission error after kubelet restart in case device plugin hasn't re-registered", framework.WithFlaky(), func(ctx context.Context) {
 			var err error
 			podCMD := "while true; do sleep 1000; done;"
 
-			ginkgo.By(fmt.Sprintf("creating a pods requiring %d %q", deviceCount, SampleDeviceResourceName))
+			ginkgo.By(fmt.Sprintf("creating a pods requiring %d %q", deviceCount, e2enode.SampleDeviceResourceName))
 
-			pod := makeBusyboxDeviceRequiringPod(SampleDeviceResourceName, podCMD)
+			pod := makeBusyboxDeviceRequiringPod(e2enode.SampleDeviceResourceName, podCMD)
 			testPod := e2epod.NewPodClient(f).CreateSync(ctx, pod)
 
 			ginkgo.By("making sure all the pods are ready")
@@ -415,10 +245,10 @@ var _ = SIGDescribe("Device Manager  [Serial] [Feature:DeviceManager][NodeFeatur
 			framework.Logf("pod %s/%s running", testPod.Namespace, testPod.Name)
 
 			ginkgo.By("stopping the kubelet")
-			startKubelet := stopKubelet()
+			restartKubelet := mustStopKubelet(ctx, f)
 
 			ginkgo.By("stopping all the local containers - using CRI")
-			rs, _, err := getCRIClient()
+			rs, _, err := getCRIClient(ctx)
 			framework.ExpectNoError(err)
 			sandboxes, err := rs.ListPodSandbox(ctx, &runtimeapi.PodSandboxFilter{})
 			framework.ExpectNoError(err)
@@ -431,7 +261,7 @@ var _ = SIGDescribe("Device Manager  [Serial] [Feature:DeviceManager][NodeFeatur
 			}
 
 			ginkgo.By("restarting the kubelet")
-			startKubelet()
+			restartKubelet(ctx)
 
 			ginkgo.By("waiting for the kubelet to be ready again")
 			// Wait for the Kubelet to be ready.
@@ -476,15 +306,25 @@ var _ = SIGDescribe("Device Manager  [Serial] [Feature:DeviceManager][NodeFeatur
 					"the pod succeeded to start, when it should fail with the admission error")
 
 			ginkgo.By("removing application pods")
-			e2epod.NewPodClient(f).DeleteSync(ctx, testPod.Name, metav1.DeleteOptions{}, 2*time.Minute)
+			e2epod.NewPodClient(f).DeleteSync(ctx, testPod.Name, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
 		})
 
 		ginkgo.AfterEach(func(ctx context.Context) {
+
+			ginkgo.By("Get and print devicePluginPod logs")
+			// Printing the logs form the pod, help to troubleshoot cases when devicePluginPod fails to register device with manual registration
+			logs, err := e2epod.GetPodLogs(ctx, f.ClientSet, devicePluginPod.Namespace, devicePluginPod.Name, devicePluginPod.Spec.Containers[0].Name)
+			if err != nil {
+				framework.Logf("failed to get pod logs %v", err)
+			} else {
+				framework.Logf("logs of %s/%s/%s (error: %v): %s", devicePluginPod.Namespace, devicePluginPod.Name, devicePluginPod.Spec.Containers[0].Name, err, logs)
+			}
+
 			ginkgo.By("Deleting the device plugin pod")
-			e2epod.NewPodClient(f).DeleteSync(ctx, devicePluginPod.Name, metav1.DeleteOptions{}, time.Minute)
+			e2epod.NewPodClient(f).DeleteSync(ctx, devicePluginPod.Name, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
 
 			ginkgo.By("Deleting the directory and file setup for controlling registration")
-			err := os.RemoveAll(triggerPathDir)
+			err = os.RemoveAll(triggerPathDir)
 			framework.ExpectNoError(err)
 
 			ginkgo.By("Deleting any Pods created by the test")
@@ -496,7 +336,7 @@ var _ = SIGDescribe("Device Manager  [Serial] [Feature:DeviceManager][NodeFeatur
 				}
 
 				framework.Logf("Deleting pod: %s", p.Name)
-				e2epod.NewPodClient(f).DeleteSync(ctx, p.Name, metav1.DeleteOptions{}, 2*time.Minute)
+				e2epod.NewPodClient(f).DeleteSync(ctx, p.Name, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
 			}
 
 			ginkgo.By("Waiting for devices to become unavailable on the local node")
@@ -504,95 +344,13 @@ var _ = SIGDescribe("Device Manager  [Serial] [Feature:DeviceManager][NodeFeatur
 				WithArguments(f).
 				WithTimeout(5 * time.Minute).
 				Should(BeReady())
+
+			ginkgo.By("devices now unavailable on the local node")
 		})
 
 	})
 
 })
-
-func compareSRIOVResources(expected, got *sriovData) {
-	if expected.resourceName != got.resourceName {
-		framework.Failf("different SRIOV resource name: expected %q got %q", expected.resourceName, got.resourceName)
-	}
-	if expected.resourceAmount != got.resourceAmount {
-		framework.Failf("different SRIOV resource amount: expected %d got %d", expected.resourceAmount, got.resourceAmount)
-	}
-}
-
-func isUnexpectedAdmissionError(pod *v1.Pod) bool {
-	re := regexp.MustCompile(`Unexpected.*Admission.*Error`)
-	return re.MatchString(pod.Status.Reason)
-}
-
-func rewriteCheckpointAsV1(dir, name string) error {
-	ginkgo.By(fmt.Sprintf("Creating temporary checkpoint manager (dir=%q)", dir))
-	checkpointManager, err := checkpointmanager.NewCheckpointManager(dir)
-	if err != nil {
-		return err
-	}
-	cp := checkpoint.New(make([]checkpoint.PodDevicesEntry, 0), make(map[string][]string))
-	err = checkpointManager.GetCheckpoint(name, cp)
-	if err != nil {
-		return err
-	}
-
-	ginkgo.By(fmt.Sprintf("Read checkpoint %q %#v", name, cp))
-
-	podDevices, registeredDevs := cp.GetDataInLatestFormat()
-	podDevicesV1 := convertPodDeviceEntriesToV1(podDevices)
-	cpV1 := checkpoint.NewV1(podDevicesV1, registeredDevs)
-
-	blob, err := cpV1.MarshalCheckpoint()
-	if err != nil {
-		return err
-	}
-
-	// TODO: why `checkpointManager.CreateCheckpoint(name, cpV1)` doesn't seem to work?
-	ckPath := filepath.Join(dir, name)
-	os.WriteFile(filepath.Join("/tmp", name), blob, 0600)
-	return os.WriteFile(ckPath, blob, 0600)
-}
-
-func convertPodDeviceEntriesToV1(entries []checkpoint.PodDevicesEntry) []checkpoint.PodDevicesEntryV1 {
-	entriesv1 := []checkpoint.PodDevicesEntryV1{}
-	for _, entry := range entries {
-		deviceIDs := []string{}
-		for _, perNUMANodeDevIDs := range entry.DeviceIDs {
-			deviceIDs = append(deviceIDs, perNUMANodeDevIDs...)
-		}
-		entriesv1 = append(entriesv1, checkpoint.PodDevicesEntryV1{
-			PodUID:        entry.PodUID,
-			ContainerName: entry.ContainerName,
-			ResourceName:  entry.ResourceName,
-			DeviceIDs:     deviceIDs,
-			AllocResp:     entry.AllocResp,
-		})
-	}
-	return entriesv1
-}
-
-func stringifyContainerDevices(devs []*kubeletpodresourcesv1.ContainerDevices) string {
-	entries := []string{}
-	for _, dev := range devs {
-		devIDs := dev.GetDeviceIds()
-		if devIDs != nil {
-			for _, devID := range dev.DeviceIds {
-				nodes := dev.GetTopology().GetNodes()
-				if nodes != nil {
-					for _, node := range nodes {
-						entries = append(entries, fmt.Sprintf("%s[%s]@NUMA=%d", dev.ResourceName, devID, node.GetID()))
-					}
-				} else {
-					entries = append(entries, fmt.Sprintf("%s[%s]@NUMA=none", dev.ResourceName, devID))
-				}
-			}
-		} else {
-			entries = append(entries, dev.ResourceName)
-		}
-	}
-	sort.Strings(entries)
-	return strings.Join(entries, ", ")
-}
 
 func makeBusyboxDeviceRequiringPod(resourceName, cmd string) *v1.Pod {
 	podName := "device-manager-test-" + string(uuid.NewUUID())
@@ -646,7 +404,7 @@ func isNodeReadyWithSampleResources(ctx context.Context, f *framework.Framework)
 		return false, fmt.Errorf("expected node to be ready=%t", ready)
 	}
 
-	if CountSampleDeviceCapacity(node) <= 0 {
+	if e2enode.CountSampleDeviceCapacity(node) <= 0 {
 		return false, fmt.Errorf("expected devices to be advertised")
 	}
 	return true, nil
@@ -679,11 +437,11 @@ func isNodeReadyWithAllocatableSampleResources(ctx context.Context, f *framework
 		return false, fmt.Errorf("expected node to be ready=%t", ready)
 	}
 
-	if CountSampleDeviceCapacity(node) != devCount {
+	if e2enode.CountSampleDeviceCapacity(node) != devCount {
 		return false, fmt.Errorf("expected devices capacity to be: %d", devCount)
 	}
 
-	if CountSampleDeviceAllocatable(node) != devCount {
+	if e2enode.CountSampleDeviceAllocatable(node) != devCount {
 		return false, fmt.Errorf("expected devices allocatable to be: %d", devCount)
 	}
 	return true, nil
@@ -695,7 +453,7 @@ func isNodeReadyWithoutSampleResources(ctx context.Context, f *framework.Framewo
 		return false, fmt.Errorf("expected node to be ready=%t", ready)
 	}
 
-	if CountSampleDeviceCapacity(node) > 0 {
+	if e2enode.CountSampleDeviceCapacity(node) > 0 {
 		return false, fmt.Errorf("expected devices to be not present")
 	}
 	return true, nil

@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
@@ -39,12 +40,10 @@ import (
 )
 
 var (
-	// BusyBoxImage is the image URI of BusyBox.
-	BusyBoxImage          = imageutils.GetE2EImage(imageutils.BusyBox)
 	durationForStuckMount = 110 * time.Second
 )
 
-var _ = utils.SIGDescribe("[Feature:Flexvolumes] Detaching volumes", func() {
+var _ = utils.SIGDescribe(feature.Flexvolumes, "Detaching volumes", framework.WithProvider("gce", "local"), func() {
 	f := framework.NewDefaultFramework("flexvolume")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
@@ -56,7 +55,6 @@ var _ = utils.SIGDescribe("[Feature:Flexvolumes] Detaching volumes", func() {
 	var suffix string
 
 	ginkgo.BeforeEach(func(ctx context.Context) {
-		e2eskipper.SkipUnlessProviderIs("gce", "local")
 		e2eskipper.SkipUnlessMasterOSDistroIs("debian", "ubuntu", "gci", "custom")
 		e2eskipper.SkipUnlessNodeOSDistroIs("debian", "ubuntu", "gci", "custom")
 		e2eskipper.SkipUnlessSSHKeyPresent()
@@ -69,16 +67,18 @@ var _ = utils.SIGDescribe("[Feature:Flexvolumes] Detaching volumes", func() {
 		suffix = ns.Name
 	})
 
-	ginkgo.It("should not work when mount is in progress [Slow]", func(ctx context.Context) {
+	f.It("should not work when mount is in progress", f.WithSlow(), func(ctx context.Context) {
 		e2eskipper.SkipUnlessSSHKeyPresent()
 
 		driver := "attachable-with-long-mount"
 		driverInstallAs := driver + "-" + suffix
+		hostExec := utils.NewHostExec(f)
+		ginkgo.DeferCleanup(hostExec.Cleanup)
 
 		ginkgo.By(fmt.Sprintf("installing flexvolume %s on node %s as %s", path.Join(driverDir, driver), node.Name, driverInstallAs))
-		installFlex(ctx, cs, node, "k8s", driverInstallAs, path.Join(driverDir, driver))
+		installFlex(ctx, cs, hostExec, node, "k8s", driverInstallAs, path.Join(driverDir, driver))
 		ginkgo.By(fmt.Sprintf("installing flexvolume %s on master as %s", path.Join(driverDir, driver), driverInstallAs))
-		installFlex(ctx, cs, nil, "k8s", driverInstallAs, path.Join(driverDir, driver))
+		installFlex(ctx, cs, hostExec, nil, "k8s", driverInstallAs, path.Join(driverDir, driver))
 		volumeSource := v1.VolumeSource{
 			FlexVolume: &v1.FlexVolumeSource{
 				Driver: "k8s/" + driverInstallAs,
@@ -123,9 +123,9 @@ var _ = utils.SIGDescribe("[Feature:Flexvolumes] Detaching volumes", func() {
 		framework.ExpectNoError(err, "while waiting for volume to be removed from in-use")
 
 		ginkgo.By(fmt.Sprintf("uninstalling flexvolume %s from node %s", driverInstallAs, node.Name))
-		uninstallFlex(ctx, cs, node, "k8s", driverInstallAs)
+		uninstallFlex(ctx, cs, hostExec, node, "k8s", driverInstallAs)
 		ginkgo.By(fmt.Sprintf("uninstalling flexvolume %s from master", driverInstallAs))
-		uninstallFlex(ctx, cs, nil, "k8s", driverInstallAs)
+		uninstallFlex(ctx, cs, hostExec, nil, "k8s", driverInstallAs)
 	})
 })
 
@@ -134,7 +134,7 @@ func getUniqueVolumeName(pod *v1.Pod, driverName string) string {
 }
 
 func waitForVolumesNotInUse(ctx context.Context, client clientset.Interface, nodeName, volumeName string) error {
-	waitErr := wait.PollImmediateWithContext(ctx, 10*time.Second, 60*time.Second, func(ctx context.Context) (bool, error) {
+	waitErr := wait.PollUntilContextTimeout(ctx, 10*time.Second, 60*time.Second, true, func(ctx context.Context) (bool, error) {
 		node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
 			return false, fmt.Errorf("error fetching node %s with %v", nodeName, err)
@@ -154,7 +154,7 @@ func waitForVolumesNotInUse(ctx context.Context, client clientset.Interface, nod
 }
 
 func waitForVolumesAttached(ctx context.Context, client clientset.Interface, nodeName, volumeName string) error {
-	waitErr := wait.PollImmediateWithContext(ctx, 2*time.Second, 2*time.Minute, func(ctx context.Context) (bool, error) {
+	waitErr := wait.PollUntilContextTimeout(ctx, 2*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
 			return false, fmt.Errorf("error fetching node %s with %v", nodeName, err)
@@ -174,7 +174,7 @@ func waitForVolumesAttached(ctx context.Context, client clientset.Interface, nod
 }
 
 func waitForVolumesInUse(ctx context.Context, client clientset.Interface, nodeName, volumeName string) error {
-	waitErr := wait.PollImmediateWithContext(ctx, 10*time.Second, 60*time.Second, func(ctx context.Context) (bool, error) {
+	waitErr := wait.PollUntilContextTimeout(ctx, 10*time.Second, 60*time.Second, true, func(ctx context.Context) (bool, error) {
 		node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
 			return false, fmt.Errorf("error fetching node %s with %v", nodeName, err)
@@ -210,7 +210,7 @@ func getFlexVolumePod(volumeSource v1.VolumeSource, nodeName string) *v1.Pod {
 			Containers: []v1.Container{
 				{
 					Name:       "flexvolume-detach-test" + "-client",
-					Image:      BusyBoxImage,
+					Image:      imageutils.GetE2EImage(imageutils.BusyBox),
 					WorkingDir: "/opt",
 					// An imperative and easily debuggable container which reads vol contents for
 					// us to scan in the tests or by eye.

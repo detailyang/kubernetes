@@ -33,10 +33,10 @@ import (
 	"k8s.io/kube-openapi/pkg/handler3"
 	"k8s.io/kube-openapi/pkg/spec3"
 
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	informers "k8s.io/apiextensions-api/pkg/client/informers/externalversions/apiextensions/v1"
+	listers "k8s.io/apiextensions-api/pkg/client/listers/apiextensions/v1"
 	apiextensionshelpers "k8s.io/apiextensions-apiserver/pkg/apihelpers"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	informers "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions/apiextensions/v1"
-	listers "k8s.io/apiextensions-apiserver/pkg/client/listers/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/controller/openapi/builder"
 )
 
@@ -48,7 +48,7 @@ type Controller struct {
 	// To allow injection for testing.
 	syncFn func(string) error
 
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 
 	openAPIV3Service *handler3.OpenAPIService
 
@@ -60,9 +60,12 @@ type Controller struct {
 // NewController creates a new Controller with input CustomResourceDefinition informer
 func NewController(crdInformer informers.CustomResourceDefinitionInformer) *Controller {
 	c := &Controller{
-		crdLister:        crdInformer.Lister(),
-		crdsSynced:       crdInformer.Informer().HasSynced,
-		queue:            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "crd_openapi_v3_controller"),
+		crdLister:  crdInformer.Lister(),
+		crdsSynced: crdInformer.Informer().HasSynced,
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "crd_openapi_v3_controller"},
+		),
 		specsByGVandName: map[schema.GroupVersion]map[string]*spec3.OpenAPI{},
 	}
 
@@ -131,11 +134,11 @@ func (c *Controller) processNextWorkItem() bool {
 	defer func() {
 		elapsed := time.Since(start)
 		if elapsed > time.Second {
-			klog.Warningf("slow openapi aggregation of %q: %s", key.(string), elapsed)
+			klog.Warningf("slow openapi aggregation of %q: %s", key, elapsed)
 		}
 	}()
 
-	err := c.syncFn(key.(string))
+	err := c.syncFn(key)
 	if err == nil {
 		c.queue.Forget(key)
 		return true
@@ -230,7 +233,9 @@ func (c *Controller) updateCRDSpec(crd *apiextensionsv1.CustomResourceDefinition
 }
 
 func (c *Controller) buildV3Spec(crd *apiextensionsv1.CustomResourceDefinition, name, versionName string) error {
-	v3, err := builder.BuildOpenAPIV3(crd, versionName, builder.Options{V2: false})
+	v3, err := builder.BuildOpenAPIV3(crd, versionName, builder.Options{
+		V2: false,
+	})
 
 	if err != nil {
 		return err

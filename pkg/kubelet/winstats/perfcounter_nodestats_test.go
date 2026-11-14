@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 /*
 Copyright 2023 The Kubernetes Authors.
@@ -21,18 +20,23 @@ package winstats
 
 import (
 	"os"
+	"os/exec"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
-	cadvisorapi "github.com/google/cadvisor/info/v1"
+	cadvisorapi "github.com/google/cadvisor/lib/model"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/klog/v2/ktesting"
 )
 
 func TestMonitoring(t *testing.T) {
-	counterClient, err := NewPerfCounterClient()
+	logger, _ := ktesting.NewTestContext(t)
+	counterClient, err := NewPerfCounterClient(logger)
 	assert.NoError(t, err)
 
 	// assert that startMonitoring has been called. nodeInfo should be set.
@@ -52,13 +56,14 @@ func TestMonitoring(t *testing.T) {
 }
 
 func TestGetMachineInfo(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	p := perfCounterNodeStatsClient{
 		nodeInfo: nodeInfo{
 			memoryPhysicalCapacityBytes: 100,
 		},
 	}
 
-	machineInfo, err := p.getMachineInfo()
+	machineInfo, err := p.getMachineInfo(logger)
 	assert.NoError(t, err)
 	assert.Equal(t, uint64(100), machineInfo.MemoryCapacity)
 	hostname, _ := os.Hostname()
@@ -90,6 +95,7 @@ func TestGetVersionInfo(t *testing.T) {
 }
 
 func TestCollectMetricsData(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	p := perfCounterNodeStatsClient{}
 
 	cpuCounter := &fakePerfCounterImpl{
@@ -107,28 +113,28 @@ func TestCollectMetricsData(t *testing.T) {
 	networkAdapterCounter := newFakedNetworkCounters(true)
 
 	// Checking the error cases first.
-	p.collectMetricsData(cpuCounter, memWorkingSetCounter, memCommittedBytesCounter, networkAdapterCounter)
+	p.collectMetricsData(logger, cpuCounter, memWorkingSetCounter, memCommittedBytesCounter, networkAdapterCounter)
 	metrics, _ := p.getNodeMetrics()
 	expectedMetrics := nodeMetrics{}
 	assert.Equal(t, expectedMetrics, metrics)
 
 	cpuCounter.raiseError = false
-	p.collectMetricsData(cpuCounter, memWorkingSetCounter, memCommittedBytesCounter, networkAdapterCounter)
+	p.collectMetricsData(logger, cpuCounter, memWorkingSetCounter, memCommittedBytesCounter, networkAdapterCounter)
 	metrics, _ = p.getNodeMetrics()
 	assert.Equal(t, expectedMetrics, metrics)
 
 	memWorkingSetCounter.raiseError = false
-	p.collectMetricsData(cpuCounter, memWorkingSetCounter, memCommittedBytesCounter, networkAdapterCounter)
+	p.collectMetricsData(logger, cpuCounter, memWorkingSetCounter, memCommittedBytesCounter, networkAdapterCounter)
 	metrics, _ = p.getNodeMetrics()
 	assert.Equal(t, expectedMetrics, metrics)
 
 	memCommittedBytesCounter.raiseError = false
-	p.collectMetricsData(cpuCounter, memWorkingSetCounter, memCommittedBytesCounter, networkAdapterCounter)
+	p.collectMetricsData(logger, cpuCounter, memWorkingSetCounter, memCommittedBytesCounter, networkAdapterCounter)
 	metrics, _ = p.getNodeMetrics()
 	assert.Equal(t, expectedMetrics, metrics)
 
 	networkAdapterCounter = newFakedNetworkCounters(false)
-	p.collectMetricsData(cpuCounter, memWorkingSetCounter, memCommittedBytesCounter, networkAdapterCounter)
+	p.collectMetricsData(logger, cpuCounter, memWorkingSetCounter, memCommittedBytesCounter, networkAdapterCounter)
 	metrics, _ = p.getNodeMetrics()
 	expectedMetrics = nodeMetrics{
 		cpuUsageCoreNanoSeconds:   uint64(ProcessorCount()) * 1e7,
@@ -136,8 +142,9 @@ func TestCollectMetricsData(t *testing.T) {
 		memoryPrivWorkingSetBytes: 2,
 		memoryCommittedBytes:      3,
 		interfaceStats:            networkAdapterCounter.listInterfaceStats(),
-		timeStamp:                 time.Now(),
 	}
+	assert.WithinDuration(t, time.Now(), metrics.timeStamp, 20*time.Millisecond)
+	expectedMetrics.timeStamp = metrics.timeStamp
 	assert.Equal(t, expectedMetrics, metrics)
 }
 
@@ -160,14 +167,16 @@ func TestConvertCPUValue(t *testing.T) {
 }
 
 func TestGetCPUUsageNanoCores(t *testing.T) {
+	// Scaled expected unit test values by the frequency the CPU perf counters are polled.
+	perfCounterUpdatePeriodSeconds := uint64(perfCounterUpdatePeriod / time.Second)
 	testCases := []struct {
 		latestValue   uint64
 		previousValue uint64
 		expected      uint64
 	}{
 		{latestValue: uint64(0), previousValue: uint64(0), expected: uint64(0)},
-		{latestValue: uint64(2000000000), previousValue: uint64(0), expected: uint64(200000000)},
-		{latestValue: uint64(5000000000), previousValue: uint64(2000000000), expected: uint64(300000000)},
+		{latestValue: uint64(2000000000), previousValue: uint64(0), expected: uint64(200000000 * perfCounterUpdatePeriodSeconds)},
+		{latestValue: uint64(5000000000), previousValue: uint64(2000000000), expected: uint64(300000000 * perfCounterUpdatePeriodSeconds)},
 	}
 
 	for _, tc := range testCases {
@@ -185,4 +194,14 @@ func testGetPhysicallyInstalledSystemMemoryBytes(t *testing.T) {
 	totalMemory, err := getPhysicallyInstalledSystemMemoryBytes()
 	assert.NoError(t, err)
 	assert.NotZero(t, totalMemory)
+}
+
+func TestGetSystemUUID(t *testing.T) {
+	uuidFromRegistry, err := getSystemUUID()
+	assert.NoError(t, err)
+
+	uuidFromWmi, err := exec.Command("powershell.exe", "Get-WmiObject", "Win32_ComputerSystemProduct", "|", "Select-Object", "-ExpandProperty UUID").Output()
+	assert.NoError(t, err)
+	uuidFromWmiString := strings.Trim(string(uuidFromWmi), "\r\n")
+	assert.Equal(t, uuidFromWmiString, uuidFromRegistry)
 }

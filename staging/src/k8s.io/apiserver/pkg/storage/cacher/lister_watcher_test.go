@@ -20,15 +20,83 @@ import (
 	"context"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/apis/example"
+	"k8s.io/apiserver/pkg/features"
+	"k8s.io/apiserver/pkg/storage"
+	storagetesting "k8s.io/apiserver/pkg/storage/testing"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/watchlist"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/utils/ptr"
+
+	cachertesting "k8s.io/apiserver/pkg/storage/cacher/testing"
 )
 
+func TestListerWatcherWatchOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		options            metav1.ListOptions
+		watchWithoutPrevKV bool
+		expectedOptions    storage.ListOptions
+	}{
+		{
+			name:            "resource version, without previous values disabled",
+			options:         metav1.ListOptions{ResourceVersion: "100"},
+			expectedOptions: storage.ListOptions{ResourceVersion: "100"},
+		},
+		{
+			name:               "without previous values enabled",
+			options:            metav1.ListOptions{ResourceVersion: "100"},
+			watchWithoutPrevKV: true,
+			expectedOptions:    storage.ListOptions{ResourceVersion: "100", WatchWithoutPrevKV: true},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.WatchFromStorageWithoutPrevKV, tc.watchWithoutPrevKV)
+			var capturedOpts storage.ListOptions
+			backingStorage := &cachertesting.MockStorage{WatchFn: func(_ context.Context, _ string, opts storage.ListOptions) (watch.Interface, error) {
+				capturedOpts = opts
+				return watch.NewEmptyWatch(), nil
+			}}
+			lw := NewListerWatcher(backingStorage, "/pods/", cachertesting.NewPodList, nil)
+			w, err := cache.ToListerWatcherWithContext(lw).WatchWithContext(context.Background(), tc.options)
+			require.NoError(t, err)
+			defer w.Stop()
+			expectedOpts := tc.expectedOptions
+			expectedOpts.Predicate.Label = storage.Everything.Label
+			expectedOpts.Predicate.Field = storage.Everything.Field
+			expectedOpts.Recursive = true
+			expectedOpts.ProgressNotify = true
+			expectedOpts.RecordTimestamps = true
+			require.Equal(t, expectedOpts, capturedOpts)
+		})
+	}
+}
+
+func TestDoesClientSupportWatchListSemanticsForKubeClient(t *testing.T) {
+	target1 := &cachertesting.MockStorage{}
+	if !watchlist.DoesClientNotSupportWatchListSemantics(target1) {
+		t.Fatalf("cachertesting.MockStorage should NOT support WatchList semantics")
+	}
+
+	server, target2 := cachertesting.NewEtcdTestStorage(t, "/pods/")
+	defer server.Terminate(t)
+
+	if watchlist.DoesClientNotSupportWatchListSemantics(target2) {
+		t.Fatalf("etcd should support WatchList semantics")
+	}
+}
+
 func TestCacherListerWatcher(t *testing.T) {
-	prefix := "pods"
+	prefix := "/pods/"
 	fn := func() runtime.Object { return &example.PodList{} }
-	server, store := newEtcdTestStorage(t, prefix, true)
+	server, store := cachertesting.NewEtcdTestStorage(t, prefix)
 	defer server.Terminate(t)
 
 	objects := []*example.Pod{
@@ -38,13 +106,13 @@ func TestCacherListerWatcher(t *testing.T) {
 	}
 	for _, obj := range objects {
 		out := &example.Pod{}
-		key := computePodKey(obj)
+		key := cachertesting.ComputePodKey(obj)
 		if err := store.Create(context.Background(), key, obj, out, 0); err != nil {
 			t.Fatalf("Create failed: %v", err)
 		}
 	}
 
-	lw := NewListerWatcher(store, prefix, fn)
+	lw := NewListerWatcher(store, prefix, fn, nil)
 
 	obj, err := lw.List(metav1.ListOptions{})
 	if err != nil {
@@ -60,9 +128,9 @@ func TestCacherListerWatcher(t *testing.T) {
 }
 
 func TestCacherListerWatcherPagination(t *testing.T) {
-	prefix := "pods"
+	prefix := "/pods/"
 	fn := func() runtime.Object { return &example.PodList{} }
-	server, store := newEtcdTestStorage(t, prefix, true)
+	server, store := cachertesting.NewEtcdTestStorage(t, prefix)
 	defer server.Terminate(t)
 
 	// We need the list to be sorted by name to later check the alphabetical order of
@@ -74,13 +142,13 @@ func TestCacherListerWatcherPagination(t *testing.T) {
 	}
 	for _, obj := range objects {
 		out := &example.Pod{}
-		key := computePodKey(obj)
+		key := cachertesting.ComputePodKey(obj)
 		if err := store.Create(context.Background(), key, obj, out, 0); err != nil {
 			t.Fatalf("Create failed: %v", err)
 		}
 	}
 
-	lw := NewListerWatcher(store, prefix, fn)
+	lw := NewListerWatcher(store, prefix, fn, nil)
 
 	obj1, err := lw.List(metav1.ListOptions{Limit: 2})
 	if err != nil {
@@ -118,4 +186,157 @@ func TestCacherListerWatcherPagination(t *testing.T) {
 		t.Errorf("Expected list2.Items[0] to be %s but got %s", objects[2].Name, limit2.Items[0].Name)
 	}
 
+}
+
+func TestCacherListerWatcherListWatch(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.WatchList, true)
+
+	prefix := "/pods/"
+	fn := func() runtime.Object { return &example.PodList{} }
+	server, store := cachertesting.NewEtcdTestStorage(t, prefix)
+	defer server.Terminate(t)
+
+	makePodFn := func() *example.Pod {
+		return &example.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"},
+		}
+	}
+	ctx := context.TODO()
+	pod := makePodFn()
+	key := cachertesting.ComputePodKey(pod)
+	createdPod := &example.Pod{}
+	if err := store.Create(ctx, key, makePodFn(), createdPod, 0); err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	lw := NewListerWatcher(store, prefix, fn, nil)
+	target := cache.ToListerWatcherWithContext(lw)
+	watchListOptions := metav1.ListOptions{
+		Watch:               true,
+		AllowWatchBookmarks: true,
+		SendInitialEvents:   ptr.To(true),
+	}
+	w, err := target.WatchWithContext(ctx, watchListOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	expectedWatchEvents := []watch.Event{
+		{Type: watch.Added, Object: createdPod},
+		{
+			Type: watch.Bookmark,
+			Object: &example.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					ResourceVersion: createdPod.ResourceVersion,
+					Annotations:     map[string]string{metav1.InitialEventsAnnotationKey: "true"},
+				},
+			},
+		},
+	}
+
+	storagetesting.ExpectWatchEventsExact(expectedWatchEvents).Check(t, w)
+	storagetesting.TestCheckNoMoreResultsWithIgnoreFunc(t, w, nil)
+}
+
+func TestCacherListerWatcherWhenListWatchDisabled(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.WatchList, false)
+
+	prefix := "/pods/"
+	fn := func() runtime.Object { return &example.PodList{} }
+	server, store := cachertesting.NewEtcdTestStorage(t, prefix)
+	defer server.Terminate(t)
+
+	lw := NewListerWatcher(store, prefix, fn, nil)
+	target := cache.ToListerWatcherWithContext(lw)
+	watchListOptions := metav1.ListOptions{
+		Watch:               true,
+		AllowWatchBookmarks: true,
+		SendInitialEvents:   ptr.To(true),
+	}
+	_, err := target.WatchWithContext(context.TODO(), watchListOptions)
+	if err == nil {
+		t.Fatalf("Expected error, but got none")
+	}
+
+	expectedErrMsg := "sendInitialEvents is forbidden for watch unless the WatchList feature gate is enabled"
+	if err.Error() != expectedErrMsg {
+		t.Fatalf("Expected error %q, but got %q", expectedErrMsg, err.Error())
+	}
+}
+
+func TestListerWatcherListResourceVersionPropagation(t *testing.T) {
+	scenarios := []struct {
+		name                             string
+		options                          metav1.ListOptions
+		watchListEnabled                 bool
+		watchListConsistencyCheckEnabled bool
+		expectedStorageResourceVer       string
+	}{
+		{
+			name: "WatchList FG disabled - RV not propagated",
+			options: metav1.ListOptions{
+				ResourceVersion:      "123",
+				ResourceVersionMatch: metav1.ResourceVersionMatchExact,
+			},
+			watchListEnabled:                 false,
+			watchListConsistencyCheckEnabled: true,
+			expectedStorageResourceVer:       "",
+		},
+		{
+			name: "WatchList consistency check disabled - RV not propagated",
+			options: metav1.ListOptions{
+				ResourceVersion:      "123",
+				ResourceVersionMatch: metav1.ResourceVersionMatchExact,
+			},
+			watchListEnabled:                 true,
+			watchListConsistencyCheckEnabled: false,
+			expectedStorageResourceVer:       "",
+		},
+		{
+			name: "Unsupported RVM - RV not propagated",
+			options: metav1.ListOptions{
+				ResourceVersion:      "123",
+				ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan,
+			},
+			watchListEnabled:                 true,
+			watchListConsistencyCheckEnabled: true,
+			expectedStorageResourceVer:       "",
+		},
+		{
+			name: "all conditions satisfied - RV propagated",
+			options: metav1.ListOptions{
+				ResourceVersion:      "123",
+				ResourceVersionMatch: metav1.ResourceVersionMatchExact,
+			},
+			watchListEnabled:                 true,
+			watchListConsistencyCheckEnabled: true,
+			expectedStorageResourceVer:       "123",
+		},
+	}
+
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.WatchList, scenario.watchListEnabled)
+
+			backingStorage := &cachertesting.MockStorage{}
+			var capturedOpts storage.ListOptions
+			backingStorage.GetListFn = func(ctx context.Context, resPrefix string, opts storage.ListOptions, listObj runtime.Object) error {
+				capturedOpts = opts
+				return nil
+			}
+
+			targetInterface := NewListerWatcher(backingStorage, "/pods/", func() runtime.Object { return &example.PodList{} }, nil)
+			target := targetInterface.(*listerWatcher)
+			target.watchListConsistencyCheckEnabled = scenario.watchListConsistencyCheckEnabled
+
+			if _, err := target.List(scenario.options); err != nil {
+				t.Fatalf("List returned error: %v", err)
+			}
+
+			if capturedOpts.ResourceVersion != scenario.expectedStorageResourceVer {
+				t.Fatalf("expected storage ResourceVersion %q, got %q", scenario.expectedStorageResourceVer, capturedOpts.ResourceVersion)
+			}
+		})
+	}
 }

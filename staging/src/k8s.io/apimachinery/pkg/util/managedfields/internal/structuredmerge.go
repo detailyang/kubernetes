@@ -18,13 +18,15 @@ package internal
 
 import (
 	"fmt"
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+	"sigs.k8s.io/structured-merge-diff/v7/merge"
+	"sigs.k8s.io/structured-merge-diff/v7/typed"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
-	"sigs.k8s.io/structured-merge-diff/v4/merge"
 )
 
 type structuredMergeManager struct {
@@ -40,7 +42,7 @@ var _ Manager = &structuredMergeManager{}
 
 // NewStructuredMergeManager creates a new Manager that merges apply requests
 // and update managed fields for other types of requests.
-func NewStructuredMergeManager(typeConverter TypeConverter, objectConverter runtime.ObjectConvertor, objectDefaulter runtime.ObjectDefaulter, gv schema.GroupVersion, hub schema.GroupVersion, resetFields map[fieldpath.APIVersion]*fieldpath.Set) (Manager, error) {
+func NewStructuredMergeManager(typeConverter TypeConverter, objectConverter runtime.ObjectConvertor, objectDefaulter runtime.ObjectDefaulter, gv schema.GroupVersion, hub schema.GroupVersion, resetFields map[fieldpath.APIVersion]fieldpath.Filter) (Manager, error) {
 	if typeConverter == nil {
 		return nil, fmt.Errorf("typeconverter must not be nil")
 	}
@@ -51,8 +53,8 @@ func NewStructuredMergeManager(typeConverter TypeConverter, objectConverter runt
 		groupVersion:    gv,
 		hubVersion:      hub,
 		updater: merge.Updater{
-			Converter:     newVersionConverter(typeConverter, objectConverter, hub), // This is the converter provided to SMD from k8s
-			IgnoredFields: resetFields,
+			Converter:    newVersionConverter(typeConverter, objectConverter, hub), // This is the converter provided to SMD from k8s
+			IgnoreFilter: resetFields,
 		},
 	}, nil
 }
@@ -60,7 +62,7 @@ func NewStructuredMergeManager(typeConverter TypeConverter, objectConverter runt
 // NewCRDStructuredMergeManager creates a new Manager specifically for
 // CRDs. This allows for the possibility of fields which are not defined
 // in models, as well as having no models defined at all.
-func NewCRDStructuredMergeManager(typeConverter TypeConverter, objectConverter runtime.ObjectConvertor, objectDefaulter runtime.ObjectDefaulter, gv schema.GroupVersion, hub schema.GroupVersion, resetFields map[fieldpath.APIVersion]*fieldpath.Set) (_ Manager, err error) {
+func NewCRDStructuredMergeManager(typeConverter TypeConverter, objectConverter runtime.ObjectConvertor, objectDefaulter runtime.ObjectDefaulter, gv schema.GroupVersion, hub schema.GroupVersion, resetFields map[fieldpath.APIVersion]fieldpath.Filter) (_ Manager, err error) {
 	return &structuredMergeManager{
 		typeConverter:   typeConverter,
 		objectConverter: objectConverter,
@@ -68,8 +70,8 @@ func NewCRDStructuredMergeManager(typeConverter TypeConverter, objectConverter r
 		groupVersion:    gv,
 		hubVersion:      hub,
 		updater: merge.Updater{
-			Converter:     newCRDVersionConverter(typeConverter, objectConverter, hub),
-			IgnoredFields: resetFields,
+			Converter:    newCRDVersionConverter(typeConverter, objectConverter, hub),
+			IgnoreFilter: resetFields,
 		},
 	}, nil
 }
@@ -95,11 +97,20 @@ func (f *structuredMergeManager) Update(liveObj, newObj runtime.Object, managed 
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to convert live object (%v) to proper version: %v", objectGVKNN(liveObj), err)
 	}
-	newObjTyped, err := f.typeConverter.ObjectToTyped(newObjVersioned)
+	newObjTyped, err := f.typeConverter.ObjectToTyped(newObjVersioned, typed.AllowDuplicates)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to convert new object (%v) to smd typed: %v", objectGVKNN(newObjVersioned), err)
 	}
-	liveObjTyped, err := f.typeConverter.ObjectToTyped(liveObjVersioned)
+	// Temporarily clear managedFields on liveObjVersioned so ObjectToTyped and
+	// updater.Update do not walk it (newObj's managedFields are already cleared,
+	// and stripMetaManager ignores metadata.managedFields).
+	if liveMeta, ok := liveObjVersioned.(metav1.ObjectMetaAccessor); ok {
+		objectMeta := liveMeta.GetObjectMeta()
+		managedFields := objectMeta.GetManagedFields()
+		objectMeta.SetManagedFields(nil)
+		defer objectMeta.SetManagedFields(managedFields)
+	}
+	liveObjTyped, err := f.typeConverter.ObjectToTyped(liveObjVersioned, typed.AllowDuplicates)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to convert live object (%v) to smd typed: %v", objectGVKNN(liveObjVersioned), err)
 	}
@@ -139,11 +150,13 @@ func (f *structuredMergeManager) Apply(liveObj, patchObj runtime.Object, managed
 		return nil, nil, fmt.Errorf("failed to convert live object (%v) to proper version: %v", objectGVKNN(liveObj), err)
 	}
 
+	// Don't allow duplicates in the applied object.
 	patchObjTyped, err := f.typeConverter.ObjectToTyped(patchObj)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create typed patch object (%v): %v", objectGVKNN(patchObj), err)
 	}
-	liveObjTyped, err := f.typeConverter.ObjectToTyped(liveObjVersioned)
+
+	liveObjTyped, err := f.typeConverter.ObjectToTyped(liveObjVersioned, typed.AllowDuplicates)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create typed live object (%v): %v", objectGVKNN(liveObjVersioned), err)
 	}

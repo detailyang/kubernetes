@@ -20,25 +20,38 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/onsi/gomega"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	fcache "k8s.io/client-go/tools/cache/testing"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/ktesting"
+	"k8s.io/klog/v2/textlogger"
 	testingclock "k8s.io/utils/clock/testing"
 )
 
 type testListener struct {
+	printlnFunc       func(string) // Some, but not all tests use this for per-test output.
 	lock              sync.RWMutex
 	resyncPeriod      time.Duration
-	expectedItemNames sets.String
+	expectedItemNames sets.Set[string]
 	receivedItemNames []string
 	name              string
 }
@@ -46,7 +59,7 @@ type testListener struct {
 func newTestListener(name string, resyncPeriod time.Duration, expected ...string) *testListener {
 	l := &testListener{
 		resyncPeriod:      resyncPeriod,
-		expectedItemNames: sets.NewString(expected...),
+		expectedItemNames: sets.New(expected...),
 		name:              name,
 	}
 	return l
@@ -63,39 +76,59 @@ func (l *testListener) OnUpdate(old, new interface{}) {
 func (l *testListener) OnDelete(obj interface{}) {
 }
 
+func (l *testListener) println(msg string) {
+	msg = l.name + ": " + msg
+	if l.printlnFunc != nil {
+		l.printlnFunc(msg)
+	} else {
+		fmt.Println(msg)
+	}
+}
+
 func (l *testListener) handle(obj interface{}) {
 	key, _ := MetaNamespaceKeyFunc(obj)
-	fmt.Printf("%s: handle: %v\n", l.name, key)
+	l.println(fmt.Sprintf("handle: %v", key))
 	l.lock.Lock()
 	defer l.lock.Unlock()
 	objectMeta, _ := meta.Accessor(obj)
 	l.receivedItemNames = append(l.receivedItemNames, objectMeta.GetName())
 }
 
-func (l *testListener) ok() bool {
-	fmt.Println("polling")
-	err := wait.PollImmediate(100*time.Millisecond, 2*time.Second, func() (bool, error) {
-		if l.satisfiedExpectations() {
-			return true, nil
-		}
-		return false, nil
-	})
-	if err != nil {
-		return false
-	}
+func (l *testListener) receivedItems() sets.Set[string] {
+	l.lock.RLock()
+	defer l.lock.RUnlock()
+
+	return sets.New(l.receivedItemNames...)
+}
+
+func (l *testListener) ok(t *testing.T) {
+	t.Helper()
+	l.println("polling")
+	gomega.NewWithT(t).Eventually(l.receivedItems).
+		WithTimeout(2*time.Second).
+		WithPolling(100*time.Millisecond).
+		Should(gomega.Equal(l.expectedItemNames), "%s: listener items", l.name)
 
 	// wait just a bit to allow any unexpected stragglers to come in
-	fmt.Println("sleeping")
-	time.Sleep(1 * time.Second)
-	fmt.Println("final check")
-	return l.satisfiedExpectations()
+	l.println("sleeping")
+	gomega.NewWithT(t).Consistently(l.receivedItems).
+		WithTimeout(1*time.Second).
+		WithPolling(100*time.Millisecond).
+		Should(gomega.Equal(l.expectedItemNames), "%s: unexpected stragglers", l.name)
+	l.println("final check")
 }
 
 func (l *testListener) satisfiedExpectations() bool {
 	l.lock.RLock()
 	defer l.lock.RUnlock()
 
-	return sets.NewString(l.receivedItemNames...).Equal(l.expectedItemNames)
+	return sets.New(l.receivedItemNames...).Equal(l.expectedItemNames)
+}
+
+func (l *testListener) reset() {
+	l.lock.Lock()
+	defer l.lock.Unlock()
+	l.receivedItemNames = nil
 }
 
 func eventHandlerCount(i SharedInformer) int {
@@ -117,96 +150,212 @@ func isRegistered(i SharedInformer, h ResourceEventHandlerRegistration) bool {
 	return s.processor.getListener(h) != nil
 }
 
-func TestListenerResyncPeriods(t *testing.T) {
+func TestIndexer(t *testing.T) {
+	assert := assert.New(t)
 	// source simulates an apiserver object endpoint.
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
+	pod1 := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1", Labels: map[string]string{"a": "a-val", "b": "b-val1"}}}
+	pod2 := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod2", Labels: map[string]string{"b": "b-val2"}}}
+	pod3 := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod3", Labels: map[string]string{"a": "a-val2"}}}
+	source.Add(pod1)
+	source.Add(pod2)
+
+	// create the shared informer and resync every 1s
+	informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second).(*sharedIndexInformer)
+	err := informer.AddIndexers(map[string]IndexFunc{
+		"labels": func(obj interface{}) ([]string, error) {
+			res := []string{}
+			for k := range obj.(*v1.Pod).Labels {
+				res = append(res, k)
+			}
+			return res, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg wait.Group
+	stop := make(chan struct{})
+	wg.StartWithChannel(stop, informer.Run)
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	WaitForCacheSync(stop, informer.HasSynced)
+
+	cmpOps := cmpopts.SortSlices(func(a, b any) bool {
+		return a.(*v1.Pod).Name < b.(*v1.Pod).Name
+	})
+
+	// We should be able to lookup by index
+	res, err := informer.GetIndexer().ByIndex("labels", "a")
+	assert.NoError(err)
+	if diff := cmp.Diff([]any{pod1}, res); diff != "" {
+		t.Fatal(diff)
+	}
+
+	// Adding an item later is fine as well
+	source.Add(pod3)
+	// Event is async, need to poll
+	assert.Eventually(func() bool {
+		res, _ := informer.GetIndexer().ByIndex("labels", "a")
+		return cmp.Diff([]any{pod1, pod3}, res, cmpOps) == ""
+	}, time.Second*3, time.Millisecond)
+
+	// Adding an index later is also fine
+	err = informer.AddIndexers(map[string]IndexFunc{
+		"labels-again": func(obj interface{}) ([]string, error) {
+			res := []string{}
+			for k := range obj.(*v1.Pod).Labels {
+				res = append(res, k)
+			}
+			return res, nil
+		},
+	})
+	assert.NoError(err)
+
+	// Should be immediately available
+	res, err = informer.GetIndexer().ByIndex("labels-again", "a")
+	assert.NoError(err)
+	if diff := cmp.Diff([]any{pod1, pod3}, res, cmpOps); diff != "" {
+		t.Fatal(diff)
+	}
+	if got := informer.GetIndexer().ListIndexFuncValues("labels"); !sets.New(got...).Equal(sets.New("a", "b")) {
+		t.Fatalf("got %v", got)
+	}
+	if got := informer.GetIndexer().ListIndexFuncValues("labels-again"); !sets.New(got...).Equal(sets.New("a", "b")) {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestListenerResyncPeriods(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) { testListenerResyncPeriods(t, 0) })
+}
+
+func TestListenerResyncPeriodsDelayed(t *testing.T) {
+	// sharedProcessor used to deadlock when sharedProcessor.run happened
+	// to be reached after the first sharedProcessor.distribute.
+	// This artififical delay simulates that situation.
+	//
+	// Must not run in parallel to other tests, but it doesn't need to:
+	// it doesn't sleep in real-world time and therefore completes quickly.
+	synctest.Test(t, func(t *testing.T) { testListenerResyncPeriods(t, time.Second) })
+}
+
+func testListenerResyncPeriods(t *testing.T, startupDelay time.Duration) {
+	start := time.Now()
+	println := func(msg string) {
+		delta := time.Since(start)
+		t.Logf("%s: %s", delta, msg)
+	}
+
+	if startupDelay > 0 {
+		hook := func() {
+			time.Sleep(startupDelay)
+		}
+		sharedProcessorRunHook.Store(&hook)
+		defer sharedProcessorRunHook.Store(nil)
+	}
+
+	// source simulates an apiserver object endpoint.
+	source := newFakeControllerSource(t)
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod2"}})
 
 	// create the shared informer and resync every 1s
 	informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second).(*sharedIndexInformer)
 
-	clock := testingclock.NewFakeClock(time.Now())
-	informer.clock = clock
-	informer.processor.clock = clock
-
 	// listener 1, never resync
 	listener1 := newTestListener("listener1", 0, "pod1", "pod2")
+	listener1.printlnFunc = println
 	informer.AddEventHandlerWithResyncPeriod(listener1, listener1.resyncPeriod)
 
 	// listener 2, resync every 2s
 	listener2 := newTestListener("listener2", 2*time.Second, "pod1", "pod2")
+	listener2.printlnFunc = println
 	informer.AddEventHandlerWithResyncPeriod(listener2, listener2.resyncPeriod)
 
 	// listener 3, resync every 3s
 	listener3 := newTestListener("listener3", 3*time.Second, "pod1", "pod2")
+	listener3.printlnFunc = println
 	informer.AddEventHandlerWithResyncPeriod(listener3, listener3.resyncPeriod)
 	listeners := []*testListener{listener1, listener2, listener3}
 
+	var wg wait.Group
 	stop := make(chan struct{})
-	defer close(stop)
+	wg.StartWithChannel(stop, informer.Run)
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
 
-	go informer.Run(stop)
+	// We must potentially advance time to unblock sharedProcess.run,
+	// otherwise synctest.Wait() below returns without anything
+	// being done.
+	time.Sleep(startupDelay)
 
-	// ensure all listeners got the initial List
+	// Ensure all listeners got the initial after the initial processing, at the initial start time.
+	//
+	// synctest.Wait doesn't detect deadlocks involving mutexes: they are considered not durably
+	// blocking, so in case of such a deadlock it'll just keep waiting until the entire unit test
+	// times out. The backtraces then show the deadlock.
+	synctest.Wait()
 	for _, listener := range listeners {
-		if !listener.ok() {
-			t.Errorf("%s: expected %v, got %v", listener.name, listener.expectedItemNames, listener.receivedItemNames)
+		if !listener.satisfiedExpectations() {
+			t.Errorf("%s: %s: expected %v, got %v", time.Since(start), listener.name, listener.expectedItemNames, listener.receivedItemNames)
 		}
 	}
 
 	// reset
 	for _, listener := range listeners {
-		listener.receivedItemNames = []string{}
+		listener.reset()
 	}
 
 	// advance so listener2 gets a resync
-	clock.Step(2 * time.Second)
+	time.Sleep(2*time.Second - startupDelay)
+	synctest.Wait()
 
 	// make sure listener2 got the resync
-	if !listener2.ok() {
-		t.Errorf("%s: expected %v, got %v", listener2.name, listener2.expectedItemNames, listener2.receivedItemNames)
+	if !listener2.satisfiedExpectations() {
+		t.Errorf("%s: %s: expected %v, got %v", time.Since(start), listener2.name, listener2.expectedItemNames, listener2.receivedItemNames)
 	}
-
-	// wait a bit to give errant items a chance to go to 1 and 3
-	time.Sleep(1 * time.Second)
 
 	// make sure listeners 1 and 3 got nothing
 	if len(listener1.receivedItemNames) != 0 {
-		t.Errorf("listener1: should not have resynced (got %d)", len(listener1.receivedItemNames))
+		t.Errorf("%s: listener1: should not have resynced (got %d)", time.Since(start), len(listener1.receivedItemNames))
 	}
 	if len(listener3.receivedItemNames) != 0 {
-		t.Errorf("listener3: should not have resynced (got %d)", len(listener3.receivedItemNames))
+		t.Errorf("%s: listener3: should not have resynced (got %d)", time.Since(start), len(listener3.receivedItemNames))
 	}
 
 	// reset
 	for _, listener := range listeners {
-		listener.receivedItemNames = []string{}
+		listener.reset()
 	}
 
 	// advance so listener3 gets a resync
-	clock.Step(1 * time.Second)
+	time.Sleep(1 * time.Second)
+	synctest.Wait()
 
 	// make sure listener3 got the resync
-	if !listener3.ok() {
-		t.Errorf("%s: expected %v, got %v", listener3.name, listener3.expectedItemNames, listener3.receivedItemNames)
+	if !listener3.satisfiedExpectations() {
+		t.Errorf("%s: %s: expected %v, got %v", time.Since(start), listener3.name, listener3.expectedItemNames, listener3.receivedItemNames)
 	}
-
-	// wait a bit to give errant items a chance to go to 1 and 2
-	time.Sleep(1 * time.Second)
 
 	// make sure listeners 1 and 2 got nothing
 	if len(listener1.receivedItemNames) != 0 {
-		t.Errorf("listener1: should not have resynced (got %d)", len(listener1.receivedItemNames))
+		t.Errorf("%s: listener1: should not have resynced (got %d)", time.Since(start), len(listener1.receivedItemNames))
 	}
 	if len(listener2.receivedItemNames) != 0 {
-		t.Errorf("listener2: should not have resynced (got %d)", len(listener2.receivedItemNames))
+		t.Errorf("%s: listener2: should not have resynced (got %d)", time.Since(start), len(listener2.receivedItemNames))
 	}
 }
 
 func TestResyncCheckPeriod(t *testing.T) {
 	// source simulates an apiserver object endpoint.
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 
 	// create the shared informer and resync every 12 hours
 	informer := NewSharedInformer(source, &v1.Pod{}, 12*time.Hour).(*sharedIndexInformer)
@@ -278,14 +427,18 @@ func TestResyncCheckPeriod(t *testing.T) {
 
 // verify that https://github.com/kubernetes/kubernetes/issues/59822 is fixed
 func TestSharedInformerInitializationRace(t *testing.T) {
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 	informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second).(*sharedIndexInformer)
 	listener := newTestListener("raceListener", 0)
 
-	stop := make(chan struct{})
 	go informer.AddEventHandlerWithResyncPeriod(listener, listener.resyncPeriod)
-	go informer.Run(stop)
-	close(stop)
+	var wg wait.Group
+	stop := make(chan struct{})
+	wg.StartWithChannel(stop, informer.Run)
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
 }
 
 // TestSharedInformerWatchDisruption simulates a watch that was closed
@@ -293,7 +446,7 @@ func TestSharedInformerInitializationRace(t *testing.T) {
 // resync and no resync see the expected state.
 func TestSharedInformerWatchDisruption(t *testing.T) {
 	// source simulates an apiserver object endpoint.
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1", UID: "pod1", ResourceVersion: "1"}})
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod2", UID: "pod2", ResourceVersion: "2"}})
@@ -313,15 +466,16 @@ func TestSharedInformerWatchDisruption(t *testing.T) {
 	informer.AddEventHandlerWithResyncPeriod(listenerResync, listenerResync.resyncPeriod)
 	listeners := []*testListener{listenerNoResync, listenerResync}
 
+	var wg wait.Group
 	stop := make(chan struct{})
-	defer close(stop)
-
-	go informer.Run(stop)
+	wg.StartWithChannel(stop, informer.Run)
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
 
 	for _, listener := range listeners {
-		if !listener.ok() {
-			t.Errorf("%s: expected %v, got %v", listener.name, listener.expectedItemNames, listener.receivedItemNames)
-		}
+		listener.ok(t)
 	}
 
 	// Add pod3, bump pod2 but don't broadcast it, so that the change will be seen only on relist
@@ -330,17 +484,15 @@ func TestSharedInformerWatchDisruption(t *testing.T) {
 
 	// Ensure that nobody saw any changes
 	for _, listener := range listeners {
-		if !listener.ok() {
-			t.Errorf("%s: expected %v, got %v", listener.name, listener.expectedItemNames, listener.receivedItemNames)
-		}
+		listener.ok(t)
 	}
 
 	for _, listener := range listeners {
 		listener.receivedItemNames = []string{}
 	}
 
-	listenerNoResync.expectedItemNames = sets.NewString("pod2", "pod3")
-	listenerResync.expectedItemNames = sets.NewString("pod1", "pod2", "pod3")
+	listenerNoResync.expectedItemNames = sets.New("pod2", "pod3")
+	listenerResync.expectedItemNames = sets.New("pod1", "pod2", "pod3")
 
 	// This calls shouldSync, which deletes noResync from the list of syncingListeners
 	clock.Step(1 * time.Second)
@@ -361,14 +513,12 @@ func TestSharedInformerWatchDisruption(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	for _, listener := range listeners {
-		if !listener.ok() {
-			t.Errorf("%s: expected %v, got %v", listener.name, listener.expectedItemNames, listener.receivedItemNames)
-		}
+		listener.ok(t)
 	}
 }
 
 func TestSharedInformerErrorHandling(t *testing.T) {
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
 	source.ListError = fmt.Errorf("Access Denied")
 
@@ -379,8 +529,13 @@ func TestSharedInformerErrorHandling(t *testing.T) {
 		errCh <- err
 	})
 
+	var wg wait.Group
 	stop := make(chan struct{})
-	go informer.Run(stop)
+	wg.StartWithChannel(stop, informer.Run)
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
 
 	select {
 	case err := <-errCh:
@@ -390,13 +545,12 @@ func TestSharedInformerErrorHandling(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Errorf("Timeout waiting for error handler call")
 	}
-	close(stop)
 }
 
 // TestSharedInformerStartRace is a regression test to ensure there is no race between
 // Run and SetWatchErrorHandler, and Run and SetTransform.
 func TestSharedInformerStartRace(t *testing.T) {
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 	informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second).(*sharedIndexInformer)
 	stop := make(chan struct{})
 	go func() {
@@ -415,14 +569,17 @@ func TestSharedInformerStartRace(t *testing.T) {
 		}
 	}()
 
-	go informer.Run(stop)
-
-	close(stop)
+	var wg wait.Group
+	wg.StartWithChannel(stop, informer.Run)
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
 }
 
 func TestSharedInformerTransformer(t *testing.T) {
 	// source simulates an apiserver object endpoint.
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1", UID: "pod1", ResourceVersion: "1"}})
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod2", UID: "pod2", ResourceVersion: "2"}})
@@ -443,29 +600,32 @@ func TestSharedInformerTransformer(t *testing.T) {
 	listenerTransformer := newTestListener("listenerTransformer", 0, "POD1", "POD2")
 	informer.AddEventHandler(listenerTransformer)
 
+	var wg wait.Group
 	stop := make(chan struct{})
-	go informer.Run(stop)
-	defer close(stop)
+	wg.StartWithChannel(stop, informer.Run)
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
 
-	if !listenerTransformer.ok() {
-		t.Errorf("%s: expected %v, got %v", listenerTransformer.name, listenerTransformer.expectedItemNames, listenerTransformer.receivedItemNames)
-	}
+	listenerTransformer.ok(t)
 }
 
 func TestSharedInformerRemoveHandler(t *testing.T) {
-	source := fcache.NewFakeControllerSource()
+	logger, _ := ktesting.NewTestContext(t)
+	source := newFakeControllerSource(t)
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
 
 	informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second)
 
 	handler1 := &ResourceEventHandlerFuncs{}
-	handle1, err := informer.AddEventHandler(handler1)
+	handle1, err := informer.AddEventHandlerWithOptions(handler1, HandlerOptions{Logger: &logger})
 	if err != nil {
 		t.Errorf("informer did not add handler1: %s", err)
 		return
 	}
 	handler2 := &ResourceEventHandlerFuncs{}
-	handle2, err := informer.AddEventHandler(handler2)
+	handle2, err := informer.AddEventHandlerWithOptions(handler2, HandlerOptions{Logger: &logger})
 	if err != nil {
 		t.Errorf("informer did not add handler2: %s", err)
 		return
@@ -491,12 +651,12 @@ func TestSharedInformerRemoveHandler(t *testing.T) {
 }
 
 func TestSharedInformerRemoveForeignHandler(t *testing.T) {
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
 
 	informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second).(*sharedIndexInformer)
 
-	source2 := fcache.NewFakeControllerSource()
+	source2 := newFakeControllerSource(t)
 	source2.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
 
 	informer2 := NewSharedInformer(source2, &v1.Pod{}, 1*time.Second).(*sharedIndexInformer)
@@ -573,7 +733,7 @@ func TestSharedInformerRemoveForeignHandler(t *testing.T) {
 }
 
 func TestSharedInformerMultipleRegistration(t *testing.T) {
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
 
 	informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second).(*sharedIndexInformer)
@@ -641,7 +801,7 @@ func TestSharedInformerMultipleRegistration(t *testing.T) {
 }
 
 func TestRemovingRemovedSharedInformer(t *testing.T) {
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
 
 	informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second).(*sharedIndexInformer)
@@ -673,14 +833,16 @@ func TestRemovingRemovedSharedInformer(t *testing.T) {
 // listeners without tripping it up. There are not really many assertions in this
 // test. Meant to be run with -race to find race conditions
 func TestSharedInformerHandlerAbuse(t *testing.T) {
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 	informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second).(*sharedIndexInformer)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	informerCtx, informerCancel := context.WithCancel(context.Background())
-	go func() {
-		informer.Run(informerCtx.Done())
+	var informerWg wait.Group
+	informerWg.StartWithChannel(informerCtx.Done(), informer.Run)
+	defer func() {
 		cancel()
+		informerWg.Wait()
 	}()
 
 	worker := func() {
@@ -787,7 +949,7 @@ func TestSharedInformerHandlerAbuse(t *testing.T) {
 }
 
 func TestStateSharedInformer(t *testing.T) {
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
 
 	informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second).(*sharedIndexInformer)
@@ -802,22 +964,25 @@ func TestStateSharedInformer(t *testing.T) {
 		t.Errorf("informer already stopped after creation")
 		return
 	}
+	var wg wait.Group
 	stop := make(chan struct{})
-	go informer.Run(stop)
-	if !listener.ok() {
-		t.Errorf("informer did not report initial objects")
-		close(stop)
-		return
-	}
+	wg.StartWithChannel(stop, informer.Run)
+	defer func() {
+		select {
+		case <-stop:
+		default:
+			close(stop)
+		}
+		wg.Wait()
+	}()
+	listener.ok(t)
 
 	if !isStarted(informer) {
 		t.Errorf("informer does not report to be started although handling events")
-		close(stop)
 		return
 	}
 	if informer.IsStopped() {
 		t.Errorf("informer reports to be stopped although stop channel not closed")
-		close(stop)
 		return
 	}
 
@@ -836,28 +1001,20 @@ func TestStateSharedInformer(t *testing.T) {
 }
 
 func TestAddOnStoppedSharedInformer(t *testing.T) {
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
 
 	informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second).(*sharedIndexInformer)
 	listener := newTestListener("listener", 0, "pod1")
 	stop := make(chan struct{})
-	go informer.Run(stop)
+	var wg wait.Group
+	wg.StartWithChannel(stop, informer.Run)
+	defer wg.Wait()
 	close(stop)
 
-	err := wait.PollImmediate(100*time.Millisecond, 2*time.Second, func() (bool, error) {
-		if informer.IsStopped() {
-			return true, nil
-		}
-		return false, nil
-	})
+	gomega.NewWithT(t).Eventually(informer.IsStopped).WithTimeout(2 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.BeTrueBecause("informer reports not to be stopped although stop channel closed"))
 
-	if err != nil {
-		t.Errorf("informer reports not to be stopped although stop channel closed")
-		return
-	}
-
-	_, err = informer.AddEventHandlerWithResyncPeriod(listener, listener.resyncPeriod)
+	_, err := informer.AddEventHandlerWithResyncPeriod(listener, listener.resyncPeriod)
 	if err == nil {
 		t.Errorf("stopped informer did not reject add handler")
 		return
@@ -869,7 +1026,7 @@ func TestAddOnStoppedSharedInformer(t *testing.T) {
 }
 
 func TestRemoveOnStoppedSharedInformer(t *testing.T) {
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
 
 	informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second).(*sharedIndexInformer)
@@ -880,7 +1037,9 @@ func TestRemoveOnStoppedSharedInformer(t *testing.T) {
 		return
 	}
 	stop := make(chan struct{})
-	go informer.Run(stop)
+	var wg wait.Group
+	wg.StartWithChannel(stop, informer.Run)
+	defer wg.Wait()
 	close(stop)
 	fmt.Println("sleeping")
 	time.Sleep(1 * time.Second)
@@ -898,7 +1057,7 @@ func TestRemoveOnStoppedSharedInformer(t *testing.T) {
 
 func TestRemoveWhileActive(t *testing.T) {
 	// source simulates an apiserver object endpoint.
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 
 	// create the shared informer and resync every 12 hours
 	informer := NewSharedInformer(source, &v1.Pod{}, 0).(*sharedIndexInformer)
@@ -907,15 +1066,16 @@ func TestRemoveWhileActive(t *testing.T) {
 	handle, _ := informer.AddEventHandler(listener)
 
 	stop := make(chan struct{})
-	defer close(stop)
+	var wg wait.Group
+	wg.StartWithChannel(stop, informer.Run)
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
 
-	go informer.Run(stop)
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
 
-	if !listener.ok() {
-		t.Errorf("event did not occur")
-		return
-	}
+	listener.ok(t)
 
 	informer.RemoveEventHandler(handle)
 
@@ -926,15 +1086,12 @@ func TestRemoveWhileActive(t *testing.T) {
 
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod2"}})
 
-	if !listener.ok() {
-		t.Errorf("unexpected event occurred")
-		return
-	}
+	listener.ok(t)
 }
 
 func TestAddWhileActive(t *testing.T) {
 	// source simulates an apiserver object endpoint.
-	source := fcache.NewFakeControllerSource()
+	source := newFakeControllerSource(t)
 
 	// create the shared informer and resync every 12 hours
 	informer := NewSharedInformer(source, &v1.Pod{}, 0).(*sharedIndexInformer)
@@ -947,18 +1104,24 @@ func TestAddWhileActive(t *testing.T) {
 	}
 
 	stop := make(chan struct{})
-	defer close(stop)
+	var wg wait.Group
+	wg.StartWithChannel(stop, informer.Run)
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
 
-	go informer.Run(stop)
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
 
-	if !listener1.ok() {
-		t.Errorf("events on listener1 did not occur")
-		return
-	}
+	listener1.ok(t)
 
-	if !handle1.HasSynced() {
-		t.Error("Not synced after Run??")
+	select {
+	case <-handle1.HasSyncedChecker().Done():
+		if !handle1.HasSynced() {
+			t.Error("Not synced after channel said we are synced??")
+		}
+	case <-time.After(10 * time.Second):
+		t.Error("Not synced 10 seconds after Run??")
 	}
 
 	listener2.lock.Lock() // ensure we observe it before it has synced
@@ -970,10 +1133,7 @@ func TestAddWhileActive(t *testing.T) {
 
 	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod2"}})
 
-	if !listener2.ok() {
-		t.Errorf("event on listener2 did not occur")
-		return
-	}
+	listener2.ok(t)
 
 	if !handle2.HasSynced() {
 		t.Error("Not synced even after processing?")
@@ -989,8 +1149,435 @@ func TestAddWhileActive(t *testing.T) {
 	}
 
 	listener1.expectedItemNames = listener2.expectedItemNames
-	if !listener1.ok() {
-		t.Errorf("events on listener1 did not occur")
-		return
+	listener1.ok(t)
+}
+
+// TestShutdown depends on goleak.VerifyTestMain in main_test.go to verify that
+// all goroutines really have stopped in the different scenarios.
+func TestShutdown(t *testing.T) {
+	t.Run("no-context", func(t *testing.T) {
+		logger, _ := ktesting.NewTestContext(t)
+		source := newFakeControllerSource(t)
+
+		informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second)
+		handler, err := informer.AddEventHandlerWithOptions(ResourceEventHandlerFuncs{
+			AddFunc: func(_ any) {},
+		}, HandlerOptions{Logger: &logger})
+		require.NoError(t, err)
+		defer func() {
+			assert.NoError(t, informer.RemoveEventHandler(handler))
+		}()
+
+		var wg wait.Group
+		stop := make(chan struct{})
+		wg.StartWithChannel(stop, informer.Run)
+		defer func() {
+			close(stop)
+			wg.Wait()
+		}()
+
+		require.Eventually(t, informer.HasSynced, time.Minute, time.Millisecond, "informer has synced")
+	})
+
+	t.Run("no-context-later", func(t *testing.T) {
+		logger, _ := ktesting.NewTestContext(t)
+		source := newFakeControllerSource(t)
+		informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second)
+
+		var wg wait.Group
+		stop := make(chan struct{})
+		wg.StartWithChannel(stop, informer.Run)
+		defer func() {
+			close(stop)
+			wg.Wait()
+		}()
+
+		require.Eventually(t, informer.HasSynced, time.Minute, time.Millisecond, "informer has synced")
+
+		handler, err := informer.AddEventHandlerWithOptions(ResourceEventHandlerFuncs{
+			AddFunc: func(_ any) {},
+		}, HandlerOptions{Logger: &logger})
+		require.NoError(t, err)
+		assert.NoError(t, informer.RemoveEventHandler(handler))
+	})
+
+	t.Run("no-run", func(t *testing.T) {
+		logger, _ := ktesting.NewTestContext(t)
+		source := newFakeControllerSource(t)
+		informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second)
+		_, err := informer.AddEventHandlerWithOptions(ResourceEventHandlerFuncs{
+			AddFunc: func(_ any) {},
+		}, HandlerOptions{Logger: &logger})
+		require.NoError(t, err)
+
+		// At this point, neither informer nor handler have any goroutines running
+		// and it doesn't matter that nothing gets stopped or removed.
+	})
+}
+
+func TestEventPanics(t *testing.T) {
+	// timeInUTC := time.Date(2009, 12, 1, 13, 30, 40, 42000, time.UTC)
+	// timeString := "1201 13:30:40.000042"
+	// Initialized by init.
+	var (
+		buffer threadSafeBuffer
+		logger klog.Logger
+		source *fcache.FakeControllerSource
+	)
+
+	init := func(t *testing.T) {
+		// Restoring state is very sensitive to ordering. All goroutines spawned
+		// by a test must have completed and there has to be a check that they
+		// have completed that is visible to the race detector. This also
+		// applies to all other tests!
+		t.Cleanup(klog.CaptureState().Restore) //nolint:logcheck // CaptureState shouldn't be used in packages with contextual logging, but here it is okay.
+		buffer.buffer.Reset()
+		logger = textlogger.NewLogger(textlogger.NewConfig(
+			// textlogger.FixedTime(timeInUTC),
+			textlogger.Output(&buffer),
+		))
+		oldReallyCrash := utilruntime.ReallyCrash
+		utilruntime.ReallyCrash = false
+		t.Cleanup(func() { utilruntime.ReallyCrash = oldReallyCrash })
+
+		source = newFakeControllerSource(t)
+		source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
 	}
+
+	newHandler := func(ctx context.Context) ResourceEventHandlerFuncs {
+		logger := klog.FromContext(ctx)
+		return ResourceEventHandlerFuncs{
+			AddFunc: func(obj any) {
+				logger.Info("Add func will panic now", "pod", klog.KObj(obj.(*v1.Pod)))
+				panic("fake panic")
+			},
+		}
+	}
+	_, _, panicLine, _ := runtime.Caller(0)
+	panicLine -= 4
+	expectedLog := func(name string) string {
+		if name == "" {
+			return fmt.Sprintf(`shared_informer_test.go:%d] "Observed a panic" panic="fake panic"`, panicLine)
+		}
+		return fmt.Sprintf(`shared_informer_test.go:%d] "Observed a panic" logger=%q panic="fake panic"`, panicLine, name)
+	}
+	handler := newHandler(context.Background())
+
+	t.Run("simple", func(t *testing.T) {
+		init(t)
+		klog.SetLogger(logger)
+		stop := make(chan struct{})
+		informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second)
+		handle, err := informer.AddEventHandlerWithOptions(handler, HandlerOptions{Logger: &logger})
+		require.NoError(t, err)
+		defer func() {
+			assert.NoError(t, informer.RemoveEventHandler(handle))
+		}()
+		var wg wait.Group
+		wg.StartWithChannel(stop, informer.Run)
+		defer func() {
+			close(stop)
+			assert.Eventually(t, informer.IsStopped, time.Minute, time.Millisecond, "informer has stopped")
+			wg.Wait() // For race detector...
+		}()
+		require.Eventually(t, informer.HasSynced, time.Minute, time.Millisecond, "informer has synced")
+
+		// This times out (https://github.com/kubernetes/kubernetes/issues/129024) because the
+		// handler never syncs when the callback panics:
+		//    require.Eventually(t, handle.HasSynced, time.Minute, time.Millisecond, "handler has synced")
+		//
+		// Wait for a non-empty buffer instead. This implies that we have to make
+		// the buffer thread-safe, which wouldn't be necessary otherwise.
+		assert.EventuallyWithT(t, func(t *assert.CollectT) {
+			assert.Contains(t, buffer.String(), expectedLog(""))
+		}, time.Minute, time.Millisecond, "handler has panicked")
+	})
+
+	t.Run("many", func(t *testing.T) {
+		init(t)
+		// One pod was already created in init, add some more.
+		numPods := 5
+		for i := 1; i < numPods; i++ {
+			source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pod%d", i+1)}})
+		}
+		_, ctx := ktesting.NewTestContext(t)
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		informer := NewSharedInformer(source, &v1.Pod{}, 1*time.Second)
+		name1 := "fake-event-handler-1"
+		logger1 := klog.LoggerWithName(logger, name1)
+		ctx1 := klog.NewContext(ctx, logger1)
+		handle1, err := informer.AddEventHandlerWithOptions(newHandler(ctx1), HandlerOptions{Logger: &logger1})
+		require.NoError(t, err)
+		defer func() {
+			assert.NoError(t, informer.RemoveEventHandler(handle1))
+		}()
+		name2 := "fake-event-handler-2"
+		logger2 := klog.LoggerWithName(logger, name2)
+		ctx2 := klog.NewContext(ctx, logger2)
+		handle2, err := informer.AddEventHandlerWithOptions(newHandler(ctx2), HandlerOptions{Logger: &logger2})
+		require.NoError(t, err)
+		defer func() {
+			assert.NoError(t, informer.RemoveEventHandler(handle2))
+		}()
+
+		start := time.Now()
+		var wg wait.Group
+		informerName := "informer"
+		informerLogger := klog.LoggerWithName(logger, informerName)
+		informerCtx := klog.NewContext(ctx, informerLogger)
+		wg.StartWithContext(informerCtx, informer.RunWithContext)
+		defer func() {
+			cancel()
+			assert.Eventually(t, informer.IsStopped, time.Minute, time.Millisecond, "informer has stopped")
+			wg.Wait() // For race detector...
+		}()
+		require.Eventually(t, informer.HasSynced, time.Minute, time.Millisecond, "informer has synced")
+
+		assert.EventuallyWithT(t, func(t *assert.CollectT) {
+			output := buffer.String()
+			expected := expectedLog(name1)
+			if !assert.Equal(t, numPods, numOccurrences(output, expected), "Log output should have the right number of panics for %q (search string: %q), got instead:\n%s", name1, expected, output) {
+				return
+			}
+			expected = expectedLog(name2)
+			assert.Equal(t, numPods, numOccurrences(output, expected), "Log output should have the right number of panics for %q (search string %q, got instead:\n%s", name2, expected, output)
+		}, 30*time.Second, time.Millisecond, "handler has panicked")
+
+		// Both handlers should have slept for one second after each panic,
+		// except after the last pod event because then the input channel
+		// gets closed.
+		assert.GreaterOrEqual(t, time.Since(start), time.Duration(numPods-1)*time.Second, "Delay in processorListener.run")
+	})
+}
+
+func numOccurrences(hay, needle string) int {
+	count := 0
+	for {
+		index := strings.Index(hay, needle)
+		if index < 0 {
+			return count
+		}
+		count++
+		hay = hay[index+len(needle):]
+	}
+}
+
+func TestRemoveEventHandler_AsynchronousPanic(t *testing.T) {
+	source := newFakeControllerSource(t)
+	informer := NewSharedInformer(source, &v1.Pod{}, 0).(*sharedIndexInformer)
+
+	stop := make(chan struct{})
+	var wg wait.Group
+	wg.StartWithChannel(stop, informer.Run)
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	scheduledPods := make(chan *v1.Pod, 1)
+	blockChan := make(chan struct{})
+	handlerStarted := make(chan struct{})
+	handlerFinished := make(chan struct{})
+	var panicVal any
+	var panicked bool
+
+	handler := ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			close(handlerStarted)
+			<-blockChan
+			defer close(handlerFinished)
+			defer func() {
+				if r := recover(); r != nil {
+					panicVal = r
+					panicked = true
+				}
+			}()
+			scheduledPods <- obj.(*v1.Pod)
+		},
+	}
+
+	handle, err := informer.AddEventHandler(handler)
+	if err != nil {
+		t.Fatalf("Failed to add event handler: %v", err)
+	}
+
+	// Trigger the event
+	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
+
+	// Wait for handler to start and block
+	<-handlerStarted
+
+	// Now remove the handler. This should return immediately.
+	err = informer.RemoveEventHandler(handle)
+	if err != nil {
+		t.Fatalf("Failed to remove event handler: %v", err)
+	}
+
+	// Close the channel that the handler writes to
+	close(scheduledPods)
+
+	// Unblock the handler
+	close(blockChan)
+
+	// Wait for handler to finish
+	<-handlerFinished
+
+	if !panicked {
+		t.Fatalf("Expected handler to panic (send on closed channel), but it did not")
+	}
+	t.Logf("Caught expected panic: %v", panicVal)
+}
+
+func TestRemoveEventHandler_SynchronousShutdown(t *testing.T) {
+	source := newFakeControllerSource(t)
+	informer := NewSharedInformer(source, &v1.Pod{}, 0).(*sharedIndexInformer)
+
+	stop := make(chan struct{})
+	var wg wait.Group
+	wg.StartWithChannel(stop, informer.Run)
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	scheduledPods := make(chan *v1.Pod, 1)
+	blockChan := make(chan struct{})
+	handlerStarted := make(chan struct{})
+	handlerFinished := make(chan struct{})
+	var panicVal any
+	var panicked bool
+
+	handler := ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			close(handlerStarted)
+			<-blockChan
+			defer close(handlerFinished)
+			defer func() {
+				if r := recover(); r != nil {
+					panicVal = r
+					panicked = true
+				}
+			}()
+			scheduledPods <- obj.(*v1.Pod)
+		},
+	}
+
+	handle, err := informer.AddEventHandler(handler)
+	if err != nil {
+		t.Fatalf("Failed to add event handler: %v", err)
+	}
+
+	// Trigger the event
+	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}})
+
+	// Wait for handler to start and block
+	<-handlerStarted
+
+	// Unblock the handler so it can run and exit
+	close(blockChan)
+
+	// Now remove the handler and wait for it to fully stop.
+	err = ShutDownEventHandler(informer, handle)
+	if err != nil {
+		t.Fatalf("Failed to shutdown event handler: %v", err)
+	}
+
+	// NOW it is safe to close the channel
+	close(scheduledPods)
+
+	// Wait for handler function to finish (should already be done)
+	<-handlerFinished
+
+	if panicked {
+		t.Fatalf("Handler panicked unexpectedly: %v", panicVal)
+	}
+}
+
+func TestShutDownEventHandler_Lifecycles(t *testing.T) {
+	t.Run("InformerNeverStarted", func(t *testing.T) {
+		source := newFakeControllerSource(t)
+		informer := NewSharedInformer(source, &v1.Pod{}, 0).(*sharedIndexInformer)
+
+		handler := ResourceEventHandlerFuncs{
+			AddFunc: func(obj any) {},
+		}
+		handle, err := informer.AddEventHandler(handler)
+		if err != nil {
+			t.Fatalf("Failed to add event handler: %v", err)
+		}
+
+		// Shutdown should return immediately because the informer was never started.
+		err = ShutDownEventHandler(informer, handle)
+		if err != nil {
+			t.Fatalf("Failed to shutdown event handler: %v", err)
+		}
+	})
+
+	t.Run("StartedThenAddedThenShutDown", func(t *testing.T) {
+		source := newFakeControllerSource(t)
+		informer := NewSharedInformer(source, &v1.Pod{}, 0).(*sharedIndexInformer)
+
+		stop := make(chan struct{})
+		var wg wait.Group
+		wg.StartWithChannel(stop, informer.Run)
+		defer func() {
+			close(stop)
+			wg.Wait()
+		}()
+
+		// Wait deterministically for the informer to sync (proving it has started)
+		syncCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if !WaitFor(syncCtx, "informer sync", informer.HasSyncedChecker()) {
+			t.Fatalf("Informer did not sync")
+		}
+
+		handler := ResourceEventHandlerFuncs{
+			AddFunc: func(obj any) {},
+		}
+		handle, err := informer.AddEventHandler(handler)
+		if err != nil {
+			t.Fatalf("Failed to add event handler: %v", err)
+		}
+
+		err = ShutDownEventHandler(informer, handle)
+		if err != nil {
+			t.Fatalf("Failed to shutdown event handler: %v", err)
+		}
+	})
+
+	t.Run("AddedThenStartedThenShutDown", func(t *testing.T) {
+		source := newFakeControllerSource(t)
+		informer := NewSharedInformer(source, &v1.Pod{}, 0).(*sharedIndexInformer)
+
+		handler := ResourceEventHandlerFuncs{
+			AddFunc: func(obj any) {},
+		}
+		handle, err := informer.AddEventHandler(handler)
+		if err != nil {
+			t.Fatalf("Failed to add event handler: %v", err)
+		}
+
+		stop := make(chan struct{})
+		var wg wait.Group
+		wg.StartWithChannel(stop, informer.Run)
+		defer func() {
+			close(stop)
+			wg.Wait()
+		}()
+
+		// Wait deterministically for the informer to sync (proving it has started)
+		syncCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if !WaitFor(syncCtx, "informer sync", informer.HasSyncedChecker()) {
+			t.Fatalf("Informer did not sync")
+		}
+
+		err = ShutDownEventHandler(informer, handle)
+		if err != nil {
+			t.Fatalf("Failed to shutdown event handler: %v", err)
+		}
+	})
 }

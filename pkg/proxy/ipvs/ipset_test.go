@@ -1,5 +1,4 @@
-//go:build !windows
-// +build !windows
+//go:build linux
 
 /*
 Copyright 2017 The Kubernetes Authors.

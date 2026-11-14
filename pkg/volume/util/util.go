@@ -19,34 +19,30 @@ package util
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
+	"slices"
 	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	storage "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
 	utypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientset "k8s.io/client-go/kubernetes"
-	storagehelpers "k8s.io/component-helpers/storage/volume"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/securitycontext"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util/types"
 	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
 	"k8s.io/mount-utils"
-	utilexec "k8s.io/utils/exec"
 	"k8s.io/utils/io"
 	utilstrings "k8s.io/utils/strings"
 )
@@ -58,10 +54,6 @@ const (
 	// objects that indicates attach/detach operations for the node should be
 	// managed by the attach/detach controller
 	ControllerManagedAttachAnnotation string = "volumes.kubernetes.io/controller-managed-attach-detach"
-
-	// KeepTerminatedPodVolumesAnnotation is the key of the annotation on Node
-	// that decides if pod volumes are unmounted when pod is terminated
-	KeepTerminatedPodVolumesAnnotation string = "volumes.kubernetes.io/keep-terminated-pod-volumes"
 
 	// MountsInGlobalPDPath is name of the directory appended to a volume plugin
 	// name to create the place for volume mounts in the global PD path.
@@ -115,22 +107,6 @@ func SetReady(dir string) {
 	file.Close()
 }
 
-// GetSecretForPod locates secret by name in the pod's namespace and returns secret map
-func GetSecretForPod(pod *v1.Pod, secretName string, kubeClient clientset.Interface) (map[string]string, error) {
-	secret := make(map[string]string)
-	if kubeClient == nil {
-		return secret, fmt.Errorf("cannot get kube client")
-	}
-	secrets, err := kubeClient.CoreV1().Secrets(pod.Namespace).Get(context.TODO(), secretName, metav1.GetOptions{})
-	if err != nil {
-		return secret, err
-	}
-	for name, data := range secrets.Data {
-		secret[name] = string(data)
-	}
-	return secret, nil
-}
-
 // GetSecretForPV locates secret by name and namespace, verifies the secret type, and returns secret map
 func GetSecretForPV(secretNamespace, secretName, volumePluginName string, kubeClient clientset.Interface) (map[string]string, error) {
 	secret := make(map[string]string)
@@ -148,23 +124,6 @@ func GetSecretForPV(secretNamespace, secretName, volumePluginName string, kubeCl
 		secret[name] = string(data)
 	}
 	return secret, nil
-}
-
-// GetClassForVolume locates storage class by persistent volume
-func GetClassForVolume(kubeClient clientset.Interface, pv *v1.PersistentVolume) (*storage.StorageClass, error) {
-	if kubeClient == nil {
-		return nil, fmt.Errorf("cannot get kube client")
-	}
-	className := storagehelpers.GetPersistentVolumeClass(pv)
-	if className == "" {
-		return nil, fmt.Errorf("volume has no storage class")
-	}
-
-	class, err := kubeClient.StorageV1().StorageClasses().Get(context.TODO(), className, metav1.GetOptions{})
-	if err != nil {
-		return nil, err
-	}
-	return class, nil
 }
 
 // LoadPodFromFile will read, decode, and return a Pod from a file.
@@ -191,33 +150,35 @@ func LoadPodFromFile(filePath string) (*v1.Pod, error) {
 // CalculateTimeoutForVolume calculates time for a Recycler pod to complete a
 // recycle operation. The calculation and return value is either the
 // minimumTimeout or the timeoutIncrement per Gi of storage size, whichever is
-// greater.
+// greater, capped at math.MaxInt32.
 func CalculateTimeoutForVolume(minimumTimeout, timeoutIncrement int, pv *v1.PersistentVolume) int64 {
 	giQty := resource.MustParse("1Gi")
 	pvQty := pv.Spec.Capacity[v1.ResourceStorage]
 	giSize := giQty.Value()
 	pvSize := pvQty.Value()
-	timeout := (pvSize / giSize) * int64(timeoutIncrement)
+	giCount := pvSize / giSize
+	increment := int64(timeoutIncrement)
+	// Neither the volume size nor the increment is bounded, so multiplying them
+	// directly can wrap in either direction and land back in range.
+	var timeout int64
+	switch {
+	case increment <= 0:
+		timeout = 0
+	case giCount > math.MaxInt64/increment:
+		timeout = math.MaxInt64
+	default:
+		timeout = giCount * increment
+	}
 	if timeout < int64(minimumTimeout) {
-		return int64(minimumTimeout)
+		timeout = int64(minimumTimeout)
+	}
+	// The result becomes the recycler pod's activeDeadlineSeconds, which the
+	// API server rejects above math.MaxInt32, so a large enough volume would
+	// otherwise produce a pod that cannot be created.
+	if timeout > math.MaxInt32 {
+		return math.MaxInt32
 	}
 	return timeout
-}
-
-// GenerateVolumeName returns a PV name with clusterName prefix. The function
-// should be used to generate a name of GCE PD or Cinder volume. It basically
-// adds "<clusterName>-dynamic-" before the PV name, making sure the resulting
-// string fits given length and cuts "dynamic" if not.
-func GenerateVolumeName(clusterName, pvName string, maxLength int) string {
-	prefix := clusterName + "-dynamic"
-	pvLen := len(pvName)
-
-	// cut the "<clusterName>-dynamic" to fit full pvName into maxLength
-	// +1 for the '-' dash
-	if pvLen+1+len(prefix) > maxLength {
-		prefix = prefix[:maxLength-pvLen-1]
-	}
-	return prefix + "-" + pvName
 }
 
 // GetPath checks if the path from the mounter is empty.
@@ -263,7 +224,7 @@ func MountOptionFromSpec(spec *volume.Spec, options ...string) []string {
 
 // JoinMountOptions joins mount options eliminating duplicates
 func JoinMountOptions(userOptions []string, systemOptions []string) []string {
-	allMountOptions := sets.NewString()
+	allMountOptions := sets.New[string]()
 
 	for _, mountOption := range userOptions {
 		if len(mountOption) > 0 {
@@ -274,17 +235,12 @@ func JoinMountOptions(userOptions []string, systemOptions []string) []string {
 	for _, mountOption := range systemOptions {
 		allMountOptions.Insert(mountOption)
 	}
-	return allMountOptions.List()
+	return sets.List(allMountOptions)
 }
 
 // ContainsAccessMode returns whether the requested mode is contained by modes
 func ContainsAccessMode(modes []v1.PersistentVolumeAccessMode, mode v1.PersistentVolumeAccessMode) bool {
-	for _, m := range modes {
-		if m == mode {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(modes, mode)
 }
 
 // ContainsAllAccessModes returns whether all of the requested modes are contained by modes
@@ -390,14 +346,6 @@ func SplitUniqueName(uniqueName v1.UniqueVolumeName) (string, string, error) {
 	}
 	pluginName := fmt.Sprintf("%s/%s", components[0], components[1])
 	return pluginName, components[2], nil
-}
-
-// NewSafeFormatAndMountFromHost creates a new SafeFormatAndMount with Mounter
-// and Exec taken from given VolumeHost.
-func NewSafeFormatAndMountFromHost(pluginName string, host volume.VolumeHost) *mount.SafeFormatAndMount {
-	mounter := host.GetMounter(pluginName)
-	exec := host.GetExec(pluginName)
-	return &mount.SafeFormatAndMount{Interface: mounter, Exec: exec}
 }
 
 // GetVolumeMode retrieves VolumeMode from pv.
@@ -558,13 +506,6 @@ func UnmapBlockVolume(
 	return nil
 }
 
-// GetPluginMountDir returns the global mount directory name appended
-// to the given plugin name's plugin directory
-func GetPluginMountDir(host volume.VolumeHost, name string) string {
-	mntDir := filepath.Join(host.GetPluginDir(name), MountsInGlobalPDPath)
-	return mntDir
-}
-
 // IsLocalEphemeralVolume determines whether the argument is a local ephemeral
 // volume vs. some other type
 // Local means the volume is using storage from the local disk that is managed by kubelet.
@@ -575,58 +516,19 @@ func IsLocalEphemeralVolume(volume v1.Volume) bool {
 		volume.ConfigMap != nil
 }
 
-// GetLocalPersistentVolumeNodeNames returns the node affinity node name(s) for
-// local PersistentVolumes. nil is returned if the PV does not have any
-// specific node affinity node selector terms and match expressions.
-// PersistentVolume with node affinity has select and match expressions
-// in the form of:
-//
-//	nodeAffinity:
-//	  required:
-//	    nodeSelectorTerms:
-//	    - matchExpressions:
-//	      - key: kubernetes.io/hostname
-//	        operator: In
-//	        values:
-//	        - <node1>
-//	        - <node2>
-func GetLocalPersistentVolumeNodeNames(pv *v1.PersistentVolume) []string {
-	if pv == nil || pv.Spec.NodeAffinity == nil || pv.Spec.NodeAffinity.Required == nil {
-		return nil
-	}
-
-	var result sets.Set[string]
-	for _, term := range pv.Spec.NodeAffinity.Required.NodeSelectorTerms {
-		var nodes sets.Set[string]
-		for _, matchExpr := range term.MatchExpressions {
-			if matchExpr.Key == v1.LabelHostname && matchExpr.Operator == v1.NodeSelectorOpIn {
-				if nodes == nil {
-					nodes = sets.New(matchExpr.Values...)
-				} else {
-					nodes = nodes.Intersection(sets.New(matchExpr.Values...))
-				}
-			}
-		}
-		result = result.Union(nodes)
-	}
-
-	return sets.List(result)
-}
-
 // GetPodVolumeNames returns names of volumes that are used in a pod,
-// either as filesystem mount or raw block device, together with list
-// of all SELinux contexts of all containers that use the volumes.
-func GetPodVolumeNames(pod *v1.Pod) (mounts sets.String, devices sets.String, seLinuxContainerContexts map[string][]*v1.SELinuxOptions) {
-	mounts = sets.NewString()
-	devices = sets.NewString()
+// either as filesystem mount or raw block device.
+// To save another sweep through containers, SELinux options are optionally collected too.
+func GetPodVolumeNames(pod *v1.Pod, collectSELinuxOptions bool) (mounts sets.Set[string], devices sets.Set[string], seLinuxContainerContexts map[string][]*v1.SELinuxOptions) {
+	mounts = sets.New[string]()
+	devices = sets.New[string]()
 	seLinuxContainerContexts = make(map[string][]*v1.SELinuxOptions)
 
 	podutil.VisitContainers(&pod.Spec, podutil.AllFeatureEnabledContainers(), func(container *v1.Container, containerType podutil.ContainerType) bool {
 		var seLinuxOptions *v1.SELinuxOptions
-		if utilfeature.DefaultFeatureGate.Enabled(features.SELinuxMountReadWriteOncePod) {
+		if collectSELinuxOptions {
 			effectiveContainerSecurity := securitycontext.DetermineEffectiveSecurityContext(pod, container)
 			if effectiveContainerSecurity != nil {
-				// No DeepCopy, SELinuxOptions is already a copy of Pod's or container's SELinuxOptions
 				seLinuxOptions = effectiveContainerSecurity.SELinuxOptions
 			}
 		}
@@ -634,7 +536,7 @@ func GetPodVolumeNames(pod *v1.Pod) (mounts sets.String, devices sets.String, se
 		if container.VolumeMounts != nil {
 			for _, mount := range container.VolumeMounts {
 				mounts.Insert(mount.Name)
-				if seLinuxOptions != nil {
+				if seLinuxOptions != nil && collectSELinuxOptions {
 					seLinuxContainerContexts[mount.Name] = append(seLinuxContainerContexts[mount.Name], seLinuxOptions.DeepCopy())
 				}
 			}
@@ -653,8 +555,7 @@ func GetPodVolumeNames(pod *v1.Pod) (mounts sets.String, devices sets.String, se
 // attributes.
 func FsUserFrom(pod *v1.Pod) *int64 {
 	var fsUser *int64
-	// Exclude ephemeral containers because SecurityContext is not allowed.
-	podutil.VisitContainers(&pod.Spec, podutil.InitContainers|podutil.Containers, func(container *v1.Container, containerType podutil.ContainerType) bool {
+	podutil.VisitContainers(&pod.Spec, podutil.AllFeatureEnabledContainers(), func(container *v1.Container, containerType podutil.ContainerType) bool {
 		runAsUser, ok := securitycontext.DetermineEffectiveRunAsUser(pod, container)
 		// One container doesn't specify user or there are more than one
 		// non-root UIDs.
@@ -703,25 +604,6 @@ func HasMountRefs(mountPath string, mountRefs []string) bool {
 		}
 	}
 	return false
-}
-
-// WriteVolumeCache flush disk data given the specified mount path
-func WriteVolumeCache(deviceMountPath string, exec utilexec.Interface) error {
-	// If runtime os is windows, execute Write-VolumeCache powershell command on the disk
-	if runtime.GOOS == "windows" {
-		cmdString := "Get-Volume -FilePath $env:mountpath | Write-Volumecache"
-		cmd := exec.Command("powershell", "/c", cmdString)
-		env := append(os.Environ(), fmt.Sprintf("mountpath=%s", deviceMountPath))
-		cmd.SetEnv(env)
-		klog.V(8).Infof("Executing command: %q", cmdString)
-		output, err := cmd.CombinedOutput()
-		klog.Infof("command (%q) execeuted: %v, output: %q", cmdString, err, string(output))
-		if err != nil {
-			return fmt.Errorf("command (%q) failed: %v, output: %q", cmdString, err, string(output))
-		}
-	}
-	// For linux runtime, it skips because unmount will automatically flush disk data
-	return nil
 }
 
 // IsMultiAttachAllowed checks if attaching this volume to multiple nodes is definitely not allowed/possible.
@@ -809,8 +691,54 @@ func GetReliableMountRefs(mounter mount.Interface, mountPath string) ([]string, 
 		}
 		return true, nil
 	})
-	if err == wait.ErrWaitTimeout {
+	if wait.Interrupted(err) {
 		return nil, lastErr
 	}
 	return paths, err
+}
+
+func VolumeHealthConditionSetsEqual(a, b []v1.VolumeHealthCondition) bool {
+	type key struct {
+		status v1.VolumeHealthStatusType
+		reason string
+	}
+	toSet := func(conds []v1.VolumeHealthCondition) map[key]struct{} {
+		s := make(map[key]struct{}, len(conds))
+		for _, c := range conds {
+			s[key{c.Status, c.Reason}] = struct{}{}
+		}
+		return s
+	}
+	sa, sb := toSet(a), toSet(b)
+	if len(sa) != len(sb) {
+		return false
+	}
+	for k := range sa {
+		if _, ok := sb[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// FindDetachablePluginBySpec is a variant of VolumePluginMgr.FindAttachablePluginByName() function.
+// The difference is that it bypass the CanAttach() check for CSI plugin, i.e. it assumes all CSI plugin supports detach.
+// The intention here is that a CSI plugin volume can end up in an Uncertain state,  so that a detach
+// operation will help it to detach no matter it actually has the ability to attach/detach.
+func FindDetachablePluginBySpec(spec *volume.Spec, pm *volume.VolumePluginMgr) (volume.AttachableVolumePlugin, error) {
+	volumePlugin, err := pm.FindPluginBySpec(spec)
+	if err != nil {
+		return nil, err
+	}
+	if attachableVolumePlugin, ok := volumePlugin.(volume.AttachableVolumePlugin); ok {
+		if attachableVolumePlugin.GetPluginName() == "kubernetes.io/csi" {
+			return attachableVolumePlugin, nil
+		}
+		if canAttach, err := attachableVolumePlugin.CanAttach(spec); err != nil {
+			return nil, err
+		} else if canAttach {
+			return attachableVolumePlugin, nil
+		}
+	}
+	return nil, nil
 }

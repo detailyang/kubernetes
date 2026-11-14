@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"strings"
 
-	"k8s.io/gengo/types"
+	"k8s.io/gengo/v2"
 )
 
 var supportedTags = []string{
@@ -41,6 +41,7 @@ var SupportedVerbs = []string{
 	"update",
 	"updateStatus",
 	"delete",
+	"deleteWithResult",
 	"deleteCollection",
 	"get",
 	"list",
@@ -64,6 +65,7 @@ const genClientPrefix = "genclient:"
 // extension client functions for.
 var unsupportedExtensionVerbs = []string{
 	"updateStatus",
+	"deleteWithResult",
 	"deleteCollection",
 	"watch",
 	"delete",
@@ -192,7 +194,7 @@ func MustParseClientGenTags(lines []string) Tags {
 // tags are provided.
 func ParseClientGenTags(lines []string) (Tags, error) {
 	ret := Tags{}
-	values := types.ExtractCommentTags("+", lines)
+	values := gengo.ExtractCommentTags("+", lines)
 	var value []string
 	value, ret.GenerateClient = values["genclient"]
 	// Check the old format and error when used to avoid generating client when //+genclient=false

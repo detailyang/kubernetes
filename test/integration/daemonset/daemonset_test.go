@@ -19,9 +19,11 @@ package daemonset
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -39,8 +41,8 @@ import (
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
-	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/daemon"
@@ -50,19 +52,16 @@ import (
 	labelsutil "k8s.io/kubernetes/pkg/util/labels"
 	"k8s.io/kubernetes/test/integration/framework"
 	testutils "k8s.io/kubernetes/test/integration/util"
-	"k8s.io/kubernetes/test/utils/ktesting"
 )
 
 var zero = int64(0)
 
-func setup(t *testing.T) (context.Context, kubeapiservertesting.TearDownFunc, *daemon.DaemonSetsController, informers.SharedInformerFactory, clientset.Interface) {
+func setup(t *testing.T) (context.Context, *daemon.DaemonSetsController, informers.SharedInformerFactory, clientset.Interface) {
 	return setupWithServerSetup(t, framework.TestServerSetup{})
 }
 
-func setupWithServerSetup(t *testing.T, serverSetup framework.TestServerSetup) (context.Context, kubeapiservertesting.TearDownFunc, *daemon.DaemonSetsController, informers.SharedInformerFactory, clientset.Interface) {
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-
+func setupWithServerSetup(t *testing.T, serverSetup framework.TestServerSetup) (context.Context, *daemon.DaemonSetsController, informers.SharedInformerFactory, clientset.Interface) {
+	tCtx := ktesting.Init(t)
 	modifyServerRunOptions := serverSetup.ModifyServerRunOptions
 	serverSetup.ModifyServerRunOptions = func(opts *options.ServerRunOptions) {
 		if modifyServerRunOptions != nil {
@@ -77,12 +76,12 @@ func setupWithServerSetup(t *testing.T, serverSetup framework.TestServerSetup) (
 		)
 	}
 
-	clientSet, config, closeFn := framework.StartTestServer(ctx, t, serverSetup)
+	clientSet, config, closeFn := framework.StartTestServer(tCtx, t, serverSetup)
 
 	resyncPeriod := 12 * time.Hour
 	informers := informers.NewSharedInformerFactory(clientset.NewForConfigOrDie(restclient.AddUserAgent(config, "daemonset-informers")), resyncPeriod)
 	dc, err := daemon.NewDaemonSetsController(
-		ctx,
+		tCtx,
 		informers.Apps().V1().DaemonSets(),
 		informers.Apps().V1().ControllerRevisions(),
 		informers.Core().V1().Pods(),
@@ -99,7 +98,7 @@ func setupWithServerSetup(t *testing.T, serverSetup framework.TestServerSetup) (
 	})
 
 	sched, err := scheduler.New(
-		ctx,
+		tCtx,
 		clientSet,
 		informers,
 		nil,
@@ -109,16 +108,19 @@ func setupWithServerSetup(t *testing.T, serverSetup framework.TestServerSetup) (
 		t.Fatalf("Couldn't create scheduler: %v", err)
 	}
 
-	eventBroadcaster.StartRecordingToSink(ctx.Done())
-	go sched.Run(ctx)
+	eventBroadcaster.StartRecordingToSink(tCtx.Done())
+	go sched.Run(tCtx)
 
-	tearDownFn := func() {
-		cancel()
+	// The scheduler above (and the DaemonSets controller started by the
+	// caller) run with tCtx, so tCtx must get canceled before the server
+	// shuts down, to avoid them logging errors while (or after) the test
+	// binary considers the test done.
+	tCtx.Cleanup(func() {
 		closeFn()
 		eventBroadcaster.Shutdown()
-	}
+	})
 
-	return ctx, tearDownFn, dc, informers, clientSet
+	return tCtx, dc, informers, clientSet
 }
 
 func testLabels() map[string]string {
@@ -356,6 +358,39 @@ func validateDaemonSetPodsActive(
 	}
 }
 
+func validateDaemonSetPodsTolerations(
+	podClient corev1client.PodInterface,
+	podInformer cache.SharedIndexInformer,
+	expectedTolerations []v1.Toleration,
+	prefix string,
+	t *testing.T,
+) {
+	objects := podInformer.GetIndexer().List()
+	for _, object := range objects {
+		var prefixedPodToleration []v1.Toleration
+		pod := object.(*v1.Pod)
+		ownerReferences := pod.ObjectMeta.OwnerReferences
+		if len(ownerReferences) != 1 {
+			t.Errorf("Pod %s has %d OwnerReferences, expected only 1", pod.Name, len(ownerReferences))
+		}
+		controllerRef := ownerReferences[0]
+		if got, want := controllerRef.Kind, "DaemonSet"; got != want {
+			t.Errorf("controllerRef.Kind = %q, want %q", got, want)
+		}
+		if controllerRef.Controller == nil || *controllerRef.Controller != true {
+			t.Errorf("controllerRef.Controller is not set to true")
+		}
+		for _, podToleration := range pod.Spec.Tolerations {
+			if strings.HasPrefix(podToleration.Key, prefix) {
+				prefixedPodToleration = append(prefixedPodToleration, podToleration)
+			}
+		}
+		if diff := cmp.Diff(expectedTolerations, prefixedPodToleration); diff != "" {
+			t.Fatalf("Unexpected tolerations (-want,+got):\n%s", diff)
+		}
+	}
+}
+
 // podUnschedulable returns a condition function that returns true if the given pod
 // gets unschedulable status.
 func podUnschedulable(c clientset.Interface, podNamespace, podName string) wait.ConditionFunc {
@@ -456,6 +491,23 @@ func validateDaemonSetStatus(
 	}
 }
 
+func validateUpdatedNumberScheduled(
+	ctx context.Context,
+	dsClient appstyped.DaemonSetInterface,
+	dsName string,
+	expectedUpdatedNumberScheduled int32,
+	t *testing.T) {
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, 60*time.Second, true, func(ctx context.Context) (bool, error) {
+		ds, err := dsClient.Get(context.TODO(), dsName, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		return ds.Status.UpdatedNumberScheduled == expectedUpdatedNumberScheduled, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func updateDS(t *testing.T, dsClient appstyped.DaemonSetInterface, dsName string, updateFunc func(*apps.DaemonSet)) *apps.DaemonSet {
 	var ds *apps.DaemonSet
 	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
@@ -482,8 +534,7 @@ func forEachStrategy(t *testing.T, tf func(t *testing.T, strategy *apps.DaemonSe
 
 func TestOneNodeDaemonLaunchesPod(t *testing.T) {
 	forEachStrategy(t, func(t *testing.T, strategy *apps.DaemonSetUpdateStrategy) {
-		ctx, closeFn, dc, informers, clientset := setup(t)
-		defer closeFn()
+		ctx, dc, informers, clientset := setup(t)
 		ns := framework.CreateNamespaceOrDie(clientset, "one-node-daemonset-test", t)
 		defer framework.DeleteNamespaceOrDie(clientset, ns, t)
 
@@ -515,8 +566,7 @@ func TestOneNodeDaemonLaunchesPod(t *testing.T) {
 
 func TestSimpleDaemonSetLaunchesPods(t *testing.T) {
 	forEachStrategy(t, func(t *testing.T, strategy *apps.DaemonSetUpdateStrategy) {
-		ctx, closeFn, dc, informers, clientset := setup(t)
-		defer closeFn()
+		ctx, dc, informers, clientset := setup(t)
 		ns := framework.CreateNamespaceOrDie(clientset, "simple-daemonset-test", t)
 		defer framework.DeleteNamespaceOrDie(clientset, ns, t)
 
@@ -562,8 +612,7 @@ func TestSimpleDaemonSetRestartsPodsOnTerminalPhase(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			forEachStrategy(t, func(t *testing.T, strategy *apps.DaemonSetUpdateStrategy) {
-				ctx, closeFn, dc, informers, clientset := setup(t)
-				defer closeFn()
+				ctx, dc, informers, clientset := setup(t)
 				ns := framework.CreateNamespaceOrDie(clientset, "daemonset-restart-terminal-pod-test", t)
 				defer framework.DeleteNamespaceOrDie(clientset, ns, t)
 
@@ -607,8 +656,7 @@ func TestSimpleDaemonSetRestartsPodsOnTerminalPhase(t *testing.T) {
 
 func TestDaemonSetWithNodeSelectorLaunchesPods(t *testing.T) {
 	forEachStrategy(t, func(t *testing.T, strategy *apps.DaemonSetUpdateStrategy) {
-		ctx, closeFn, dc, informers, clientset := setup(t)
-		defer closeFn()
+		ctx, dc, informers, clientset := setup(t)
 		ns := framework.CreateNamespaceOrDie(clientset, "simple-daemonset-test", t)
 		defer framework.DeleteNamespaceOrDie(clientset, ns, t)
 
@@ -670,8 +718,7 @@ func TestDaemonSetWithNodeSelectorLaunchesPods(t *testing.T) {
 
 func TestNotReadyNodeDaemonDoesLaunchPod(t *testing.T) {
 	forEachStrategy(t, func(t *testing.T, strategy *apps.DaemonSetUpdateStrategy) {
-		ctx, closeFn, dc, informers, clientset := setup(t)
-		defer closeFn()
+		ctx, dc, informers, clientset := setup(t)
 		ns := framework.CreateNamespaceOrDie(clientset, "simple-daemonset-test", t)
 		defer framework.DeleteNamespaceOrDie(clientset, ns, t)
 
@@ -711,8 +758,7 @@ func TestNotReadyNodeDaemonDoesLaunchPod(t *testing.T) {
 // not schedule Pods onto the nodes with insufficient resource.
 func TestInsufficientCapacityNode(t *testing.T) {
 	forEachStrategy(t, func(t *testing.T, strategy *apps.DaemonSetUpdateStrategy) {
-		ctx, closeFn, dc, informers, clientset := setup(t)
-		defer closeFn()
+		ctx, dc, informers, clientset := setup(t)
 		ns := framework.CreateNamespaceOrDie(clientset, "insufficient-capacity", t)
 		defer framework.DeleteNamespaceOrDie(clientset, ns, t)
 
@@ -769,8 +815,7 @@ func TestInsufficientCapacityNode(t *testing.T) {
 // TestLaunchWithHashCollision tests that a DaemonSet can be updated even if there is a
 // hash collision with an existing ControllerRevision
 func TestLaunchWithHashCollision(t *testing.T) {
-	ctx, closeFn, dc, informers, clientset := setup(t)
-	defer closeFn()
+	ctx, dc, informers, clientset := setup(t)
 	ns := framework.CreateNamespaceOrDie(clientset, "one-node-daemonset-test", t)
 	defer framework.DeleteNamespaceOrDie(clientset, ns, t)
 
@@ -874,8 +919,7 @@ func TestLaunchWithHashCollision(t *testing.T) {
 // 2. Add a node to ensure the controller sync
 // 3. The dsc is expected to "PATCH" the existing pod label with new hash and deletes the old controllerrevision once finishes the update
 func TestDSCUpdatesPodLabelAfterDedupCurHistories(t *testing.T) {
-	ctx, closeFn, dc, informers, clientset := setup(t)
-	defer closeFn()
+	ctx, dc, informers, clientset := setup(t)
 	ns := framework.CreateNamespaceOrDie(clientset, "one-node-daemonset-test", t)
 	defer framework.DeleteNamespaceOrDie(clientset, ns, t)
 
@@ -1003,8 +1047,7 @@ func TestDSCUpdatesPodLabelAfterDedupCurHistories(t *testing.T) {
 // TestTaintedNode tests tainted node isn't expected to have pod scheduled
 func TestTaintedNode(t *testing.T) {
 	forEachStrategy(t, func(t *testing.T, strategy *apps.DaemonSetUpdateStrategy) {
-		ctx, closeFn, dc, informers, clientset := setup(t)
-		defer closeFn()
+		ctx, dc, informers, clientset := setup(t)
 		ns := framework.CreateNamespaceOrDie(clientset, "tainted-node", t)
 		defer framework.DeleteNamespaceOrDie(clientset, ns, t)
 
@@ -1062,8 +1105,7 @@ func TestTaintedNode(t *testing.T) {
 // to the Unschedulable nodes.
 func TestUnschedulableNodeDaemonDoesLaunchPod(t *testing.T) {
 	forEachStrategy(t, func(t *testing.T, strategy *apps.DaemonSetUpdateStrategy) {
-		ctx, closeFn, dc, informers, clientset := setup(t)
-		defer closeFn()
+		ctx, dc, informers, clientset := setup(t)
 		ns := framework.CreateNamespaceOrDie(clientset, "daemonset-unschedulable-test", t)
 		defer framework.DeleteNamespaceOrDie(clientset, ns, t)
 
@@ -1126,14 +1168,13 @@ func TestUnschedulableNodeDaemonDoesLaunchPod(t *testing.T) {
 func TestUpdateStatusDespitePodCreationFailure(t *testing.T) {
 	forEachStrategy(t, func(t *testing.T, strategy *apps.DaemonSetUpdateStrategy) {
 		limitedPodNumber := 2
-		ctx, closeFn, dc, informers, clientset := setupWithServerSetup(t, framework.TestServerSetup{
+		ctx, dc, informers, clientset := setupWithServerSetup(t, framework.TestServerSetup{
 			ModifyServerConfig: func(config *controlplane.Config) {
-				config.GenericConfig.AdmissionControl = &fakePodFailAdmission{
+				config.ControlPlane.Generic.AdmissionControl = &fakePodFailAdmission{
 					limitedPodNumber: limitedPodNumber,
 				}
 			},
 		})
-		defer closeFn()
 		ns := framework.CreateNamespaceOrDie(clientset, "update-status-despite-pod-failure", t)
 		defer framework.DeleteNamespaceOrDie(clientset, ns, t)
 
@@ -1158,4 +1199,121 @@ func TestUpdateStatusDespitePodCreationFailure(t *testing.T) {
 		validateDaemonSetPodsAndMarkReady(podClient, podInformer, limitedPodNumber, t)
 		validateDaemonSetStatus(dsClient, ds.Name, int32(limitedPodNumber), t)
 	})
+}
+
+func TestDaemonSetRollingUpdateWithTolerations(t *testing.T) {
+	var taints []v1.Taint
+	var node *v1.Node
+	var tolerations []v1.Toleration
+	ctx, dc, informers, clientset := setup(t)
+	ns := framework.CreateNamespaceOrDie(clientset, "daemonset-rollingupdate-with-tolerations-test", t)
+	defer framework.DeleteNamespaceOrDie(clientset, ns, t)
+
+	dsClient := clientset.AppsV1().DaemonSets(ns.Name)
+	podClient := clientset.CoreV1().Pods(ns.Name)
+	nodeClient := clientset.CoreV1().Nodes()
+	podInformer := informers.Core().V1().Pods().Informer()
+	informers.Start(ctx.Done())
+	go dc.Run(ctx, 2)
+
+	zero := intstr.FromInt32(0)
+	maxSurge := intstr.FromInt32(1)
+	ds := newDaemonSet("foo", ns.Name)
+	ds.Spec.UpdateStrategy = apps.DaemonSetUpdateStrategy{
+		Type: apps.RollingUpdateDaemonSetStrategyType,
+		RollingUpdate: &apps.RollingUpdateDaemonSet{
+			MaxUnavailable: &zero,
+			MaxSurge:       &maxSurge,
+		},
+	}
+
+	// Add six nodes with zone-y, zone-z or common taint
+	for i := range 6 {
+		if i < 2 {
+			taints = []v1.Taint{
+				{Key: "zone-y", Effect: v1.TaintEffectNoSchedule},
+			}
+		} else if i < 4 {
+			taints = []v1.Taint{
+				{Key: "zone-z", Effect: v1.TaintEffectNoSchedule},
+			}
+		} else {
+			taints = []v1.Taint{
+				{Key: "zone-common", Effect: v1.TaintEffectNoSchedule},
+			}
+		}
+		node = newNode(fmt.Sprintf("node-%d", i), nil)
+		node.Spec.Taints = taints
+		_, err := nodeClient.Create(context.TODO(), node, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Failed to create node: %v", err)
+		}
+	}
+
+	// Create DaemonSet with zone-y toleration
+	tolerations = []v1.Toleration{
+		{Key: "zone-y", Operator: v1.TolerationOpExists},
+		{Key: "zone-common", Operator: v1.TolerationOpExists},
+	}
+	ds.Spec.Template.Spec.Tolerations = tolerations
+	_, err := dsClient.Create(ctx, ds, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create DaemonSet: %v", err)
+	}
+	defer cleanupDaemonSets(t, clientset, ds)
+	validateDaemonSetPodsActive(podClient, podInformer, 4, t)
+	validateDaemonSetPodsAndMarkReady(podClient, podInformer, 4, t)
+	validateDaemonSetStatus(dsClient, ds.Name, 4, t)
+	validateUpdatedNumberScheduled(ctx, dsClient, ds.Name, 4, t)
+	validateDaemonSetPodsTolerations(podClient, podInformer, tolerations, "zone-", t)
+
+	// Update DaemonSet with zone-z toleration
+	tolerations = []v1.Toleration{
+		{Key: "zone-z", Operator: v1.TolerationOpExists},
+		{Key: "zone-common", Operator: v1.TolerationOpExists},
+	}
+	ds.Spec.Template.Spec.Tolerations = tolerations
+	_, err = dsClient.Update(ctx, ds, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to update DaemonSet: %v", err)
+	}
+
+	// Expected numberPods of validateDaemonSetPodsActive is 7 when update DaemonSet
+	// and before updated pods become ready because:
+	//   - New 2 pods are created and Pending on Zone Z nodes
+	//   - New 1 pod are created as surge and Pending on Zone Common node
+	//   - Old 2 pods that violate scheduling constraints on Zone Y nodes will remain existing and Running
+	//     until other new pods become available
+	validateDaemonSetPodsActive(podClient, podInformer, 7, t)
+	validateDaemonSetPodsAndMarkReady(podClient, podInformer, 4, t)
+	validateDaemonSetStatus(dsClient, ds.Name, 4, t)
+	validateUpdatedNumberScheduled(ctx, dsClient, ds.Name, 4, t)
+	validateDaemonSetPodsTolerations(podClient, podInformer, tolerations, "zone-", t)
+
+	// Update DaemonSet with zone-y and zone-z toleration
+	tolerations = []v1.Toleration{
+		{Key: "zone-y", Operator: v1.TolerationOpExists},
+		{Key: "zone-z", Operator: v1.TolerationOpExists},
+		{Key: "zone-common", Operator: v1.TolerationOpExists},
+	}
+	ds.Spec.Template.Spec.Tolerations = tolerations
+	_, err = dsClient.Update(ctx, ds, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to update DaemonSet: %v", err)
+	}
+	validateDaemonSetPodsActive(podClient, podInformer, 7, t)
+	validateDaemonSetPodsAndMarkReady(podClient, podInformer, 6, t)
+	validateDaemonSetStatus(dsClient, ds.Name, 6, t)
+	validateUpdatedNumberScheduled(ctx, dsClient, ds.Name, 6, t)
+	validateDaemonSetPodsTolerations(podClient, podInformer, tolerations, "zone-", t)
+
+	// Update DaemonSet with no toleration
+	ds.Spec.Template.Spec.Tolerations = nil
+	_, err = dsClient.Update(ctx, ds, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to update DaemonSet: %v", err)
+	}
+	validateDaemonSetPodsActive(podClient, podInformer, 0, t)
+	validateDaemonSetStatus(dsClient, ds.Name, 0, t)
+	validateUpdatedNumberScheduled(ctx, dsClient, ds.Name, 0, t)
 }

@@ -29,6 +29,7 @@ import (
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
+
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/test/e2e/framework"
@@ -196,9 +197,16 @@ var _ = common.SIGDescribe("Netpol API", func() {
 		ginkgo.By("deleting")
 		err = npClient.Delete(ctx, createdNetPol.Name, metav1.DeleteOptions{})
 		framework.ExpectNoError(err)
-		_, err = npClient.Get(ctx, createdNetPol.Name, metav1.GetOptions{})
-		if !apierrors.IsNotFound(err) {
-			framework.Failf("expected 404, got %#v", err)
+		err = wait.PollUntilContextTimeout(ctx, 2*time.Second, 1*time.Minute, false, func(ctx context.Context) (done bool, err error) {
+			_, err = npClient.Get(ctx, createdNetPol.Name, metav1.GetOptions{})
+			if !apierrors.IsNotFound(err) {
+				framework.Logf("expected 404, got %#v", err)
+				return false, nil
+			}
+			return true, nil
+		})
+		if err != nil {
+			framework.Failf("unexpected error deleting existing network policy: %v", err)
 		}
 		nps, err = npClient.List(ctx, metav1.ListOptions{LabelSelector: "special-label=" + f.UniqueName})
 		framework.ExpectNoError(err)
@@ -207,9 +215,20 @@ var _ = common.SIGDescribe("Netpol API", func() {
 		ginkgo.By("deleting a collection")
 		err = npClient.DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: "special-label=" + f.UniqueName})
 		framework.ExpectNoError(err)
-		nps, err = npClient.List(ctx, metav1.ListOptions{LabelSelector: "special-label=" + f.UniqueName})
-		framework.ExpectNoError(err)
-		gomega.Expect(nps.Items).To(gomega.BeEmpty(), "filtered list should have 0 items")
+		err = wait.PollUntilContextTimeout(ctx, 2*time.Second, 1*time.Minute, false, func(ctx context.Context) (done bool, err error) {
+			nps, err = npClient.List(ctx, metav1.ListOptions{LabelSelector: "special-label=" + f.UniqueName})
+			if err != nil {
+				return false, err
+			}
+			if len(nps.Items) > 0 {
+				framework.Logf("still %d network policies present, retrying ...", len(nps.Items))
+				return false, nil
+			}
+			return true, nil
+		})
+		if err != nil {
+			framework.Failf("unexpected error deleting existing network policies: %v", err)
+		}
 	})
 
 	/*
@@ -233,14 +252,14 @@ var _ = common.SIGDescribe("Netpol API", func() {
 			SetSpecPodSelectorMatchLabels(map[string]string{"pod-name": "test-pod"}),
 			SetSpecEgressRules(egressRule))
 		_, err := npClient.Create(ctx, npTemplate, metav1.CreateOptions{})
-		framework.ExpectError(err, "request template:%v", npTemplate)
+		gomega.Expect(err).To(gomega.HaveOccurred(), "request template:%v", npTemplate)
 
 		ginkgo.By("EndPort field cannot be defined if the Port field is defined as a named (string) port.")
 		egressRule = networkingv1.NetworkPolicyEgressRule{}
 		egressRule.Ports = append(egressRule.Ports, networkingv1.NetworkPolicyPort{Port: &intstr.IntOrString{Type: intstr.String, StrVal: "serve-80"}, EndPort: &endport})
 		npTemplate.Spec.Egress = []networkingv1.NetworkPolicyEgressRule{egressRule}
 		_, err = npClient.Create(ctx, npTemplate, metav1.CreateOptions{})
-		framework.ExpectError(err, "request template:%v", npTemplate)
+		gomega.Expect(err).To(gomega.HaveOccurred(), "request template:%v", npTemplate)
 
 		ginkgo.By("EndPort field must be equal or greater than port.")
 		ginkgo.By("When EndPort field is smaller than port, it will failed")
@@ -248,7 +267,7 @@ var _ = common.SIGDescribe("Netpol API", func() {
 		egressRule.Ports = append(egressRule.Ports, networkingv1.NetworkPolicyPort{Port: &intstr.IntOrString{Type: intstr.Int, IntVal: 30000}, EndPort: &endport})
 		npTemplate.Spec.Egress = []networkingv1.NetworkPolicyEgressRule{egressRule}
 		_, err = npClient.Create(ctx, npTemplate, metav1.CreateOptions{})
-		framework.ExpectError(err, "request template:%v", npTemplate)
+		gomega.Expect(err).To(gomega.HaveOccurred(), "request template:%v", npTemplate)
 
 		ginkgo.By("EndPort field is equal with port.")
 		egressRule.Ports[0].Port = &intstr.IntOrString{Type: intstr.Int, IntVal: 20000}
@@ -266,8 +285,19 @@ var _ = common.SIGDescribe("Netpol API", func() {
 		ginkgo.By("deleting all test collection")
 		err = npClient.DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: "special-label=" + f.UniqueName})
 		framework.ExpectNoError(err)
-		nps, err := npClient.List(ctx, metav1.ListOptions{LabelSelector: "special-label=" + f.UniqueName})
-		framework.ExpectNoError(err)
-		gomega.Expect(nps.Items).To(gomega.BeEmpty(), "filtered list should be 0 items")
+		err = wait.PollUntilContextTimeout(ctx, 2*time.Second, 1*time.Minute, false, func(ctx context.Context) (done bool, err error) {
+			nps, err := npClient.List(ctx, metav1.ListOptions{LabelSelector: "special-label=" + f.UniqueName})
+			if err != nil {
+				return false, err
+			}
+			if len(nps.Items) > 0 {
+				framework.Logf("still %d network policies present, retrying ...", len(nps.Items))
+				return false, nil
+			}
+			return true, nil
+		})
+		if err != nil {
+			framework.Failf("unexpected error deleting existing network policies: %v", err)
+		}
 	})
 })

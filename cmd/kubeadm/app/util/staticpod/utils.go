@@ -18,9 +18,9 @@ package staticpod
 
 import (
 	"bytes"
-	"crypto/md5"
 	"fmt"
 	"hash"
+	"hash/fnv"
 	"io"
 	"math"
 	"net/url"
@@ -29,17 +29,19 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/pkg/errors"
+	"github.com/pmezard/go-difflib/difflib"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/dump"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/dump"
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/patches"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/users"
 )
@@ -150,22 +152,6 @@ func VolumeMountMapToSlice(volumeMounts map[string]v1.VolumeMount) []v1.VolumeMo
 	return v
 }
 
-// GetExtraParameters builds a list of flag arguments two string-string maps, one with default, base commands and one with overrides
-func GetExtraParameters(overrides map[string]string, defaults map[string]string) []string {
-	var command []string
-	for k, v := range overrides {
-		if len(v) > 0 {
-			command = append(command, fmt.Sprintf("--%s=%s", k, v))
-		}
-	}
-	for k, v := range defaults {
-		if _, overrideExists := overrides[k]; !overrideExists {
-			command = append(command, fmt.Sprintf("--%s=%s", k, v))
-		}
-	}
-	return command
-}
-
 // PatchStaticPod applies patches stored in patchesDir to a static Pod.
 func PatchStaticPod(pod *v1.Pod, patchesDir string, output io.Writer) (*v1.Pod, error) {
 	// Marshal the Pod manifest into YAML.
@@ -188,9 +174,9 @@ func PatchStaticPod(pod *v1.Pod, patchesDir string, output io.Writer) (*v1.Pod, 
 		return pod, err
 	}
 
-	obj, err := kubeadmutil.UnmarshalFromYaml(patchTarget.Data, v1.SchemeGroupVersion)
+	obj, err := kubeadmutil.UniversalUnmarshal(patchTarget.Data)
 	if err != nil {
-		return pod, errors.Wrap(err, "failed to unmarshal patched manifest from YAML")
+		return pod, errors.Wrap(err, "failed to unmarshal patched manifest")
 	}
 
 	pod2, ok := obj.(*v1.Pod)
@@ -231,32 +217,57 @@ func ReadStaticPodFromDisk(manifestPath string) (*v1.Pod, error) {
 		return &v1.Pod{}, errors.Wrapf(err, "failed to read manifest for %q", manifestPath)
 	}
 
-	obj, err := kubeadmutil.UnmarshalFromYaml(buf, v1.SchemeGroupVersion)
+	obj, err := kubeadmutil.UniversalUnmarshal(buf)
 	if err != nil {
-		return &v1.Pod{}, errors.Errorf("failed to unmarshal manifest for %q from YAML: %v", manifestPath, err)
+		return &v1.Pod{}, errors.Errorf("failed to unmarshal manifest for %q: %v", manifestPath, err)
 	}
 
-	pod := obj.(*v1.Pod)
+	pod, ok := obj.(*v1.Pod)
+	if !ok {
+		return &v1.Pod{}, errors.Errorf("failed to parse Pod object defined in %q", manifestPath)
+	}
 
 	return pod, nil
 }
 
+// ReadMultipleStaticPodsFromDisk reads multiple known component static Pods from manifestDir
+// and returns a list of Pods objects.
+func ReadMultipleStaticPodsFromDisk(manifestDir string, components ...string) (map[string]*v1.Pod, error) {
+	var (
+		podMap = map[string]*v1.Pod{}
+		errs   []error
+	)
+	for _, c := range components {
+		path := kubeadmconstants.GetStaticPodFilepath(c, manifestDir)
+		pod, err := ReadStaticPodFromDisk(path)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		podMap[c] = pod
+	}
+	if len(errs) > 0 {
+		return nil, utilerrors.NewAggregate(errs)
+	}
+	return podMap, nil
+}
+
 // LivenessProbe creates a Probe object with a HTTPGet handler
-func LivenessProbe(host, path string, port int32, scheme v1.URIScheme) *v1.Probe {
+func LivenessProbe(host, path, port string, scheme v1.URIScheme) *v1.Probe {
 	// sets initialDelaySeconds same as periodSeconds to skip one period before running a check
 	return createHTTPProbe(host, path, port, scheme, 10, 15, 8, 10)
 }
 
 // ReadinessProbe creates a Probe object with a HTTPGet handler
-func ReadinessProbe(host, path string, port int32, scheme v1.URIScheme) *v1.Probe {
+func ReadinessProbe(host, path, port string, scheme v1.URIScheme) *v1.Probe {
 	// sets initialDelaySeconds as '0' because we don't want to delay user infrastructure checks
 	// looking for "ready" status on kubeadm static Pods
 	return createHTTPProbe(host, path, port, scheme, 0, 15, 3, 1)
 }
 
 // StartupProbe creates a Probe object with a HTTPGet handler
-func StartupProbe(host, path string, port int32, scheme v1.URIScheme, timeoutForControlPlane *metav1.Duration) *v1.Probe {
-	periodSeconds, timeoutForControlPlaneSeconds := int32(10), kubeadmconstants.DefaultControlPlaneTimeout.Seconds()
+func StartupProbe(host, path, port string, scheme v1.URIScheme, timeoutForControlPlane *metav1.Duration) *v1.Probe {
+	periodSeconds, timeoutForControlPlaneSeconds := int32(10), kubeadmconstants.ControlPlaneComponentHealthCheckTimeout.Seconds()
 	if timeoutForControlPlane != nil {
 		timeoutForControlPlaneSeconds = timeoutForControlPlane.Seconds()
 	}
@@ -267,13 +278,13 @@ func StartupProbe(host, path string, port int32, scheme v1.URIScheme, timeoutFor
 	return createHTTPProbe(host, path, port, scheme, periodSeconds, 15, failureThreshold, periodSeconds)
 }
 
-func createHTTPProbe(host, path string, port int32, scheme v1.URIScheme, initialDelaySeconds, timeoutSeconds, failureThreshold, periodSeconds int32) *v1.Probe {
+func createHTTPProbe(host, path, port string, scheme v1.URIScheme, initialDelaySeconds, timeoutSeconds, failureThreshold, periodSeconds int32) *v1.Probe {
 	return &v1.Probe{
 		ProbeHandler: v1.ProbeHandler{
 			HTTPGet: &v1.HTTPGetAction{
 				Host:   host,
 				Path:   path,
-				Port:   intstr.FromInt32(port),
+				Port:   intstr.FromString(port),
 				Scheme: scheme,
 			},
 		},
@@ -352,23 +363,46 @@ func GetEtcdProbeEndpoint(cfg *kubeadmapi.Etcd, isIPv6 bool) (string, int32, v1.
 }
 
 // ManifestFilesAreEqual compares 2 files. It returns true if their contents are equal, false otherwise
-func ManifestFilesAreEqual(path1, path2 string) (bool, error) {
+func ManifestFilesAreEqual(path1, path2 string) (bool, string, error) {
 	pod1, err := ReadStaticPodFromDisk(path1)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	pod2, err := ReadStaticPodFromDisk(path2)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 
-	hasher := md5.New()
+	hasher := fnv.New128a()
 	DeepHashObject(hasher, pod1)
 	hash1 := hasher.Sum(nil)[0:]
 	DeepHashObject(hasher, pod2)
 	hash2 := hasher.Sum(nil)[0:]
+	if bytes.Equal(hash1, hash2) {
+		return true, "", nil
+	}
 
-	return bytes.Equal(hash1, hash2), nil
+	manifest1, err := kubeadmutil.MarshalToYaml(pod1, v1.SchemeGroupVersion)
+	if err != nil {
+		return false, "", errors.Wrapf(err, "failed to marshal Pod manifest for %q to YAML", path1)
+	}
+
+	manifest2, err := kubeadmutil.MarshalToYaml(pod2, v1.SchemeGroupVersion)
+	if err != nil {
+		return false, "", errors.Wrapf(err, "failed to marshal Pod manifest for %q to YAML", path2)
+	}
+
+	diff := difflib.UnifiedDiff{
+		A: difflib.SplitLines(string(manifest1)),
+		B: difflib.SplitLines(string(manifest2)),
+	}
+
+	diffStr, err := difflib.GetUnifiedDiffString(diff)
+	if err != nil {
+		return false, "", errors.Wrapf(err, "failed to generate the differences between manifest %q and manifest %q", path1, path2)
+	}
+
+	return false, diffStr, nil
 }
 
 // getProbeAddress returns a valid probe address.
@@ -384,6 +418,8 @@ func getProbeAddress(addr string) string {
 	return addr
 }
 
+// GetUsersAndGroups returns the local usersAndGroups, but first creates it
+// in a thread safe way once.
 func GetUsersAndGroups() (*users.UsersAndGroups, error) {
 	var err error
 	usersAndGroupsOnce.Do(func() {
@@ -399,4 +435,19 @@ func GetUsersAndGroups() (*users.UsersAndGroups, error) {
 func DeepHashObject(hasher hash.Hash, objectToWrite interface{}) {
 	hasher.Reset()
 	fmt.Fprintf(hasher, "%v", dump.ForHash(objectToWrite))
+}
+
+// IsControlPlaneNode returns true if the kube-apiserver static pod manifest is present
+// on the host.
+func IsControlPlaneNode() bool {
+	isControlPlaneNode := true
+
+	filepath := kubeadmconstants.GetStaticPodFilepath(kubeadmconstants.KubeAPIServer,
+		kubeadmconstants.GetStaticPodDirectory())
+
+	if _, err := os.Stat(filepath); os.IsNotExist(err) {
+		isControlPlaneNode = false
+	}
+
+	return isControlPlaneNode
 }

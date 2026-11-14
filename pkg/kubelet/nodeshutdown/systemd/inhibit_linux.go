@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 /*
 Copyright 2020 The Kubernetes Authors.
@@ -40,6 +39,7 @@ type dBusConnector interface {
 	Object(dest string, path dbus.ObjectPath) dbus.BusObject
 	AddMatchSignal(options ...dbus.MatchOption) error
 	Signal(ch chan<- *dbus.Signal)
+	Close() error
 }
 
 // DBusCon has functions that can be used to interact with systemd and logind over dbus.
@@ -47,8 +47,13 @@ type DBusCon struct {
 	SystemBus dBusConnector
 }
 
+// Close closes the underlying DBus connection.
+func (bus *DBusCon) Close() error {
+	return bus.SystemBus.Close()
+}
+
 func NewDBusCon() (*DBusCon, error) {
-	conn, err := dbus.SystemBus()
+	conn, err := dbus.ConnectSystemBus()
 	if err != nil {
 		return nil, err
 	}
@@ -133,9 +138,9 @@ func (bus *DBusCon) ReloadLogindConf() error {
 	return nil
 }
 
-// MonitorShutdown detects the a node shutdown by watching for "PrepareForShutdown" logind events.
+// MonitorShutdown detects the node shutdown by watching for "PrepareForShutdown" logind events.
 // see https://www.freedesktop.org/wiki/Software/systemd/inhibit/ for more details.
-func (bus *DBusCon) MonitorShutdown() (<-chan bool, error) {
+func (bus *DBusCon) MonitorShutdown(logger klog.Logger) (<-chan bool, error) {
 	err := bus.SystemBus.AddMatchSignal(dbus.WithMatchInterface(logindInterface), dbus.WithMatchMember("PrepareForShutdown"), dbus.WithMatchObjectPath("/org/freedesktop/login1"))
 
 	if err != nil {
@@ -155,12 +160,12 @@ func (bus *DBusCon) MonitorShutdown() (<-chan bool, error) {
 				return
 			}
 			if event == nil || len(event.Body) == 0 {
-				klog.ErrorS(nil, "Failed obtaining shutdown event, PrepareForShutdown event was empty")
+				logger.Error(nil, "Failed obtaining shutdown event, PrepareForShutdown event was empty")
 				continue
 			}
 			shutdownActive, ok := event.Body[0].(bool)
 			if !ok {
-				klog.ErrorS(nil, "Failed obtaining shutdown event, PrepareForShutdown event was not bool type as expected")
+				logger.Error(nil, "Failed obtaining shutdown event, PrepareForShutdown event was not bool type as expected")
 				continue
 			}
 			shutdownChan <- shutdownActive

@@ -34,7 +34,7 @@ var (
 			Subsystem:      EndpointSliceSubsystem,
 			Name:           "endpoints_added_per_sync",
 			Help:           "Number of endpoints added on each Service sync",
-			StabilityLevel: metrics.ALPHA,
+			StabilityLevel: metrics.BETA,
 			Buckets:        metrics.ExponentialBuckets(2, 2, 15),
 		},
 		[]string{},
@@ -46,7 +46,7 @@ var (
 			Subsystem:      EndpointSliceSubsystem,
 			Name:           "endpoints_removed_per_sync",
 			Help:           "Number of endpoints removed on each Service sync",
-			StabilityLevel: metrics.ALPHA,
+			StabilityLevel: metrics.BETA,
 			Buckets:        metrics.ExponentialBuckets(2, 2, 15),
 		},
 		[]string{},
@@ -57,7 +57,7 @@ var (
 			Subsystem:      EndpointSliceSubsystem,
 			Name:           "endpoints_desired",
 			Help:           "Number of endpoints desired",
-			StabilityLevel: metrics.ALPHA,
+			StabilityLevel: metrics.BETA,
 		},
 		[]string{},
 	)
@@ -67,7 +67,7 @@ var (
 			Subsystem:      EndpointSliceSubsystem,
 			Name:           "num_endpoint_slices",
 			Help:           "Number of EndpointSlices",
-			StabilityLevel: metrics.ALPHA,
+			StabilityLevel: metrics.BETA,
 		},
 		[]string{},
 	)
@@ -78,16 +78,31 @@ var (
 			Subsystem:      EndpointSliceSubsystem,
 			Name:           "desired_endpoint_slices",
 			Help:           "Number of EndpointSlices that would exist with perfect endpoint allocation",
-			StabilityLevel: metrics.ALPHA,
+			StabilityLevel: metrics.BETA,
 		},
 		[]string{},
 	)
 
 	// EndpointSliceChanges tracks the number of changes to Endpoint Slices.
+	//
+	// Deprecated: use EndpointSliceChangesTotal. The old name lacks the
+	// conventional _total suffix required for counters.
 	EndpointSliceChanges = metrics.NewCounterVec(
 		&metrics.CounterOpts{
+			Subsystem:         EndpointSliceSubsystem,
+			Name:              "changes",
+			Help:              "Number of EndpointSlice changes. Deprecated in favor of endpoint_slice_controller_changes_total.",
+			StabilityLevel:    metrics.ALPHA,
+			DeprecatedVersion: "1.38.0",
+		},
+		[]string{"operation"},
+	)
+
+	// EndpointSliceChangesTotal tracks the number of changes to Endpoint Slices.
+	EndpointSliceChangesTotal = metrics.NewCounterVec(
+		&metrics.CounterOpts{
 			Subsystem:      EndpointSliceSubsystem,
-			Name:           "changes",
+			Name:           "changes_total",
 			Help:           "Number of EndpointSlice changes",
 			StabilityLevel: metrics.ALPHA,
 		},
@@ -102,7 +117,10 @@ var (
 			Name:      "endpointslices_changed_per_sync",
 			Help:      "Number of EndpointSlices changed on each Service sync",
 		},
-		[]string{"topology"}, // either "Auto" or "Disabled"
+		[]string{
+			"topology",             // either "Auto" or "Disabled"
+			"traffic_distribution", // a trafficDistribution value or <empty>
+		},
 	)
 
 	// EndpointSliceSyncs tracks the number of sync operations the controller
@@ -115,6 +133,18 @@ var (
 			StabilityLevel: metrics.ALPHA,
 		},
 		[]string{"result"}, // either "success", "stale", or "error"
+	)
+
+	// ServicesCountByTrafficDistribution tracks the number of Services using some
+	// specific trafficDistribution
+	ServicesCountByTrafficDistribution = metrics.NewGaugeVec(
+		&metrics.GaugeOpts{
+			Subsystem:      EndpointSliceSubsystem,
+			Name:           "services_count_by_traffic_distribution",
+			Help:           "Number of Services using some specific trafficDistribution",
+			StabilityLevel: metrics.BETA,
+		},
+		[]string{"traffic_distribution"}, // A trafficDistribution value
 	)
 )
 
@@ -129,7 +159,9 @@ func RegisterMetrics() {
 		legacyregistry.MustRegister(NumEndpointSlices)
 		legacyregistry.MustRegister(DesiredEndpointSlices)
 		legacyregistry.MustRegister(EndpointSliceChanges)
+		legacyregistry.MustRegister(EndpointSliceChangesTotal)
 		legacyregistry.MustRegister(EndpointSlicesChangedPerSync)
 		legacyregistry.MustRegister(EndpointSliceSyncs)
+		legacyregistry.MustRegister(ServicesCountByTrafficDistribution)
 	})
 }

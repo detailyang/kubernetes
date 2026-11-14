@@ -28,19 +28,13 @@ source "${KUBE_ROOT}/hack/lib/util.sh"
 
 kube::golang::setup_env
 
-make -C "${KUBE_ROOT}" WHAT=cmd/genswaggertypedocs
-
-# Find binary
-genswaggertypedocs=$(kube::util::find-binary "genswaggertypedocs")
-
-result=0
+GOPROXY=off go install ./cmd/genswaggertypedocs
 
 find_files() {
   find . -not \( \
       \( \
-        -wholename './output' \
+        -wholename '.git' \
         -o -wholename './_output' \
-        -o -wholename './_gopath' \
         -o -wholename './release' \
         -o -wholename './target' \
         -o -wholename '*/third_party/*' \
@@ -50,7 +44,7 @@ find_files() {
     \) \
     \( -wholename './staging/src/k8s.io/api/*/v*/types.go' \
        -o -wholename './staging/src/k8s.io/kube-aggregator/pkg/apis/*/v*/types.go' \
-       -o -wholename './staging/src/k8s.io/apiextensions-apiserver/pkg/apis/*/v*/types.go' \
+       -o -wholename './staging/src/k8s.io/apiextensions-api/pkg/apis/*/v*/types.go' \
     \)
 }
 
@@ -70,10 +64,11 @@ kube::util::check-file-in-alphabetical-order "${failure_file}"
 failing_files=()
 while IFS='' read -r line; do failing_files+=("$line"); done < <(cat "$failure_file")
 
+result=0
 for file in $versioned_api_files; do
   if ! kube::util::array_contains "$file" "${failing_files[@]}"; then
     gen_swagger_result=0
-    $genswaggertypedocs -v -s "${file}" -f - || gen_swagger_result=$?
+    genswaggertypedocs -v -s "${file}" -f - || gen_swagger_result=$?
     if [[ "${gen_swagger_result}" -ne 0 ]]; then
       echo "API file: ${file} is missing: ${gen_swagger_result} descriptions"
       result=1

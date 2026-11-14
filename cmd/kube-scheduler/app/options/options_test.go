@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,6 +33,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	apiserveroptions "k8s.io/apiserver/pkg/server/options"
+	clientfeatures "k8s.io/client-go/features"
+	clientfeaturestesting "k8s.io/client-go/features/testing"
+	clientset "k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
+	basecompatibility "k8s.io/component-base/compatibility"
 	componentbaseconfig "k8s.io/component-base/config"
 	"k8s.io/component-base/logs"
 	"k8s.io/klog/v2/ktesting"
@@ -41,7 +47,7 @@ import (
 	configtesting "k8s.io/kubernetes/pkg/scheduler/apis/config/testing"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/testing/defaults"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 func TestSchedulerOptions(t *testing.T) {
@@ -279,7 +285,9 @@ profiles:
 
 	defaultPodInitialBackoffSeconds := int64(1)
 	defaultPodMaxBackoffSeconds := int64(10)
-	defaultPercentageOfNodesToScore := pointer.Int32(0)
+	defaultPercentageOfNodesToScore := ptr.To[int32](0)
+
+	componentGlobalsRegistry := basecompatibility.NewComponentGlobalsRegistry()
 
 	testcases := []struct {
 		name             string
@@ -303,7 +311,7 @@ profiles:
 						PairName:      "kube-scheduler",
 					},
 					HTTP2MaxStreamsPerConnection: 47,
-				}).WithLoopback(),
+				}),
 				Authentication: &apiserveroptions.DelegatingAuthenticationOptions{
 					CacheTTL:   10 * time.Second,
 					ClientCert: apiserveroptions.ClientCertAuthenticationOptions{},
@@ -321,7 +329,8 @@ profiles:
 					AlwaysAllowPaths:             []string{"/healthz", "/readyz", "/livez"}, // note: this does not match /healthz/ or /healthz/*
 					AlwaysAllowGroups:            []string{"system:masters"},
 				},
-				Logs: logs.NewOptions(),
+				Logs:                     logs.NewOptions(),
+				ComponentGlobalsRegistry: componentGlobalsRegistry,
 			},
 			expectedUsername: "config",
 			expectedConfig: kubeschedulerconfig.KubeSchedulerConfiguration{
@@ -372,23 +381,26 @@ profiles:
 					}
 					return cfg
 				}(),
-				Logs: logs.NewOptions(),
+				Logs:                     logs.NewOptions(),
+				ComponentGlobalsRegistry: componentGlobalsRegistry,
 			},
 			expectedError: "no kind \"KubeSchedulerConfiguration\" is registered for version \"componentconfig/v1alpha1\"",
 		},
 		{
 			name: "unknown version kubescheduler.config.k8s.io/unknown",
 			options: &Options{
-				ConfigFile: unknownVersionConfig,
-				Logs:       logs.NewOptions(),
+				ConfigFile:               unknownVersionConfig,
+				Logs:                     logs.NewOptions(),
+				ComponentGlobalsRegistry: componentGlobalsRegistry,
 			},
 			expectedError: "no kind \"KubeSchedulerConfiguration\" is registered for version \"kubescheduler.config.k8s.io/unknown\"",
 		},
 		{
 			name: "config file with no version",
 			options: &Options{
-				ConfigFile: noVersionConfig,
-				Logs:       logs.NewOptions(),
+				ConfigFile:               noVersionConfig,
+				Logs:                     logs.NewOptions(),
+				ComponentGlobalsRegistry: componentGlobalsRegistry,
 			},
 			expectedError: "Object 'apiVersion' is missing",
 		},
@@ -406,7 +418,7 @@ profiles:
 						PairName:      "kube-scheduler",
 					},
 					HTTP2MaxStreamsPerConnection: 47,
-				}).WithLoopback(),
+				}),
 				Authentication: &apiserveroptions.DelegatingAuthenticationOptions{
 					CacheTTL:   10 * time.Second,
 					ClientCert: apiserveroptions.ClientCertAuthenticationOptions{},
@@ -424,7 +436,8 @@ profiles:
 					AlwaysAllowPaths:             []string{"/healthz", "/readyz", "/livez"}, // note: this does not match /healthz/ or /healthz/*
 					AlwaysAllowGroups:            []string{"system:masters"},
 				},
-				Logs: logs.NewOptions(),
+				Logs:                     logs.NewOptions(),
+				ComponentGlobalsRegistry: componentGlobalsRegistry,
 			},
 			expectedUsername: "flag",
 			expectedConfig: kubeschedulerconfig.KubeSchedulerConfiguration{
@@ -479,7 +492,7 @@ profiles:
 						PairName:      "kube-scheduler",
 					},
 					HTTP2MaxStreamsPerConnection: 47,
-				}).WithLoopback(),
+				}),
 				Authentication: &apiserveroptions.DelegatingAuthenticationOptions{
 					CacheTTL: 10 * time.Second,
 					RequestHeader: apiserveroptions.RequestHeaderAuthenticationOptions{
@@ -496,7 +509,8 @@ profiles:
 					AlwaysAllowPaths:             []string{"/healthz", "/readyz", "/livez"}, // note: this does not match /healthz/ or /healthz/*
 					AlwaysAllowGroups:            []string{"system:masters"},
 				},
-				Logs: logs.NewOptions(),
+				Logs:                     logs.NewOptions(),
+				ComponentGlobalsRegistry: componentGlobalsRegistry,
 			},
 			expectedConfig: kubeschedulerconfig.KubeSchedulerConfiguration{
 				TypeMeta: metav1.TypeMeta{
@@ -539,8 +553,9 @@ profiles:
 		{
 			name: "plugin config",
 			options: &Options{
-				ConfigFile: pluginConfigFile,
-				Logs:       logs.NewOptions(),
+				ConfigFile:               pluginConfigFile,
+				Logs:                     logs.NewOptions(),
+				ComponentGlobalsRegistry: componentGlobalsRegistry,
 			},
 			expectedUsername: "config",
 			expectedConfig: kubeschedulerconfig.KubeSchedulerConfiguration{
@@ -587,6 +602,7 @@ profiles:
 								},
 								Disabled: []kubeschedulerconfig.Plugin{
 									{Name: names.VolumeBinding},
+									{Name: names.DefaultPreemption},
 								},
 							},
 							PreBind: kubeschedulerconfig.PluginSet{
@@ -621,6 +637,13 @@ profiles:
 								},
 							},
 							{
+								Name: "DynamicResources",
+								Args: &kubeschedulerconfig.DynamicResourcesArgs{
+									FilterTimeout:  &metav1.Duration{Duration: 10 * time.Second},
+									BindingTimeout: &metav1.Duration{Duration: 10 * time.Minute},
+								},
+							},
+							{
 								Name: "NodeAffinity",
 								Args: &kubeschedulerconfig.NodeAffinityArgs{},
 							},
@@ -649,6 +672,10 @@ profiles:
 								Name: "VolumeBinding",
 								Args: &kubeschedulerconfig.VolumeBindingArgs{
 									BindTimeoutSeconds: 600,
+									Shape: []kubeschedulerconfig.UtilizationShapePoint{
+										{Utilization: 0, Score: 10},
+										{Utilization: 100, Score: 0},
+									},
 								},
 							},
 						},
@@ -659,8 +686,9 @@ profiles:
 		{
 			name: "multiple profiles",
 			options: &Options{
-				ConfigFile: multiProfilesConfig,
-				Logs:       logs.NewOptions(),
+				ConfigFile:               multiProfilesConfig,
+				Logs:                     logs.NewOptions(),
+				ComponentGlobalsRegistry: componentGlobalsRegistry,
 			},
 			expectedUsername: "config",
 			expectedConfig: kubeschedulerconfig.KubeSchedulerConfiguration{
@@ -703,6 +731,7 @@ profiles:
 								},
 								Disabled: []kubeschedulerconfig.Plugin{
 									{Name: names.VolumeBinding},
+									{Name: names.DefaultPreemption},
 								},
 							},
 						},
@@ -712,6 +741,7 @@ profiles:
 						SchedulerName: "bar-profile",
 						Plugins: &kubeschedulerconfig.Plugins{
 							MultiPoint: defaults.PluginsV1.MultiPoint,
+							Reserve:    defaults.PluginsV1.Reserve,
 							PreBind: kubeschedulerconfig.PluginSet{
 								Disabled: []kubeschedulerconfig.Plugin{
 									{Name: names.VolumeBinding},
@@ -727,6 +757,13 @@ profiles:
 								Args: &kubeschedulerconfig.DefaultPreemptionArgs{
 									MinCandidateNodesPercentage: 10,
 									MinCandidateNodesAbsolute:   100,
+								},
+							},
+							{
+								Name: "DynamicResources",
+								Args: &kubeschedulerconfig.DynamicResourcesArgs{
+									FilterTimeout:  &metav1.Duration{Duration: 10 * time.Second},
+									BindingTimeout: &metav1.Duration{Duration: 10 * time.Minute},
 								},
 							},
 							{
@@ -764,6 +801,10 @@ profiles:
 								Name: "VolumeBinding",
 								Args: &kubeschedulerconfig.VolumeBindingArgs{
 									BindTimeoutSeconds: 600,
+									Shape: []kubeschedulerconfig.UtilizationShapePoint{
+										{Utilization: 0, Score: 10},
+										{Utilization: 100, Score: 0},
+									},
 								},
 							},
 						},
@@ -774,15 +815,17 @@ profiles:
 		{
 			name: "no config",
 			options: &Options{
-				Logs: logs.NewOptions(),
+				Logs:                     logs.NewOptions(),
+				ComponentGlobalsRegistry: componentGlobalsRegistry,
 			},
 			expectedError: "no configuration has been provided",
 		},
 		{
 			name: "unknown field",
 			options: &Options{
-				ConfigFile: unknownFieldConfig,
-				Logs:       logs.NewOptions(),
+				ConfigFile:               unknownFieldConfig,
+				Logs:                     logs.NewOptions(),
+				ComponentGlobalsRegistry: componentGlobalsRegistry,
 			},
 			expectedError: `unknown field "foo"`,
 			checkErrFn:    runtime.IsStrictDecodingError,
@@ -790,8 +833,9 @@ profiles:
 		{
 			name: "duplicate fields",
 			options: &Options{
-				ConfigFile: duplicateFieldConfig,
-				Logs:       logs.NewOptions(),
+				ConfigFile:               duplicateFieldConfig,
+				Logs:                     logs.NewOptions(),
+				ComponentGlobalsRegistry: componentGlobalsRegistry,
 			},
 			expectedError: `key "leaderElect" already set`,
 			checkErrFn:    runtime.IsStrictDecodingError,
@@ -799,8 +843,9 @@ profiles:
 		{
 			name: "high throughput profile",
 			options: &Options{
-				ConfigFile: highThroughputProfileConfig,
-				Logs:       logs.NewOptions(),
+				ConfigFile:               highThroughputProfileConfig,
+				Logs:                     logs.NewOptions(),
+				ComponentGlobalsRegistry: componentGlobalsRegistry,
 			},
 			expectedUsername: "config",
 			expectedConfig: kubeschedulerconfig.KubeSchedulerConfiguration{
@@ -866,6 +911,13 @@ profiles:
 								},
 							},
 							{
+								Name: "DynamicResources",
+								Args: &kubeschedulerconfig.DynamicResourcesArgs{
+									FilterTimeout:  &metav1.Duration{Duration: 10 * time.Second},
+									BindingTimeout: &metav1.Duration{Duration: 10 * time.Minute},
+								},
+							},
+							{
 								Name: "NodeAffinity",
 								Args: &kubeschedulerconfig.NodeAffinityArgs{},
 							},
@@ -894,6 +946,10 @@ profiles:
 								Name: "VolumeBinding",
 								Args: &kubeschedulerconfig.VolumeBindingArgs{
 									BindTimeoutSeconds: 600,
+									Shape: []kubeschedulerconfig.UtilizationShapePoint{
+										{Utilization: 0, Score: 10},
+										{Utilization: 100, Score: 0},
+									},
 								},
 							},
 						},
@@ -920,7 +976,7 @@ profiles:
 			if err != nil {
 				if tc.expectedError != "" || tc.checkErrFn != nil {
 					if tc.expectedError != "" {
-						assert.Contains(t, err.Error(), tc.expectedError)
+						assert.ErrorContains(t, err, tc.expectedError)
 					}
 					if tc.checkErrFn != nil {
 						assert.True(t, tc.checkErrFn(err), "got error: %v", err)
@@ -954,6 +1010,42 @@ profiles:
 			}
 			if username != tc.expectedUsername {
 				t.Errorf("expected server call with user %q, got %q", tc.expectedUsername, username)
+			}
+		})
+	}
+}
+
+func TestCreateClients(t *testing.T) {
+	var accept string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		accept = req.Header.Get("Accept")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"kind":"PodList","apiVersion":"v1","items":[]}`))
+	}))
+	defer server.Close()
+
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ManagedFieldsOptOutClient=%t", enabled), func(t *testing.T) {
+			clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.ManagedFieldsOptOutClient, enabled)
+			client, informerClient, _, err := createClients(&restclient.Config{Host: server.URL})
+			if err != nil {
+				t.Fatalf("unexpected error creating clients: %v", err)
+			}
+			// Without the gate, the informers keep sharing client, including its rate limiter.
+			if !enabled && informerClient != client {
+				t.Error("expected the informers to share the scheduler's client")
+			}
+			list := func(c clientset.Interface) string {
+				if _, err := c.CoreV1().Pods("").List(context.Background(), metav1.ListOptions{}); err != nil {
+					t.Fatalf("unexpected error listing pods: %v", err)
+				}
+				return accept
+			}
+			if got := list(client); strings.Contains(got, "drop=") {
+				t.Errorf("client Accept = %q, want no drop parameter", got)
+			}
+			if got := list(informerClient); strings.Contains(got, "drop=metadata.managedFields") != enabled {
+				t.Errorf("informer client Accept = %q, want drop parameter: %t", got, enabled)
 			}
 		})
 	}

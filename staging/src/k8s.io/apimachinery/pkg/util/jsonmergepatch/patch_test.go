@@ -21,9 +21,9 @@ import (
 	"reflect"
 	"testing"
 
-	jsonpatch "github.com/evanphx/json-patch"
-	"k8s.io/apimachinery/pkg/util/dump"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	"k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/utils/dump"
 	"sigs.k8s.io/yaml"
 )
 

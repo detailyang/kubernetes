@@ -19,7 +19,7 @@ package roundtrip
 import (
 	"bytes"
 	gojson "encoding/json"
-	"io/ioutil"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -115,7 +115,7 @@ func (c *CompatibilityTestOptions) Complete(t *testing.T) *CompatibilityTestOpti
 		c.TestDataDir = "testdata"
 	}
 	if c.TestDataDirCurrentVersion == "" {
-		c.TestDataDirCurrentVersion = filepath.Join(c.TestDataDir, "HEAD")
+		c.TestDataDirCurrentVersion = filepath.Join(c.TestDataDir, http.MethodHead)
 	}
 	if c.TestDataDirsPreviousVersions == nil {
 		dirs, err := filepath.Glob(filepath.Join(c.TestDataDir, "v*"))
@@ -181,10 +181,10 @@ func (c *CompatibilityTestOptions) Complete(t *testing.T) *CompatibilityTestOpti
 	}
 
 	if c.JSON == nil {
-		c.JSON = json.NewSerializer(json.DefaultMetaFactory, c.Scheme, c.Scheme, true)
+		c.JSON = json.NewSerializerWithOptions(json.DefaultMetaFactory, c.Scheme, c.Scheme, json.SerializerOptions{Pretty: true})
 	}
 	if c.YAML == nil {
-		c.YAML = json.NewYAMLSerializer(json.DefaultMetaFactory, c.Scheme, c.Scheme)
+		c.YAML = json.NewSerializerWithOptions(json.DefaultMetaFactory, c.Scheme, c.Scheme, json.SerializerOptions{Yaml: true})
 	}
 	if c.Proto == nil {
 		c.Proto = protobuf.NewSerializer(c.Scheme, c.Scheme)
@@ -199,7 +199,7 @@ func (c *CompatibilityTestOptions) Run(t *testing.T) {
 	for _, gvk := range c.Kinds {
 		t.Run(makeName(gvk), func(t *testing.T) {
 
-			t.Run("HEAD", func(t *testing.T) {
+			t.Run(http.MethodHead, func(t *testing.T) {
 				c.runCurrentVersionTest(t, gvk, usedHEADFixtures)
 			})
 
@@ -333,11 +333,11 @@ func (c *CompatibilityTestOptions) encode(t *testing.T, obj runtime.Object) (jso
 
 func read(dir string, gvk schema.GroupVersionKind, suffix string, usedFiles sets.String) (json, yaml, proto []byte, err error) {
 	jsonFilename := makeName(gvk) + suffix + ".json"
-	actualJSON, jsonErr := ioutil.ReadFile(filepath.Join(dir, jsonFilename))
+	actualJSON, jsonErr := os.ReadFile(filepath.Join(dir, jsonFilename))
 	yamlFilename := makeName(gvk) + suffix + ".yaml"
-	actualYAML, yamlErr := ioutil.ReadFile(filepath.Join(dir, yamlFilename))
+	actualYAML, yamlErr := os.ReadFile(filepath.Join(dir, yamlFilename))
 	protoFilename := makeName(gvk) + suffix + ".pb"
-	actualProto, protoErr := ioutil.ReadFile(filepath.Join(dir, protoFilename))
+	actualProto, protoErr := os.ReadFile(filepath.Join(dir, protoFilename))
 	if usedFiles != nil {
 		usedFiles.Insert(jsonFilename)
 		usedFiles.Insert(yamlFilename)
@@ -359,7 +359,7 @@ func writeFile(t *testing.T, dir string, gvk schema.GroupVersionKind, suffix, ex
 	if err := os.MkdirAll(dir, os.FileMode(0755)); err != nil {
 		t.Fatal("error making directory", err)
 	}
-	if err := ioutil.WriteFile(filepath.Join(dir, makeName(gvk)+suffix+"."+extension), data, os.FileMode(0644)); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, makeName(gvk)+suffix+"."+extension), data, os.FileMode(0644)); err != nil {
 		t.Fatalf("error writing %s: %v", extension, err)
 	}
 }

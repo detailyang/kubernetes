@@ -31,9 +31,9 @@ import (
 	"strings"
 	"text/template"
 
-	"gopkg.in/yaml.v2"
-
 	"github.com/onsi/ginkgo/v2/types"
+
+	yaml "go.yaml.in/yaml/v2"
 )
 
 // ConformanceData describes the structure of the conformance.yaml file
@@ -57,6 +57,7 @@ var (
 	k8sPath = flag.String("source", "", "location of the current source on the current machine")
 	confDoc = flag.Bool("docs", false, "write a conformance document")
 	version = flag.String("version", "v1.9", "version of this conformance document")
+	label   = flag.String("label", "Conformance", "test label to match")
 
 	// If a test name contains any of these tags, it is ineligible for promotion to conformance
 	regexIneligibleTags = regexp.MustCompile(`\[(Alpha|Feature:[^\]]+|Flaky)\]`)
@@ -101,7 +102,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		if isConformance(spec) {
+		if shouldOutput(spec) {
 			testInfo := getTestInfo(spec)
 			if testInfo != nil {
 				testInfos = append(testInfos, testInfo)
@@ -116,8 +117,8 @@ func main() {
 	saveAllTestInfo(testInfos)
 }
 
-func isConformance(spec *types.SpecReport) bool {
-	return strings.Contains(getTestName(spec), "[Conformance]")
+func shouldOutput(spec *types.SpecReport) bool {
+	return strings.Contains(getTestName(spec), "["+*label+"]")
 }
 
 func getTestInfo(spec *types.SpecReport) *ConformanceData {
@@ -179,12 +180,12 @@ func saveAllTestInfo(dataSet []*ConformanceData) {
 }
 
 func getConformanceData(targetFrame frame) (*ConformanceData, error) {
-	// filenames are in one of two special GOPATHs depending on if they were
-	// built dockerized or with the host go
-	// we want to trim this prefix to produce portable relative paths
-	k8sSRC := *k8sPath + "/_output/local/go/src/k8s.io/kubernetes/"
-	trimmedFile := strings.TrimPrefix(targetFrame.File, k8sSRC)
-	trimmedFile = strings.TrimPrefix(trimmedFile, "/go/src/k8s.io/kubernetes/_output/dockerized/go/src/k8s.io/kubernetes/")
+	root := *k8sPath
+	if !strings.HasSuffix(root, string(os.PathSeparator)) {
+		root += string(os.PathSeparator)
+	}
+
+	trimmedFile := strings.TrimPrefix(targetFrame.File, root)
 	targetFrame.File = trimmedFile
 
 	freader, err := os.Open(targetFrame.File)

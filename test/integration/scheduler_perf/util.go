@@ -20,35 +20,46 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path"
+	"runtime"
 	"sort"
-	"testing"
+	"strings"
+	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	resourcev1alpha2 "k8s.io/api/resource/v1alpha2"
+	schedulingapiv1beta1 "k8s.io/api/scheduling/v1beta1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/ktesting"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	restclient "k8s.io/client-go/rest"
-	cliflag "k8s.io/component-base/cli/flag"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/component-base/featuregate"
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/metrics/testutil"
+	pvutil "k8s.io/component-helpers/storage/volume"
 	"k8s.io/klog/v2"
 	kubeschedulerconfigv1 "k8s.io/kube-scheduler/config/v1"
-	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
+	apiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
+	"k8s.io/kubernetes/pkg/controller/namespace"
 	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/scheduler"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	kubeschedulerscheme "k8s.io/kubernetes/pkg/scheduler/apis/config/scheme"
+	schedulermetrics "k8s.io/kubernetes/pkg/scheduler/metrics"
+	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
 	"k8s.io/kubernetes/test/integration/framework"
 	"k8s.io/kubernetes/test/integration/util"
 	testutils "k8s.io/kubernetes/test/utils"
@@ -61,7 +72,9 @@ const (
 	throughputSampleInterval = time.Second
 )
 
-var dataItemsDir = flag.String("data-items-dir", "", "destination directory for storing generated data items for perf dashboard")
+var dataItemsDir = flag.String("data-items-dir", "", "destination directory for storing generated data items for perf dashboard or performance profiles")
+
+var runID = time.Now().Format(dateFormat)
 
 func newDefaultComponentConfig() (*config.KubeSchedulerConfiguration, error) {
 	gvk := kubeschedulerconfigv1.SchemeGroupVersion.WithKind("KubeSchedulerConfiguration")
@@ -82,33 +95,33 @@ func newDefaultComponentConfig() (*config.KubeSchedulerConfiguration, error) {
 // remove resources after finished.
 // Notes on rate limiter:
 //   - client rate limit is set to 5000.
-func mustSetupCluster(ctx context.Context, tb testing.TB, config *config.KubeSchedulerConfiguration, enabledFeatures map[featuregate.Feature]bool) (informers.SharedInformerFactory, clientset.Interface, dynamic.Interface) {
-	// Run API server with minimimal logging by default. Can be raised with -v.
-	framework.MinVerbosity = 0
-
-	_, kubeConfig, tearDownFn := framework.StartTestServer(ctx, tb, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
-			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount", "TaintNodesByCondition", "Priority"}
-
-			// Enable DRA API group.
-			if enabledFeatures[features.DynamicResourceAllocation] {
-				opts.APIEnablement.RuntimeConfig = cliflag.ConfigurationMap{
-					resourcev1alpha2.SchemeGroupVersion.String(): "true",
-				}
-			}
-		},
-	})
-	tb.Cleanup(tearDownFn)
-
-	// Cleanup will be in reverse order: first the clients get cancelled,
-	// then the apiserver is torn down.
-	ctx, cancel := context.WithCancel(ctx)
-	tb.Cleanup(cancel)
+func mustSetupCluster(tCtx ktesting.TContext, config *config.KubeSchedulerConfiguration, enabledFeatures map[featuregate.Feature]bool, opts *schedulerPerfOptions) (*scheduler.Scheduler, informers.SharedInformerFactory, <-chan struct{}, ktesting.TContext) {
+	var runtimeConfig []string
+	if enabledFeatures[features.GenericWorkload] {
+		runtimeConfig = append(runtimeConfig, fmt.Sprintf("%s=true", schedulingapiv1beta1.SchemeGroupVersion))
+	}
+	customFlags := []string{
+		// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+		"--disable-admission-plugins=ServiceAccount,TaintNodesByCondition,Priority",
+	}
+	if len(runtimeConfig) > 0 {
+		customFlags = append(customFlags, "--runtime-config="+strings.Join(runtimeConfig, ","))
+	}
+	serverOpts := apiservertesting.NewDefaultTestServerOptions()
+	// Timeout sufficiently long to handle deleting pods of the largest test cases.
+	serverOpts.RequestTimeout = 10 * time.Minute
+	server, err := apiservertesting.StartTestServer(tCtx, serverOpts, customFlags, framework.SharedEtcd())
+	if err != nil {
+		tCtx.Fatalf("start apiserver: %v", err)
+	}
+	// Cleanup will be in reverse order: first the clients by canceling the
+	// child context, then the server.
+	tCtx.Cleanup(server.TearDownFn)
+	tCtx = tCtx.WithCancel()
 
 	// TODO: client connection configuration, such as QPS or Burst is configurable in theory, this could be derived from the `config`, need to
 	// support this when there is any testcase that depends on such configuration.
-	cfg := restclient.CopyConfig(kubeConfig)
+	cfg := restclient.CopyConfig(server.ClientConfig)
 	cfg.QPS = 5000.0
 	cfg.Burst = 5000
 
@@ -117,53 +130,147 @@ func mustSetupCluster(ctx context.Context, tb testing.TB, config *config.KubeSch
 		var err error
 		config, err = newDefaultComponentConfig()
 		if err != nil {
-			tb.Fatalf("Error creating default component config: %v", err)
+			tCtx.Fatalf("Error creating default component config: %v", err)
 		}
 	}
 
-	client := clientset.NewForConfigOrDie(cfg)
-	dynClient := dynamic.NewForConfigOrDie(cfg)
+	tCtx = tCtx.WithRESTConfig(cfg)
 
 	// Not all config options will be effective but only those mostly related with scheduler performance will
 	// be applied to start a scheduler, most of them are defined in `scheduler.schedulerOptions`.
-	_, informerFactory := util.StartScheduler(ctx, client, cfg, config)
-	util.StartFakePVController(ctx, client, informerFactory)
-	runGC := util.CreateGCController(ctx, tb, *cfg, informerFactory)
-	runNS := util.CreateNamespaceController(ctx, tb, *cfg, informerFactory)
+	scheduler, informerFactory, done := util.StartSchedulerWithDone(tCtx, config, opts.outOfTreePluginRegistry)
 
-	runResourceClaimController := func() {}
-	if enabledFeatures[features.DynamicResourceAllocation] {
-		// Testing of DRA with inline resource claims depends on this
-		// controller for creating and removing ResourceClaims.
-		runResourceClaimController = util.CreateResourceClaimController(ctx, tb, client, informerFactory)
-	}
+	// The controllers below stand in for kube-controller-manager, which runs in a
+	// separate process from kube-scheduler in a real cluster. Give them their own
+	// client (so that their rate limiting is independent from the scheduler's) and
+	// their own informer factory (so that watches and caches aren't shared with the
+	// scheduler either).
+	controllerClient := clientset.NewForConfigOrDie(cfg)
+	controllerInformerFactory := informers.NewSharedInformerFactory(controllerClient, 0)
+	startFakePVController(tCtx, controllerClient, controllerInformerFactory)
+	runGC := util.CreateGCController(tCtx, tCtx, *cfg, controllerInformerFactory)
+	runNS := createNamespaceController(tCtx, tCtx, *cfg, controllerInformerFactory)
+	// Testing of DRA with inline resource claims depends on this
+	// controller for creating and removing ResourceClaims.
+	runResourceClaimController := util.CreateResourceClaimController(tCtx, tCtx, controllerClient, controllerInformerFactory)
 
-	informerFactory.Start(ctx.Done())
-	informerFactory.WaitForCacheSync(ctx.Done())
+	informerFactory.Start(tCtx.Done())
+	informerFactory.WaitForCacheSync(tCtx.Done())
+	controllerInformerFactory.Start(tCtx.Done())
+	controllerInformerFactory.WaitForCacheSync(tCtx.Done())
 	go runGC()
 	go runNS()
 	go runResourceClaimController()
 
-	return informerFactory, client, dynClient
+	return scheduler, informerFactory, done, tCtx
 }
 
-// Returns the list of scheduled pods in the specified namespaces.
+// startFakePVController is a simplified pv controller logic that sets PVC VolumeName and annotation for each PV binding.
+// TODO(mborsz): Use a real PV controller here.
+func startFakePVController(tCtx ktesting.TContext, clientSet clientset.Interface, informerFactory informers.SharedInformerFactory) {
+	pvInformer := informerFactory.Core().V1().PersistentVolumes()
+
+	syncPV := func(obj *v1.PersistentVolume) {
+		if obj.Spec.ClaimRef != nil {
+			claimRef := obj.Spec.ClaimRef
+			pvc, err := clientSet.CoreV1().PersistentVolumeClaims(claimRef.Namespace).Get(tCtx, claimRef.Name, metav1.GetOptions{})
+			if err != nil {
+				// Note that the error can be anything, because components like
+				// apiserver are also shutting down at the same time, but this
+				// check is conservative and only ignores the "context canceled"
+				// error while shutting down.
+				if tCtx.Err() == nil || !errors.Is(err, context.Canceled) {
+					klog.Errorf("error while getting %v/%v: %v", claimRef.Namespace, claimRef.Name, err)
+				}
+				return
+			}
+
+			if pvc.Spec.VolumeName == "" {
+				pvc.Spec.VolumeName = obj.Name
+				metav1.SetMetaDataAnnotation(&pvc.ObjectMeta, pvutil.AnnBindCompleted, "yes")
+				_, err := clientSet.CoreV1().PersistentVolumeClaims(claimRef.Namespace).Update(tCtx, pvc, metav1.UpdateOptions{})
+				if err != nil {
+					if tCtx.Err() == nil || !errors.Is(err, context.Canceled) {
+						// Shutting down, no need to record this.
+						klog.Errorf("error while updating %v/%v: %v", claimRef.Namespace, claimRef.Name, err)
+					}
+					return
+				}
+			}
+		}
+	}
+
+	_, err := pvInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			syncPV(obj.(*v1.PersistentVolume))
+		},
+		UpdateFunc: func(_, obj interface{}) {
+			syncPV(obj.(*v1.PersistentVolume))
+		},
+	})
+	tCtx.ExpectNoError(err, "add PV event handler")
+}
+
+// createNamespaceController creates a namespace controller and returns a run
+// function for it. The informer factory needs to be started before invoking
+// that function.
+func createNamespaceController(ctx context.Context, tb testutils.TB, restConfig restclient.Config, informerSet informers.SharedInformerFactory) func() {
+	restclient.AddUserAgent(&restConfig, "namespace-controller")
+	clientSet := clientset.NewForConfigOrDie(&restConfig)
+	metadataClient, err := metadata.NewForConfig(&restConfig)
+	if err != nil {
+		tb.Fatalf("Failed to create metadataClient: %v", err)
+	}
+	discoverResourcesFn := clientSet.Discovery().ServerPreferredNamespacedResources
+	controller := namespace.NewNamespaceController(
+		ctx,
+		clientSet,
+		metadataClient,
+		discoverResourcesFn,
+		informerSet.Core().V1().Namespaces(),
+		10*time.Hour,
+		v1.FinalizerKubernetes)
+	return func() {
+		go controller.Run(ctx, 5)
+	}
+}
+
+func isAttempted(pod *v1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == v1.PodScheduled {
+			return true
+		}
+	}
+	return false
+}
+
+// getScheduledPods returns the list of scheduled, attempted but unschedulable
+// and unattempted pods in the specified namespaces.
+// Label selector can be used to filter the pods.
 // Note that no namespaces specified matches all namespaces.
-func getScheduledPods(podInformer coreinformers.PodInformer, namespaces ...string) ([]*v1.Pod, error) {
+func getScheduledPods(podInformer coreinformers.PodInformer, labelSelector map[string]string, namespaces ...string) ([]*v1.Pod, []*v1.Pod, []*v1.Pod, error) {
 	pods, err := podInformer.Lister().List(labels.Everything())
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	s := sets.New(namespaces...)
 	scheduled := make([]*v1.Pod, 0, len(pods))
+	attempted := make([]*v1.Pod, 0, len(pods))
+	unattempted := make([]*v1.Pod, 0, len(pods))
 	for i := range pods {
 		pod := pods[i]
-		if len(pod.Spec.NodeName) > 0 && (len(s) == 0 || s.Has(pod.Namespace)) {
-			scheduled = append(scheduled, pod)
+		if (len(s) == 0 || s.Has(pod.Namespace)) && labelsMatch(pod.Labels, labelSelector) {
+			if len(pod.Spec.NodeName) > 0 {
+				scheduled = append(scheduled, pod)
+			} else if isAttempted(pod) {
+				attempted = append(attempted, pod)
+			} else {
+				unattempted = append(unattempted, pod)
+			}
 		}
 	}
-	return scheduled, nil
+	return scheduled, attempted, unattempted, nil
 }
 
 // DataItem is the data point.
@@ -176,6 +283,10 @@ type DataItem struct {
 	Unit string `json:"unit"`
 	// Labels is the labels of the data item.
 	Labels map[string]string `json:"labels,omitempty"`
+
+	// progress contains number of scheduled pods over time.
+	progress []podScheduling
+	start    time.Time
 }
 
 // DataItems is the data point set. It is the struct that perf dashboard expects.
@@ -184,15 +295,53 @@ type DataItems struct {
 	DataItems []DataItem `json:"dataItems"`
 }
 
+type podScheduling struct {
+	ts            time.Time
+	attempts      int
+	completed     int
+	observedTotal int
+	observedRate  float64
+	activePods    int
+	backoffPods   int
+	unschedulable int
+	gatedPods     int
+}
+
 // makeBasePod creates a Pod object to be used as a template.
 func makeBasePod() *v1.Pod {
 	basePod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "pod-",
 		},
-		Spec: testutils.MakePodSpec(),
+		Spec: MakePodSpec(),
 	}
 	return basePod
+}
+
+// makeBaseNode creates a Node object with given nodeNamePrefix to be used as a template.
+func makeBaseNode(nodeNamePrefix string) *v1.Node {
+	return &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: nodeNamePrefix,
+		},
+		Status: v1.NodeStatus{
+			Capacity: v1.ResourceList{
+				v1.ResourcePods:   *resource.NewQuantity(110, resource.DecimalSI),
+				v1.ResourceCPU:    resource.MustParse("4"),
+				v1.ResourceMemory: resource.MustParse("32Gi"),
+			},
+			Allocatable: v1.ResourceList{
+				v1.ResourcePods:   *resource.NewQuantity(110, resource.DecimalSI),
+				v1.ResourceCPU:    resource.MustParse("4"),
+				v1.ResourceMemory: resource.MustParse("32Gi"),
+			},
+			Phase: v1.NodeRunning,
+			Conditions: []v1.NodeCondition{
+				{Type: v1.NodeReady, Status: v1.ConditionTrue},
+			},
+		},
+	}
+
 }
 
 func dataItems2JSONFile(dataItems DataItems, namePrefix string) error {
@@ -237,15 +386,31 @@ func dataItems2JSONFile(dataItems DataItems, namePrefix string) error {
 	return os.WriteFile(destFile, formatted.Bytes(), 0644)
 }
 
+func createOutputFile(suffix string) (*os.File, error) {
+	destFile := perTestFilePrefix + suffix
+	if *dataItemsDir != "" {
+		// Ensure the "dataItemsDir" path is valid.
+		if err := os.MkdirAll(*dataItemsDir, 0750); err != nil {
+			return nil, fmt.Errorf("dataItemsDir path %v does not exist and cannot be created: %w", *dataItemsDir, err)
+		}
+		destFile = path.Join(*dataItemsDir, destFile)
+	}
+	f, err := os.Create(destFile)
+	if err != nil {
+		return nil, fmt.Errorf("create output file: %w", err)
+	}
+	return f, nil
+}
+
 type labelValues struct {
-	label  string
-	values []string
+	Label  string
+	Values []string
 }
 
 // metricsCollectorConfig is the config to be marshalled to YAML config file.
 // NOTE: The mapping here means only one filter is supported, either value in the list of `values` is able to be collected.
 type metricsCollectorConfig struct {
-	Metrics map[string]*labelValues
+	Metrics map[string][]*labelValues
 }
 
 // metricsCollector collects metrics from legacyregistry.DefaultGatherer.Gather() endpoint.
@@ -262,24 +427,43 @@ func newMetricsCollector(config *metricsCollectorConfig, labels map[string]strin
 	}
 }
 
-func (*metricsCollector) run(ctx context.Context) {
+func (mc *metricsCollector) init() error {
+	// Reset the metrics so that the measurements do not interfere with those collected during the previous steps.
+	m, err := legacyregistry.DefaultGatherer.Gather()
+	if err != nil {
+		return fmt.Errorf("failed to gather metrics to reset: %w", err)
+	}
+	for _, mFamily := range m {
+		// Reset only metrics defined in the collector.
+		if _, ok := mc.Metrics[mFamily.GetName()]; ok {
+			mFamily.Reset()
+		}
+	}
+	return nil
+}
+
+func (*metricsCollector) run(tCtx ktesting.TContext) {
 	// metricCollector doesn't need to start before the tests, so nothing to do here.
 }
 
-func (pc *metricsCollector) collect() []DataItem {
+func (mc *metricsCollector) collect() []DataItem {
+	gm, err := testutil.GatherMetrics(legacyregistry.DefaultGatherer)
+	if err != nil {
+		klog.ErrorS(err, "failed to gather metrics for collection")
+		return nil
+	}
+
 	var dataItems []DataItem
-	for metric, labelVals := range pc.Metrics {
+	for metric, labelValsSlice := range mc.Metrics {
 		// no filter is specified, aggregate all the metrics within the same metricFamily.
-		if labelVals == nil {
-			dataItem := collectHistogramVec(metric, pc.labels, nil)
+		if labelValsSlice == nil {
+			dataItem := collectHistogramVec(gm, metric, mc.labels, nil)
 			if dataItem != nil {
 				dataItems = append(dataItems, *dataItem)
 			}
 		} else {
-			// fetch the metric from metricFamily which match each of the lvMap.
-			for _, value := range labelVals.values {
-				lvMap := map[string]string{labelVals.label: value}
-				dataItem := collectHistogramVec(metric, pc.labels, lvMap)
+			for _, lvMap := range uniqueLVCombos(labelValsSlice) {
+				dataItem := collectHistogramVec(gm, metric, mc.labels, lvMap)
 				if dataItem != nil {
 					dataItems = append(dataItems, *dataItem)
 				}
@@ -289,10 +473,39 @@ func (pc *metricsCollector) collect() []DataItem {
 	return dataItems
 }
 
-func collectHistogramVec(metric string, labels map[string]string, lvMap map[string]string) *DataItem {
-	vec, err := testutil.GetHistogramVecFromGatherer(legacyregistry.DefaultGatherer, metric, lvMap)
+// uniqueLVCombos lists up all possible label values combinations.
+// e.g., if there are 3 labelValues, each of which has 2 values,
+// the result would be {A: a1, B: b1, C: c1}, {A: a2, B: b1, C: c1}, {A: a1, B: b2, C: c1}, ... (2^3 = 8 combinations).
+func uniqueLVCombos(lvs []*labelValues) []map[string]string {
+	if len(lvs) == 0 {
+		return []map[string]string{{}}
+	}
+
+	remainingCombos := uniqueLVCombos(lvs[1:])
+
+	results := make([]map[string]string, 0)
+
+	current := lvs[0]
+	for _, value := range current.Values {
+		for _, combo := range remainingCombos {
+			newCombo := make(map[string]string, len(combo)+1)
+			for k, v := range combo {
+				newCombo[k] = v
+			}
+			newCombo[current.Label] = value
+			results = append(results, newCombo)
+		}
+	}
+	return results
+}
+
+func collectHistogramVec(gm *testutil.GatheredMetrics, metric string, labels map[string]string, lvMap map[string]string) *DataItem {
+	vec, err := gm.GetHistogramVec(metric, lvMap)
 	if err != nil {
-		klog.Error(err)
+		// "metric ... not found" is pretty normal. Don't spam the output with it!
+		if !strings.HasSuffix(err.Error(), "not found") {
+			klog.Error(err)
+		}
 		return nil
 	}
 
@@ -302,7 +515,6 @@ func collectHistogramVec(metric string, labels map[string]string, lvMap map[stri
 	}
 
 	if vec.GetAggregatedSampleCount() == 0 {
-		klog.InfoS("It is expected that this metric wasn't recorded. The data for this metric won't be stored in a benchmark result file", "metric", metric, "labels", labels)
 		return nil
 	}
 
@@ -336,48 +548,120 @@ func collectHistogramVec(metric string, labels map[string]string, lvMap map[stri
 }
 
 type throughputCollector struct {
-	tb                    testing.TB
 	podInformer           coreinformers.PodInformer
 	schedulingThroughputs []float64
-	labels                map[string]string
-	namespaces            []string
+	labelSelector         map[string]string
+	resultLabels          map[string]string
+	namespaces            sets.Set[string]
 	errorMargin           float64
+
+	progress []podScheduling
+	start    time.Time
 }
 
-func newThroughputCollector(tb testing.TB, podInformer coreinformers.PodInformer, labels map[string]string, namespaces []string, errorMargin float64) *throughputCollector {
+func newThroughputCollector(podInformer coreinformers.PodInformer, resultLabels map[string]string, labelSelector map[string]string, namespaces []string, errorMargin float64) *throughputCollector {
 	return &throughputCollector{
-		tb:          tb,
-		podInformer: podInformer,
-		labels:      labels,
-		namespaces:  namespaces,
-		errorMargin: errorMargin,
+		podInformer:   podInformer,
+		labelSelector: labelSelector,
+		resultLabels:  resultLabels,
+		namespaces:    sets.New(namespaces...),
+		errorMargin:   errorMargin,
 	}
 }
 
-func (tc *throughputCollector) run(ctx context.Context) {
-	podsScheduled, err := getScheduledPods(tc.podInformer, tc.namespaces...)
-	if err != nil {
-		klog.Fatalf("%v", err)
+func (tc *throughputCollector) init() error {
+	return nil
+}
+
+func (tc *throughputCollector) run(tCtx ktesting.TContext) {
+	// The collector is based on informer cache events instead of periodically listing pods because:
+	// - polling causes more overhead
+	// - it does not work when pods get created, scheduled and deleted quickly
+	//
+	// Normally, informers cannot be used to observe state changes reliably.
+	// They only guarantee that the *some* updates get reported, but not *all*.
+	// But in scheduler_perf, the scheduler and the test share the same informer,
+	// therefore we are guaranteed to see a new pod without NodeName (because
+	// that is what the scheduler needs to see to schedule it) and then the updated
+	// pod with NodeName (because nothing makes further changes to it).
+	var mutex sync.Mutex
+	scheduledPods := 0
+	getScheduledPods := func() int {
+		mutex.Lock()
+		defer mutex.Unlock()
+		return scheduledPods
 	}
-	lastScheduledCount := len(podsScheduled)
+	onPodChange := func(oldObj, newObj any) {
+		oldPod, newPod, err := schedutil.As[*v1.Pod](oldObj, newObj)
+		if err != nil {
+			tCtx.Errorf("unexpected pod events: %v", err)
+			return
+		}
+
+		if !tc.namespaces.Has(newPod.Namespace) || !labelsMatch(newPod.Labels, tc.labelSelector) {
+			return
+		}
+
+		mutex.Lock()
+		defer mutex.Unlock()
+		if (oldPod == nil || oldPod.Spec.NodeName == "") && newPod.Spec.NodeName != "" {
+			// Got scheduled.
+			scheduledPods++
+		}
+	}
+	handle, err := tc.podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			onPodChange(nil, obj)
+		},
+		UpdateFunc: func(oldObj, newObj any) {
+			onPodChange(oldObj, newObj)
+		},
+	})
+	if err != nil {
+		tCtx.Fatalf("register pod event handler: %v", err)
+	}
+	defer func() {
+		tCtx.ExpectNoError(tc.podInformer.Informer().RemoveEventHandler(handle), "remove event handler")
+	}()
+
+	// Waiting for the initial sync didn't work, `handle.HasSynced` always returned
+	// false - perhaps because the event handlers get added to a running informer.
+	// That's okay(ish), throughput is typically measured within an empty namespace.
+	//
+	// syncTicker := time.NewTicker(time.Millisecond)
+	// defer syncTicker.Stop()
+	// for {
+	// 	select {
+	// 	case <-syncTicker.C:
+	// 		if handle.HasSynced() {
+	// 			break
+	// 		}
+	// 	case <-tCtx.Done():
+	// 		return
+	// 	}
+	// }
+	tCtx.Logf("Started pod throughput collector for namespace(s) %s, %d pods scheduled so far", sets.List(tc.namespaces), getScheduledPods())
+
+	lastScheduledCount := getScheduledPods()
 	ticker := time.NewTicker(throughputSampleInterval)
 	defer ticker.Stop()
 	lastSampleTime := time.Now()
 	started := false
 	skipped := 0
 
+	activePods := schedulermetrics.ActivePods()
+	backoffPods := schedulermetrics.BackoffPods()
+	unschedulablePods := schedulermetrics.UnschedulablePods()
+	gatedPods := schedulermetrics.GatedPods()
+
 	for {
 		select {
-		case <-ctx.Done():
+		case <-tCtx.Done():
 			return
 		case <-ticker.C:
 			now := time.Now()
-			podsScheduled, err := getScheduledPods(tc.podInformer, tc.namespaces...)
-			if err != nil {
-				klog.Fatalf("%v", err)
-			}
 
-			scheduled := len(podsScheduled)
+			scheduled := getScheduledPods()
 			// Only do sampling if number of scheduled pods is greater than zero.
 			if scheduled == 0 {
 				continue
@@ -388,6 +672,7 @@ func (tc *throughputCollector) run(ctx context.Context) {
 				// sampling and creating pods get started independently.
 				lastScheduledCount = scheduled
 				lastSampleTime = now
+				tc.start = now
 				continue
 			}
 
@@ -407,22 +692,43 @@ func (tc *throughputCollector) run(ctx context.Context) {
 			// be scheduled immediately when the timer
 			// triggers. Instead we track the actual time stamps.
 			duration := now.Sub(lastSampleTime)
-			durationInSeconds := duration.Seconds()
-			throughput := float64(newScheduled) / durationInSeconds
 			expectedDuration := throughputSampleInterval * time.Duration(skipped+1)
 			errorMargin := (duration - expectedDuration).Seconds() / expectedDuration.Seconds() * 100
 			if tc.errorMargin > 0 && math.Abs(errorMargin) > tc.errorMargin {
 				// This might affect the result, report it.
-				tc.tb.Errorf("ERROR: Expected throuput collector to sample at regular time intervals. The %d most recent intervals took %s instead of %s, a difference of %0.1f%%.", skipped+1, duration, expectedDuration, errorMargin)
+				klog.Infof("WARNING: Expected throughput collector to sample at regular time intervals. The %d most recent intervals took %s instead of %s, a difference of %0.1f%%.", skipped+1, duration, expectedDuration, errorMargin)
 			}
 
 			// To keep percentiles accurate, we have to record multiple samples with the same
 			// throughput value if we skipped some intervals.
+			throughput := float64(newScheduled) / duration.Seconds()
 			for i := 0; i <= skipped; i++ {
 				tc.schedulingThroughputs = append(tc.schedulingThroughputs, throughput)
 			}
+
+			// Record the metric sample.
+			counters, err := testutil.GetCounterValuesFromGatherer(legacyregistry.DefaultGatherer, "scheduler_schedule_attempts_total", map[string]string{"profile": "default-scheduler"}, "result")
+			if err != nil {
+				klog.Error(err)
+			}
+			activePods, _ := testutil.GetGaugeMetricValue(activePods)
+			backoffPods, _ := testutil.GetGaugeMetricValue(backoffPods)
+			unschedulable, _ := testutil.GetGaugeMetricValue(unschedulablePods)
+			gatedPods, _ := testutil.GetGaugeMetricValue(gatedPods)
+			tc.progress = append(tc.progress, podScheduling{
+				ts:            now,
+				attempts:      int(counters["unschedulable"] + counters["error"] + counters["scheduled"]),
+				completed:     int(counters["scheduled"]),
+				observedTotal: scheduled,
+				observedRate:  throughput,
+				activePods:    int(activePods),
+				backoffPods:   int(backoffPods),
+				unschedulable: int(unschedulable),
+				gatedPods:     int(gatedPods),
+			})
+
 			lastScheduledCount = scheduled
-			klog.Infof("%d pods scheduled", lastScheduledCount)
+			klog.Infof("%d pods have been scheduled successfully", lastScheduledCount)
 			skipped = 0
 			lastSampleTime = now
 		}
@@ -430,24 +736,187 @@ func (tc *throughputCollector) run(ctx context.Context) {
 }
 
 func (tc *throughputCollector) collect() []DataItem {
-	throughputSummary := DataItem{Labels: tc.labels}
-	if length := len(tc.schedulingThroughputs); length > 0 {
-		sort.Float64s(tc.schedulingThroughputs)
-		sum := 0.0
-		for i := range tc.schedulingThroughputs {
-			sum += tc.schedulingThroughputs[i]
-		}
-
-		throughputSummary.Labels["Metric"] = "SchedulingThroughput"
-		throughputSummary.Data = map[string]float64{
-			"Average": sum / float64(length),
-			"Perc50":  tc.schedulingThroughputs[int(math.Ceil(float64(length*50)/100))-1],
-			"Perc90":  tc.schedulingThroughputs[int(math.Ceil(float64(length*90)/100))-1],
-			"Perc95":  tc.schedulingThroughputs[int(math.Ceil(float64(length*95)/100))-1],
-			"Perc99":  tc.schedulingThroughputs[int(math.Ceil(float64(length*99)/100))-1],
-		}
-		throughputSummary.Unit = "pods/s"
+	throughputSummary := DataItem{
+		Labels:   tc.resultLabels,
+		progress: tc.progress,
+		start:    tc.start,
 	}
 
+	// tc.schedulingThroughputs can be empty if the scenario doesn't have
+	// enough number of pods and nodes to take more than throughputSampleInterval (i.e. 1 second).
+	length := len(tc.schedulingThroughputs)
+	if length == 0 {
+		klog.Warningf("Failed to measure SchedulingThroughput for %s. Increase pods and/or nodes to make scheduling take longer", tc.resultLabels["Name"])
+		return []DataItem{throughputSummary}
+	}
+
+	sort.Float64s(tc.schedulingThroughputs)
+	sum := 0.0
+	for i := range tc.schedulingThroughputs {
+		sum += tc.schedulingThroughputs[i]
+	}
+
+	throughputSummary.Labels["Metric"] = "SchedulingThroughput"
+	throughputSummary.Data = map[string]float64{
+		"Average": sum / float64(length),
+		"Perc50":  tc.schedulingThroughputs[int(math.Ceil(float64(length*50)/100))-1],
+		"Perc90":  tc.schedulingThroughputs[int(math.Ceil(float64(length*90)/100))-1],
+		"Perc95":  tc.schedulingThroughputs[int(math.Ceil(float64(length*95)/100))-1],
+		"Perc99":  tc.schedulingThroughputs[int(math.Ceil(float64(length*99)/100))-1],
+	}
+	throughputSummary.Unit = "pods/s"
+
 	return []DataItem{throughputSummary}
+}
+
+// memoryCollector collects memory usage metrics during the test
+type memoryCollector struct {
+	samples      []memorySample
+	resultLabels map[string]string
+	interval     time.Duration
+	mu           sync.RWMutex
+}
+
+type memorySample struct {
+	timestamp   time.Time
+	heapInuseMB float64
+}
+
+func newMemoryCollector(resultLabels map[string]string, interval time.Duration) *memoryCollector {
+	return &memoryCollector{
+		resultLabels: resultLabels,
+		interval:     interval,
+	}
+}
+
+func (mc *memoryCollector) init() error {
+	mc.collectSample()
+	return nil
+}
+
+func (mc *memoryCollector) run(tCtx ktesting.TContext) {
+	ticker := time.NewTicker(mc.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-tCtx.Done():
+			return
+		case <-ticker.C:
+			mc.collectSample()
+		}
+	}
+}
+
+func (mc *memoryCollector) collectSample() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	sample := memorySample{
+		timestamp:   time.Now(),
+		heapInuseMB: float64(m.HeapInuse) / 1024 / 1024,
+	}
+
+	mc.mu.Lock()
+	mc.samples = append(mc.samples, sample)
+	mc.mu.Unlock()
+}
+
+func (mc *memoryCollector) createMetricDataItem(values []float64, unit, metricName string) DataItem {
+	sort.Float64s(values)
+
+	sum := 0.0
+	for _, v := range values {
+		sum += v
+	}
+
+	labels := maps.Clone(mc.resultLabels)
+	labels["Metric"] = metricName
+
+	return DataItem{
+		Labels: labels,
+		Data: map[string]float64{
+			"Perc50":  values[int(math.Ceil(float64(len(values)*50)/100))-1],
+			"Perc90":  values[int(math.Ceil(float64(len(values)*90)/100))-1],
+			"Perc95":  values[int(math.Ceil(float64(len(values)*95)/100))-1],
+			"Perc99":  values[int(math.Ceil(float64(len(values)*99)/100))-1],
+			"Average": sum / float64(len(values)),
+			"Max":     values[len(values)-1],
+		},
+		Unit: unit,
+	}
+}
+
+func (mc *memoryCollector) collect() []DataItem {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+
+	length := len(mc.samples)
+	if length == 0 {
+		return nil
+	}
+
+	firstSample := mc.samples[0]
+	lastSample := firstSample
+	if length >= 2 {
+		lastSample = mc.samples[length-1]
+	}
+	durationMin := lastSample.timestamp.Sub(firstSample.timestamp).Minutes()
+	growthRateMBPerMin := 0.0
+	if durationMin > 0 {
+		growthRateMBPerMin = (lastSample.heapInuseMB - firstSample.heapInuseMB) / durationMin
+	}
+	growthItem := DataItem{
+		Labels: maps.Clone(mc.resultLabels),
+		Data: map[string]float64{
+			"GrowthRate": growthRateMBPerMin,
+		},
+		Unit: "MB/min",
+	}
+	growthItem.Labels["Metric"] = "memory_growth_rate"
+
+	heapValues := make([]float64, len(mc.samples))
+	for i, s := range mc.samples {
+		heapValues[i] = s.heapInuseMB
+	}
+
+	return []DataItem{
+		mc.createMetricDataItem(heapValues, "MB", "heap_memory_usage"),
+		growthItem,
+	}
+}
+
+// schedulingDurationCollector calculates the total duration of the scheduling phase, including pod creation.
+type schedulingDurationCollector struct {
+	resultLabels map[string]string
+	duration     time.Duration
+}
+
+func newSchedulingDurationCollector(resultLabels map[string]string) *schedulingDurationCollector {
+	return &schedulingDurationCollector{
+		resultLabels: resultLabels,
+	}
+}
+
+func (sdc *schedulingDurationCollector) init() error {
+	return nil
+}
+
+func (sdc *schedulingDurationCollector) run(tCtx ktesting.TContext) {
+	start := time.Now()
+	// Wait for the scheduling to finish
+	<-tCtx.Done()
+	sdc.duration = time.Since(start)
+}
+
+func (sdc *schedulingDurationCollector) collect() []DataItem {
+	labels := maps.Clone(sdc.resultLabels)
+	labels["Metric"] = "SchedulingDuration"
+	return []DataItem{{
+		Labels: labels,
+		Data: map[string]float64{
+			"Duration": sdc.duration.Seconds(),
+		},
+		Unit: "s",
+	}}
 }

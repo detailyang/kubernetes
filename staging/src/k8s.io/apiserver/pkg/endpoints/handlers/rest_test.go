@@ -27,9 +27,9 @@ import (
 	"testing"
 	"time"
 
-	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/google/go-cmp/cmp"
-	fuzz "github.com/google/gofuzz"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
+
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -53,6 +53,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/metrics/testutil"
+	"sigs.k8s.io/randfill"
 )
 
 var (
@@ -67,9 +68,9 @@ func init() {
 }
 
 type testPatchType struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 
-	TestPatchSubType `json:",inline"`
+	TestPatchSubType `json:""`
 }
 
 // We explicitly make it public as private types doesn't
@@ -134,42 +135,42 @@ func TestLimitedReadBody(t *testing.T) {
 			requestBody: strings.NewReader("aaaa"),
 			limit:       5,
 			expectedMetrics: `
-        # HELP apiserver_request_body_sizes [ALPHA] Apiserver request body sizes broken out by size.
-        # TYPE apiserver_request_body_sizes histogram
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="50000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="150000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="250000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="350000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="450000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="550000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="650000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="750000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="850000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="950000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.05e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.15e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.25e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.35e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.45e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.55e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.65e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.75e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.85e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.95e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.05e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.15e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.25e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.35e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.45e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.55e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.65e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.75e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.85e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.95e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="3.05e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="+Inf"} 1
-        apiserver_request_body_sizes_sum{resource="resource.group",verb="create"} 4
-        apiserver_request_body_sizes_count{resource="resource.group",verb="create"} 1
+        # HELP apiserver_request_body_size_bytes [ALPHA] Apiserver request body size in bytes broken out by resource and verb.
+        # TYPE apiserver_request_body_size_bytes histogram
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="50000"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="150000"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="250000"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="350000"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="450000"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="550000"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="650000"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="750000"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="850000"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="950000"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="1.05e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="1.15e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="1.25e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="1.35e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="1.45e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="1.55e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="1.65e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="1.75e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="1.85e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="1.95e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="2.05e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="2.15e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="2.25e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="2.35e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="2.45e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="2.55e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="2.65e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="2.75e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="2.85e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="2.95e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="3.05e+06"} 1
+        apiserver_request_body_size_bytes_bucket{group="group",resource="resource",verb="create",le="+Inf"} 1
+        apiserver_request_body_size_bytes_sum{group="group",resource="resource",verb="create"} 4
+        apiserver_request_body_size_bytes_count{group="group",resource="resource",verb="create"} 1
 `,
 			expectedErr: false,
 		},
@@ -177,22 +178,23 @@ func TestLimitedReadBody(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.desc, func(t *testing.T) {
+			ctx := t.Context()
 			// reset metrics
 			defer metrics.RequestBodySizes.Reset()
 			defer legacyregistry.Reset()
 
-			req, err := http.NewRequest("POST", "/", tc.requestBody)
+			req, err := http.NewRequestWithContext(ctx, request.MethodPost, "/", tc.requestBody)
 			if err != nil {
 				t.Errorf("err not expected: got %v", err)
 			}
-			_, err = limitedReadBodyWithRecordMetric(context.Background(), req, tc.limit, "resource.group", metrics.Create)
+			_, err = limitedReadBodyWithRecordMetric(context.Background(), req, tc.limit, schema.GroupResource{Group: "group", Resource: "resource"}, metrics.Create)
 			if tc.expectedErr {
 				if err == nil {
 					t.Errorf("err expected: got nil")
 				}
 				return
 			}
-			if err = testutil.GatherAndCompare(legacyregistry.DefaultGatherer, strings.NewReader(tc.expectedMetrics), "apiserver_request_body_sizes"); err != nil {
+			if err = testutil.GatherAndCompare(legacyregistry.DefaultGatherer, strings.NewReader(tc.expectedMetrics), "apiserver_request_body_size_bytes"); err != nil {
 				t.Errorf("unexpected err: %v", err)
 			}
 		})
@@ -244,6 +246,19 @@ func TestJSONPatch(t *testing.T) {
 			expectedError:     "the server rejected our request due to an error in our request",
 			expectedErrorType: metav1.StatusReasonInvalid,
 		},
+		{
+			name:  "valid-negative-index-patch",
+			patch: `[{"op": "test", "value": "foo", "path": "/metadata/finalizers/-1"}]`,
+		},
+		// This demonstrates out-of-spec behavior json-patch v4 allows,
+		// which Kubernetes clients may depend on, and which updating to json-patch v5 currently breaks
+		{
+			name: "replace-missing-path-allowed",
+			patch: `[
+				{"op":"replace", "path":"/metadata/path", "value":"foo"},
+				{"op":"test", "path":"/metadata/path", "value":"foo"}
+			]`,
+		},
 	} {
 		p := &patcher{
 			patchType:  types.JSONPatchType,
@@ -253,6 +268,7 @@ func TestJSONPatch(t *testing.T) {
 		codec := codecs.LegacyCodec(examplev1.SchemeGroupVersion)
 		pod := &examplev1.Pod{}
 		pod.Name = "podA"
+		pod.ObjectMeta.Finalizers = []string{"foo"}
 		versionedJS, err := runtime.Encode(codec, pod)
 		if err != nil {
 			t.Errorf("%s: unexpected error: %v", test.name, err)
@@ -305,6 +321,25 @@ func TestPatchCustomResource(t *testing.T) {
 	if err.Error() != expectedError {
 		t.Errorf("expected %#v, got %#v", expectedError, err.Error())
 	}
+}
+
+type testTimeoutPatcher struct {
+	t *testing.T
+}
+
+func (p *testTimeoutPatcher) New() runtime.Object {
+	return &example.Pod{}
+}
+
+func (p *testTimeoutPatcher) Update(ctx context.Context, _ string, _ rest.UpdatedObjectInfo, _ rest.ValidateObjectFunc, _ rest.ValidateObjectUpdateFunc, _ bool, _ *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	// Block until the context is canceled to simulate a timeout scenario.
+	<-ctx.Done()
+	return nil, false, apierrors.NewTimeoutError("test reason", 10)
+}
+
+func (p *testTimeoutPatcher) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	p.t.Fatal("unexpected call to testPatcher.Get")
+	return nil, errors.New("unexpected call to testPatcher.Get")
 }
 
 type testPatcher struct {
@@ -416,6 +451,9 @@ type patchTestCase struct {
 	expectedError string
 	// if set, indicates the number of times patching was expected to be attempted
 	expectedTries int
+
+	// isTimeout for this test case
+	isTimeout bool
 }
 
 func (tc *patchTestCase) Run(t *testing.T) {
@@ -548,8 +586,16 @@ func (tc *patchTestCase) Run(t *testing.T) {
 				FieldManager: "test-manager",
 			},
 		}
-
-		ctx, cancel := context.WithTimeout(ctx, time.Second)
+		var timeout time.Duration
+		if tc.isTimeout {
+			// Simulate timeout by using a zero-duration timeout and the timeout patcher
+			// replace testPatcher with the timeout simulator
+			timeout = 0
+			p.restPatcher = &testTimeoutPatcher{t: t}
+		} else {
+			timeout = time.Second
+		}
+		ctx, cancel := context.WithTimeout(ctx, timeout)
 		resultObj, _, err := p.patchResource(ctx, &RequestScope{
 			FieldManager: fieldmanager,
 		})
@@ -558,6 +604,11 @@ func (tc *patchTestCase) Run(t *testing.T) {
 		if len(tc.expectedError) != 0 {
 			if err == nil || err.Error() != tc.expectedError {
 				t.Errorf("%s: expected error %v, but got %v", tc.name, tc.expectedError, err)
+				continue
+			}
+		} else if tc.isTimeout {
+			if !apierrors.IsTimeout(err) {
+				t.Errorf("%s: expected timeout error, but got: %v", tc.name, err)
 				continue
 			}
 		} else {
@@ -610,10 +661,13 @@ func TestNumberConversion(t *testing.T) {
 	activeDeadlineSeconds := int64(42)
 	currentVersionedObject := &examplev1.Pod{
 		TypeMeta:   metav1.TypeMeta{Kind: "Example", APIVersion: examplev1.SchemeGroupVersion.String()},
-		ObjectMeta: metav1.ObjectMeta{Name: "test-example"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test-example", Labels: map[string]string{"a": "b"}},
 		Spec: examplev1.PodSpec{
 			TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
 			ActiveDeadlineSeconds:         &activeDeadlineSeconds,
+		},
+		Status: examplev1.PodStatus{
+			Phase: examplev1.PodPhase("Running"),
 		},
 	}
 	versionedObjToUpdate := &examplev1.Pod{}
@@ -628,6 +682,14 @@ func TestNumberConversion(t *testing.T) {
 	if versionedObjToUpdate.Spec.TerminationGracePeriodSeconds == nil || *versionedObjToUpdate.Spec.TerminationGracePeriodSeconds != 42 ||
 		versionedObjToUpdate.Spec.ActiveDeadlineSeconds == nil || *versionedObjToUpdate.Spec.ActiveDeadlineSeconds != 120 {
 		t.Fatal(errors.New("Ports failed to merge because of number conversion issue"))
+	}
+	if versionedObjToUpdate.Status.Phase != examplev1.PodPhase("Running") || versionedObjToUpdate.Labels["a"] != "b" {
+		t.Fatalf("expected unpatched fields to be preserved, got status=%v labels=%v", versionedObjToUpdate.Status.Phase, versionedObjToUpdate.Labels)
+	}
+	versionedObjToUpdate.Labels["a"] = "mutated"
+	*versionedObjToUpdate.Spec.ActiveDeadlineSeconds = 999
+	if currentVersionedObject.Labels["a"] != "b" || *currentVersionedObject.Spec.ActiveDeadlineSeconds != 42 {
+		t.Fatal("patched object aliases original object")
 	}
 }
 
@@ -659,6 +721,19 @@ func TestPatchResourceNumberConversion(t *testing.T) {
 	setTcPod(tc.updatePod, name, namespace, uid, "2", examplev1.SchemeGroupVersion.String(), &thirty, "anywhere")
 
 	setTcPod(tc.expectedPod, name, namespace, uid, "2", "", &thirty, "anywhere")
+
+	tc.Run(t)
+}
+
+func TestPatchResourceTimeout(t *testing.T) {
+	tc := &patchTestCase{
+		name:        "TestPatchResourceTimeout",
+		startingPod: &example.Pod{},
+		changedPod:  &example.Pod{},
+		updatePod:   &example.Pod{},
+		expectedPod: nil,
+		isTimeout:   true,
+	}
 
 	tc.Run(t)
 }
@@ -986,11 +1061,11 @@ func (alwaysErrorTyper) Recognizes(gvk schema.GroupVersionKind) bool {
 }
 
 func TestUpdateToCreateOptions(t *testing.T) {
-	f := fuzz.New()
+	f := randfill.New()
 	for i := 0; i < 100; i++ {
 		t.Run(fmt.Sprintf("Run %d/100", i), func(t *testing.T) {
 			update := &metav1.UpdateOptions{}
-			f.Fuzz(update)
+			f.Fill(update)
 			create := updateToCreateOptions(update)
 
 			b, err := json.Marshal(create)
@@ -1033,13 +1108,13 @@ func TestPatchToUpdateOptions(t *testing.T) {
 		},
 	}
 
-	f := fuzz.New()
+	f := randfill.New()
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			for i := 0; i < 100; i++ {
 				t.Run(fmt.Sprintf("Run %d/100", i), func(t *testing.T) {
 					patch := &metav1.PatchOptions{}
-					f.Fuzz(patch)
+					f.Fill(patch)
 					converted := test.converterFn(patch)
 
 					b, err := json.Marshal(converted)

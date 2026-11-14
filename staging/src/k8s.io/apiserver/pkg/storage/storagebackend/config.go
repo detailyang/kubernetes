@@ -20,12 +20,14 @@ import (
 	"time"
 
 	oteltrace "go.opentelemetry.io/otel/trace"
+	noopoteltrace "go.opentelemetry.io/otel/trace/noop"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/server/egressselector"
 	"k8s.io/apiserver/pkg/storage/etcd3"
 	"k8s.io/apiserver/pkg/storage/value"
+	"k8s.io/apiserver/pkg/storage/value/compression"
 	flowcontrolrequest "k8s.io/apiserver/pkg/util/flowcontrol/request"
 )
 
@@ -36,6 +38,7 @@ const (
 
 	DefaultCompactInterval      = 5 * time.Minute
 	DefaultDBMetricPollInterval = 30 * time.Second
+	DefaultEventsHistoryWindow  = 75 * time.Second
 	DefaultHealthcheckTimeout   = 2 * time.Second
 	DefaultReadinessTimeout     = 2 * time.Second
 )
@@ -62,11 +65,6 @@ type Config struct {
 	Prefix string
 	// Transport holds all connection related info, i.e. equal TransportConfig means equal servers we talk to.
 	Transport TransportConfig
-	// Paging indicates whether the server implementation should allow paging (if it is
-	// supported). This is generally configured by feature gating, or by a specific
-	// resource type not wishing to allow paging, and is not intended for end users to
-	// set.
-	Paging bool
 
 	Codec runtime.Codec
 	// EncodeVersioner is the same groupVersioner used to build the
@@ -84,6 +82,8 @@ type Config struct {
 	CountMetricPollPeriod time.Duration
 	// DBMetricPollInterval specifies how often should storage backend metric be updated.
 	DBMetricPollInterval time.Duration
+	// EventsHistoryWindow specifies minimum history duration that storage is keeping.
+	EventsHistoryWindow time.Duration
 	// HealthcheckTimeout specifies the timeout used when checking health
 	HealthcheckTimeout time.Duration
 	// ReadycheckTimeout specifies the timeout used when checking readiness
@@ -103,6 +103,10 @@ type ConfigForResource struct {
 
 	// GroupResource is the relevant one
 	GroupResource schema.GroupResource
+
+	// CompressionRule says how the store writes this resource's values. The zero
+	// Rule writes them uncompressed. Reads don't depend on it.
+	CompressionRule compression.Rule
 }
 
 // ForResource specializes to the given resource
@@ -115,14 +119,14 @@ func (config *Config) ForResource(resource schema.GroupResource) *ConfigForResou
 
 func NewDefaultConfig(prefix string, codec runtime.Codec) *Config {
 	return &Config{
-		Paging:               true,
 		Prefix:               prefix,
 		Codec:                codec,
 		CompactionInterval:   DefaultCompactInterval,
 		DBMetricPollInterval: DefaultDBMetricPollInterval,
+		EventsHistoryWindow:  DefaultEventsHistoryWindow,
 		HealthcheckTimeout:   DefaultHealthcheckTimeout,
 		ReadycheckTimeout:    DefaultReadinessTimeout,
 		LeaseManagerConfig:   etcd3.NewDefaultLeaseManagerConfig(),
-		Transport:            TransportConfig{TracerProvider: oteltrace.NewNoopTracerProvider()},
+		Transport:            TransportConfig{TracerProvider: noopoteltrace.NewTracerProvider()},
 	}
 }

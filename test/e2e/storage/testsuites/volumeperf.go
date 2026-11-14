@@ -28,7 +28,6 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/dump"
 	"k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/watch"
 	clientset "k8s.io/client-go/kubernetes"
@@ -38,6 +37,7 @@ import (
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
 	admissionapi "k8s.io/pod-security-admission/api"
+	"k8s.io/utils/dump"
 )
 
 type volumePerformanceTestSuite struct {
@@ -88,7 +88,8 @@ func (t *volumePerformanceTestSuite) GetTestSuiteInfo() storageframework.TestSui
 	return t.tsInfo
 }
 
-func (t *volumePerformanceTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
+func (t *volumePerformanceTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) string {
+	return ""
 }
 
 func (t *volumePerformanceTestSuite) DefineTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
@@ -150,7 +151,7 @@ func (t *volumePerformanceTestSuite) DefineTests(driver storageframework.TestDri
 		}
 	})
 
-	ginkgo.It("should provision volumes at scale within performance constraints [Slow] [Serial]", func(ctx context.Context) {
+	f.It("should provision volumes at scale within performance constraints", f.WithSlow(), f.WithSerial(), func(ctx context.Context) {
 		l = &local{
 			cs:      f.ClientSet,
 			ns:      f.Namespace,
@@ -297,11 +298,11 @@ func newPVCWatch(ctx context.Context, f *framework.Framework, provisionCount int
 	_, controller := cache.NewInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-				obj, err := f.ClientSet.CoreV1().PersistentVolumeClaims(ns).List(ctx, metav1.ListOptions{})
+				obj, err := f.ClientSet.CoreV1().PersistentVolumeClaims(ns).List(ctx, options)
 				return runtime.Object(obj), err
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				return f.ClientSet.CoreV1().PersistentVolumeClaims(ns).Watch(ctx, metav1.ListOptions{})
+				return f.ClientSet.CoreV1().PersistentVolumeClaims(ns).Watch(ctx, options)
 			},
 		},
 		&v1.PersistentVolumeClaim{},

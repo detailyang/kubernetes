@@ -19,14 +19,12 @@ package e2e
 import (
 	"flag"
 	"fmt"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/onsi/ginkgo/v2"
-	"gopkg.in/yaml.v2"
+	yaml "go.yaml.in/yaml/v2"
 
 	// Never, ever remove the line with "/ginkgo". Without it,
 	// the ginkgo test runner will not detect that this
@@ -43,32 +41,35 @@ import (
 	e2etestingmanifests "k8s.io/kubernetes/test/e2e/testing-manifests"
 	testfixtures "k8s.io/kubernetes/test/fixtures"
 
+	// define and freeze constants
+	_ "k8s.io/kubernetes/test/e2e/feature"
+
 	// test sources
 	_ "k8s.io/kubernetes/test/e2e/apimachinery"
 	_ "k8s.io/kubernetes/test/e2e/apps"
 	_ "k8s.io/kubernetes/test/e2e/architecture"
 	_ "k8s.io/kubernetes/test/e2e/auth"
 	_ "k8s.io/kubernetes/test/e2e/autoscaling"
-	_ "k8s.io/kubernetes/test/e2e/cloud"
 	_ "k8s.io/kubernetes/test/e2e/common"
 	_ "k8s.io/kubernetes/test/e2e/dra"
 	_ "k8s.io/kubernetes/test/e2e/instrumentation"
+	_ "k8s.io/kubernetes/test/e2e/invariants"
+	"k8s.io/kubernetes/test/e2e/invariants/logcheck"
 	_ "k8s.io/kubernetes/test/e2e/kubectl"
 	_ "k8s.io/kubernetes/test/e2e/lifecycle"
-	_ "k8s.io/kubernetes/test/e2e/lifecycle/bootstrap"
 	_ "k8s.io/kubernetes/test/e2e/network"
 	_ "k8s.io/kubernetes/test/e2e/node"
 	_ "k8s.io/kubernetes/test/e2e/scheduling"
 	_ "k8s.io/kubernetes/test/e2e/storage"
-	_ "k8s.io/kubernetes/test/e2e/storage/csi_mock"
+	_ "k8s.io/kubernetes/test/e2e/storage/csimock"
 	_ "k8s.io/kubernetes/test/e2e/storage/external"
 	_ "k8s.io/kubernetes/test/e2e/windows"
 
 	// reconfigure framework
+	_ "k8s.io/ktesting/format"
 	_ "k8s.io/kubernetes/test/e2e/framework/debug/init"
 	_ "k8s.io/kubernetes/test/e2e/framework/metrics/init"
 	_ "k8s.io/kubernetes/test/e2e/framework/node/init"
-	_ "k8s.io/kubernetes/test/utils/format"
 )
 
 // handleFlags sets up all flags and parses the command line.
@@ -76,6 +77,7 @@ func handleFlags() {
 	config.CopyFlags(config.Flags, flag.CommandLine)
 	framework.RegisterCommonFlags(flag.CommandLine)
 	framework.RegisterClusterFlags(flag.CommandLine)
+	logcheck.RegisterFlags(flag.CommandLine)
 	flag.Parse()
 }
 
@@ -138,7 +140,6 @@ func TestMain(m *testing.M) {
 		testfiles.AddFileSource(testfiles.RootFileSource{Root: framework.TestContext.RepoRoot})
 	}
 
-	rand.Seed(time.Now().UnixNano())
 	os.Exit(m.Run())
 }
 

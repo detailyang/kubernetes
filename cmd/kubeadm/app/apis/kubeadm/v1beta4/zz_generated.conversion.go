@@ -59,16 +59,6 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}); err != nil {
 		return err
 	}
-	if err := s.AddGeneratedConversionFunc((*Arg)(nil), (*kubeadm.Arg)(nil), func(a, b interface{}, scope conversion.Scope) error {
-		return Convert_v1beta4_Arg_To_kubeadm_Arg(a.(*Arg), b.(*kubeadm.Arg), scope)
-	}); err != nil {
-		return err
-	}
-	if err := s.AddGeneratedConversionFunc((*kubeadm.Arg)(nil), (*Arg)(nil), func(a, b interface{}, scope conversion.Scope) error {
-		return Convert_kubeadm_Arg_To_v1beta4_Arg(a.(*kubeadm.Arg), b.(*Arg), scope)
-	}); err != nil {
-		return err
-	}
 	if err := s.AddGeneratedConversionFunc((*BootstrapTokenDiscovery)(nil), (*kubeadm.BootstrapTokenDiscovery)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_v1beta4_BootstrapTokenDiscovery_To_kubeadm_BootstrapTokenDiscovery(a.(*BootstrapTokenDiscovery), b.(*kubeadm.BootstrapTokenDiscovery), scope)
 	}); err != nil {
@@ -116,6 +106,16 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}
 	if err := s.AddGeneratedConversionFunc((*kubeadm.Discovery)(nil), (*Discovery)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_kubeadm_Discovery_To_v1beta4_Discovery(a.(*kubeadm.Discovery), b.(*Discovery), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*EnvVar)(nil), (*kubeadm.EnvVar)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta4_EnvVar_To_kubeadm_EnvVar(a.(*EnvVar), b.(*kubeadm.EnvVar), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*kubeadm.EnvVar)(nil), (*EnvVar)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_kubeadm_EnvVar_To_v1beta4_EnvVar(a.(*kubeadm.EnvVar), b.(*EnvVar), scope)
 	}); err != nil {
 		return err
 	}
@@ -229,6 +229,16 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}); err != nil {
 		return err
 	}
+	if err := s.AddGeneratedConversionFunc((*Proxy)(nil), (*kubeadm.Proxy)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta4_Proxy_To_kubeadm_Proxy(a.(*Proxy), b.(*kubeadm.Proxy), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*kubeadm.Proxy)(nil), (*Proxy)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_kubeadm_Proxy_To_v1beta4_Proxy(a.(*kubeadm.Proxy), b.(*Proxy), scope)
+	}); err != nil {
+		return err
+	}
 	if err := s.AddGeneratedConversionFunc((*ResetConfiguration)(nil), (*kubeadm.ResetConfiguration)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_v1beta4_ResetConfiguration_To_kubeadm_ResetConfiguration(a.(*ResetConfiguration), b.(*kubeadm.ResetConfiguration), scope)
 	}); err != nil {
@@ -239,8 +249,78 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}); err != nil {
 		return err
 	}
+	if err := s.AddGeneratedConversionFunc((*Timeouts)(nil), (*kubeadm.Timeouts)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta4_Timeouts_To_kubeadm_Timeouts(a.(*Timeouts), b.(*kubeadm.Timeouts), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*kubeadm.Timeouts)(nil), (*Timeouts)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_kubeadm_Timeouts_To_v1beta4_Timeouts(a.(*kubeadm.Timeouts), b.(*Timeouts), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*UpgradeApplyConfiguration)(nil), (*kubeadm.UpgradeApplyConfiguration)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta4_UpgradeApplyConfiguration_To_kubeadm_UpgradeApplyConfiguration(a.(*UpgradeApplyConfiguration), b.(*kubeadm.UpgradeApplyConfiguration), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*kubeadm.UpgradeApplyConfiguration)(nil), (*UpgradeApplyConfiguration)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_kubeadm_UpgradeApplyConfiguration_To_v1beta4_UpgradeApplyConfiguration(a.(*kubeadm.UpgradeApplyConfiguration), b.(*UpgradeApplyConfiguration), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*UpgradeConfiguration)(nil), (*kubeadm.UpgradeConfiguration)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta4_UpgradeConfiguration_To_kubeadm_UpgradeConfiguration(a.(*UpgradeConfiguration), b.(*kubeadm.UpgradeConfiguration), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*kubeadm.UpgradeConfiguration)(nil), (*UpgradeConfiguration)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_kubeadm_UpgradeConfiguration_To_v1beta4_UpgradeConfiguration(a.(*kubeadm.UpgradeConfiguration), b.(*UpgradeConfiguration), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*UpgradeDiffConfiguration)(nil), (*kubeadm.UpgradeDiffConfiguration)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta4_UpgradeDiffConfiguration_To_kubeadm_UpgradeDiffConfiguration(a.(*UpgradeDiffConfiguration), b.(*kubeadm.UpgradeDiffConfiguration), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*kubeadm.UpgradeDiffConfiguration)(nil), (*UpgradeDiffConfiguration)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_kubeadm_UpgradeDiffConfiguration_To_v1beta4_UpgradeDiffConfiguration(a.(*kubeadm.UpgradeDiffConfiguration), b.(*UpgradeDiffConfiguration), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*UpgradeNodeConfiguration)(nil), (*kubeadm.UpgradeNodeConfiguration)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta4_UpgradeNodeConfiguration_To_kubeadm_UpgradeNodeConfiguration(a.(*UpgradeNodeConfiguration), b.(*kubeadm.UpgradeNodeConfiguration), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*kubeadm.UpgradeNodeConfiguration)(nil), (*UpgradeNodeConfiguration)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_kubeadm_UpgradeNodeConfiguration_To_v1beta4_UpgradeNodeConfiguration(a.(*kubeadm.UpgradeNodeConfiguration), b.(*UpgradeNodeConfiguration), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*UpgradePlanConfiguration)(nil), (*kubeadm.UpgradePlanConfiguration)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta4_UpgradePlanConfiguration_To_kubeadm_UpgradePlanConfiguration(a.(*UpgradePlanConfiguration), b.(*kubeadm.UpgradePlanConfiguration), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*kubeadm.UpgradePlanConfiguration)(nil), (*UpgradePlanConfiguration)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_kubeadm_UpgradePlanConfiguration_To_v1beta4_UpgradePlanConfiguration(a.(*kubeadm.UpgradePlanConfiguration), b.(*UpgradePlanConfiguration), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddConversionFunc((*kubeadm.Arg)(nil), (*Arg)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_kubeadm_Arg_To_v1beta4_Arg(a.(*kubeadm.Arg), b.(*Arg), scope)
+	}); err != nil {
+		return err
+	}
 	if err := s.AddConversionFunc((*kubeadm.InitConfiguration)(nil), (*InitConfiguration)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_kubeadm_InitConfiguration_To_v1beta4_InitConfiguration(a.(*kubeadm.InitConfiguration), b.(*InitConfiguration), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddConversionFunc((*Arg)(nil), (*kubeadm.Arg)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta4_Arg_To_kubeadm_Arg(a.(*Arg), b.(*kubeadm.Arg), scope)
 	}); err != nil {
 		return err
 	}
@@ -253,8 +333,7 @@ func RegisterConversions(s *runtime.Scheme) error {
 }
 
 func autoConvert_v1beta4_APIEndpoint_To_kubeadm_APIEndpoint(in *APIEndpoint, out *kubeadm.APIEndpoint, s conversion.Scope) error {
-	out.AdvertiseAddress = in.AdvertiseAddress
-	out.BindPort = in.BindPort
+	*out = *(*kubeadm.APIEndpoint)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -264,8 +343,7 @@ func Convert_v1beta4_APIEndpoint_To_kubeadm_APIEndpoint(in *APIEndpoint, out *ku
 }
 
 func autoConvert_kubeadm_APIEndpoint_To_v1beta4_APIEndpoint(in *kubeadm.APIEndpoint, out *APIEndpoint, s conversion.Scope) error {
-	out.AdvertiseAddress = in.AdvertiseAddress
-	out.BindPort = in.BindPort
+	*out = *(*APIEndpoint)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -279,7 +357,6 @@ func autoConvert_v1beta4_APIServer_To_kubeadm_APIServer(in *APIServer, out *kube
 		return err
 	}
 	out.CertSANs = *(*[]string)(unsafe.Pointer(&in.CertSANs))
-	out.TimeoutForControlPlane = (*v1.Duration)(unsafe.Pointer(in.TimeoutForControlPlane))
 	return nil
 }
 
@@ -293,7 +370,6 @@ func autoConvert_kubeadm_APIServer_To_v1beta4_APIServer(in *kubeadm.APIServer, o
 		return err
 	}
 	out.CertSANs = *(*[]string)(unsafe.Pointer(&in.CertSANs))
-	out.TimeoutForControlPlane = (*v1.Duration)(unsafe.Pointer(in.TimeoutForControlPlane))
 	return nil
 }
 
@@ -308,27 +384,15 @@ func autoConvert_v1beta4_Arg_To_kubeadm_Arg(in *Arg, out *kubeadm.Arg, s convers
 	return nil
 }
 
-// Convert_v1beta4_Arg_To_kubeadm_Arg is an autogenerated conversion function.
-func Convert_v1beta4_Arg_To_kubeadm_Arg(in *Arg, out *kubeadm.Arg, s conversion.Scope) error {
-	return autoConvert_v1beta4_Arg_To_kubeadm_Arg(in, out, s)
-}
-
 func autoConvert_kubeadm_Arg_To_v1beta4_Arg(in *kubeadm.Arg, out *Arg, s conversion.Scope) error {
 	out.Name = in.Name
 	out.Value = in.Value
+	// WARNING: in.MergeMethod requires manual conversion: does not exist in peer-type
 	return nil
 }
 
-// Convert_kubeadm_Arg_To_v1beta4_Arg is an autogenerated conversion function.
-func Convert_kubeadm_Arg_To_v1beta4_Arg(in *kubeadm.Arg, out *Arg, s conversion.Scope) error {
-	return autoConvert_kubeadm_Arg_To_v1beta4_Arg(in, out, s)
-}
-
 func autoConvert_v1beta4_BootstrapTokenDiscovery_To_kubeadm_BootstrapTokenDiscovery(in *BootstrapTokenDiscovery, out *kubeadm.BootstrapTokenDiscovery, s conversion.Scope) error {
-	out.Token = in.Token
-	out.APIServerEndpoint = in.APIServerEndpoint
-	out.CACertHashes = *(*[]string)(unsafe.Pointer(&in.CACertHashes))
-	out.UnsafeSkipCAVerification = in.UnsafeSkipCAVerification
+	*out = *(*kubeadm.BootstrapTokenDiscovery)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -338,10 +402,7 @@ func Convert_v1beta4_BootstrapTokenDiscovery_To_kubeadm_BootstrapTokenDiscovery(
 }
 
 func autoConvert_kubeadm_BootstrapTokenDiscovery_To_v1beta4_BootstrapTokenDiscovery(in *kubeadm.BootstrapTokenDiscovery, out *BootstrapTokenDiscovery, s conversion.Scope) error {
-	out.Token = in.Token
-	out.APIServerEndpoint = in.APIServerEndpoint
-	out.CACertHashes = *(*[]string)(unsafe.Pointer(&in.CACertHashes))
-	out.UnsafeSkipCAVerification = in.UnsafeSkipCAVerification
+	*out = *(*BootstrapTokenDiscovery)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -371,10 +432,16 @@ func autoConvert_v1beta4_ClusterConfiguration_To_kubeadm_ClusterConfiguration(in
 	if err := Convert_v1beta4_DNS_To_kubeadm_DNS(&in.DNS, &out.DNS, s); err != nil {
 		return err
 	}
+	if err := Convert_v1beta4_Proxy_To_kubeadm_Proxy(&in.Proxy, &out.Proxy, s); err != nil {
+		return err
+	}
 	out.CertificatesDir = in.CertificatesDir
 	out.ImageRepository = in.ImageRepository
 	out.FeatureGates = *(*map[string]bool)(unsafe.Pointer(&in.FeatureGates))
 	out.ClusterName = in.ClusterName
+	out.EncryptionAlgorithm = kubeadm.EncryptionAlgorithmType(in.EncryptionAlgorithm)
+	out.CertificateValidityPeriod = (*v1.Duration)(unsafe.Pointer(in.CertificateValidityPeriod))
+	out.CACertificateValidityPeriod = (*v1.Duration)(unsafe.Pointer(in.CACertificateValidityPeriod))
 	return nil
 }
 
@@ -406,11 +473,17 @@ func autoConvert_kubeadm_ClusterConfiguration_To_v1beta4_ClusterConfiguration(in
 	if err := Convert_kubeadm_DNS_To_v1beta4_DNS(&in.DNS, &out.DNS, s); err != nil {
 		return err
 	}
+	if err := Convert_kubeadm_Proxy_To_v1beta4_Proxy(&in.Proxy, &out.Proxy, s); err != nil {
+		return err
+	}
 	out.CertificatesDir = in.CertificatesDir
 	out.ImageRepository = in.ImageRepository
 	// INFO: in.CIImageRepository opted out of conversion generation
 	out.FeatureGates = *(*map[string]bool)(unsafe.Pointer(&in.FeatureGates))
 	out.ClusterName = in.ClusterName
+	out.EncryptionAlgorithm = EncryptionAlgorithmType(in.EncryptionAlgorithm)
+	out.CertificateValidityPeriod = (*v1.Duration)(unsafe.Pointer(in.CertificateValidityPeriod))
+	out.CACertificateValidityPeriod = (*v1.Duration)(unsafe.Pointer(in.CACertificateValidityPeriod))
 	return nil
 }
 
@@ -420,9 +493,19 @@ func Convert_kubeadm_ClusterConfiguration_To_v1beta4_ClusterConfiguration(in *ku
 }
 
 func autoConvert_v1beta4_ControlPlaneComponent_To_kubeadm_ControlPlaneComponent(in *ControlPlaneComponent, out *kubeadm.ControlPlaneComponent, s conversion.Scope) error {
-	out.ExtraArgs = *(*[]kubeadm.Arg)(unsafe.Pointer(&in.ExtraArgs))
+	if in.ExtraArgs != nil {
+		in, out := &in.ExtraArgs, &out.ExtraArgs
+		*out = make([]kubeadm.Arg, len(*in))
+		for i := range *in {
+			if err := Convert_v1beta4_Arg_To_kubeadm_Arg(&(*in)[i], &(*out)[i], s); err != nil {
+				return err
+			}
+		}
+	} else {
+		out.ExtraArgs = nil
+	}
 	out.ExtraVolumes = *(*[]kubeadm.HostPathMount)(unsafe.Pointer(&in.ExtraVolumes))
-	out.ExtraEnvs = *(*[]corev1.EnvVar)(unsafe.Pointer(&in.ExtraEnvs))
+	out.ExtraEnvs = *(*[]kubeadm.EnvVar)(unsafe.Pointer(&in.ExtraEnvs))
 	return nil
 }
 
@@ -432,9 +515,19 @@ func Convert_v1beta4_ControlPlaneComponent_To_kubeadm_ControlPlaneComponent(in *
 }
 
 func autoConvert_kubeadm_ControlPlaneComponent_To_v1beta4_ControlPlaneComponent(in *kubeadm.ControlPlaneComponent, out *ControlPlaneComponent, s conversion.Scope) error {
-	out.ExtraArgs = *(*[]Arg)(unsafe.Pointer(&in.ExtraArgs))
+	if in.ExtraArgs != nil {
+		in, out := &in.ExtraArgs, &out.ExtraArgs
+		*out = make([]Arg, len(*in))
+		for i := range *in {
+			if err := Convert_kubeadm_Arg_To_v1beta4_Arg(&(*in)[i], &(*out)[i], s); err != nil {
+				return err
+			}
+		}
+	} else {
+		out.ExtraArgs = nil
+	}
 	out.ExtraVolumes = *(*[]HostPathMount)(unsafe.Pointer(&in.ExtraVolumes))
-	out.ExtraEnvs = *(*[]corev1.EnvVar)(unsafe.Pointer(&in.ExtraEnvs))
+	out.ExtraEnvs = *(*[]EnvVar)(unsafe.Pointer(&in.ExtraEnvs))
 	return nil
 }
 
@@ -444,9 +537,7 @@ func Convert_kubeadm_ControlPlaneComponent_To_v1beta4_ControlPlaneComponent(in *
 }
 
 func autoConvert_v1beta4_DNS_To_kubeadm_DNS(in *DNS, out *kubeadm.DNS, s conversion.Scope) error {
-	if err := Convert_v1beta4_ImageMeta_To_kubeadm_ImageMeta(&in.ImageMeta, &out.ImageMeta, s); err != nil {
-		return err
-	}
+	*out = *(*kubeadm.DNS)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -456,9 +547,7 @@ func Convert_v1beta4_DNS_To_kubeadm_DNS(in *DNS, out *kubeadm.DNS, s conversion.
 }
 
 func autoConvert_kubeadm_DNS_To_v1beta4_DNS(in *kubeadm.DNS, out *DNS, s conversion.Scope) error {
-	if err := Convert_kubeadm_ImageMeta_To_v1beta4_ImageMeta(&in.ImageMeta, &out.ImageMeta, s); err != nil {
-		return err
-	}
+	*out = *(*DNS)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -468,10 +557,7 @@ func Convert_kubeadm_DNS_To_v1beta4_DNS(in *kubeadm.DNS, out *DNS, s conversion.
 }
 
 func autoConvert_v1beta4_Discovery_To_kubeadm_Discovery(in *Discovery, out *kubeadm.Discovery, s conversion.Scope) error {
-	out.BootstrapToken = (*kubeadm.BootstrapTokenDiscovery)(unsafe.Pointer(in.BootstrapToken))
-	out.File = (*kubeadm.FileDiscovery)(unsafe.Pointer(in.File))
-	out.TLSBootstrapToken = in.TLSBootstrapToken
-	out.Timeout = (*v1.Duration)(unsafe.Pointer(in.Timeout))
+	*out = *(*kubeadm.Discovery)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -481,10 +567,7 @@ func Convert_v1beta4_Discovery_To_kubeadm_Discovery(in *Discovery, out *kubeadm.
 }
 
 func autoConvert_kubeadm_Discovery_To_v1beta4_Discovery(in *kubeadm.Discovery, out *Discovery, s conversion.Scope) error {
-	out.BootstrapToken = (*BootstrapTokenDiscovery)(unsafe.Pointer(in.BootstrapToken))
-	out.File = (*FileDiscovery)(unsafe.Pointer(in.File))
-	out.TLSBootstrapToken = in.TLSBootstrapToken
-	out.Timeout = (*v1.Duration)(unsafe.Pointer(in.Timeout))
+	*out = *(*Discovery)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -493,8 +576,36 @@ func Convert_kubeadm_Discovery_To_v1beta4_Discovery(in *kubeadm.Discovery, out *
 	return autoConvert_kubeadm_Discovery_To_v1beta4_Discovery(in, out, s)
 }
 
+func autoConvert_v1beta4_EnvVar_To_kubeadm_EnvVar(in *EnvVar, out *kubeadm.EnvVar, s conversion.Scope) error {
+	*out = *(*kubeadm.EnvVar)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta4_EnvVar_To_kubeadm_EnvVar is an autogenerated conversion function.
+func Convert_v1beta4_EnvVar_To_kubeadm_EnvVar(in *EnvVar, out *kubeadm.EnvVar, s conversion.Scope) error {
+	return autoConvert_v1beta4_EnvVar_To_kubeadm_EnvVar(in, out, s)
+}
+
+func autoConvert_kubeadm_EnvVar_To_v1beta4_EnvVar(in *kubeadm.EnvVar, out *EnvVar, s conversion.Scope) error {
+	*out = *(*EnvVar)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_kubeadm_EnvVar_To_v1beta4_EnvVar is an autogenerated conversion function.
+func Convert_kubeadm_EnvVar_To_v1beta4_EnvVar(in *kubeadm.EnvVar, out *EnvVar, s conversion.Scope) error {
+	return autoConvert_kubeadm_EnvVar_To_v1beta4_EnvVar(in, out, s)
+}
+
 func autoConvert_v1beta4_Etcd_To_kubeadm_Etcd(in *Etcd, out *kubeadm.Etcd, s conversion.Scope) error {
-	out.Local = (*kubeadm.LocalEtcd)(unsafe.Pointer(in.Local))
+	if in.Local != nil {
+		in, out := &in.Local, &out.Local
+		*out = new(kubeadm.LocalEtcd)
+		if err := Convert_v1beta4_LocalEtcd_To_kubeadm_LocalEtcd(*in, *out, s); err != nil {
+			return err
+		}
+	} else {
+		out.Local = nil
+	}
 	out.External = (*kubeadm.ExternalEtcd)(unsafe.Pointer(in.External))
 	return nil
 }
@@ -505,7 +616,15 @@ func Convert_v1beta4_Etcd_To_kubeadm_Etcd(in *Etcd, out *kubeadm.Etcd, s convers
 }
 
 func autoConvert_kubeadm_Etcd_To_v1beta4_Etcd(in *kubeadm.Etcd, out *Etcd, s conversion.Scope) error {
-	out.Local = (*LocalEtcd)(unsafe.Pointer(in.Local))
+	if in.Local != nil {
+		in, out := &in.Local, &out.Local
+		*out = new(LocalEtcd)
+		if err := Convert_kubeadm_LocalEtcd_To_v1beta4_LocalEtcd(*in, *out, s); err != nil {
+			return err
+		}
+	} else {
+		out.Local = nil
+	}
 	out.External = (*ExternalEtcd)(unsafe.Pointer(in.External))
 	return nil
 }
@@ -516,10 +635,7 @@ func Convert_kubeadm_Etcd_To_v1beta4_Etcd(in *kubeadm.Etcd, out *Etcd, s convers
 }
 
 func autoConvert_v1beta4_ExternalEtcd_To_kubeadm_ExternalEtcd(in *ExternalEtcd, out *kubeadm.ExternalEtcd, s conversion.Scope) error {
-	out.Endpoints = *(*[]string)(unsafe.Pointer(&in.Endpoints))
-	out.CAFile = in.CAFile
-	out.CertFile = in.CertFile
-	out.KeyFile = in.KeyFile
+	*out = *(*kubeadm.ExternalEtcd)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -529,10 +645,7 @@ func Convert_v1beta4_ExternalEtcd_To_kubeadm_ExternalEtcd(in *ExternalEtcd, out 
 }
 
 func autoConvert_kubeadm_ExternalEtcd_To_v1beta4_ExternalEtcd(in *kubeadm.ExternalEtcd, out *ExternalEtcd, s conversion.Scope) error {
-	out.Endpoints = *(*[]string)(unsafe.Pointer(&in.Endpoints))
-	out.CAFile = in.CAFile
-	out.CertFile = in.CertFile
-	out.KeyFile = in.KeyFile
+	*out = *(*ExternalEtcd)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -542,7 +655,7 @@ func Convert_kubeadm_ExternalEtcd_To_v1beta4_ExternalEtcd(in *kubeadm.ExternalEt
 }
 
 func autoConvert_v1beta4_FileDiscovery_To_kubeadm_FileDiscovery(in *FileDiscovery, out *kubeadm.FileDiscovery, s conversion.Scope) error {
-	out.KubeConfigPath = in.KubeConfigPath
+	*out = *(*kubeadm.FileDiscovery)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -552,7 +665,7 @@ func Convert_v1beta4_FileDiscovery_To_kubeadm_FileDiscovery(in *FileDiscovery, o
 }
 
 func autoConvert_kubeadm_FileDiscovery_To_v1beta4_FileDiscovery(in *kubeadm.FileDiscovery, out *FileDiscovery, s conversion.Scope) error {
-	out.KubeConfigPath = in.KubeConfigPath
+	*out = *(*FileDiscovery)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -562,11 +675,7 @@ func Convert_kubeadm_FileDiscovery_To_v1beta4_FileDiscovery(in *kubeadm.FileDisc
 }
 
 func autoConvert_v1beta4_HostPathMount_To_kubeadm_HostPathMount(in *HostPathMount, out *kubeadm.HostPathMount, s conversion.Scope) error {
-	out.Name = in.Name
-	out.HostPath = in.HostPath
-	out.MountPath = in.MountPath
-	out.ReadOnly = in.ReadOnly
-	out.PathType = corev1.HostPathType(in.PathType)
+	*out = *(*kubeadm.HostPathMount)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -576,11 +685,7 @@ func Convert_v1beta4_HostPathMount_To_kubeadm_HostPathMount(in *HostPathMount, o
 }
 
 func autoConvert_kubeadm_HostPathMount_To_v1beta4_HostPathMount(in *kubeadm.HostPathMount, out *HostPathMount, s conversion.Scope) error {
-	out.Name = in.Name
-	out.HostPath = in.HostPath
-	out.MountPath = in.MountPath
-	out.ReadOnly = in.ReadOnly
-	out.PathType = corev1.HostPathType(in.PathType)
+	*out = *(*HostPathMount)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -590,8 +695,7 @@ func Convert_kubeadm_HostPathMount_To_v1beta4_HostPathMount(in *kubeadm.HostPath
 }
 
 func autoConvert_v1beta4_ImageMeta_To_kubeadm_ImageMeta(in *ImageMeta, out *kubeadm.ImageMeta, s conversion.Scope) error {
-	out.ImageRepository = in.ImageRepository
-	out.ImageTag = in.ImageTag
+	*out = *(*kubeadm.ImageMeta)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -601,8 +705,7 @@ func Convert_v1beta4_ImageMeta_To_kubeadm_ImageMeta(in *ImageMeta, out *kubeadm.
 }
 
 func autoConvert_kubeadm_ImageMeta_To_v1beta4_ImageMeta(in *kubeadm.ImageMeta, out *ImageMeta, s conversion.Scope) error {
-	out.ImageRepository = in.ImageRepository
-	out.ImageTag = in.ImageTag
+	*out = *(*ImageMeta)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -623,6 +726,7 @@ func autoConvert_v1beta4_InitConfiguration_To_kubeadm_InitConfiguration(in *Init
 	out.CertificateKey = in.CertificateKey
 	out.SkipPhases = *(*[]string)(unsafe.Pointer(&in.SkipPhases))
 	out.Patches = (*kubeadm.Patches)(unsafe.Pointer(in.Patches))
+	out.Timeouts = (*kubeadm.Timeouts)(unsafe.Pointer(in.Timeouts))
 	return nil
 }
 
@@ -639,6 +743,7 @@ func autoConvert_kubeadm_InitConfiguration_To_v1beta4_InitConfiguration(in *kube
 	out.CertificateKey = in.CertificateKey
 	out.SkipPhases = *(*[]string)(unsafe.Pointer(&in.SkipPhases))
 	out.Patches = (*Patches)(unsafe.Pointer(in.Patches))
+	out.Timeouts = (*Timeouts)(unsafe.Pointer(in.Timeouts))
 	return nil
 }
 
@@ -654,6 +759,7 @@ func autoConvert_v1beta4_JoinConfiguration_To_kubeadm_JoinConfiguration(in *Join
 	out.ControlPlane = (*kubeadm.JoinControlPlane)(unsafe.Pointer(in.ControlPlane))
 	out.SkipPhases = *(*[]string)(unsafe.Pointer(&in.SkipPhases))
 	out.Patches = (*kubeadm.Patches)(unsafe.Pointer(in.Patches))
+	out.Timeouts = (*kubeadm.Timeouts)(unsafe.Pointer(in.Timeouts))
 	return nil
 }
 
@@ -674,6 +780,7 @@ func autoConvert_kubeadm_JoinConfiguration_To_v1beta4_JoinConfiguration(in *kube
 	out.ControlPlane = (*JoinControlPlane)(unsafe.Pointer(in.ControlPlane))
 	out.SkipPhases = *(*[]string)(unsafe.Pointer(&in.SkipPhases))
 	out.Patches = (*Patches)(unsafe.Pointer(in.Patches))
+	out.Timeouts = (*Timeouts)(unsafe.Pointer(in.Timeouts))
 	return nil
 }
 
@@ -683,10 +790,7 @@ func Convert_kubeadm_JoinConfiguration_To_v1beta4_JoinConfiguration(in *kubeadm.
 }
 
 func autoConvert_v1beta4_JoinControlPlane_To_kubeadm_JoinControlPlane(in *JoinControlPlane, out *kubeadm.JoinControlPlane, s conversion.Scope) error {
-	if err := Convert_v1beta4_APIEndpoint_To_kubeadm_APIEndpoint(&in.LocalAPIEndpoint, &out.LocalAPIEndpoint, s); err != nil {
-		return err
-	}
-	out.CertificateKey = in.CertificateKey
+	*out = *(*kubeadm.JoinControlPlane)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -696,10 +800,7 @@ func Convert_v1beta4_JoinControlPlane_To_kubeadm_JoinControlPlane(in *JoinContro
 }
 
 func autoConvert_kubeadm_JoinControlPlane_To_v1beta4_JoinControlPlane(in *kubeadm.JoinControlPlane, out *JoinControlPlane, s conversion.Scope) error {
-	if err := Convert_kubeadm_APIEndpoint_To_v1beta4_APIEndpoint(&in.LocalAPIEndpoint, &out.LocalAPIEndpoint, s); err != nil {
-		return err
-	}
-	out.CertificateKey = in.CertificateKey
+	*out = *(*JoinControlPlane)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -713,8 +814,18 @@ func autoConvert_v1beta4_LocalEtcd_To_kubeadm_LocalEtcd(in *LocalEtcd, out *kube
 		return err
 	}
 	out.DataDir = in.DataDir
-	out.ExtraArgs = *(*[]kubeadm.Arg)(unsafe.Pointer(&in.ExtraArgs))
-	out.ExtraEnvs = *(*[]corev1.EnvVar)(unsafe.Pointer(&in.ExtraEnvs))
+	if in.ExtraArgs != nil {
+		in, out := &in.ExtraArgs, &out.ExtraArgs
+		*out = make([]kubeadm.Arg, len(*in))
+		for i := range *in {
+			if err := Convert_v1beta4_Arg_To_kubeadm_Arg(&(*in)[i], &(*out)[i], s); err != nil {
+				return err
+			}
+		}
+	} else {
+		out.ExtraArgs = nil
+	}
+	out.ExtraEnvs = *(*[]kubeadm.EnvVar)(unsafe.Pointer(&in.ExtraEnvs))
 	out.ServerCertSANs = *(*[]string)(unsafe.Pointer(&in.ServerCertSANs))
 	out.PeerCertSANs = *(*[]string)(unsafe.Pointer(&in.PeerCertSANs))
 	return nil
@@ -730,8 +841,18 @@ func autoConvert_kubeadm_LocalEtcd_To_v1beta4_LocalEtcd(in *kubeadm.LocalEtcd, o
 		return err
 	}
 	out.DataDir = in.DataDir
-	out.ExtraArgs = *(*[]Arg)(unsafe.Pointer(&in.ExtraArgs))
-	out.ExtraEnvs = *(*[]corev1.EnvVar)(unsafe.Pointer(&in.ExtraEnvs))
+	if in.ExtraArgs != nil {
+		in, out := &in.ExtraArgs, &out.ExtraArgs
+		*out = make([]Arg, len(*in))
+		for i := range *in {
+			if err := Convert_kubeadm_Arg_To_v1beta4_Arg(&(*in)[i], &(*out)[i], s); err != nil {
+				return err
+			}
+		}
+	} else {
+		out.ExtraArgs = nil
+	}
+	out.ExtraEnvs = *(*[]EnvVar)(unsafe.Pointer(&in.ExtraEnvs))
 	out.ServerCertSANs = *(*[]string)(unsafe.Pointer(&in.ServerCertSANs))
 	out.PeerCertSANs = *(*[]string)(unsafe.Pointer(&in.PeerCertSANs))
 	return nil
@@ -743,9 +864,7 @@ func Convert_kubeadm_LocalEtcd_To_v1beta4_LocalEtcd(in *kubeadm.LocalEtcd, out *
 }
 
 func autoConvert_v1beta4_Networking_To_kubeadm_Networking(in *Networking, out *kubeadm.Networking, s conversion.Scope) error {
-	out.ServiceSubnet = in.ServiceSubnet
-	out.PodSubnet = in.PodSubnet
-	out.DNSDomain = in.DNSDomain
+	*out = *(*kubeadm.Networking)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -755,9 +874,7 @@ func Convert_v1beta4_Networking_To_kubeadm_Networking(in *Networking, out *kubea
 }
 
 func autoConvert_kubeadm_Networking_To_v1beta4_Networking(in *kubeadm.Networking, out *Networking, s conversion.Scope) error {
-	out.ServiceSubnet = in.ServiceSubnet
-	out.PodSubnet = in.PodSubnet
-	out.DNSDomain = in.DNSDomain
+	*out = *(*Networking)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -770,9 +887,20 @@ func autoConvert_v1beta4_NodeRegistrationOptions_To_kubeadm_NodeRegistrationOpti
 	out.Name = in.Name
 	out.CRISocket = in.CRISocket
 	out.Taints = *(*[]corev1.Taint)(unsafe.Pointer(&in.Taints))
-	out.KubeletExtraArgs = *(*[]kubeadm.Arg)(unsafe.Pointer(&in.KubeletExtraArgs))
+	if in.KubeletExtraArgs != nil {
+		in, out := &in.KubeletExtraArgs, &out.KubeletExtraArgs
+		*out = make([]kubeadm.Arg, len(*in))
+		for i := range *in {
+			if err := Convert_v1beta4_Arg_To_kubeadm_Arg(&(*in)[i], &(*out)[i], s); err != nil {
+				return err
+			}
+		}
+	} else {
+		out.KubeletExtraArgs = nil
+	}
 	out.IgnorePreflightErrors = *(*[]string)(unsafe.Pointer(&in.IgnorePreflightErrors))
 	out.ImagePullPolicy = corev1.PullPolicy(in.ImagePullPolicy)
+	out.ImagePullSerial = (*bool)(unsafe.Pointer(in.ImagePullSerial))
 	return nil
 }
 
@@ -785,9 +913,20 @@ func autoConvert_kubeadm_NodeRegistrationOptions_To_v1beta4_NodeRegistrationOpti
 	out.Name = in.Name
 	out.CRISocket = in.CRISocket
 	out.Taints = *(*[]corev1.Taint)(unsafe.Pointer(&in.Taints))
-	out.KubeletExtraArgs = *(*[]Arg)(unsafe.Pointer(&in.KubeletExtraArgs))
+	if in.KubeletExtraArgs != nil {
+		in, out := &in.KubeletExtraArgs, &out.KubeletExtraArgs
+		*out = make([]Arg, len(*in))
+		for i := range *in {
+			if err := Convert_kubeadm_Arg_To_v1beta4_Arg(&(*in)[i], &(*out)[i], s); err != nil {
+				return err
+			}
+		}
+	} else {
+		out.KubeletExtraArgs = nil
+	}
 	out.IgnorePreflightErrors = *(*[]string)(unsafe.Pointer(&in.IgnorePreflightErrors))
 	out.ImagePullPolicy = corev1.PullPolicy(in.ImagePullPolicy)
+	out.ImagePullSerial = (*bool)(unsafe.Pointer(in.ImagePullSerial))
 	return nil
 }
 
@@ -797,7 +936,7 @@ func Convert_kubeadm_NodeRegistrationOptions_To_v1beta4_NodeRegistrationOptions(
 }
 
 func autoConvert_v1beta4_Patches_To_kubeadm_Patches(in *Patches, out *kubeadm.Patches, s conversion.Scope) error {
-	out.Directory = in.Directory
+	*out = *(*kubeadm.Patches)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -807,13 +946,33 @@ func Convert_v1beta4_Patches_To_kubeadm_Patches(in *Patches, out *kubeadm.Patche
 }
 
 func autoConvert_kubeadm_Patches_To_v1beta4_Patches(in *kubeadm.Patches, out *Patches, s conversion.Scope) error {
-	out.Directory = in.Directory
+	*out = *(*Patches)(unsafe.Pointer(in))
 	return nil
 }
 
 // Convert_kubeadm_Patches_To_v1beta4_Patches is an autogenerated conversion function.
 func Convert_kubeadm_Patches_To_v1beta4_Patches(in *kubeadm.Patches, out *Patches, s conversion.Scope) error {
 	return autoConvert_kubeadm_Patches_To_v1beta4_Patches(in, out, s)
+}
+
+func autoConvert_v1beta4_Proxy_To_kubeadm_Proxy(in *Proxy, out *kubeadm.Proxy, s conversion.Scope) error {
+	*out = *(*kubeadm.Proxy)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta4_Proxy_To_kubeadm_Proxy is an autogenerated conversion function.
+func Convert_v1beta4_Proxy_To_kubeadm_Proxy(in *Proxy, out *kubeadm.Proxy, s conversion.Scope) error {
+	return autoConvert_v1beta4_Proxy_To_kubeadm_Proxy(in, out, s)
+}
+
+func autoConvert_kubeadm_Proxy_To_v1beta4_Proxy(in *kubeadm.Proxy, out *Proxy, s conversion.Scope) error {
+	*out = *(*Proxy)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_kubeadm_Proxy_To_v1beta4_Proxy is an autogenerated conversion function.
+func Convert_kubeadm_Proxy_To_v1beta4_Proxy(in *kubeadm.Proxy, out *Proxy, s conversion.Scope) error {
+	return autoConvert_kubeadm_Proxy_To_v1beta4_Proxy(in, out, s)
 }
 
 func autoConvert_v1beta4_ResetConfiguration_To_kubeadm_ResetConfiguration(in *ResetConfiguration, out *kubeadm.ResetConfiguration, s conversion.Scope) error {
@@ -824,6 +983,8 @@ func autoConvert_v1beta4_ResetConfiguration_To_kubeadm_ResetConfiguration(in *Re
 	out.Force = in.Force
 	out.IgnorePreflightErrors = *(*[]string)(unsafe.Pointer(&in.IgnorePreflightErrors))
 	out.SkipPhases = *(*[]string)(unsafe.Pointer(&in.SkipPhases))
+	out.UnmountFlags = *(*[]string)(unsafe.Pointer(&in.UnmountFlags))
+	out.Timeouts = (*kubeadm.Timeouts)(unsafe.Pointer(in.Timeouts))
 	return nil
 }
 
@@ -840,10 +1001,156 @@ func autoConvert_kubeadm_ResetConfiguration_To_v1beta4_ResetConfiguration(in *ku
 	out.Force = in.Force
 	out.IgnorePreflightErrors = *(*[]string)(unsafe.Pointer(&in.IgnorePreflightErrors))
 	out.SkipPhases = *(*[]string)(unsafe.Pointer(&in.SkipPhases))
+	out.UnmountFlags = *(*[]string)(unsafe.Pointer(&in.UnmountFlags))
+	out.Timeouts = (*Timeouts)(unsafe.Pointer(in.Timeouts))
 	return nil
 }
 
 // Convert_kubeadm_ResetConfiguration_To_v1beta4_ResetConfiguration is an autogenerated conversion function.
 func Convert_kubeadm_ResetConfiguration_To_v1beta4_ResetConfiguration(in *kubeadm.ResetConfiguration, out *ResetConfiguration, s conversion.Scope) error {
 	return autoConvert_kubeadm_ResetConfiguration_To_v1beta4_ResetConfiguration(in, out, s)
+}
+
+func autoConvert_v1beta4_Timeouts_To_kubeadm_Timeouts(in *Timeouts, out *kubeadm.Timeouts, s conversion.Scope) error {
+	*out = *(*kubeadm.Timeouts)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta4_Timeouts_To_kubeadm_Timeouts is an autogenerated conversion function.
+func Convert_v1beta4_Timeouts_To_kubeadm_Timeouts(in *Timeouts, out *kubeadm.Timeouts, s conversion.Scope) error {
+	return autoConvert_v1beta4_Timeouts_To_kubeadm_Timeouts(in, out, s)
+}
+
+func autoConvert_kubeadm_Timeouts_To_v1beta4_Timeouts(in *kubeadm.Timeouts, out *Timeouts, s conversion.Scope) error {
+	*out = *(*Timeouts)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_kubeadm_Timeouts_To_v1beta4_Timeouts is an autogenerated conversion function.
+func Convert_kubeadm_Timeouts_To_v1beta4_Timeouts(in *kubeadm.Timeouts, out *Timeouts, s conversion.Scope) error {
+	return autoConvert_kubeadm_Timeouts_To_v1beta4_Timeouts(in, out, s)
+}
+
+func autoConvert_v1beta4_UpgradeApplyConfiguration_To_kubeadm_UpgradeApplyConfiguration(in *UpgradeApplyConfiguration, out *kubeadm.UpgradeApplyConfiguration, s conversion.Scope) error {
+	*out = *(*kubeadm.UpgradeApplyConfiguration)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta4_UpgradeApplyConfiguration_To_kubeadm_UpgradeApplyConfiguration is an autogenerated conversion function.
+func Convert_v1beta4_UpgradeApplyConfiguration_To_kubeadm_UpgradeApplyConfiguration(in *UpgradeApplyConfiguration, out *kubeadm.UpgradeApplyConfiguration, s conversion.Scope) error {
+	return autoConvert_v1beta4_UpgradeApplyConfiguration_To_kubeadm_UpgradeApplyConfiguration(in, out, s)
+}
+
+func autoConvert_kubeadm_UpgradeApplyConfiguration_To_v1beta4_UpgradeApplyConfiguration(in *kubeadm.UpgradeApplyConfiguration, out *UpgradeApplyConfiguration, s conversion.Scope) error {
+	*out = *(*UpgradeApplyConfiguration)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_kubeadm_UpgradeApplyConfiguration_To_v1beta4_UpgradeApplyConfiguration is an autogenerated conversion function.
+func Convert_kubeadm_UpgradeApplyConfiguration_To_v1beta4_UpgradeApplyConfiguration(in *kubeadm.UpgradeApplyConfiguration, out *UpgradeApplyConfiguration, s conversion.Scope) error {
+	return autoConvert_kubeadm_UpgradeApplyConfiguration_To_v1beta4_UpgradeApplyConfiguration(in, out, s)
+}
+
+func autoConvert_v1beta4_UpgradeConfiguration_To_kubeadm_UpgradeConfiguration(in *UpgradeConfiguration, out *kubeadm.UpgradeConfiguration, s conversion.Scope) error {
+	if err := Convert_v1beta4_UpgradeApplyConfiguration_To_kubeadm_UpgradeApplyConfiguration(&in.Apply, &out.Apply, s); err != nil {
+		return err
+	}
+	if err := Convert_v1beta4_UpgradeDiffConfiguration_To_kubeadm_UpgradeDiffConfiguration(&in.Diff, &out.Diff, s); err != nil {
+		return err
+	}
+	if err := Convert_v1beta4_UpgradeNodeConfiguration_To_kubeadm_UpgradeNodeConfiguration(&in.Node, &out.Node, s); err != nil {
+		return err
+	}
+	if err := Convert_v1beta4_UpgradePlanConfiguration_To_kubeadm_UpgradePlanConfiguration(&in.Plan, &out.Plan, s); err != nil {
+		return err
+	}
+	out.Timeouts = (*kubeadm.Timeouts)(unsafe.Pointer(in.Timeouts))
+	return nil
+}
+
+// Convert_v1beta4_UpgradeConfiguration_To_kubeadm_UpgradeConfiguration is an autogenerated conversion function.
+func Convert_v1beta4_UpgradeConfiguration_To_kubeadm_UpgradeConfiguration(in *UpgradeConfiguration, out *kubeadm.UpgradeConfiguration, s conversion.Scope) error {
+	return autoConvert_v1beta4_UpgradeConfiguration_To_kubeadm_UpgradeConfiguration(in, out, s)
+}
+
+func autoConvert_kubeadm_UpgradeConfiguration_To_v1beta4_UpgradeConfiguration(in *kubeadm.UpgradeConfiguration, out *UpgradeConfiguration, s conversion.Scope) error {
+	if err := Convert_kubeadm_UpgradeApplyConfiguration_To_v1beta4_UpgradeApplyConfiguration(&in.Apply, &out.Apply, s); err != nil {
+		return err
+	}
+	if err := Convert_kubeadm_UpgradeDiffConfiguration_To_v1beta4_UpgradeDiffConfiguration(&in.Diff, &out.Diff, s); err != nil {
+		return err
+	}
+	if err := Convert_kubeadm_UpgradeNodeConfiguration_To_v1beta4_UpgradeNodeConfiguration(&in.Node, &out.Node, s); err != nil {
+		return err
+	}
+	if err := Convert_kubeadm_UpgradePlanConfiguration_To_v1beta4_UpgradePlanConfiguration(&in.Plan, &out.Plan, s); err != nil {
+		return err
+	}
+	out.Timeouts = (*Timeouts)(unsafe.Pointer(in.Timeouts))
+	return nil
+}
+
+// Convert_kubeadm_UpgradeConfiguration_To_v1beta4_UpgradeConfiguration is an autogenerated conversion function.
+func Convert_kubeadm_UpgradeConfiguration_To_v1beta4_UpgradeConfiguration(in *kubeadm.UpgradeConfiguration, out *UpgradeConfiguration, s conversion.Scope) error {
+	return autoConvert_kubeadm_UpgradeConfiguration_To_v1beta4_UpgradeConfiguration(in, out, s)
+}
+
+func autoConvert_v1beta4_UpgradeDiffConfiguration_To_kubeadm_UpgradeDiffConfiguration(in *UpgradeDiffConfiguration, out *kubeadm.UpgradeDiffConfiguration, s conversion.Scope) error {
+	*out = *(*kubeadm.UpgradeDiffConfiguration)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta4_UpgradeDiffConfiguration_To_kubeadm_UpgradeDiffConfiguration is an autogenerated conversion function.
+func Convert_v1beta4_UpgradeDiffConfiguration_To_kubeadm_UpgradeDiffConfiguration(in *UpgradeDiffConfiguration, out *kubeadm.UpgradeDiffConfiguration, s conversion.Scope) error {
+	return autoConvert_v1beta4_UpgradeDiffConfiguration_To_kubeadm_UpgradeDiffConfiguration(in, out, s)
+}
+
+func autoConvert_kubeadm_UpgradeDiffConfiguration_To_v1beta4_UpgradeDiffConfiguration(in *kubeadm.UpgradeDiffConfiguration, out *UpgradeDiffConfiguration, s conversion.Scope) error {
+	*out = *(*UpgradeDiffConfiguration)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_kubeadm_UpgradeDiffConfiguration_To_v1beta4_UpgradeDiffConfiguration is an autogenerated conversion function.
+func Convert_kubeadm_UpgradeDiffConfiguration_To_v1beta4_UpgradeDiffConfiguration(in *kubeadm.UpgradeDiffConfiguration, out *UpgradeDiffConfiguration, s conversion.Scope) error {
+	return autoConvert_kubeadm_UpgradeDiffConfiguration_To_v1beta4_UpgradeDiffConfiguration(in, out, s)
+}
+
+func autoConvert_v1beta4_UpgradeNodeConfiguration_To_kubeadm_UpgradeNodeConfiguration(in *UpgradeNodeConfiguration, out *kubeadm.UpgradeNodeConfiguration, s conversion.Scope) error {
+	*out = *(*kubeadm.UpgradeNodeConfiguration)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta4_UpgradeNodeConfiguration_To_kubeadm_UpgradeNodeConfiguration is an autogenerated conversion function.
+func Convert_v1beta4_UpgradeNodeConfiguration_To_kubeadm_UpgradeNodeConfiguration(in *UpgradeNodeConfiguration, out *kubeadm.UpgradeNodeConfiguration, s conversion.Scope) error {
+	return autoConvert_v1beta4_UpgradeNodeConfiguration_To_kubeadm_UpgradeNodeConfiguration(in, out, s)
+}
+
+func autoConvert_kubeadm_UpgradeNodeConfiguration_To_v1beta4_UpgradeNodeConfiguration(in *kubeadm.UpgradeNodeConfiguration, out *UpgradeNodeConfiguration, s conversion.Scope) error {
+	*out = *(*UpgradeNodeConfiguration)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_kubeadm_UpgradeNodeConfiguration_To_v1beta4_UpgradeNodeConfiguration is an autogenerated conversion function.
+func Convert_kubeadm_UpgradeNodeConfiguration_To_v1beta4_UpgradeNodeConfiguration(in *kubeadm.UpgradeNodeConfiguration, out *UpgradeNodeConfiguration, s conversion.Scope) error {
+	return autoConvert_kubeadm_UpgradeNodeConfiguration_To_v1beta4_UpgradeNodeConfiguration(in, out, s)
+}
+
+func autoConvert_v1beta4_UpgradePlanConfiguration_To_kubeadm_UpgradePlanConfiguration(in *UpgradePlanConfiguration, out *kubeadm.UpgradePlanConfiguration, s conversion.Scope) error {
+	*out = *(*kubeadm.UpgradePlanConfiguration)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta4_UpgradePlanConfiguration_To_kubeadm_UpgradePlanConfiguration is an autogenerated conversion function.
+func Convert_v1beta4_UpgradePlanConfiguration_To_kubeadm_UpgradePlanConfiguration(in *UpgradePlanConfiguration, out *kubeadm.UpgradePlanConfiguration, s conversion.Scope) error {
+	return autoConvert_v1beta4_UpgradePlanConfiguration_To_kubeadm_UpgradePlanConfiguration(in, out, s)
+}
+
+func autoConvert_kubeadm_UpgradePlanConfiguration_To_v1beta4_UpgradePlanConfiguration(in *kubeadm.UpgradePlanConfiguration, out *UpgradePlanConfiguration, s conversion.Scope) error {
+	*out = *(*UpgradePlanConfiguration)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_kubeadm_UpgradePlanConfiguration_To_v1beta4_UpgradePlanConfiguration is an autogenerated conversion function.
+func Convert_kubeadm_UpgradePlanConfiguration_To_v1beta4_UpgradePlanConfiguration(in *kubeadm.UpgradePlanConfiguration, out *UpgradePlanConfiguration, s conversion.Scope) error {
+	return autoConvert_kubeadm_UpgradePlanConfiguration_To_v1beta4_UpgradePlanConfiguration(in, out, s)
 }

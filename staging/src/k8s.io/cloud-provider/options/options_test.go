@@ -20,25 +20,34 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/spf13/pflag"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apiserverapis "k8s.io/apiserver/pkg/apis/apiserver"
+	genericfeatures "k8s.io/apiserver/pkg/features"
 	apiserver "k8s.io/apiserver/pkg/server"
 	apiserveroptions "k8s.io/apiserver/pkg/server/options"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	appconfig "k8s.io/cloud-provider/app/config"
 	cpconfig "k8s.io/cloud-provider/config"
 	nodeconfig "k8s.io/cloud-provider/controllers/node/config"
+	nodelifecycleconfig "k8s.io/cloud-provider/controllers/nodelifecycle/config"
 	serviceconfig "k8s.io/cloud-provider/controllers/service/config"
+	cliflag "k8s.io/component-base/cli/flag"
 	componentbaseconfig "k8s.io/component-base/config"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	cmconfig "k8s.io/controller-manager/config"
 	cmoptions "k8s.io/controller-manager/options"
+	cmfeatures "k8s.io/controller-manager/pkg/features"
 	migration "k8s.io/controller-manager/pkg/leadermigration/options"
 	netutils "k8s.io/utils/net"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDefaultFlags(t *testing.T) {
@@ -81,7 +90,6 @@ func TestDefaultFlags(t *testing.T) {
 		KubeCloudShared: &KubeCloudSharedOptions{
 			KubeCloudSharedConfiguration: &cpconfig.KubeCloudSharedConfiguration{
 				RouteReconciliationPeriod: metav1.Duration{Duration: 10 * time.Second},
-				NodeMonitorPeriod:         metav1.Duration{Duration: 5 * time.Second},
 				ClusterName:               "kubernetes",
 				ClusterCIDR:               "",
 				AllocateNodeCIDRs:         false,
@@ -98,6 +106,12 @@ func TestDefaultFlags(t *testing.T) {
 		NodeController: &NodeControllerOptions{
 			NodeControllerConfiguration: &nodeconfig.NodeControllerConfiguration{
 				ConcurrentNodeSyncs: 1,
+			},
+		},
+		NodeLifecycleController: &NodeLifecycleControllerOptions{
+			NodeLifecycleControllerConfiguration: &nodelifecycleconfig.NodeLifecycleControllerConfiguration{
+				ConcurrentNodeLifecycleSyncs: 1,
+				NodeMonitorPeriod:            metav1.Duration{Duration: 5 * time.Second},
 			},
 		},
 		ServiceController: &ServiceControllerOptions{
@@ -132,10 +146,12 @@ func TestDefaultFlags(t *testing.T) {
 			ClientCert:          apiserveroptions.ClientCertAuthenticationOptions{},
 			RequestHeader: apiserveroptions.RequestHeaderAuthenticationOptions{
 				UsernameHeaders:     []string{"x-remote-user"},
+				UIDHeaders:          nil,
 				GroupHeaders:        []string{"x-remote-group"},
 				ExtraHeaderPrefixes: []string{"x-remote-extra-"},
 			},
 			RemoteKubeConfigFileOptional: true,
+			Anonymous:                    &apiserverapis.AnonymousAuthConfig{Enabled: true},
 		},
 		Authorization: &apiserveroptions.DelegatingAuthorizationOptions{
 			AllowCacheTTL:                10 * time.Second,
@@ -187,8 +203,9 @@ func TestAddFlags(t *testing.T) {
 		"--leader-elect=false",
 		"--leader-elect-lease-duration=30s",
 		"--leader-elect-renew-deadline=15s",
-		"--leader-elect-resource-lock=configmap",
+		"--leader-elect-resource-lock=leases",
 		"--leader-elect-retry-period=5s",
+		"--leader-elect-recovery-deadline=90s",
 		"--master=192.168.4.20",
 		"--min-resync-period=100m",
 		"--node-status-update-frequency=10m",
@@ -198,6 +215,10 @@ func TestAddFlags(t *testing.T) {
 		"--use-service-account-credentials=false",
 		"--concurrent-node-syncs=5",
 		"--webhooks=foo,bar,-baz",
+		"--webhook-disable-http2-serving=true",
+		"--webhook-tls-cipher-suites=TLS_RSA_WITH_AES_128_CBC_SHA,TLS_RSA_WITH_AES_256_CBC_SHA",
+		"--webhook-tls-min-version=VersionTLS13",
+		"--webhook-tls-sni-cert-key=example.crt,example.key:example.com",
 	}
 	err = fs.Parse(args)
 	if err != nil {
@@ -217,7 +238,7 @@ func TestAddFlags(t *testing.T) {
 				},
 				ControllerStartInterval: metav1.Duration{Duration: 2 * time.Minute},
 				LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
-					ResourceLock:      "configmap",
+					ResourceLock:      "leases",
 					LeaderElect:       false,
 					LeaseDuration:     metav1.Duration{Duration: 30 * time.Second},
 					RenewDeadline:     metav1.Duration{Duration: 15 * time.Second},
@@ -225,7 +246,8 @@ func TestAddFlags(t *testing.T) {
 					ResourceName:      "cloud-controller-manager",
 					ResourceNamespace: "kube-system",
 				},
-				Controllers: []string{"foo", "bar"},
+				LeaderElectionRecoveryDeadline: metav1.Duration{Duration: 90 * time.Second},
+				Controllers:                    []string{"foo", "bar"},
 			},
 			Debugging: &cmoptions.DebuggingOptions{
 				DebuggingConfiguration: &componentbaseconfig.DebuggingConfiguration{
@@ -238,7 +260,6 @@ func TestAddFlags(t *testing.T) {
 		KubeCloudShared: &KubeCloudSharedOptions{
 			KubeCloudSharedConfiguration: &cpconfig.KubeCloudSharedConfiguration{
 				RouteReconciliationPeriod: metav1.Duration{Duration: 30 * time.Second},
-				NodeMonitorPeriod:         metav1.Duration{Duration: 5 * time.Second},
 				ClusterName:               "k8s",
 				ClusterCIDR:               "1.2.3.4/24",
 				AllocateNodeCIDRs:         true,
@@ -257,6 +278,12 @@ func TestAddFlags(t *testing.T) {
 				ConcurrentNodeSyncs: 5,
 			},
 		},
+		NodeLifecycleController: &NodeLifecycleControllerOptions{
+			NodeLifecycleControllerConfiguration: &nodelifecycleconfig.NodeLifecycleControllerConfiguration{
+				ConcurrentNodeLifecycleSyncs: 1,
+				NodeMonitorPeriod:            metav1.Duration{Duration: 5 * time.Second},
+			},
+		},
 		ServiceController: &ServiceControllerOptions{
 			ServiceControllerConfiguration: &serviceconfig.ServiceControllerConfiguration{
 				ConcurrentServiceSyncs: 1,
@@ -271,8 +298,16 @@ func TestAddFlags(t *testing.T) {
 					CertDirectory: "",
 					PairName:      "cloud-controller-manager-webhook",
 				},
-				BindPort:    10260,
-				BindAddress: netutils.ParseIPSloppy("0.0.0.0"),
+				BindPort:            10260,
+				BindAddress:         netutils.ParseIPSloppy("0.0.0.0"),
+				DisableHTTP2Serving: true,
+				CipherSuites:        []string{"TLS_RSA_WITH_AES_128_CBC_SHA", "TLS_RSA_WITH_AES_256_CBC_SHA"},
+				MinTLSVersion:       "VersionTLS13",
+				SNICertKeys: []cliflag.NamedCertKey{{
+					CertFile: "example.crt",
+					KeyFile:  "example.key",
+					Names:    []string{"example.com"},
+				}},
 			},
 		},
 		SecureServing: (&apiserveroptions.SecureServingOptions{
@@ -291,10 +326,12 @@ func TestAddFlags(t *testing.T) {
 			ClientCert:          apiserveroptions.ClientCertAuthenticationOptions{},
 			RequestHeader: apiserveroptions.RequestHeaderAuthenticationOptions{
 				UsernameHeaders:     []string{"x-remote-user"},
+				UIDHeaders:          nil,
 				GroupHeaders:        []string{"x-remote-group"},
 				ExtraHeaderPrefixes: []string{"x-remote-extra-"},
 			},
 			RemoteKubeConfigFileOptional: true,
+			Anonymous:                    &apiserverapis.AnonymousAuthConfig{Enabled: true},
 		},
 		Authorization: &apiserveroptions.DelegatingAuthorizationOptions{
 			AllowCacheTTL:                10 * time.Second,
@@ -314,6 +351,8 @@ func TestAddFlags(t *testing.T) {
 }
 
 func TestCreateConfig(t *testing.T) {
+	// --leader-elect-recovery-deadline is rejected unless the gate is enabled.
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, cmfeatures.LeaderElectionRecovery, true)
 	fs := pflag.NewFlagSet("addflagstest", pflag.ContinueOnError)
 
 	s, err := NewCloudControllerManagerOptions()
@@ -353,8 +392,9 @@ func TestCreateConfig(t *testing.T) {
 		"--leader-elect=false",
 		"--leader-elect-lease-duration=30s",
 		"--leader-elect-renew-deadline=15s",
-		"--leader-elect-resource-lock=configmap",
+		"--leader-elect-resource-lock=leases",
 		"--leader-elect-retry-period=5s",
+		"--leader-elect-recovery-deadline=90s",
 		"--master=192.168.4.20",
 		"--min-resync-period=100m",
 		"--node-status-update-frequency=10m",
@@ -365,14 +405,14 @@ func TestCreateConfig(t *testing.T) {
 		"--webhook-secure-port=10300",
 	}
 	err = fs.Parse(args)
-	assert.Nil(t, err, "unexpected error: %s", err)
+	require.NoError(t, err, "unexpected error: %s", err)
 
 	fs.VisitAll(func(f *pflag.Flag) {
 		fmt.Printf("%s: %s\n", f.Name, f.Value)
 	})
 
 	c, err := s.Config([]string{"foo", "bar"}, []string{}, nil, []string{"foo", "bar", "baz"}, []string{})
-	assert.Nil(t, err, "unexpected error: %s", err)
+	require.NoError(t, err, "unexpected error: %s", err)
 
 	expected := &appconfig.Config{
 		ComponentConfig: cpconfig.CloudControllerManagerConfiguration{
@@ -386,7 +426,7 @@ func TestCreateConfig(t *testing.T) {
 				},
 				ControllerStartInterval: metav1.Duration{Duration: 2 * time.Minute},
 				LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
-					ResourceLock:      "configmap",
+					ResourceLock:      "leases",
 					LeaderElect:       false,
 					LeaseDuration:     metav1.Duration{Duration: 30 * time.Second},
 					RenewDeadline:     metav1.Duration{Duration: 15 * time.Second},
@@ -394,7 +434,8 @@ func TestCreateConfig(t *testing.T) {
 					ResourceName:      "cloud-controller-manager",
 					ResourceNamespace: "kube-system",
 				},
-				Controllers: []string{"foo", "bar"},
+				LeaderElectionRecoveryDeadline: metav1.Duration{Duration: 90 * time.Second},
+				Controllers:                    []string{"foo", "bar"},
 				Debugging: componentbaseconfig.DebuggingConfiguration{
 					EnableProfiling:           false,
 					EnableContentionProfiling: true,
@@ -403,7 +444,6 @@ func TestCreateConfig(t *testing.T) {
 			},
 			KubeCloudShared: cpconfig.KubeCloudSharedConfiguration{
 				RouteReconciliationPeriod: metav1.Duration{Duration: 30 * time.Second},
-				NodeMonitorPeriod:         metav1.Duration{Duration: 5 * time.Second},
 				ClusterName:               "k8s",
 				ClusterCIDR:               "1.2.3.4/24",
 				AllocateNodeCIDRs:         true,
@@ -417,7 +457,15 @@ func TestCreateConfig(t *testing.T) {
 			ServiceController: serviceconfig.ServiceControllerConfiguration{
 				ConcurrentServiceSyncs: 1,
 			},
-			NodeController:            nodeconfig.NodeControllerConfiguration{ConcurrentNodeSyncs: 1},
+			NodeController: nodeconfig.NodeControllerConfiguration{
+				ConcurrentNodeSyncs: 1,
+				// ConcurrentNodeStatusUpdates should default to the value of ConcurrentNodeSyncs only at the stage of config creation
+				ConcurrentNodeStatusUpdates: 1,
+			},
+			NodeLifecycleController: nodelifecycleconfig.NodeLifecycleControllerConfiguration{
+				ConcurrentNodeLifecycleSyncs: 1,
+				NodeMonitorPeriod:            metav1.Duration{Duration: 5 * time.Second},
+			},
 			NodeStatusUpdateFrequency: metav1.Duration{Duration: 10 * time.Minute},
 			Webhook: cpconfig.WebhookConfiguration{
 				Webhooks: []string{"foo", "bar", "-baz"},
@@ -431,7 +479,156 @@ func TestCreateConfig(t *testing.T) {
 
 	// Don't check
 	c.SecureServing = nil
+	assert.NotNil(t, c.WebhookSecureServing, "webhook secureserving shouldn't be nil")
 	c.WebhookSecureServing = nil
+	c.Authentication = apiserver.AuthenticationInfo{}
+	c.Authorization = apiserver.AuthorizationInfo{}
+	c.SharedInformers = nil
+	c.VersionedClient = nil
+	c.ClientBuilder = nil
+	c.EventRecorder = nil
+	c.EventBroadcaster = nil
+	c.Kubeconfig = nil
+	c.Client = nil
+	c.LoopbackClientConfig = nil
+
+	if !reflect.DeepEqual(expected, c) {
+		t.Errorf("Got different config than expected.\nDifference detected on:\n%s", cmp.Diff(expected, c))
+	}
+}
+
+func TestCreateConfigWithoutWebHooks(t *testing.T) {
+	// --leader-elect-recovery-deadline is rejected unless the gate is enabled.
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, cmfeatures.LeaderElectionRecovery, true)
+	fs := pflag.NewFlagSet("addflagstest", pflag.ContinueOnError)
+
+	s, err := NewCloudControllerManagerOptions()
+	if err != nil {
+		t.Errorf("unexpected err: %v", err)
+	}
+
+	for _, f := range s.Flags([]string{""}, []string{""}, nil, []string{""}, []string{""}).FlagSets {
+		fs.AddFlagSet(f)
+	}
+
+	tmpdir, err := os.MkdirTemp("", "options_test")
+	if err != nil {
+		t.Fatalf("%s", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(tmpdir); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	args := []string{
+		"--allocate-node-cidrs=true",
+		"--authorization-always-allow-paths=",
+		"--bind-address=0.0.0.0",
+		"--secure-port=10400",
+		fmt.Sprintf("--cert-dir=%s/certs", tmpdir),
+		"--cloud-provider=aws",
+		"--cluster-cidr=1.2.3.4/24",
+		"--cluster-name=k8s",
+		"--configure-cloud-routes=false",
+		"--contention-profiling=true",
+		"--controller-start-interval=2m",
+		"--controllers=foo,bar",
+		"--concurrent-node-syncs=1",
+		"--concurrent-node-status-updates=2",
+		"--http2-max-streams-per-connection=47",
+		"--kube-api-burst=101",
+		"--kube-api-content-type=application/vnd.kubernetes.protobuf",
+		"--kube-api-qps=50.0",
+		"--leader-elect=false",
+		"--leader-elect-lease-duration=30s",
+		"--leader-elect-renew-deadline=15s",
+		"--leader-elect-resource-lock=leases",
+		"--leader-elect-retry-period=5s",
+		"--leader-elect-recovery-deadline=90s",
+		"--master=192.168.4.20",
+		"--min-resync-period=100m",
+		"--node-status-update-frequency=10m",
+		"--profiling=false",
+		"--route-reconciliation-period=30s",
+		"--use-service-account-credentials=false",
+	}
+	err = fs.Parse(args)
+	if err != nil {
+		t.Errorf("error parsing the arguments, error : %v", err)
+	}
+
+	fs.VisitAll(func(f *pflag.Flag) {
+		fmt.Printf("%s: %s\n", f.Name, f.Value)
+	})
+
+	c, err := s.Config([]string{"foo", "bar"}, []string{}, nil, []string{"foo", "bar", "baz"}, []string{})
+	if err != nil {
+		t.Errorf("error generating config, error : %v", err)
+	}
+
+	expected := &appconfig.Config{
+		ComponentConfig: cpconfig.CloudControllerManagerConfiguration{
+			Generic: cmconfig.GenericControllerManagerConfiguration{
+				Address:         "0.0.0.0",
+				MinResyncPeriod: metav1.Duration{Duration: 100 * time.Minute},
+				ClientConnection: componentbaseconfig.ClientConnectionConfiguration{
+					ContentType: "application/vnd.kubernetes.protobuf",
+					QPS:         50.0,
+					Burst:       101,
+				},
+				ControllerStartInterval: metav1.Duration{Duration: 2 * time.Minute},
+				LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
+					ResourceLock:      "leases",
+					LeaderElect:       false,
+					LeaseDuration:     metav1.Duration{Duration: 30 * time.Second},
+					RenewDeadline:     metav1.Duration{Duration: 15 * time.Second},
+					RetryPeriod:       metav1.Duration{Duration: 5 * time.Second},
+					ResourceName:      "cloud-controller-manager",
+					ResourceNamespace: "kube-system",
+				},
+				LeaderElectionRecoveryDeadline: metav1.Duration{Duration: 90 * time.Second},
+				Controllers:                    []string{"foo", "bar"},
+				Debugging: componentbaseconfig.DebuggingConfiguration{
+					EnableProfiling:           false,
+					EnableContentionProfiling: true,
+				},
+				LeaderMigration: cmconfig.LeaderMigrationConfiguration{},
+			},
+			KubeCloudShared: cpconfig.KubeCloudSharedConfiguration{
+				RouteReconciliationPeriod: metav1.Duration{Duration: 30 * time.Second},
+				ClusterName:               "k8s",
+				ClusterCIDR:               "1.2.3.4/24",
+				AllocateNodeCIDRs:         true,
+				CIDRAllocatorType:         "RangeAllocator",
+				ConfigureCloudRoutes:      false,
+				CloudProvider: cpconfig.CloudProviderConfiguration{
+					Name:            "aws",
+					CloudConfigFile: "",
+				},
+			},
+			ServiceController: serviceconfig.ServiceControllerConfiguration{
+				ConcurrentServiceSyncs: 1,
+			},
+			NodeController: nodeconfig.NodeControllerConfiguration{
+				ConcurrentNodeSyncs:         1,
+				ConcurrentNodeStatusUpdates: 2,
+			},
+			NodeLifecycleController: nodelifecycleconfig.NodeLifecycleControllerConfiguration{
+				ConcurrentNodeLifecycleSyncs: 1,
+				NodeMonitorPeriod:            metav1.Duration{Duration: 5 * time.Second},
+			},
+			NodeStatusUpdateFrequency: metav1.Duration{Duration: 10 * time.Minute},
+			Webhook:                   cpconfig.WebhookConfiguration{},
+		},
+		SecureServing:        nil,
+		WebhookSecureServing: nil,
+		Authentication:       apiserver.AuthenticationInfo{},
+		Authorization:        apiserver.AuthorizationInfo{},
+	}
+
+	// Don't check
+	c.SecureServing = nil
 	c.Authentication = apiserver.AuthenticationInfo{}
 	c.Authorization = apiserver.AuthorizationInfo{}
 	c.SharedInformers = nil
@@ -481,5 +678,39 @@ func TestCloudControllerManagerAliases(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cfg.Controllers, expectedControllers) {
 		t.Errorf("controller aliases not resolved correctly, expected %+v, got %+v", expectedControllers, cfg.Controllers)
+	}
+}
+
+func TestValidateLeaderElectionRecoveryDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		recovery, coordinated bool
+		wantErr               string
+	}{
+		{name: "gate off", wantErr: "leader-elect-recovery-deadline requires the LeaderElectionRecovery feature gate"},
+		{name: "gate on", recovery: true},
+		{name: "gate on with coordinated leader election", recovery: true, coordinated: true, wantErr: "leader-elect-recovery-deadline is not yet supported with the CoordinatedLeaderElection feature gate"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, cmfeatures.LeaderElectionRecovery, tc.recovery)
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.CoordinatedLeaderElection, tc.coordinated)
+			o, err := NewCloudControllerManagerOptions()
+			if err != nil {
+				t.Fatal(err)
+			}
+			o.Generic.LeaderElectionRecoveryDeadline = metav1.Duration{Duration: 30 * time.Second}
+			// Other options are left at their defaults, so Validate may report
+			// unrelated errors; only the recovery deadline ones matter here.
+			got := ""
+			if err := o.Validate(nil, nil, nil, nil, nil); err != nil {
+				got = err.Error()
+			}
+			if tc.wantErr == "" && strings.Contains(got, "leader-elect-recovery-deadline") {
+				t.Errorf("unexpected recovery deadline error: %s", got)
+			}
+			if tc.wantErr != "" && !strings.Contains(got, tc.wantErr) {
+				t.Errorf("expected an error containing %q, got %q", tc.wantErr, got)
+			}
+		})
 	}
 }

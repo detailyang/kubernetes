@@ -1,19 +1,10 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
 approvers:
-  - fabriziopandini
-  - neolit123
-  - SataQiu
-  - pacoxu
+  - sig-node-approvers
+  - atiratree
 reviewers:
-  - fabriziopandini
-  - neolit123
-  - SataQiu
-  - pacoxu
+  - atiratree
 labels:
-  - sig/cluster-lifecycle
-emeritus_approvers:
-  - rosti
-  - ereslibre
-  - timothysc
-  - luxas
+  - sig/node
+  - wg/node-lifecycle

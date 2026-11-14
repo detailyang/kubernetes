@@ -34,13 +34,13 @@ import (
 
 	"sigs.k8s.io/yaml"
 
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	"k8s.io/apiextensions-api/pkg/client/clientset/clientset/fake"
+	informers "k8s.io/apiextensions-api/pkg/client/informers/externalversions"
+	listers "k8s.io/apiextensions-api/pkg/client/listers/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/conversion"
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
-	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
-	informers "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
-	listers "k8s.io/apiextensions-apiserver/pkg/client/listers/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/controller/establish"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -58,6 +58,7 @@ import (
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/server/options"
+	"k8s.io/apiserver/pkg/storage/cacher"
 	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
 	"k8s.io/apiserver/pkg/util/webhook"
 	"k8s.io/client-go/tools/cache"
@@ -484,6 +485,10 @@ func testHandlerConversion(t *testing.T, enableWatchCache bool) {
 		t.Fatal(err)
 	}
 
+	if enableWatchCache {
+		storageConfig.EventsHistoryWindow = cacher.DefaultEventFreshDuration
+	}
+
 	etcdOptions := options.NewEtcdOptions(storageConfig)
 	etcdOptions.StorageConfig.Codec = unstructured.UnstructuredJSONScheme
 	restOptionsGetter := generic.RESTOptions{
@@ -673,7 +678,6 @@ unknown: foo`
 	"apiVersion": "stable.example.com/v1beta1",
 	"kind": "MultiVersion",
 	"metadata": {
-		"creationTimestamp": null,
 		"generation": 1,
 		"name": "my-mv"
 	},
@@ -690,7 +694,6 @@ unknown: foo`
 	"apiVersion": "stable.example.com/v1beta1",
 	"kind": "MultiVersion",
 	"metadata": {
-		"creationTimestamp": null,
 		"generation": 1,
 		"name": "my-mv"
 	},

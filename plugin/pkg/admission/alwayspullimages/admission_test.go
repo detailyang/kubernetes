@@ -47,6 +47,11 @@ func TestAdmission(t *testing.T) {
 				{Name: "ctr3", Image: "image", ImagePullPolicy: api.PullIfNotPresent},
 				{Name: "ctr4", Image: "image", ImagePullPolicy: api.PullAlways},
 			},
+			Volumes: []api.Volume{
+				{Name: "volume1", VolumeSource: api.VolumeSource{Image: &api.ImageVolumeSource{PullPolicy: api.PullNever}}},
+				{Name: "volume2", VolumeSource: api.VolumeSource{Image: &api.ImageVolumeSource{PullPolicy: api.PullIfNotPresent}}},
+				{Name: "volume3", VolumeSource: api.VolumeSource{Image: &api.ImageVolumeSource{PullPolicy: api.PullAlways}}},
+			},
 		},
 	}
 	err := handler.Admit(context.TODO(), admission.NewAttributesRecord(&pod, nil, api.Kind("Pod").WithVersion("version"), pod.Namespace, pod.Name, api.Resource("pods").WithVersion("version"), "", admission.Create, &metav1.CreateOptions{}, false, nil), nil)
@@ -61,6 +66,11 @@ func TestAdmission(t *testing.T) {
 	for _, c := range pod.Spec.Containers {
 		if c.ImagePullPolicy != api.PullAlways {
 			t.Errorf("Container %v: expected pull always, got %v", c, c.ImagePullPolicy)
+		}
+	}
+	for _, v := range pod.Spec.Volumes {
+		if v.Image.PullPolicy != api.PullAlways {
+			t.Errorf("Image volume %v: expected pull always, got %v", v, v.Image.PullPolicy)
 		}
 	}
 }
@@ -83,6 +93,12 @@ func TestValidate(t *testing.T) {
 				{Name: "ctr3", Image: "image", ImagePullPolicy: api.PullIfNotPresent},
 				{Name: "ctr4", Image: "image", ImagePullPolicy: api.PullAlways},
 			},
+			Volumes: []api.Volume{
+				{Name: "volume1", VolumeSource: api.VolumeSource{Image: &api.ImageVolumeSource{PullPolicy: ""}}},
+				{Name: "volume2", VolumeSource: api.VolumeSource{Image: &api.ImageVolumeSource{PullPolicy: api.PullNever}}},
+				{Name: "volume3", VolumeSource: api.VolumeSource{Image: &api.ImageVolumeSource{PullPolicy: api.PullIfNotPresent}}},
+				{Name: "volume4", VolumeSource: api.VolumeSource{Image: &api.ImageVolumeSource{PullPolicy: api.PullAlways}}},
+			},
 		},
 	}
 	expectedError := `[` +
@@ -91,7 +107,11 @@ func TestValidate(t *testing.T) {
 		`pods "123" is forbidden: spec.initContainers[2].imagePullPolicy: Unsupported value: "IfNotPresent": supported values: "Always", ` +
 		`pods "123" is forbidden: spec.containers[0].imagePullPolicy: Unsupported value: "": supported values: "Always", ` +
 		`pods "123" is forbidden: spec.containers[1].imagePullPolicy: Unsupported value: "Never": supported values: "Always", ` +
-		`pods "123" is forbidden: spec.containers[2].imagePullPolicy: Unsupported value: "IfNotPresent": supported values: "Always"]`
+		`pods "123" is forbidden: spec.containers[2].imagePullPolicy: Unsupported value: "IfNotPresent": supported values: "Always", ` +
+		`pods "123" is forbidden: spec.volumes[0].image.pullPolicy: Unsupported value: "": supported values: "Always", ` +
+		`pods "123" is forbidden: spec.volumes[1].image.pullPolicy: Unsupported value: "Never": supported values: "Always", ` +
+		`pods "123" is forbidden: spec.volumes[2].image.pullPolicy: Unsupported value: "IfNotPresent": supported values: "Always"` +
+		`]`
 	err := handler.Validate(context.TODO(), admission.NewAttributesRecord(&pod, nil, api.Kind("Pod").WithVersion("version"), pod.Namespace, pod.Name, api.Resource("pods").WithVersion("version"), "", admission.Create, &metav1.CreateOptions{}, false, nil), nil)
 	if err == nil {
 		t.Fatal("missing expected error")
@@ -265,4 +285,68 @@ func TestUpdatePod(t *testing.T) {
 
 	}
 
+}
+
+// TestDynamicContainers verifies that containers added through the pods/dynamic subresource are
+// forced to always pull their images.
+func TestDynamicContainers(t *testing.T) {
+	oldPod := &api.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "ns"},
+		Spec: api.PodSpec{
+			Containers: []api.Container{{Name: "existing", Image: "image", ImagePullPolicy: api.PullAlways}},
+		},
+	}
+	newPod := func() *api.Pod {
+		pod := oldPod.DeepCopy()
+		pod.Spec.Containers = append(pod.Spec.Containers, api.Container{Name: "added", Image: "new-image", ImagePullPolicy: api.PullIfNotPresent})
+		return pod
+	}
+	attrs := func(pod *api.Pod, subresource string) admission.Attributes {
+		return admission.NewAttributesRecord(pod, oldPod, api.Kind("Pod").WithVersion("version"), pod.Namespace, pod.Name, api.Resource("pods").WithVersion("version"), subresource, admission.Update, &metav1.UpdateOptions{}, false, nil)
+	}
+	handler := &AlwaysPullImages{}
+
+	pod := newPod()
+	if err := admissiontesting.WithReinvocationTesting(t, handler).Admit(t.Context(), attrs(pod, "dynamic"), nil); err != nil {
+		t.Fatalf("Admit() error: %v", err)
+	}
+	if got := pod.Spec.Containers[1].ImagePullPolicy; got != api.PullAlways {
+		t.Errorf("added container ImagePullPolicy = %s, want %s", got, api.PullAlways)
+	}
+
+	if err := handler.Validate(t.Context(), attrs(newPod(), "dynamic"), nil); err == nil {
+		t.Error("expected Validate() to reject an added container that doesn't always pull")
+	}
+
+	if err := handler.Validate(t.Context(), attrs(newPod(), "status"), nil); err != nil {
+		t.Errorf("expected Validate() to ignore the status subresource, got %v", err)
+	}
+
+	reusedImage := newPod()
+	reusedImage.Spec.Containers[1].Image = oldPod.Spec.Containers[0].Image
+	if err := handler.Validate(t.Context(), attrs(reusedImage.DeepCopy(), "dynamic"), nil); err == nil {
+		t.Error("expected Validate() to reject an added container that reuses an image and doesn't always pull")
+	}
+	if err := admissiontesting.WithReinvocationTesting(t, handler).Admit(t.Context(), attrs(reusedImage, "dynamic"), nil); err != nil {
+		t.Fatalf("Admit() error: %v", err)
+	}
+	if got := reusedImage.Spec.Containers[1].ImagePullPolicy; got != api.PullAlways {
+		t.Errorf("added container with a reused image ImagePullPolicy = %s, want %s", got, api.PullAlways)
+	}
+
+	// Existing containers that predate the plugin keep their immutable pull policy.
+	oldPod.Spec.Containers[0].ImagePullPolicy = api.PullIfNotPresent
+	predating := newPod()
+	if err := admissiontesting.WithReinvocationTesting(t, handler).Admit(t.Context(), attrs(predating, "dynamic"), nil); err != nil {
+		t.Fatalf("Admit() error: %v", err)
+	}
+	if got := predating.Spec.Containers[0].ImagePullPolicy; got != api.PullIfNotPresent {
+		t.Errorf("existing container ImagePullPolicy = %s, want %s", got, api.PullIfNotPresent)
+	}
+	if got := predating.Spec.Containers[1].ImagePullPolicy; got != api.PullAlways {
+		t.Errorf("added container ImagePullPolicy = %s, want %s", got, api.PullAlways)
+	}
+	if err := handler.Validate(t.Context(), attrs(predating, "dynamic"), nil); err != nil {
+		t.Errorf("expected Validate() to ignore an existing container that predates the plugin, got %v", err)
+	}
 }

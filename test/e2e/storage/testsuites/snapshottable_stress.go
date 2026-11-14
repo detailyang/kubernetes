@@ -20,6 +20,7 @@ package testsuites
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/onsi/ginkgo/v2"
@@ -28,10 +29,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	errors "k8s.io/apimachinery/pkg/util/errors"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
-	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
 	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
 	storageutils "k8s.io/kubernetes/test/e2e/storage/utils"
@@ -67,7 +68,7 @@ func InitCustomSnapshottableStressTestSuite(patterns []storageframework.TestPatt
 			SupportedSizeRange: e2evolume.SizeRange{
 				Min: "1Mi",
 			},
-			FeatureTag: "[Feature:VolumeSnapshotDataSource]",
+			TestTags: []interface{}{feature.VolumeSnapshotDataSource},
 		},
 	}
 }
@@ -86,11 +87,11 @@ func (t *snapshottableStressTestSuite) GetTestSuiteInfo() storageframework.TestS
 	return t.tsInfo
 }
 
-func (t *snapshottableStressTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
+func (t *snapshottableStressTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) string {
 	driverInfo := driver.GetDriverInfo()
 	var ok bool
 	if driverInfo.VolumeSnapshotStressTestOptions == nil {
-		e2eskipper.Skipf("Driver %s doesn't specify snapshot stress test options -- skipping", driverInfo.Name)
+		return fmt.Sprintf("Driver %s doesn't specify snapshot stress test options", driverInfo.Name)
 	}
 	if driverInfo.VolumeSnapshotStressTestOptions.NumPods <= 0 {
 		framework.Failf("NumPods in snapshot stress test options must be a positive integer, received: %d", driverInfo.VolumeSnapshotStressTestOptions.NumPods)
@@ -100,13 +101,14 @@ func (t *snapshottableStressTestSuite) SkipUnsupportedTests(driver storageframew
 	}
 	_, ok = driver.(storageframework.SnapshottableTestDriver)
 	if !driverInfo.Capabilities[storageframework.CapSnapshotDataSource] || !ok {
-		e2eskipper.Skipf("Driver %q doesn't implement SnapshottableTestDriver - skipping", driverInfo.Name)
+		return fmt.Sprintf("Driver %q doesn't implement SnapshottableTestDriver", driverInfo.Name)
 	}
 
 	_, ok = driver.(storageframework.DynamicPVTestDriver)
 	if !ok {
-		e2eskipper.Skipf("Driver %s doesn't implement DynamicPVTestDriver -- skipping", driverInfo.Name)
+		return fmt.Sprintf("Driver %s doesn't implement DynamicPVTestDriver", driverInfo.Name)
 	}
+	return ""
 }
 
 func (t *snapshottableStressTestSuite) DefineTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
@@ -119,7 +121,7 @@ func (t *snapshottableStressTestSuite) DefineTests(driver storageframework.TestD
 
 	// Beware that it also registers an AfterEach which renders f unusable. Any code using
 	// f must run inside an It or Context callback.
-	f := framework.NewDefaultFramework("snapshottable-stress")
+	f := framework.NewFrameworkWithCustomTimeouts("snapshottable-stress", storageframework.GetDriverTimeouts(driver))
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
 	init := func(ctx context.Context) {
@@ -237,7 +239,7 @@ func (t *snapshottableStressTestSuite) DefineTests(driver storageframework.TestD
 		framework.ExpectNoError(errors.NewAggregate(errs), "while cleaning up resources")
 	}
 
-	ginkgo.It("should support snapshotting of many volumes repeatedly [Slow] [Serial]", func(ctx context.Context) {
+	f.It("should support snapshotting of many volumes repeatedly", f.WithSlow(), f.WithSerial(), func(ctx context.Context) {
 		init(ctx)
 		ginkgo.DeferCleanup(cleanup)
 		createPodsAndVolumes(ctx)

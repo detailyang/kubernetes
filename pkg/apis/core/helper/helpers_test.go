@@ -60,7 +60,7 @@ func TestIsStandardResource(t *testing.T) {
 		{"requests.hugepages-2Mi", true},
 	}
 	for i, tc := range testCases {
-		if IsStandardResourceName(tc.input) != tc.output {
+		if IsStandardResourceName(core.ResourceName(tc.input)) != tc.output {
 			t.Errorf("case[%d], input: %s, expected: %t, got: %t", i, tc.input, tc.output, !tc.output)
 		}
 	}
@@ -77,7 +77,26 @@ func TestIsStandardContainerResource(t *testing.T) {
 		{"hugepages-2Mi", true},
 	}
 	for i, tc := range testCases {
-		if IsStandardContainerResourceName(tc.input) != tc.output {
+		if IsStandardContainerResourceName(core.ResourceName(tc.input)) != tc.output {
+			t.Errorf("case[%d], input: %s, expected: %t, got: %t", i, tc.input, tc.output, !tc.output)
+		}
+	}
+}
+
+func TestIsNodeAllocatableResource(t *testing.T) {
+	testCases := []struct {
+		input  string
+		output bool
+	}{
+		{"cpu", true},
+		{"memory", true},
+		{"ephemeral-storage", false},
+		{"hugepages-2Mi", true},
+		{"disk", false},
+		{"blah", false},
+	}
+	for i, tc := range testCases {
+		if IsNodeAllocatableResourceName(core.ResourceName(tc.input)) != tc.output {
 			t.Errorf("case[%d], input: %s, expected: %t, got: %t", i, tc.input, tc.output, !tc.output)
 		}
 	}
@@ -158,6 +177,52 @@ func TestIsHugePageResourceName(t *testing.T) {
 	for _, testCase := range testCases {
 		if testCase.result != IsHugePageResourceName(testCase.name) {
 			t.Errorf("resource: %v expected result: %v", testCase.name, testCase.result)
+		}
+	}
+}
+
+func TestIsHugePageResourceValueDivisibleOverflow(t *testing.T) {
+	testCases := []struct {
+		desc     string
+		name     core.ResourceName
+		quantity string
+		result   bool
+	}{
+		{"request at the int64 limit, page size 1", "hugepages-1", "9223372036854775807", true},
+		{"request at the int64 limit, not a multiple", "hugepages-2Mi", "9223372036854775807", false},
+		{"request past int64", "hugepages-2Mi", "9223372036854775808", false},
+		{"request well past int64", "hugepages-2Mi", "1e30", false},
+		{"request past int64, page size dividing MaxInt64", "hugepages-7", "9223372036854775808", false},
+		{"negative request past int64", "hugepages-2Mi", "-1e30", false},
+		{"page size whose milli value exceeds int64", "hugepages-16Pi", "16Pi", false},
+		{"page size past int64", "hugepages-1e19", "1", false},
+		{"page size well past int64", "hugepages-1e30", "1", false},
+		{"page size below one byte", "hugepages-0.5", "1", false},
+	}
+	for _, testCase := range testCases {
+		if testCase.result != IsHugePageResourceValueDivisible(testCase.name, resource.MustParse(testCase.quantity)) {
+			t.Errorf("%s: resource: %v quantity: %v expected result: %v", testCase.desc, testCase.name, testCase.quantity, testCase.result)
+		}
+	}
+}
+
+func TestIsHugePageResourceValueDivisibleRounding(t *testing.T) {
+	// Both operands are rounded to whole bytes before the comparison.
+	testCases := []struct {
+		desc     string
+		name     core.ResourceName
+		quantity string
+		result   bool
+	}{
+		{"2Mi written in milli", "hugepages-2Mi", "2097152000m", true},
+		{"half a byte below 2Mi rounds up to it", "hugepages-2Mi", "2097151500m", true},
+		{"half a byte above 2Mi rounds away from it", "hugepages-2Mi", "2097152500m", false},
+		{"page size with trailing zeros", "hugepages-17179869184.000000000", "34359738368", true},
+		{"page size half a milli below 2 bytes", "hugepages-1.9995", "2", true},
+	}
+	for _, testCase := range testCases {
+		if testCase.result != IsHugePageResourceValueDivisible(testCase.name, resource.MustParse(testCase.quantity)) {
+			t.Errorf("%s: resource: %v quantity: %v expected result: %v", testCase.desc, testCase.name, testCase.quantity, testCase.result)
 		}
 	}
 }
@@ -365,6 +430,51 @@ func TestIsServiceIPSet(t *testing.T) {
 			}
 			if IsServiceIPSet(&s) != tc.output {
 				t.Errorf("case, input: %v, expected: %v, got: %v", tc.input, tc.output, !tc.output)
+			}
+		})
+	}
+}
+
+func TestHasInvalidLabelValueInNodeSelectorTerms(t *testing.T) {
+	testCases := []struct {
+		name   string
+		terms  []core.NodeSelectorTerm
+		expect bool
+	}{
+		{
+			name: "valid values",
+			terms: []core.NodeSelectorTerm{{
+				MatchExpressions: []core.NodeSelectorRequirement{{
+					Key:      "foo",
+					Operator: core.NodeSelectorOpIn,
+					Values:   []string{"far"},
+				}},
+			}},
+			expect: false,
+		},
+		{
+			name:   "empty terms",
+			terms:  []core.NodeSelectorTerm{},
+			expect: false,
+		},
+		{
+			name: "invalid label value",
+			terms: []core.NodeSelectorTerm{{
+				MatchExpressions: []core.NodeSelectorRequirement{{
+					Key:      "foo",
+					Operator: core.NodeSelectorOpIn,
+					Values:   []string{"-1"},
+				}},
+			}},
+			expect: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := HasInvalidLabelValueInNodeSelectorTerms(tc.terms)
+			if got != tc.expect {
+				t.Errorf("exepct %v, got %v", tc.expect, got)
 			}
 		})
 	}

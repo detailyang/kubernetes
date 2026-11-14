@@ -19,6 +19,7 @@ package bootstrap
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -68,20 +69,27 @@ type TokenCleaner struct {
 	// secretSynced returns true if the secret shared informer has been synced at least once.
 	secretSynced cache.InformerSynced
 
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 }
 
 // NewTokenCleaner returns a new *NewTokenCleaner.
-func NewTokenCleaner(cl clientset.Interface, secrets coreinformers.SecretInformer, options TokenCleanerOptions) (*TokenCleaner, error) {
+func NewTokenCleaner(ctx context.Context, cl clientset.Interface, secrets coreinformers.SecretInformer, options TokenCleanerOptions) (*TokenCleaner, error) {
+	logger := klog.FromContext(ctx)
 	e := &TokenCleaner{
 		client:               cl,
 		secretLister:         secrets.Lister(),
 		secretSynced:         secrets.Informer().HasSynced,
 		tokenSecretNamespace: options.TokenSecretNamespace,
-		queue:                workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "token_cleaner"),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: &logger,
+				Name:   "token_cleaner",
+			},
+		),
 	}
 
-	secrets.Informer().AddEventHandlerWithResyncPeriod(
+	_, _ = secrets.Informer().AddEventHandlerWithOptions(
 		cache.FilteringResourceEventHandler{
 			FilterFunc: func(obj interface{}) bool {
 				switch t := obj.(type) {
@@ -97,7 +105,10 @@ func NewTokenCleaner(cl clientset.Interface, secrets coreinformers.SecretInforme
 				UpdateFunc: func(oldSecret, newSecret interface{}) { e.enqueueSecrets(newSecret) },
 			},
 		},
-		options.SecretResync,
+		cache.HandlerOptions{
+			Logger:       &logger,
+			ResyncPeriod: &options.SecretResync,
+		},
 	)
 
 	return e, nil
@@ -105,19 +116,25 @@ func NewTokenCleaner(cl clientset.Interface, secrets coreinformers.SecretInforme
 
 // Run runs controller loops and returns when they are done
 func (tc *TokenCleaner) Run(ctx context.Context) {
-	defer utilruntime.HandleCrash()
-	defer tc.queue.ShutDown()
+	defer utilruntime.HandleCrashWithContext(ctx)
 
 	logger := klog.FromContext(ctx)
 	logger.Info("Starting token cleaner controller")
-	defer logger.Info("Shutting down token cleaner controller")
 
-	if !cache.WaitForNamedCacheSync("token_cleaner", ctx.Done(), tc.secretSynced) {
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down token cleaner controller")
+		tc.queue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, tc.secretSynced) {
 		return
 	}
 
-	go wait.UntilWithContext(ctx, tc.worker, 10*time.Second)
-
+	wg.Go(func() {
+		wait.UntilWithContext(ctx, tc.worker, 10*time.Second)
+	})
 	<-ctx.Done()
 }
 
@@ -144,7 +161,7 @@ func (tc *TokenCleaner) processNextWorkItem(ctx context.Context) bool {
 	}
 	defer tc.queue.Done(key)
 
-	if err := tc.syncFunc(ctx, key.(string)); err != nil {
+	if err := tc.syncFunc(ctx, key); err != nil {
 		tc.queue.AddRateLimited(key)
 		utilruntime.HandleError(fmt.Errorf("Sync %v failed with : %v", key, err))
 		return true

@@ -20,24 +20,77 @@ package kubectl
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+
+	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubectl/pkg/cmd/util/podcmd"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2edeployment "k8s.io/kubernetes/test/e2e/framework/deployment"
 	e2ekubectl "k8s.io/kubernetes/test/e2e/framework/kubectl"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eoutput "k8s.io/kubernetes/test/e2e/framework/pod/output"
+	imageutils "k8s.io/kubernetes/test/utils/image"
 	admissionapi "k8s.io/pod-security-admission/api"
-
-	"github.com/onsi/ginkgo/v2"
-	"github.com/onsi/gomega"
+	"k8s.io/utils/ptr"
 )
+
+func testingDeployment(name, ns string, numberOfPods int32) appsv1.Deployment {
+	return appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			Labels: map[string]string{
+				"name": name,
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &numberOfPods,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"name": name,
+				},
+			},
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"name": name,
+					},
+					Annotations: map[string]string{
+						podcmd.DefaultContainerAnnotationName: "container-2",
+					},
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name:    "container-1",
+							Image:   imageutils.GetE2EImage(imageutils.Agnhost),
+							Command: []string{"/bin/sh", "-c"},
+							Args:    []string{"/agnhost logs-generator --log-lines-total 10 --run-duration 30s && /agnhost pause"},
+						},
+						{
+							Name:    "container-2",
+							Image:   imageutils.GetE2EImage(imageutils.Agnhost),
+							Command: []string{"/bin/sh", "-c"},
+							Args:    []string{"/agnhost logs-generator --log-lines-total 20 --run-duration 30s && /agnhost pause"},
+						},
+					},
+					RestartPolicy:                 v1.RestartPolicyAlways,
+					TerminationGracePeriodSeconds: ptr.To[int64](0),
+				},
+			},
+		},
+	}
+}
 
 func testingPod(name, value, defaultContainerName string) v1.Pod {
 	return v1.Pod{
@@ -55,12 +108,12 @@ func testingPod(name, value, defaultContainerName string) v1.Pod {
 			Containers: []v1.Container{
 				{
 					Name:  "container-1",
-					Image: agnhostImage,
+					Image: imageutils.GetE2EImage(imageutils.Agnhost),
 					Args:  []string{"logs-generator", "--log-lines-total", "10", "--run-duration", "5s"},
 				},
 				{
 					Name:  defaultContainerName,
-					Image: agnhostImage,
+					Image: imageutils.GetE2EImage(imageutils.Agnhost),
 					Args:  []string{"logs-generator", "--log-lines-total", "20", "--run-duration", "5s"},
 				},
 			},
@@ -92,9 +145,9 @@ var _ = SIGDescribe("Kubectl logs", func() {
 		podName := "logs-generator"
 		containerName := "logs-generator"
 		ginkgo.BeforeEach(func() {
-			ginkgo.By("creating an pod")
+			ginkgo.By("creating a pod")
 			// Agnhost image generates logs for a total of 100 lines over 20s.
-			e2ekubectl.RunKubectlOrDie(ns, "run", podName, "--image="+agnhostImage, "--restart=Never", podRunningTimeoutArg, "--", "logs-generator", "--log-lines-total", "100", "--run-duration", "20s")
+			e2ekubectl.RunKubectlOrDie(ns, "run", podName, "--image="+imageutils.GetE2EImage(imageutils.Agnhost), "--restart=Never", podRunningTimeoutArg, "--", "logs-generator", "--log-lines-total", "100", "--run-duration", "20s")
 		})
 		ginkgo.AfterEach(func() {
 			e2ekubectl.RunKubectlOrDie(ns, "delete", "pod", podName)
@@ -111,7 +164,7 @@ var _ = SIGDescribe("Kubectl logs", func() {
 				'kubectl --since=1s' should output logs that are only 1 second older from now
 				'kubectl --since=24h' should output logs that are only 1 day older from now
 		*/
-		framework.ConformanceIt("should be able to retrieve and filter logs ", func(ctx context.Context) {
+		framework.ConformanceIt("should be able to retrieve and filter logs", func(ctx context.Context) {
 
 			ginkgo.By("Waiting for log generator to start.")
 			if !e2epod.CheckPodsRunningReadyOrSucceeded(ctx, c, ns, []string{podName}, framework.PodStartTimeout) {
@@ -205,6 +258,83 @@ var _ = SIGDescribe("Kubectl logs", func() {
 				framework.Logf("got output %q", out)
 				gomega.Expect(lines(out)).To(gomega.HaveLen(20))
 			})
+		})
+	})
+
+	ginkgo.Describe("all pod logs", func() {
+		ginkgo.Describe("the Deployment has 2 replicas and each pod has 2 containers", func() {
+			var deploy *appsv1.Deployment
+			deployName := "deploy-" + string(uuid.NewUUID())
+			numberReplicas := int32(2)
+			ginkgo.BeforeEach(func(ctx context.Context) {
+				deployClient := c.AppsV1().Deployments(ns)
+				ginkgo.By("constructing the Deployment")
+				deployCopy := testingDeployment(deployName, ns, numberReplicas)
+				deploy = &deployCopy
+				ginkgo.By("creating the Deployment")
+				var err error
+				deploy, err = deployClient.Create(ctx, deploy, metav1.CreateOptions{})
+				framework.ExpectNoError(err, "failed to create deployment")
+
+				framework.ExpectNoError(e2edeployment.WaitForDeploymentComplete(c, deploy),
+					"failed to wait for deployment to complete")
+				framework.ExpectNoError(e2epod.WaitForPodsRunningReady(ctx, c, ns, 2, framework.PodStartTimeout),
+					"failed to wait for pods are running")
+			})
+
+			ginkgo.AfterEach(func() {
+				e2ekubectl.RunKubectlOrDie(ns, "delete", "deploy", deployName)
+			})
+
+			ginkgo.It("should get logs from all pods based on default container", func(ctx context.Context) {
+				ginkgo.By("Waiting for Deployment pods to be running.")
+
+				pods, err := e2edeployment.GetPodsForDeployment(ctx, c, deploy)
+				framework.ExpectNoError(err, "failed to get pods for deployment")
+
+				podOne := pods.Items[0].GetName()
+				podTwo := pods.Items[1].GetName()
+
+				ginkgo.By("expecting logs from the default container from both pods in a deployment")
+				var out string
+				gomega.Eventually(func() (string, error) {
+					var runErr error
+					out, runErr = e2ekubectl.RunKubectl(ns, "logs", fmt.Sprintf("deploy/%s", deployName), "--all-pods")
+					return out, runErr
+				}, framework.PodStartTimeout, 5*time.Second).Should(
+					gomega.SatisfyAll(
+						gomega.ContainSubstring(fmt.Sprintf("[pod/%s/container-2]", podOne)),
+						gomega.ContainSubstring(fmt.Sprintf("[pod/%s/container-2]", podTwo)),
+					),
+				)
+
+				ginkgo.By("logs should NOT contain data from the non-default container from both pods in a deployment")
+				gomega.Expect(strings.Contains(out, fmt.Sprintf("[pod/%s/container-1]", podOne))).To(gomega.BeFalseBecause("pod 1 container 1 log should NOT be present"))
+				gomega.Expect(strings.Contains(out, fmt.Sprintf("[pod/%s/container-1]", podTwo))).To(gomega.BeFalseBecause("pod 2 container 1 log should NOT be present"))
+			})
+
+			ginkgo.It("should get logs from each pod and each container in Deployment", func(ctx context.Context) {
+				ginkgo.By("Waiting for Deployment pods to be running.")
+
+				pods, err := e2edeployment.GetPodsForDeployment(ctx, c, deploy)
+				framework.ExpectNoError(err, "failed to get pods for deployment")
+
+				podOne := pods.Items[0].GetName()
+				podTwo := pods.Items[1].GetName()
+
+				ginkgo.By("expecting logs from all containers from both pods in a deployment")
+				gomega.Eventually(func() (string, error) {
+					return e2ekubectl.RunKubectl(ns, "logs", fmt.Sprintf("deploy/%s", deployName), "--all-pods", "--all-containers")
+				}, framework.PodStartTimeout, 5*time.Second).Should(
+					gomega.SatisfyAll(
+						gomega.ContainSubstring(fmt.Sprintf("[pod/%s/container-1]", podOne)),
+						gomega.ContainSubstring(fmt.Sprintf("[pod/%s/container-2]", podOne)),
+						gomega.ContainSubstring(fmt.Sprintf("[pod/%s/container-1]", podTwo)),
+						gomega.ContainSubstring(fmt.Sprintf("[pod/%s/container-2]", podTwo)),
+					),
+				)
+			})
+
 		})
 	})
 

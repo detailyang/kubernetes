@@ -18,6 +18,7 @@ package exec
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,20 +34,21 @@ import (
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/rest/fake"
 	"k8s.io/client-go/tools/remotecommand"
-
 	cmdtesting "k8s.io/kubectl/pkg/cmd/testing"
 	"k8s.io/kubectl/pkg/scheme"
 	"k8s.io/kubectl/pkg/util/term"
 )
 
 type fakeRemoteExecutor struct {
-	method  string
 	url     *url.URL
 	execErr error
 }
 
-func (f *fakeRemoteExecutor) Execute(method string, url *url.URL, config *restclient.Config, stdin io.Reader, stdout, stderr io.Writer, tty bool, terminalSizeQueue remotecommand.TerminalSizeQueue) error {
-	f.method = method
+func (f *fakeRemoteExecutor) Execute(url *url.URL, config *restclient.Config, stdin io.Reader, stdout, stderr io.Writer, tty bool, terminalSizeQueue remotecommand.TerminalSizeQueue) error {
+	return f.ExecuteWithContext(context.Background(), url, config, stdin, stdout, stderr, tty, terminalSizeQueue)
+}
+
+func (f *fakeRemoteExecutor) ExecuteWithContext(ctx context.Context, url *url.URL, config *restclient.Config, stdin io.Reader, stdout, stderr io.Writer, tty bool, terminalSizeQueue remotecommand.TerminalSizeQueue) error {
 	f.url = url
 	return f.execErr
 }
@@ -55,7 +57,7 @@ func TestPodAndContainer(t *testing.T) {
 	tests := []struct {
 		args              []string
 		argsLenAtDash     int
-		p                 *ExecOptions
+		flags             *ExecFlags
 		name              string
 		expectError       bool
 		expectedPod       string
@@ -64,27 +66,27 @@ func TestPodAndContainer(t *testing.T) {
 		obj               *corev1.Pod
 	}{
 		{
-			p:             &ExecOptions{},
+			flags:         &ExecFlags{},
 			argsLenAtDash: -1,
 			expectError:   true,
 			name:          "empty",
 		},
 		{
-			p:             &ExecOptions{},
+			flags:         &ExecFlags{},
 			argsLenAtDash: -1,
 			expectError:   true,
 			name:          "no cmd",
 			obj:           execPod(),
 		},
 		{
-			p:             &ExecOptions{StreamOptions: StreamOptions{ContainerName: "bar"}},
+			flags:         &ExecFlags{ContainerName: "bar"},
 			argsLenAtDash: -1,
 			expectError:   true,
 			name:          "no cmd, w/ container",
 			obj:           execPod(),
 		},
 		{
-			p:             &ExecOptions{},
+			flags:         &ExecFlags{},
 			args:          []string{"foo", "cmd"},
 			argsLenAtDash: 0,
 			expectError:   true,
@@ -92,7 +94,7 @@ func TestPodAndContainer(t *testing.T) {
 			obj:           execPod(),
 		},
 		{
-			p:             &ExecOptions{},
+			flags:         &ExecFlags{},
 			args:          []string{"foo"},
 			argsLenAtDash: -1,
 			expectError:   true,
@@ -100,7 +102,7 @@ func TestPodAndContainer(t *testing.T) {
 			obj:           execPod(),
 		},
 		{
-			p:             &ExecOptions{},
+			flags:         &ExecFlags{},
 			args:          []string{"foo", "cmd"},
 			argsLenAtDash: 1,
 			expectedPod:   "foo",
@@ -109,23 +111,36 @@ func TestPodAndContainer(t *testing.T) {
 			obj:           execPod(),
 		},
 		{
-			p:             &ExecOptions{},
+			flags:         &ExecFlags{},
 			args:          []string{"foo", "cmd"},
 			argsLenAtDash: -1,
-			expectedPod:   "foo",
-			expectedArgs:  []string{"cmd"},
+			expectError:   true,
 			name:          "cmd, cmd is behind dash",
 			obj:           execPod(),
 		},
 		{
-			p:                 &ExecOptions{StreamOptions: StreamOptions{ContainerName: "bar"}},
-			args:              []string{"foo", "cmd"},
-			argsLenAtDash:     -1,
-			expectedPod:       "foo",
-			expectedContainer: "bar",
-			expectedArgs:      []string{"cmd"},
-			name:              "cmd, container in flag",
-			obj:               execPod(),
+			flags:         &ExecFlags{ContainerName: "bar"},
+			args:          []string{"foo", "cmd"},
+			argsLenAtDash: -1,
+			expectError:   true,
+			name:          "cmd, container in flag",
+			obj:           execPod(),
+		},
+		{
+			flags:         &ExecFlags{},
+			args:          []string{"foo", "cmd", "bar"},
+			argsLenAtDash: 2,
+			expectError:   true,
+			name:          "cmd with double dashes and extra args between pod and cmd",
+			obj:           execPod(),
+		},
+		{
+			flags:         &ExecFlags{},
+			args:          []string{"foo", "--any-flag", "any-value"},
+			argsLenAtDash: -1,
+			expectError:   true,
+			name:          "cmd without dash separator with flag-like args",
+			obj:           execPod(),
 		},
 	}
 	for _, test := range tests {
@@ -143,14 +158,16 @@ func TestPodAndContainer(t *testing.T) {
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
 
 			cmd := NewCmdExec(tf, genericiooptions.NewTestIOStreamsDiscard())
-			options := test.p
-			options.ErrOut = bytes.NewBuffer([]byte{})
-			options.Out = bytes.NewBuffer([]byte{})
-			err = options.Complete(tf, cmd, test.args, test.argsLenAtDash)
+			flags := test.flags
+			flags.ErrOut = bytes.NewBuffer([]byte{})
+			flags.Out = bytes.NewBuffer([]byte{})
+			options, err := flags.ToOptions(tf, cmd, test.args, test.argsLenAtDash)
 			if !test.expectError && err != nil {
 				t.Errorf("%s: unexpected error: %v", test.name, err)
 			}
-			err = options.Validate()
+			if err == nil {
+				err = options.Validate()
+			}
 
 			if test.expectError && err == nil {
 				t.Errorf("%s: unexpected non-error", test.name)
@@ -231,20 +248,19 @@ func TestExec(t *testing.T) {
 			if test.execErr {
 				ex.execErr = fmt.Errorf("exec error")
 			}
-			params := &ExecOptions{
-				StreamOptions: StreamOptions{
-					PodName:       "foo",
-					ContainerName: "bar",
-					IOStreams:     genericiooptions.NewTestIOStreamsDiscard(),
-				},
-				Executor: ex,
+			flags := &ExecFlags{
+				ContainerName: "bar",
+				IOStreams:     genericiooptions.NewTestIOStreamsDiscard(),
 			}
 			cmd := NewCmdExec(tf, genericiooptions.NewTestIOStreamsDiscard())
-			args := []string{"pod/foo", "command"}
-			if err := params.Complete(tf, cmd, args, -1); err != nil {
+			args := []string{"pod/foo", "--", "command"}
+			params, err := flags.ToOptions(tf, cmd, args, 1)
+			if err != nil {
 				t.Fatal(err)
 			}
-			err := params.Run()
+			params.PodName = "foo"
+			params.Executor = ex
+			err = params.Run()
 			if test.execErr && err != ex.execErr {
 				t.Errorf("%s: Unexpected exec error: %v", test.name, err)
 				return
@@ -263,9 +279,6 @@ func TestExec(t *testing.T) {
 			if strings.Count(ex.url.RawQuery, "container=bar") != 1 {
 				t.Errorf("%s: Did not get expected container query param for exec request", test.name)
 				return
-			}
-			if ex.method != "POST" {
-				t.Errorf("%s: Did not get method for exec request: %s", test.name, ex.method)
 			}
 		})
 	}
@@ -406,4 +419,21 @@ func TestSetupTTY(t *testing.T) {
 	if tty.Out != o.Out {
 		t.Errorf("attach stdin, TTY, is a terminal: tty.Out should equal o.Out")
 	}
+}
+
+func TestCreateExecutor(t *testing.T) {
+	url, err := url.Parse("http://localhost:8080/index.html")
+	if err != nil {
+		t.Fatalf("unable to parse test url: %v", err)
+	}
+	config := cmdtesting.DefaultClientConfig()
+	// WebSockets with SPDY fallback is always used.
+	executor, err := createExecutor(url, config)
+	if err != nil {
+		t.Fatalf("unable to create executor: %v", err)
+	}
+	if _, isFallback := executor.(*remotecommand.FallbackExecutor); !isFallback {
+		t.Errorf("expected fallback executor, got %#v", executor)
+	}
+
 }

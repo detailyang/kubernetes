@@ -37,6 +37,13 @@ type Schema interface {
 	// The values of the returned map are of the adapted type.
 	Properties() map[string]Schema
 
+	// HasProperties returns true if the OpenAPI properties field exists.
+	HasProperties() bool
+
+	// Property returns the OpenAPI property for the given key, or false if the
+	// property does not exist.
+	Property(key string) (Schema, bool)
+
 	// AdditionalProperties returns the OpenAPI additional properties field,
 	// or nil if this field does not exist.
 	AdditionalProperties() SchemaOrBool
@@ -56,12 +63,27 @@ type Schema interface {
 
 // Validations contains OpenAPI validation that the CEL library uses.
 type Validations interface {
+	Pattern() string
+	Minimum() *float64
+	IsExclusiveMinimum() bool
+	Maximum() *float64
+	IsExclusiveMaximum() bool
+	MultipleOf() *float64
+	MinItems() *int64
 	MaxItems() *int64
+	MinLength() *int64
 	MaxLength() *int64
+	MinProperties() *int64
 	MaxProperties() *int64
 	Required() []string
 	Enum() []any
 	Nullable() bool
+	UniqueItems() bool
+
+	AllOf() []Schema
+	OneOf() []Schema
+	AnyOf() []Schema
+	Not() Schema
 }
 
 // KubeExtensions contains Kubernetes-specific extensions to the OpenAPI schema.
@@ -71,6 +93,16 @@ type KubeExtensions interface {
 	IsXPreserveUnknownFields() bool
 	XListType() string
 	XListMapKeys() []string
+	XMapType() string
+	XValidations() []ValidationRule
+}
+
+// ValidationRule represents a single x-kubernetes-validations rule.
+type ValidationRule interface {
+	Rule() string
+	Message() string
+	MessageExpression() string
+	FieldPath() string
 }
 
 // SchemaOrBool contains either a schema or a boolean indicating if the object

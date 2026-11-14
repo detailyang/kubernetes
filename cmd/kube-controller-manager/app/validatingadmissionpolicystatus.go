@@ -18,27 +18,56 @@ package app
 
 import (
 	"context"
+	"fmt"
 
-	pluginvalidatingadmissionpolicy "k8s.io/apiserver/pkg/admission/plugin/validatingadmissionpolicy"
+	apiextensionsscheme "k8s.io/apiextensions-api/pkg/client/clientset/clientset/scheme"
+	pluginvalidatingadmissionpolicy "k8s.io/apiserver/pkg/admission/plugin/policy/validating"
 	"k8s.io/apiserver/pkg/cel/openapi/resolver"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/controller-manager/controller"
+	k8sscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/component-base/featuregate"
+	"k8s.io/kubernetes/cmd/kube-controller-manager/names"
 	"k8s.io/kubernetes/pkg/controller/validatingadmissionpolicystatus"
 	"k8s.io/kubernetes/pkg/generated/openapi"
 )
 
-func startValidatingAdmissionPolicyStatusController(ctx context.Context, controllerContext ControllerContext) (controller.Interface, bool, error) {
-	// KCM won't start the controller without the feature gate set.
+func newValidatingAdmissionPolicyStatusControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:                 names.ValidatingAdmissionPolicyStatusController,
+		constructor:          newValidatingAdmissionPolicyStatusController,
+		requiredFeatureGates: []featuregate.Feature{},
+	}
+}
+
+func newValidatingAdmissionPolicyStatusController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	discoveryClient, err := controllerContext.ClientBuilder.DiscoveryClient(names.ValidatingAdmissionPolicyStatusController)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create discovery client for %s: %w", controllerName, err)
+	}
+
+	schemaResolver := resolver.NewDefinitionsSchemaResolver(openapi.GetOpenAPIDefinitions, k8sscheme.Scheme, apiextensionsscheme.Scheme).
+		Combine(&resolver.ClientDiscoveryResolver{Discovery: discoveryClient})
+
 	typeChecker := &pluginvalidatingadmissionpolicy.TypeChecker{
-		SchemaResolver: resolver.NewDefinitionsSchemaResolver(scheme.Scheme, openapi.GetOpenAPIDefinitions),
+		SchemaResolver: schemaResolver,
 		RestMapper:     controllerContext.RESTMapper,
 	}
+
+	client, err := controllerContext.NewClient(names.ValidatingAdmissionPolicyStatusController)
+	if err != nil {
+		return nil, err
+	}
+
 	c, err := validatingadmissionpolicystatus.NewController(
-		controllerContext.InformerFactory.Admissionregistration().V1beta1().ValidatingAdmissionPolicies(),
-		controllerContext.ClientBuilder.ClientOrDie("validatingadmissionpolicy-status-controller").AdmissionregistrationV1beta1().ValidatingAdmissionPolicies(),
+		ctx,
+		controllerContext.InformerFactory.Admissionregistration().V1().ValidatingAdmissionPolicies(),
+		client.AdmissionregistrationV1().ValidatingAdmissionPolicies(),
 		typeChecker,
 	)
+	if err != nil {
+		return nil, err
+	}
 
-	go c.Run(ctx, int(controllerContext.ComponentConfig.ValidatingAdmissionPolicyStatusController.ConcurrentPolicySyncs))
-	return nil, true, err
+	return newControllerLoop(func(ctx context.Context) {
+		c.Run(ctx, int(controllerContext.ComponentConfig.ValidatingAdmissionPolicyStatusController.ConcurrentPolicySyncs))
+	}, controllerName), nil
 }

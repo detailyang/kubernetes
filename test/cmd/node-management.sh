@@ -160,6 +160,24 @@ run_cluster_management_tests() {
   # Post-condition: node is still schedulable
   kube::test::get_object_assert "nodes 127.0.0.1" "{{.spec.unschedulable}}" '<no value>'
 
+  ### kubectl drain reports lifecycle conditions without replacing unrelated status
+  kubectl patch node "127.0.0.1" --subresource=status --type=strategic \
+    -p '{"status":{"conditions":[{"type":"DrainConditionTest","status":"True","reason":"TestCondition"}]}}'
+  KUBECTL_DRAIN_NODE_CONDITIONS=true kubectl drain "127.0.0.1" --pod-selector 'lifecycle-condition-test=none' --force
+  kube::test::get_object_assert "nodes 127.0.0.1" '{{range .status.conditions}}{{if eq .type "DrainInProgress"}}{{.status}}:{{.reason}}{{end}}{{end}}' 'False:KubectlDrainCompleted'
+  kube::test::get_object_assert "nodes 127.0.0.1" '{{range .status.conditions}}{{if eq .type "Drained"}}{{.status}}:{{.reason}}{{end}}{{end}}' 'True:KubectlDrainCompleted'
+  kube::test::get_object_assert "nodes 127.0.0.1" '{{range .status.conditions}}{{if eq .type "DrainConditionTest"}}{{.status}}:{{.reason}}{{end}}{{end}}' 'True:TestCondition'
+
+  KUBECTL_DRAIN_NODE_CONDITIONS=true kubectl uncordon "127.0.0.1"
+  kube::test::get_object_assert "nodes 127.0.0.1" '{{range .status.conditions}}{{if eq .type "DrainInProgress"}}{{.status}}:{{.reason}}{{end}}{{end}}' 'False:KubectlUncordoned'
+  kube::test::get_object_assert "nodes 127.0.0.1" '{{range .status.conditions}}{{if eq .type "Drained"}}{{.status}}:{{.reason}}{{end}}{{end}}' 'False:KubectlUncordoned'
+
+  KUBECTL_DRAIN_NODE_CONDITIONS=true kubectl drain "127.0.0.1" --pod-selector 'lifecycle-condition-test=none' --force --dry-run=server
+  kube::test::get_object_assert "nodes 127.0.0.1" '{{range .status.conditions}}{{if eq .type "DrainInProgress"}}{{.status}}:{{.reason}}{{end}}{{end}}' 'False:KubectlUncordoned'
+  kube::test::get_object_assert "nodes 127.0.0.1" '{{range .status.conditions}}{{if eq .type "Drained"}}{{.status}}:{{.reason}}{{end}}{{end}}' 'False:KubectlUncordoned'
+  kubectl patch node "127.0.0.1" --subresource=status --type=strategic \
+    -p "{\"status\":{\"conditions\":[{\"type\":\"DrainConditionTest\",\"\$patch\":\"delete\"},{\"type\":\"DrainInProgress\",\"\$patch\":\"delete\"},{\"type\":\"Drained\",\"\$patch\":\"delete\"}]}}"
+
   ### kubectl drain command fails when both --selector and a node argument are given
   # Pre-condition: node exists and contains label test=label
   kubectl label node "127.0.0.1" "test=label"
@@ -177,9 +195,9 @@ run_cluster_management_tests() {
    # command - need to use force because pods are unmanaged, dry run (or skip-wait) because node is unready
    output_message=$(kubectl --v=6 drain --force --pod-selector type=test-pod --selector test=label --chunk-size=1 --dry-run=client 2>&1 "${kube_flags[@]}")
    # Post-condition: Check if we get a limit on node, and both limit and continue on pods
-   kube::test::if_has_string "${output_message}" "/v1/nodes?labelSelector=test%3Dlabel&limit=1 200 OK"
-   kube::test::if_has_string "${output_message}" "/v1/pods?fieldSelector=spec.nodeName%3D127.0.0.1&labelSelector=type%3Dtest-pod&limit=1 200 OK"
-   kube::test::if_has_string "${output_message}" "/v1/pods?continue=.*&fieldSelector=spec.nodeName%3D127.0.0.1&labelSelector=type%3Dtest-pod&limit=1 200 OK"
+   kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/v1/nodes?labelSelector=test%3Dlabel&limit=1" status="200 OK"'
+   kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/v1/pods?fieldSelector=spec.nodeName%3D127.0.0.1&labelSelector=type%3Dtest-pod&limit=1" status="200 OK"'
+   kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/v1/pods?continue=.*&fieldSelector=spec.nodeName%3D127.0.0.1&labelSelector=type%3Dtest-pod&limit=1" status="200 OK"'
    # Post-condition: Check we evict multiple pages worth of pods
    kube::test::if_has_string "${output_message}" "evicting pod .*/test-pod-1"
    kube::test::if_has_string "${output_message}" "evicting pod .*/test-pod-2"
@@ -190,8 +208,12 @@ run_cluster_management_tests() {
    ### Test kubectl drain chunk size defaults to 500
    output_message=$(kubectl --v=6 drain --force --selector test=label --dry-run=client 2>&1 "${kube_flags[@]}")
    # Post-condition: Check if we get a limit
-   kube::test::if_has_string "${output_message}" "/v1/nodes?labelSelector=test%3Dlabel&limit=500 200 OK"
-   kube::test::if_has_string "${output_message}" "/v1/pods?fieldSelector=spec.nodeName%3D127.0.0.1&limit=500 200 OK"
+   kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/v1/nodes?labelSelector=test%3Dlabel&limit=500" status="200 OK"'
+   kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/v1/pods?fieldSelector=spec.nodeName%3D127.0.0.1&limit=500" status="200 OK"'
+
+   ### kubectl drain with --disable-eviction --dry-run=server completes successfully
+   kubectl drain "127.0.0.1" --force --disable-eviction --dry-run=server
+   kube::test::get_object_assert "pods" "{{range .items}}{{.metadata.name}},{{end}}" 'test-pod-1,test-pod-2,'
 
   ### kubectl cordon command fails when no arguments are passed
   # Pre-condition: node exists

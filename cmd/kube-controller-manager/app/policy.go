@@ -21,23 +21,33 @@ package app
 
 import (
 	"context"
-
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/scale"
-	"k8s.io/controller-manager/controller"
+	"k8s.io/kubernetes/cmd/kube-controller-manager/names"
 	"k8s.io/kubernetes/pkg/controller/disruption"
 )
 
-func startDisruptionController(ctx context.Context, controllerContext ControllerContext) (controller.Interface, bool, error) {
-	client := controllerContext.ClientBuilder.ClientOrDie("disruption-controller")
-	config := controllerContext.ClientBuilder.ConfigOrDie("disruption-controller")
-	scaleKindResolver := scale.NewDiscoveryScaleKindResolver(client.Discovery())
-	scaleClient, err := scale.NewForConfig(config, controllerContext.RESTMapper, dynamic.LegacyAPIPathResolverFunc, scaleKindResolver)
+func newDisruptionControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.DisruptionController,
+		aliases:     []string{"disruption"},
+		constructor: newDisruptionController,
+	}
+}
+
+func newDisruptionController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("disruption-controller")
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
-	go disruption.NewDisruptionController(
+	scaleKindResolver := scale.NewDiscoveryScaleKindResolver(client.Discovery())
+	scaleClient, err := controllerContext.ClientBuilder.ScaleClient("disruption-controller", controllerContext.RESTMapper, dynamic.LegacyAPIPathResolverFunc, scaleKindResolver)
+	if err != nil {
+		return nil, err
+	}
+
+	dc := disruption.NewDisruptionController(
 		ctx,
 		controllerContext.InformerFactory.Core().V1().Pods(),
 		controllerContext.InformerFactory.Policy().V1().PodDisruptionBudgets(),
@@ -49,6 +59,8 @@ func startDisruptionController(ctx context.Context, controllerContext Controller
 		controllerContext.RESTMapper,
 		scaleClient,
 		client.Discovery(),
-	).Run(ctx)
-	return nil, true, nil
+	)
+	return newControllerLoop(func(ctx context.Context) {
+		dc.Run(ctx, int(controllerContext.ComponentConfig.DisruptionController.ConcurrentDisruptionSyncs))
+	}, controllerName), nil
 }

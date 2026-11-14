@@ -37,6 +37,13 @@ type GenericControllerManagerConfiguration struct {
 	ControllerStartInterval metav1.Duration
 	// leaderElection defines the configuration of leader election client.
 	LeaderElection componentbaseconfigv1alpha1.LeaderElectionConfiguration
+	// LeaderElectionRecoveryDeadline limits how long a leader keeps trying to
+	// renew its lease after LeaderElection.RenewDeadline has expired without a
+	// successful renewal, before it gives up and exits. The deadline starts
+	// when the renew deadline expires. The zero value, which is the default,
+	// means no limit. Any other value must be at least one second. Requires
+	// the LeaderElectionRecovery feature gate.
+	LeaderElectionRecoveryDeadline metav1.Duration
 	// Controllers is the list of controllers to enable or disable
 	// '*' means "all enabled by default controllers"
 	// 'foo' means "enable 'foo'"
@@ -54,7 +61,7 @@ type GenericControllerManagerConfiguration struct {
 // LeaderMigrationConfiguration provides versioned configuration for all migrating leader locks.
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type LeaderMigrationConfiguration struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 
 	// LeaderName is the name of the leader election resource that protects the migration
 	// E.g. 1-20-KCM-to-1-21-CCM

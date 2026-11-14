@@ -22,60 +22,50 @@ import (
 	"testing"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/server/v3/embed"
 
-	"k8s.io/apimachinery/pkg/api/apitesting"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apiserver/pkg/apis/example"
-	examplev1 "k8s.io/apiserver/pkg/apis/example/v1"
-	example2v1 "k8s.io/apiserver/pkg/apis/example2/v1"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/etcd3"
 	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
+	"k8s.io/apiserver/pkg/storage/etcd3/testserver"
 	storagetesting "k8s.io/apiserver/pkg/storage/testing"
 	"k8s.io/apiserver/pkg/storage/value/encrypt/identity"
+	"k8s.io/utils/clock"
 )
 
-var (
-	scheme   = runtime.NewScheme()
-	codecs   = serializer.NewCodecFactory(scheme)
-	errDummy = fmt.Errorf("dummy error")
-)
+const DefaultBookmarkFrequency = defaultBookmarkFrequency
 
-func init() {
-	metav1.AddToGroupVersion(scheme, metav1.SchemeGroupVersion)
-	utilruntime.Must(example.AddToScheme(scheme))
-	utilruntime.Must(examplev1.AddToScheme(scheme))
-	utilruntime.Must(example2v1.AddToScheme(scheme))
-}
+var errDummy = fmt.Errorf("dummy error")
 
-func newPod() runtime.Object     { return &example.Pod{} }
-func newPodList() runtime.Object { return &example.PodList{} }
-
-func newEtcdTestStorage(t *testing.T, prefix string, pagingEnabled bool) (*etcd3testing.EtcdTestServer, storage.Interface) {
-	server, _ := etcd3testing.NewUnsecuredEtcd3TestClientServer(t)
-	storage := etcd3.New(
+func benchmarkEtcdTestStorage(t testing.TB) (*etcd3testing.EtcdTestServer, storage.Interface) {
+	config := storagetesting.StoreConfigForBenchmarks()
+	server := &etcd3testing.EtcdTestServer{V3Client: testserver.RunEtcd(t, func(cfg *embed.Config) {
+		cfg.QuotaBackendBytes = 4 << 30 // 4 GiB (default 2 GiB is too small for 150k pods)
+	})}
+	compactor := etcd3.NewCompactor(server.V3Client.Client, 0, clock.RealClock{}, nil)
+	t.Cleanup(compactor.Stop)
+	s, err := etcd3.New(
 		server.V3Client,
-		apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion),
-		newPod,
-		newPodList,
-		prefix,
-		"/pods",
-		schema.GroupResource{Resource: "pods"},
+		compactor,
+		config.Codec,
+		config.NewFunc,
+		config.NewListFunc,
+		storagetesting.PodReverseKeyFunc(config.ResourcePrefix, true),
+		etcd3testing.PathPrefix(),
+		config.ResourcePrefix,
+		config.GroupResource,
 		identity.NewEncryptCheckTransformer(),
-		pagingEnabled,
-		etcd3.NewDefaultLeaseManagerConfig())
-	return server, storage
+		etcd3.NewDefaultLeaseManagerConfig(),
+		etcd3.NewDefaultDecoder(config.Codec, config.Versioner),
+		config.Versioner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	return server, s
 }
 
-func computePodKey(obj *example.Pod) string {
-	return fmt.Sprintf("/pods/%s/%s", obj.Namespace, obj.Name)
-}
-
-func compactStorage(c *Cacher, client *clientv3.Client) storagetesting.Compaction {
+func CompactWatch(c *CacheDelegator, client *clientv3.Client) storagetesting.Compaction {
 	return func(ctx context.Context, t *testing.T, resourceVersion string) {
 		versioner := storage.APIObjectVersioner{}
 		rv, err := versioner.ParseResourceVersion(resourceVersion)
@@ -83,42 +73,31 @@ func compactStorage(c *Cacher, client *clientv3.Client) storagetesting.Compactio
 			t.Fatal(err)
 		}
 
-		err = c.watchCache.waitUntilFreshAndBlock(context.TODO(), rv)
+		c.cacher.watchCache.RLock()
+		err = c.cacher.watchCache.waitUntilFreshLocked(context.TODO(), rv)
+		c.cacher.watchCache.RUnlock()
 		if err != nil {
 			t.Fatalf("WatchCache didn't caught up to RV: %v", rv)
 		}
-		c.watchCache.RUnlock()
+		c.cacher.watchCache.Lock()
+		defer c.cacher.watchCache.Unlock()
+		c.cacher.Lock()
+		defer c.cacher.Unlock()
 
-		c.watchCache.Lock()
-		defer c.watchCache.Unlock()
-		c.Lock()
-		defer c.Unlock()
-
-		if c.watchCache.resourceVersion < rv {
+		if c.cacher.watchCache.resourceVersion < rv {
 			t.Fatalf("Can't compact into a future version: %v", resourceVersion)
 		}
 
-		if len(c.watchers.allWatchers) > 0 || len(c.watchers.valueWatchers) > 0 {
-			// We could consider terminating those watchers, but given
-			// watchcache doesn't really support compaction and we don't
-			// exercise it in tests, we just throw an error here.
-			t.Error("Open watchers are not supported during compaction")
-		}
-
-		for c.watchCache.startIndex < c.watchCache.endIndex {
-			index := c.watchCache.startIndex % c.watchCache.capacity
-			if c.watchCache.cache[index].ResourceVersion > rv {
+		for c.cacher.watchCache.history.startIndex < c.cacher.watchCache.history.endIndex {
+			index := c.cacher.watchCache.history.startIndex % c.cacher.watchCache.history.capacity
+			if c.cacher.watchCache.history.cache[index].ResourceVersion > rv {
 				break
 			}
 
-			c.watchCache.startIndex++
+			c.cacher.watchCache.history.startIndex++
 		}
-		c.watchCache.listResourceVersion = rv
-
-		if _, err = client.KV.Put(ctx, "compact_rev_key", resourceVersion); err != nil {
-			t.Fatalf("Could not update compact_rev_key: %v", err)
-		}
-		if _, err = client.Compact(ctx, int64(rv)); err != nil {
+		c.cacher.watchCache.history.listResourceVersion = rv
+		if _, err := client.Compact(ctx, int64(rv)); err != nil {
 			t.Fatalf("Could not compact: %v", err)
 		}
 	}

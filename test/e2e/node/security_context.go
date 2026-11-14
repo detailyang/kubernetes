@@ -186,15 +186,15 @@ var _ = SIGDescribe("Security Context", func() {
 		})
 	})
 
-	ginkgo.It("should support volume SELinux relabeling [Flaky] [LinuxOnly]", func(ctx context.Context) {
+	f.It("should support volume SELinux relabeling", f.WithFlaky(), f.WithLabel("LinuxOnly"), func(ctx context.Context) {
 		testPodSELinuxLabeling(ctx, f, false, false)
 	})
 
-	ginkgo.It("should support volume SELinux relabeling when using hostIPC [Flaky] [LinuxOnly]", func(ctx context.Context) {
+	f.It("should support volume SELinux relabeling when using hostIPC", f.WithFlaky(), f.WithLabel("LinuxOnly"), func(ctx context.Context) {
 		testPodSELinuxLabeling(ctx, f, true, false)
 	})
 
-	ginkgo.It("should support volume SELinux relabeling when using hostPID [Flaky] [LinuxOnly]", func(ctx context.Context) {
+	f.It("should support volume SELinux relabeling when using hostPID", f.WithFlaky(), f.WithLabel("LinuxOnly"), func(ctx context.Context) {
 		testPodSELinuxLabeling(ctx, f, false, true)
 	})
 
@@ -218,12 +218,6 @@ var _ = SIGDescribe("Security Context", func() {
 		pod.Spec.Containers[0].SecurityContext = &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeRuntimeDefault}}
 		pod.Spec.Containers[0].Command = []string{"grep", SeccompProcStatusField, ProcSelfStatusPath}
 		e2eoutput.TestContainerOutput(ctx, f, "seccomp runtime/default", pod, 0, []string{"2"}) // seccomp filtered
-	})
-
-	ginkgo.It("should support seccomp default which is unconfined [LinuxOnly]", func(ctx context.Context) {
-		pod := scTestPod(false, false)
-		pod.Spec.Containers[0].Command = []string{"grep", SeccompProcStatusField, ProcSelfStatusPath}
-		e2eoutput.TestContainerOutput(ctx, f, "seccomp default unconfined", pod, 0, []string{"0"}) // seccomp disabled
 	})
 })
 
@@ -322,6 +316,6 @@ func testPodSELinuxLabeling(ctx context.Context, f *framework.Framework, hostIPC
 	isEnforced, err := tk.ReadFileViaContainer(pod.Name, "test-container", "/sys/fs/selinux/enforce")
 	if err == nil && isEnforced == "1" {
 		_, err = tk.ReadFileViaContainer(pod.Name, "test-container", testFilePath)
-		framework.ExpectError(err, "expecting SELinux to not let the container with different MCS label to read the file")
+		gomega.Expect(err).To(gomega.HaveOccurred(), "expecting SELinux to not let the container with different MCS label to read the file")
 	}
 }

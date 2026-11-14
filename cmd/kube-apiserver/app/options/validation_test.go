@@ -18,15 +18,12 @@ package options
 
 import (
 	"net"
+	"strings"
 	"testing"
 
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	apiserveroptions "k8s.io/apiserver/pkg/server/options"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	netutils "k8s.io/utils/net"
-
-	"k8s.io/kubernetes/pkg/features"
 )
 
 func makeOptionsWithCIDRs(serviceCIDR string, secondaryServiceCIDR string) *ServerRunOptions {
@@ -63,7 +60,6 @@ func TestClusterServiceIPRange(t *testing.T) {
 		name         string
 		options      *ServerRunOptions
 		expectErrors bool
-		gate         bool
 	}{
 		{
 			name:         "no service cidr",
@@ -84,34 +80,6 @@ func TestClusterServiceIPRange(t *testing.T) {
 			name:         "primary and secondary are provided but not dual stack v6-v6",
 			expectErrors: true,
 			options:      makeOptionsWithCIDRs("2000::/108", "3000::/108"),
-		},
-		{
-			name:         "service cidr is too big",
-			expectErrors: true,
-			options:      makeOptionsWithCIDRs("10.0.0.0/8", ""),
-		},
-		{
-			name:         "service cidr IPv4 is too big but gate enbled",
-			expectErrors: false,
-			options:      makeOptionsWithCIDRs("10.0.0.0/8", ""),
-			gate:         true,
-		},
-		{
-			name:         "service cidr IPv6 is too big but gate enbled",
-			expectErrors: false,
-			options:      makeOptionsWithCIDRs("2001:db8::/64", ""),
-			gate:         true,
-		},
-		{
-			name:         "service cidr IPv6 is too big despuite gate enbled",
-			expectErrors: true,
-			options:      makeOptionsWithCIDRs("2001:db8::/12", ""),
-			gate:         true,
-		},
-		{
-			name:         "dual-stack secondary cidr too big",
-			expectErrors: true,
-			options:      makeOptionsWithCIDRs("10.0.0.0/16", "3000::/64"),
 		},
 		{
 			name:         "more than two entries",
@@ -139,12 +107,30 @@ func TestClusterServiceIPRange(t *testing.T) {
 			expectErrors: false,
 			options:      makeOptionsWithCIDRs("3000::/108", "10.0.0.0/16"),
 		},
+		{
+			name:         "service cidr is larger than old limit",
+			expectErrors: false,
+			options:      makeOptionsWithCIDRs("10.0.0.0/8", ""),
+		},
+		{
+			name:         "service cidr IPv6 is larger than old limit",
+			expectErrors: false,
+			options:      makeOptionsWithCIDRs("2001:db8::/64", ""),
+		},
+		{
+			name:         "service cidr IPv6 is MUCH larger than old limit",
+			expectErrors: false,
+			options:      makeOptionsWithCIDRs("2001:db8::/12", ""),
+		},
+		{
+			name:         "dual-stack secondary cidr is larger than old limit",
+			expectErrors: false,
+			options:      makeOptionsWithCIDRs("10.0.0.0/16", "3000::/64"),
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.MultiCIDRServiceAllocator, tc.gate)()
-
 			errs := validateClusterIPFlags(tc.options.Extra)
 			if len(errs) > 0 && !tc.expectErrors {
 				t.Errorf("expected no errors, errors found %+v", errs)
@@ -287,11 +273,6 @@ func TestValidatePublicIPServiceClusterIPRangeIPFamilies(t *testing.T) {
 	}
 }
 
-func getIPnetFromCIDR(cidr string) *net.IPNet {
-	_, ipnet, _ := netutils.ParseCIDRSloppy(cidr)
-	return ipnet
-}
-
 func TestValidateServiceNodePort(t *testing.T) {
 	testCases := []struct {
 		name         string
@@ -353,63 +334,44 @@ func makeOptionsWithPort(kubernetesServiceNodePort int, base int, size int) *Ser
 	}
 }
 
-func TestValidateMaxCIDRRange(t *testing.T) {
-	testCases := []struct {
-		// tc.cidr, tc.maxCIDRBits, tc.cidrFlag) tc.expectedErrorMessage
-		name                 string
-		cidr                 net.IPNet
-		maxCIDRBits          int
-		cidrFlag             string
-		expectedErrorMessage string
-		expectErrors         bool
+func TestValidateDisablePodSubresources(t *testing.T) {
+	tests := []struct {
+		name         string
+		subresources []string
+		expectedErrs []string
 	}{
 		{
-			name:                 "valid ipv4 cidr",
-			cidr:                 *getIPnetFromCIDR("10.92.0.0/12"),
-			maxCIDRBits:          20,
-			cidrFlag:             "--service-cluster-ip-range",
-			expectedErrorMessage: "",
-			expectErrors:         false,
+			name: "none",
 		},
 		{
-			name:                 "valid ipv6 cidr",
-			cidr:                 *getIPnetFromCIDR("3000::/108"),
-			maxCIDRBits:          20,
-			cidrFlag:             "--service-cluster-ip-range",
-			expectedErrorMessage: "",
-			expectErrors:         false,
+			name:         "disableable",
+			subresources: []string{"exec", "resize"},
 		},
 		{
-			name:                 "ipv4 cidr too big",
-			cidr:                 *getIPnetFromCIDR("10.92.0.0/8"),
-			maxCIDRBits:          20,
-			cidrFlag:             "--service-cluster-ip-range",
-			expectedErrorMessage: "specified --service-cluster-ip-range is too large; for 32-bit addresses, the mask must be >= 12",
-			expectErrors:         true,
+			name:         "core lifecycle",
+			subresources: []string{"status"},
+			expectedErrs: []string{`pod subresource "status" is required for core pod lifecycle`},
 		},
 		{
-			name:                 "ipv6 cidr too big",
-			cidr:                 *getIPnetFromCIDR("3000::/64"),
-			maxCIDRBits:          20,
-			cidrFlag:             "--service-cluster-ip-range",
-			expectedErrorMessage: "specified --service-cluster-ip-range is too large; for 128-bit addresses, the mask must be >= 108",
-			expectErrors:         true,
+			name:         "unknown",
+			subresources: []string{"pods/exec", ""},
+			expectedErrs: []string{
+				`unknown pod subresource "pods/exec", valid values are: attach, dynamic, ephemeralcontainers,`,
+				`unknown pod subresource ""`,
+			},
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := validateMaxCIDRRange(tc.cidr, tc.maxCIDRBits, tc.cidrFlag)
-			if err != nil && !tc.expectErrors {
-				t.Errorf("expected no errors, error found %+v", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			errs := validateDisablePodSubresources(Extra{DisablePodSubresources: test.subresources})
+			if len(errs) != len(test.expectedErrs) {
+				t.Fatalf("expected %d errors, got %d: %v", len(test.expectedErrs), len(errs), errs)
 			}
-
-			if err == nil && tc.expectErrors {
-				t.Errorf("expected errors, no errors found")
-			}
-
-			if err != nil && tc.expectErrors && err.Error() != tc.expectedErrorMessage {
-				t.Errorf("Expected error message: \"%s\"\nGot: \"%s\"", tc.expectedErrorMessage, err.Error())
+			for i, err := range errs {
+				if !strings.Contains(err.Error(), test.expectedErrs[i]) {
+					t.Errorf("expected error %q to contain %q", err, test.expectedErrs[i])
+				}
 			}
 		})
 	}

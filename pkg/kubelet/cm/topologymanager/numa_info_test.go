@@ -19,14 +19,20 @@ package topologymanager
 import (
 	"fmt"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
-	cadvisorapi "github.com/google/cadvisor/info/v1"
+	cadvisorapi "github.com/google/cadvisor/lib/model"
 	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager/bitmask"
 )
 
 func TestNUMAInfo(t *testing.T) {
+	numaDistanceErr := "error getting NUMA distances from cadvisor"
+	if runtime.GOOS == "windows" {
+		numaDistanceErr = fmt.Sprintf("the %q policy option is not supported on Windows because NUMA node distances are not available", PreferClosestNUMANodes)
+	}
+
 	tcases := []struct {
 		name             string
 		topology         []cadvisorapi.Node
@@ -325,7 +331,7 @@ func TestNUMAInfo(t *testing.T) {
 				},
 			},
 			expectedNUMAInfo: nil,
-			expectedErr:      fmt.Errorf("error getting NUMA distances from cadvisor"),
+			expectedErr:      fmt.Errorf("%s", numaDistanceErr),
 			opts: PolicyOptions{
 				PreferClosestNUMA: true,
 			},
@@ -691,7 +697,7 @@ func TestClosest(t *testing.T) {
 	for _, tc := range tcases {
 		t.Run(tc.description, func(t *testing.T) {
 
-			result := tc.numaInfo.Closest(tc.candidate, tc.current)
+			result, _ := tc.numaInfo.Closest(tc.candidate, tc.current)
 			if result != tc.current && result != tc.candidate {
 				t.Errorf("Expected result to be either 'current' or 'candidate' hint")
 			}
@@ -700,6 +706,80 @@ func TestClosest(t *testing.T) {
 			}
 			if tc.expected == "candidate" && result != tc.candidate {
 				t.Errorf("Expected result to be %v, got %v", tc.candidate, result)
+			}
+		})
+	}
+}
+
+func TestEquallyFit(t *testing.T) {
+	numaInfo := &NUMAInfo{
+		Nodes: []int{0, 1, 2, 3},
+		NUMADistances: NUMADistances{
+			0: {10, 11, 12, 12},
+			1: {11, 10, 12, 12},
+			2: {12, 12, 10, 11},
+			3: {12, 12, 11, 10},
+		},
+	}
+
+	tcases := []struct {
+		description   string
+		m1            bitmask.BitMask
+		m2            bitmask.BitMask
+		preferClosest bool
+		expected      bool
+	}{
+		{
+			description: "masks of the same width are equally narrow",
+			m1:          NewTestBitMask(0),
+			m2:          NewTestBitMask(1),
+			expected:    true,
+		},
+		{
+			description: "masks of different widths are not equally fit (m1 narrower)",
+			m1:          NewTestBitMask(0),
+			m2:          NewTestBitMask(0, 1),
+			expected:    false,
+		},
+		{
+			description: "masks of different widths are not equally fit (m1 wider)",
+			m1:          NewTestBitMask(0, 1),
+			m2:          NewTestBitMask(0),
+			expected:    false,
+		},
+		{
+			description:   "masks of the same width and distance are equally close",
+			m1:            NewTestBitMask(0, 1),
+			m2:            NewTestBitMask(2, 3),
+			preferClosest: true,
+			expected:      true,
+		},
+		{
+			description:   "the mask with the shorter average distance is a better fit",
+			m1:            NewTestBitMask(0, 1),
+			m2:            NewTestBitMask(1, 2),
+			preferClosest: true,
+			expected:      false,
+		},
+		{
+			description:   "a narrower mask is a better fit regardless of distance",
+			m1:            NewTestBitMask(0),
+			m2:            NewTestBitMask(1, 2),
+			preferClosest: true,
+			expected:      false,
+		},
+	}
+
+	for _, tc := range tcases {
+		t.Run(tc.description, func(t *testing.T) {
+			var equal bool
+			if tc.preferClosest {
+				_, equal = numaInfo.Closest(tc.m1, tc.m2)
+			} else {
+				_, equal = numaInfo.Narrowest(tc.m1, tc.m2)
+			}
+			if equal != tc.expected {
+				t.Errorf("expected equal to be %v, got %v", tc.expected, equal)
 			}
 		})
 	}

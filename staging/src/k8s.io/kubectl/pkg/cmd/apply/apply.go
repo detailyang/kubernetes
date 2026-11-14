@@ -23,7 +23,7 @@ import (
 	"net/http"
 
 	"github.com/spf13/cobra"
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -39,17 +39,16 @@ import (
 	"k8s.io/cli-runtime/pkg/printers"
 	"k8s.io/cli-runtime/pkg/resource"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/openapi3"
 	"k8s.io/client-go/util/csaupgrade"
 	"k8s.io/component-base/version"
 	"k8s.io/klog/v2"
-	"k8s.io/kubectl/pkg/cmd/delete"
+	cmddelete "k8s.io/kubectl/pkg/cmd/delete"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
 	"k8s.io/kubectl/pkg/util"
 	"k8s.io/kubectl/pkg/util/i18n"
-	"k8s.io/kubectl/pkg/util/openapi"
 	"k8s.io/kubectl/pkg/util/prune"
-	"k8s.io/kubectl/pkg/util/slice"
 	"k8s.io/kubectl/pkg/util/templates"
 	"k8s.io/kubectl/pkg/validation"
 )
@@ -61,7 +60,7 @@ type ApplyFlags struct {
 	RecordFlags *genericclioptions.RecordFlags
 	PrintFlags  *genericclioptions.PrintFlags
 
-	DeleteFlags *delete.DeleteFlags
+	DeleteFlags *cmddelete.DeleteFlags
 
 	FieldManager   string
 	Selector       string
@@ -71,9 +70,8 @@ type ApplyFlags struct {
 	All            bool
 	Overwrite      bool
 	OpenAPIPatch   bool
+	Subresource    string
 
-	// DEPRECATED: Use PruneAllowlist instead
-	PruneWhitelist []string // TODO: Remove this in kubectl 1.28 or later
 	PruneAllowlist []string
 
 	genericiooptions.IOStreams
@@ -86,7 +84,7 @@ type ApplyOptions struct {
 	PrintFlags *genericclioptions.PrintFlags
 	ToPrinter  func(string) (printers.ResourcePrinter, error)
 
-	DeleteOptions *delete.DeleteOptions
+	DeleteOptions *cmddelete.DeleteOptions
 
 	ServerSideApply bool
 	ForceConflicts  bool
@@ -99,13 +97,14 @@ type ApplyOptions struct {
 	All             bool
 	Overwrite       bool
 	OpenAPIPatch    bool
+	Subresource     string
 
 	ValidationDirective string
 	Validator           validation.Schema
 	Builder             *resource.Builder
 	Mapper              meta.RESTMapper
 	DynamicClient       dynamic.Interface
-	OpenAPISchema       openapi.Resources
+	OpenAPIV3Root       openapi3.RootAndResources
 
 	Namespace        string
 	EnforceNamespace bool
@@ -183,7 +182,7 @@ var ApplySetToolVersion = version.Get().GitVersion
 func NewApplyFlags(streams genericiooptions.IOStreams) *ApplyFlags {
 	return &ApplyFlags{
 		RecordFlags: genericclioptions.NewRecordFlags(),
-		DeleteFlags: delete.NewDeleteFlags("The files that contain the configurations to apply."),
+		DeleteFlags: cmddelete.NewDeleteFlags("The files, directories or URLs that contain the configurations to apply."),
 		PrintFlags:  genericclioptions.NewPrintFlags("created").WithTypeSetter(scheme.Scheme),
 
 		Overwrite:    true,
@@ -233,10 +232,10 @@ func (flags *ApplyFlags) AddFlags(cmd *cobra.Command) {
 	cmdutil.AddServerSideApplyFlags(cmd)
 	cmdutil.AddFieldManagerFlagVar(cmd, &flags.FieldManager, FieldManagerClientSideApply)
 	cmdutil.AddLabelSelectorFlagVar(cmd, &flags.Selector)
-	cmdutil.AddPruningFlags(cmd, &flags.Prune, &flags.PruneAllowlist, &flags.PruneWhitelist, &flags.All, &flags.ApplySetRef)
-
+	cmdutil.AddPruningFlags(cmd, &flags.Prune, &flags.PruneAllowlist, &flags.All, &flags.ApplySetRef)
 	cmd.Flags().BoolVar(&flags.Overwrite, "overwrite", flags.Overwrite, "Automatically resolve conflicts between the modified and live configuration by using values from the modified configuration")
 	cmd.Flags().BoolVar(&flags.OpenAPIPatch, "openapi-patch", flags.OpenAPIPatch, "If true, use openapi to calculate diff when the openapi presents and the resource can be found in the openapi spec. Otherwise, fall back to use baked-in types.")
+	cmdutil.AddSubresourceFlags(cmd, &flags.Subresource, "If specified, apply will operate on the subresource of the requested object.  Only allowed when using --server-side.")
 }
 
 // ToOptions converts from CLI inputs to runtime inputs
@@ -282,7 +281,13 @@ func (flags *ApplyFlags) ToOptions(f cmdutil.Factory, cmd *cobra.Command, baseNa
 		return nil, err
 	}
 
-	openAPISchema, _ := f.OpenAPISchema()
+	var openAPIV3Root openapi3.RootAndResources
+	openAPIV3Client, err := f.OpenAPIV3Client()
+	if err == nil {
+		openAPIV3Root = openapi3.NewRootAndResources(openAPIV3Client)
+	} else {
+		klog.V(4).Infof("warning: OpenAPI V3 Patch is enabled but is unable to be loaded")
+	}
 
 	validationDirective, err := cmdutil.GetValidationDirective(cmd)
 	if err != nil {
@@ -325,8 +330,7 @@ func (flags *ApplyFlags) ToOptions(f cmdutil.Factory, cmd *cobra.Command, baseNa
 		applySet = NewApplySet(parent, tooling, mapper, restClient)
 	}
 	if flags.Prune {
-		pruneAllowlist := slice.ToSet(flags.PruneAllowlist, flags.PruneWhitelist)
-		flags.PruneResources, err = prune.ParseResources(mapper, pruneAllowlist)
+		flags.PruneResources, err = prune.ParseResources(mapper, flags.PruneAllowlist)
 		if err != nil {
 			return nil, err
 		}
@@ -351,6 +355,7 @@ func (flags *ApplyFlags) ToOptions(f cmdutil.Factory, cmd *cobra.Command, baseNa
 		All:             flags.All,
 		Overwrite:       flags.Overwrite,
 		OpenAPIPatch:    flags.OpenAPIPatch,
+		Subresource:     flags.Subresource,
 
 		Recorder:            recorder,
 		Namespace:           namespace,
@@ -360,7 +365,7 @@ func (flags *ApplyFlags) ToOptions(f cmdutil.Factory, cmd *cobra.Command, baseNa
 		Builder:             builder,
 		Mapper:              mapper,
 		DynamicClient:       dynamicClient,
-		OpenAPISchema:       openAPISchema,
+		OpenAPIV3Root:       openAPIV3Root,
 
 		IOStreams: flags.IOStreams,
 
@@ -431,6 +436,9 @@ func (o *ApplyOptions) Validate() error {
 				return fmt.Errorf("--prune is in alpha and doesn't currently work on objects created by server-side apply")
 			}
 		}
+	}
+	if len(o.Subresource) > 0 && !o.ServerSideApply {
+		return fmt.Errorf("--subresource can only be specified for --server-side")
 	}
 
 	return nil
@@ -571,13 +579,15 @@ func (o *ApplyOptions) applyOneObject(info *resource.Info) error {
 		options := metav1.PatchOptions{
 			Force: &o.ForceConflicts,
 		}
-		obj, err := helper.Patch(
-			info.Namespace,
-			info.Name,
-			types.ApplyPatchType,
-			data,
-			&options,
-		)
+		obj, err := helper.
+			WithSubresource(o.Subresource).
+			Patch(
+				info.Namespace,
+				info.Name,
+				types.ApplyPatchType,
+				data,
+				&options,
+			)
 		if err != nil {
 			if isIncompatibleServerError(err) {
 				err = fmt.Errorf("Server-side apply not available on the server: (%v)", err)
@@ -675,6 +685,12 @@ See https://kubernetes.io/docs/reference/using-api/server-side-apply/#conflicts`
 			return cmdutil.AddSourceToErr("creating", info.Source, err)
 		}
 
+		// prune nulls when client-side apply does a create to match what will happen when client-side applying an update.
+		// do this after CreateApplyAnnotation so the annotation matches what will be persisted on an update apply of the same manifest.
+		if u, ok := info.Object.(runtime.Unstructured); ok {
+			pruneNullsFromMap(u.UnstructuredContent())
+		}
+
 		if o.DryRunStrategy != cmdutil.DryRunClient {
 			// Then create the resource and skip the three-way merge
 			obj, err := helper.Create(info.Namespace, true, info.Object)
@@ -706,36 +722,43 @@ See https://kubernetes.io/docs/reference/using-api/server-side-apply/#conflicts`
 		return err
 	}
 
-	if o.DryRunStrategy != cmdutil.DryRunClient {
-		metadata, _ := meta.Accessor(info.Object)
-		annotationMap := metadata.GetAnnotations()
-		if _, ok := annotationMap[corev1.LastAppliedConfigAnnotation]; !ok {
-			fmt.Fprintf(o.ErrOut, warningNoLastAppliedConfigAnnotation, info.ObjectName(), corev1.LastAppliedConfigAnnotation, o.cmdBaseName)
-		}
+	metadata, _ := meta.Accessor(info.Object)
+	annotationMap := metadata.GetAnnotations()
+	if _, ok := annotationMap[corev1.LastAppliedConfigAnnotation]; !ok {
+		fmt.Fprintf(o.ErrOut, warningNoLastAppliedConfigAnnotation, info.ObjectName(), corev1.LastAppliedConfigAnnotation, o.cmdBaseName) //nolint:errcheck
+	}
 
-		patcher, err := newPatcher(o, info, helper)
+	patcher, err := newPatcher(o, info, helper)
+	if err != nil {
+		return err
+	}
+
+	var patchBytes []byte
+	var patchedObject runtime.Object
+
+	if o.DryRunStrategy != cmdutil.DryRunClient {
+		patchBytes, patchedObject, err = patcher.Patch(info.Object, modified, info.Source, info.Namespace, info.Name, o.ErrOut)
+	} else {
+		patchBytes, patchedObject, err = patcher.PatchLocal(info.Object, modified, o.ErrOut)
+	}
+
+	if err != nil {
+		return cmdutil.AddSourceToErr(fmt.Sprintf("applying patch:\n%s\nto:\n%v\nfor:", patchBytes, info), info.Source, err)
+	}
+
+	info.Refresh(patchedObject, true) //nolint:errcheck
+
+	WarnIfDeleting(info.Object, o.ErrOut)
+
+	if string(patchBytes) == "{}" && !o.shouldPrintObject() {
+		printer, err := o.ToPrinter("unchanged")
 		if err != nil {
 			return err
 		}
-		patchBytes, patchedObject, err := patcher.Patch(info.Object, modified, info.Source, info.Namespace, info.Name, o.ErrOut)
-		if err != nil {
-			return cmdutil.AddSourceToErr(fmt.Sprintf("applying patch:\n%s\nto:\n%v\nfor:", patchBytes, info), info.Source, err)
+		if err = printer.PrintObj(info.Object, o.Out); err != nil {
+			return err
 		}
-
-		info.Refresh(patchedObject, true)
-
-		WarnIfDeleting(info.Object, o.ErrOut)
-
-		if string(patchBytes) == "{}" && !o.shouldPrintObject() {
-			printer, err := o.ToPrinter("unchanged")
-			if err != nil {
-				return err
-			}
-			if err = printer.PrintObj(info.Object, o.Out); err != nil {
-				return err
-			}
-			return nil
-		}
+		return nil
 	}
 
 	if o.shouldPrintObject() {
@@ -751,6 +774,29 @@ See https://kubernetes.io/docs/reference/using-api/server-side-apply/#conflicts`
 	}
 
 	return nil
+}
+
+func pruneNullsFromMap(data map[string]interface{}) {
+	for k, v := range data {
+		if v == nil {
+			delete(data, k)
+		} else {
+			pruneNulls(v)
+		}
+	}
+}
+func pruneNullsFromSlice(data []interface{}) {
+	for _, v := range data {
+		pruneNulls(v)
+	}
+}
+func pruneNulls(v interface{}) {
+	switch v := v.(type) {
+	case map[string]interface{}:
+		pruneNullsFromMap(v)
+	case []interface{}:
+		pruneNullsFromSlice(v)
+	}
 }
 
 // Saves the last-applied-configuration annotation in a separate SSA field manager

@@ -18,6 +18,7 @@ package network
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -123,11 +124,11 @@ func (t *dnsTestCommon) runDig(dnsName, target string) []string {
 	case "cluster-dns-ipv6":
 		cmd = append(cmd, "AAAA")
 	default:
-		panic(fmt.Errorf("invalid target: " + target))
+		panic(errors.New("invalid target: " + target))
 	}
 	cmd = append(cmd, dnsName)
 
-	stdout, stderr, err := e2epod.ExecWithOptions(t.f, e2epod.ExecOptions{
+	stdout, stderr, err := e2epod.Exec(t.f.TContext(context.Background()), e2epod.ExecOptions{
 		Command:       cmd,
 		Namespace:     t.f.Namespace.Name,
 		PodName:       t.utilPod.Name,
@@ -352,7 +353,13 @@ func (t *dnsTestCommon) deleteDNSServerPod(ctx context.Context) {
 	}
 }
 
-func createDNSPod(namespace, wheezyProbeCmd, jessieProbeCmd, podHostName, serviceName string) *v1.Pod {
+type dnsQuerier struct {
+	name  string             // container name
+	image imageutils.ImageID // container image
+	cmd   string             // a shell-script in a string
+}
+
+func createDNSPod(namespace string, probers []dnsQuerier, podHostName, serviceName string) *v1.Pod {
 	podName := "dns-test-" + string(uuid.NewUUID())
 	volumes := []v1.Volume{
 		{
@@ -369,21 +376,31 @@ func createDNSPod(namespace, wheezyProbeCmd, jessieProbeCmd, podHostName, servic
 		},
 	}
 
+	// This is an "agnhost pod" but we use the 0th container as a webserver.
 	// TODO: Consider scraping logs instead of running a webserver.
 	dnsPod := e2epod.NewAgnhostPod(namespace, podName, volumes, mounts, nil, "test-webserver")
 	dnsPod.Spec.Containers[0].Name = "webserver"
 
-	querier := e2epod.NewAgnhostContainer("querier", mounts, nil, wheezyProbeCmd)
-	querier.Command = []string{"sh", "-c"}
-
-	jessieQuerier := v1.Container{
-		Name:         "jessie-querier",
-		Image:        imageutils.GetE2EImage(imageutils.JessieDnsutils),
-		Command:      []string{"sh", "-c", jessieProbeCmd},
-		VolumeMounts: mounts,
+	probeCtrs := []v1.Container{}
+	for _, probe := range probers {
+		name := probe.name + "-querier"
+		if probe.image == imageutils.Agnhost {
+			// agnhost is special cased, to keep all of its logic consistent.
+			ctr := e2epod.NewAgnhostContainer(name, mounts, nil)
+			ctr.Command = []string{"sh", "-c", probe.cmd}
+			probeCtrs = append(probeCtrs, ctr)
+		} else {
+			ctr := v1.Container{
+				Name:         name,
+				Image:        imageutils.GetE2EImage(probe.image),
+				Command:      []string{"sh", "-c", probe.cmd},
+				VolumeMounts: mounts,
+			}
+			probeCtrs = append(probeCtrs, ctr)
+		}
 	}
 
-	dnsPod.Spec.Containers = append(dnsPod.Spec.Containers, querier, jessieQuerier)
+	dnsPod.Spec.Containers = append(dnsPod.Spec.Containers, probeCtrs...)
 	dnsPod.Spec.Hostname = podHostName
 	dnsPod.Spec.Subdomain = serviceName
 
@@ -456,7 +473,7 @@ func assertFilesExist(ctx context.Context, fileNames []string, fileDir string, p
 func assertFilesContain(ctx context.Context, fileNames []string, fileDir string, pod *v1.Pod, client clientset.Interface, check bool, expected string) {
 	var failed []string
 
-	framework.ExpectNoError(wait.PollImmediateWithContext(ctx, time.Second*5, time.Second*600, func(ctx context.Context) (bool, error) {
+	framework.ExpectNoError(wait.PollUntilContextTimeout(ctx, time.Second*5, time.Second*600, true, func(ctx context.Context) (bool, error) {
 		failed = []string{}
 
 		ctx, cancel := context.WithTimeout(ctx, framework.SingleCallTimeout)
@@ -473,7 +490,7 @@ func assertFilesContain(ctx context.Context, fileNames []string, fileDir string,
 
 			if err != nil {
 				if ctx.Err() != nil {
-					framework.Failf("Unable to read %s from pod %s/%s: %v", fileName, pod.Namespace, pod.Name, err)
+					return false, fmt.Errorf("Unable to read %s from pod %s/%s: %v", fileName, pod.Namespace, pod.Name, err)
 				} else {
 					framework.Logf("Unable to read %s from pod %s/%s: %v", fileName, pod.Namespace, pod.Name, err)
 				}
@@ -491,7 +508,9 @@ func assertFilesContain(ctx context.Context, fileNames []string, fileDir string,
 		// grab logs from all the containers
 		for _, container := range pod.Spec.Containers {
 			logs, err := e2epod.GetPodLogs(ctx, client, pod.Namespace, pod.Name, container.Name)
-			framework.ExpectNoError(err)
+			if err != nil {
+				return false, fmt.Errorf("unexpected error getting pod client logs for %s: %v", container.Name, err)
+			}
 			framework.Logf("Pod client logs for %s: %s", container.Name, logs)
 		}
 
@@ -503,10 +522,6 @@ func assertFilesContain(ctx context.Context, fileNames []string, fileDir string,
 func validateDNSResults(ctx context.Context, f *framework.Framework, pod *v1.Pod, fileNames []string) {
 	ginkgo.By("submitting the pod to kubernetes")
 	podClient := f.ClientSet.CoreV1().Pods(f.Namespace.Name)
-	ginkgo.DeferCleanup(func(ctx context.Context) error {
-		ginkgo.By("deleting the pod")
-		return podClient.Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
-	})
 	if _, err := podClient.Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		framework.Failf("ginkgo.Failed to create pod %s/%s: %v", pod.Namespace, pod.Name, err)
 	}
@@ -530,10 +545,6 @@ func validateDNSResults(ctx context.Context, f *framework.Framework, pod *v1.Pod
 func validateTargetedProbeOutput(ctx context.Context, f *framework.Framework, pod *v1.Pod, fileNames []string, value string) {
 	ginkgo.By("submitting the pod to kubernetes")
 	podClient := f.ClientSet.CoreV1().Pods(f.Namespace.Name)
-	ginkgo.DeferCleanup(func(ctx context.Context) error {
-		ginkgo.By("deleting the pod")
-		return podClient.Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
-	})
 	if _, err := podClient.Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		framework.Failf("ginkgo.Failed to create pod %s/%s: %v", pod.Namespace, pod.Name, err)
 	}

@@ -19,19 +19,21 @@ package validatingadmissionpolicystatus
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
-	"k8s.io/api/admissionregistration/v1beta1"
+	v1 "k8s.io/api/admissionregistration/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apiserver/pkg/admission/plugin/validatingadmissionpolicy"
-	admissionregistrationv1beta1apply "k8s.io/client-go/applyconfigurations/admissionregistration/v1beta1"
-	informerv1beta1 "k8s.io/client-go/informers/admissionregistration/v1beta1"
-	admissionregistrationv1beta1 "k8s.io/client-go/kubernetes/typed/admissionregistration/v1beta1"
+	validatingadmissionpolicy "k8s.io/apiserver/pkg/admission/plugin/policy/validating"
+	admissionregistrationv1apply "k8s.io/client-go/applyconfigurations/admissionregistration/v1"
+	informerv1 "k8s.io/client-go/informers/admissionregistration/v1"
+	admissionregistrationv1 "k8s.io/client-go/kubernetes/typed/admissionregistration/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
 )
 
 // ControllerName has "Status" in it to differentiate this controller with the other that runs in API server.
@@ -40,10 +42,10 @@ const ControllerName = "validatingadmissionpolicy-status"
 // Controller is the ValidatingAdmissionPolicy Status controller that reconciles the Status field of each policy object.
 // This controller runs type checks against referred types for each policy definition.
 type Controller struct {
-	policyInformer informerv1beta1.ValidatingAdmissionPolicyInformer
-	policyQueue    workqueue.RateLimitingInterface
+	policyInformer informerv1.ValidatingAdmissionPolicyInformer
+	policyQueue    workqueue.TypedRateLimitingInterface[string]
 	policySynced   cache.InformerSynced
-	policyClient   admissionregistrationv1beta1.ValidatingAdmissionPolicyInterface
+	policyClient   admissionregistrationv1.ValidatingAdmissionPolicyInterface
 
 	// typeChecker checks the policy's expressions for type errors.
 	// Type of params is defined in policy.Spec.ParamsKind
@@ -52,35 +54,48 @@ type Controller struct {
 }
 
 func (c *Controller) Run(ctx context.Context, workers int) {
-	defer utilruntime.HandleCrash()
+	defer utilruntime.HandleCrashWithContext(ctx)
 
-	if !cache.WaitForNamedCacheSync(ControllerName, ctx.Done(), c.policySynced) {
+	var wg sync.WaitGroup
+	defer func() {
+		c.policyQueue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, c.policySynced) {
 		return
 	}
 
-	defer c.policyQueue.ShutDown()
 	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, c.runWorker, time.Second)
+		})
 	}
-
 	<-ctx.Done()
 }
 
-func NewController(policyInformer informerv1beta1.ValidatingAdmissionPolicyInformer, policyClient admissionregistrationv1beta1.ValidatingAdmissionPolicyInterface, typeChecker *validatingadmissionpolicy.TypeChecker) (*Controller, error) {
+func NewController(ctx context.Context, policyInformer informerv1.ValidatingAdmissionPolicyInformer, policyClient admissionregistrationv1.ValidatingAdmissionPolicyInterface, typeChecker *validatingadmissionpolicy.TypeChecker) (*Controller, error) {
+	logger := klog.FromContext(ctx)
 	c := &Controller{
 		policyInformer: policyInformer,
-		policyQueue:    workqueue.NewRateLimitingQueueWithConfig(workqueue.DefaultControllerRateLimiter(), workqueue.RateLimitingQueueConfig{Name: ControllerName}),
-		policyClient:   policyClient,
-		typeChecker:    typeChecker,
+		policyQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: &logger,
+				Name:   ControllerName,
+			},
+		),
+		policyClient: policyClient,
+		typeChecker:  typeChecker,
 	}
-	reg, err := policyInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	reg, err := policyInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			c.enqueuePolicy(obj)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			c.enqueuePolicy(newObj)
 		},
-	})
+	}, cache.HandlerOptions{Logger: &logger})
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +104,7 @@ func NewController(policyInformer informerv1beta1.ValidatingAdmissionPolicyInfor
 }
 
 func (c *Controller) enqueuePolicy(policy any) {
-	if policy, ok := policy.(*v1beta1.ValidatingAdmissionPolicy); ok {
+	if policy, ok := policy.(*v1.ValidatingAdmissionPolicy); ok {
 		// policy objects are cluster-scoped, no point include its namespace.
 		key := policy.ObjectMeta.Name
 		if key == "" {
@@ -112,10 +127,6 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	defer c.policyQueue.Done(key)
 
 	err := func() error {
-		key, ok := key.(string)
-		if !ok {
-			return fmt.Errorf("expect a string but got %v", key)
-		}
 		policy, err := c.policyInformer.Lister().Get(key)
 		if err != nil {
 			if kerrors.IsNotFound(err) {
@@ -138,7 +149,7 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	return true
 }
 
-func (c *Controller) reconcile(ctx context.Context, policy *v1beta1.ValidatingAdmissionPolicy) error {
+func (c *Controller) reconcile(ctx context.Context, policy *v1.ValidatingAdmissionPolicy) error {
 	if policy == nil {
 		return nil
 	}
@@ -146,16 +157,16 @@ func (c *Controller) reconcile(ctx context.Context, policy *v1beta1.ValidatingAd
 		return nil
 	}
 	warnings := c.typeChecker.Check(policy)
-	warningsConfig := make([]*admissionregistrationv1beta1apply.ExpressionWarningApplyConfiguration, 0, len(warnings))
+	warningsConfig := make([]*admissionregistrationv1apply.ExpressionWarningApplyConfiguration, 0, len(warnings))
 	for _, warning := range warnings {
-		warningsConfig = append(warningsConfig, admissionregistrationv1beta1apply.ExpressionWarning().
+		warningsConfig = append(warningsConfig, admissionregistrationv1apply.ExpressionWarning().
 			WithFieldRef(warning.FieldRef).
 			WithWarning(warning.Warning))
 	}
-	applyConfig := admissionregistrationv1beta1apply.ValidatingAdmissionPolicy(policy.Name).
-		WithStatus(admissionregistrationv1beta1apply.ValidatingAdmissionPolicyStatus().
+	applyConfig := admissionregistrationv1apply.ValidatingAdmissionPolicy(policy.Name).
+		WithStatus(admissionregistrationv1apply.ValidatingAdmissionPolicyStatus().
 			WithObservedGeneration(policy.Generation).
-			WithTypeChecking(admissionregistrationv1beta1apply.TypeChecking().
+			WithTypeChecking(admissionregistrationv1apply.TypeChecking().
 				WithExpressionWarnings(warningsConfig...)))
 	_, err := c.policyClient.ApplyStatus(ctx, applyConfig, metav1.ApplyOptions{FieldManager: ControllerName, Force: true})
 	return err

@@ -20,9 +20,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+
+	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
 // phaseSeparator defines the separator to be used when concatenating nested
@@ -118,7 +120,7 @@ func (e *Runner) computePhaseRunFlags() (map[string]bool, error) {
 	// Initialize support data structure
 	phaseRunFlags := map[string]bool{}
 	phaseHierarchy := map[string][]string{}
-	e.visitAll(func(p *phaseRunner) error {
+	for _, p := range e.phaseRunners {
 		// Initialize phaseRunFlags assuming that all the phases should be run.
 		phaseRunFlags[p.generatedName] = true
 
@@ -132,8 +134,7 @@ func (e *Runner) computePhaseRunFlags() (map[string]bool, error) {
 			phaseHierarchy[parent.generatedName] = append(phaseHierarchy[parent.generatedName], p.generatedName)
 			parent = parent.parent
 		}
-		return nil
-	})
+	}
 
 	// If a filter option is specified, set all phaseRunFlags to false except for
 	// the phases included in the filter and their hierarchy of nested phases.
@@ -229,10 +230,10 @@ func (e *Runner) Run(args []string) error {
 		}
 	}
 
-	err = e.visitAll(func(p *phaseRunner) error {
+	for _, p := range e.phaseRunners {
 		// if the phase should not be run, skip the phase.
 		if run, ok := phaseRunFlags[p.generatedName]; !run || !ok {
-			return nil
+			continue
 		}
 
 		// Errors if phases that are meant to create special subcommands only
@@ -250,7 +251,7 @@ func (e *Runner) Run(args []string) error {
 			}
 
 			if !ok {
-				return nil
+				continue
 			}
 		}
 
@@ -260,11 +261,9 @@ func (e *Runner) Run(args []string) error {
 				return errors.Wrapf(err, "error execution phase %s", p.generatedName)
 			}
 		}
+	}
 
-		return nil
-	})
-
-	return err
+	return nil
 }
 
 // Help returns text with the list of phases included in the workflow.
@@ -273,22 +272,21 @@ func (e *Runner) Help(cmdUse string) string {
 
 	// computes the max length of for each phase use line
 	maxLength := 0
-	e.visitAll(func(p *phaseRunner) error {
+	for _, p := range e.phaseRunners {
 		if !p.Hidden && !p.RunAllSiblings {
 			length := len(p.use)
 			if maxLength < length {
 				maxLength = length
 			}
 		}
-		return nil
-	})
+	}
 
 	// prints the list of phases indented by level and formatted using the maxlength
-	// the list is enclosed in a mardown code block for ensuring better readability in the public web site
+	// the list is enclosed in a markdown code block for ensuring better readability in the public web site
 	line := fmt.Sprintf("The %q command executes the following phases:\n", cmdUse)
 	line += "```\n"
 	offset := 2
-	e.visitAll(func(p *phaseRunner) error {
+	for _, p := range e.phaseRunners {
 		if !p.Hidden && !p.RunAllSiblings {
 			padding := maxLength - len(p.use) + offset
 			line += strings.Repeat(" ", offset*p.level) // indentation
@@ -297,9 +295,7 @@ func (e *Runner) Help(cmdUse string) string {
 			line += p.Short                             // phase short description
 			line += "\n"
 		}
-
-		return nil
-	})
+	}
 	line += "```"
 	return line
 }
@@ -332,17 +328,18 @@ func (e *Runner) BindToCommand(cmd *cobra.Command) {
 	// adds the phases subcommand
 	phaseCommand := &cobra.Command{
 		Use:   "phase",
-		Short: fmt.Sprintf("Use this command to invoke single phase of the %s workflow", cmd.Name()),
+		Short: fmt.Sprintf("Use this command to invoke single phase of the %q workflow", cmd.Name()),
 	}
+	cmdutil.RequireSubcommand(phaseCommand)
 
 	cmd.AddCommand(phaseCommand)
 
 	// generate all the nested subcommands for invoking single phases
 	subcommands := map[string]*cobra.Command{}
-	e.visitAll(func(p *phaseRunner) error {
+	for _, p := range e.phaseRunners {
 		// skip hidden phases
 		if p.Hidden {
-			return nil
+			continue
 		}
 
 		// initialize phase selector
@@ -363,7 +360,8 @@ func (e *Runner) BindToCommand(cmd *cobra.Command) {
 			RunE: func(cmd *cobra.Command, args []string) error {
 				// if the phase has subphases, print the help and exits
 				if len(p.Phases) > 0 {
-					return cmd.Help()
+					_ = cmd.Help()
+					return cmdutil.ErrorSubcommandRequired
 				}
 
 				// overrides the command triggering the Runner using the phaseCmd
@@ -408,8 +406,7 @@ func (e *Runner) BindToCommand(cmd *cobra.Command) {
 		}
 
 		subcommands[p.generatedName] = phaseCmd
-		return nil
-	})
+	}
 
 	// alters the command description to show available phases
 	if cmd.Long != "" {
@@ -436,18 +433,6 @@ func inheritsFlags(sourceFlags, targetFlags *pflag.FlagSet, cmdFlags []string) {
 			}
 		}
 	})
-}
-
-// visitAll provides a utility method for visiting all the phases in the workflow
-// in the execution order and executing a func on each phase.
-// Nested phase are visited immediately after their parent phase.
-func (e *Runner) visitAll(fn func(*phaseRunner) error) error {
-	for _, currentRunner := range e.phaseRunners {
-		if err := fn(currentRunner); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // prepareForExecution initialize the internal state of the Runner (the list of phaseRunner).

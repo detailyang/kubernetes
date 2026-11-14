@@ -22,7 +22,9 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/klog/v2"
+
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 )
@@ -31,37 +33,40 @@ import (
 const Name = names.SchedulingGates
 
 // SchedulingGates checks if a Pod carries .spec.schedulingGates.
-type SchedulingGates struct {
-	enablePodSchedulingReadiness bool
-}
+type SchedulingGates struct{}
 
-var _ framework.PreEnqueuePlugin = &SchedulingGates{}
-var _ framework.EnqueueExtensions = &SchedulingGates{}
+var _ fwk.PreEnqueuePlugin = &SchedulingGates{}
+var _ fwk.EnqueueExtensions = &SchedulingGates{}
 
 func (pl *SchedulingGates) Name() string {
 	return Name
 }
 
-func (pl *SchedulingGates) PreEnqueue(ctx context.Context, p *v1.Pod) *framework.Status {
-	if !pl.enablePodSchedulingReadiness || len(p.Spec.SchedulingGates) == 0 {
+func (pl *SchedulingGates) PreEnqueue(ctx context.Context, p *v1.Pod) *fwk.Status {
+	if len(p.Spec.SchedulingGates) == 0 {
 		return nil
 	}
-	var gates []string
+	gates := make([]string, 0, len(p.Spec.SchedulingGates))
 	for _, gate := range p.Spec.SchedulingGates {
 		gates = append(gates, gate.Name)
 	}
-	return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("waiting for scheduling gates: %v", gates))
+	return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, fmt.Sprintf("waiting for scheduling gates: %v", gates))
 }
 
 // EventsToRegister returns the possible events that may make a Pod
 // failed by this plugin schedulable.
-func (pl *SchedulingGates) EventsToRegister() []framework.ClusterEventWithHint {
-	return []framework.ClusterEventWithHint{
-		{Event: framework.ClusterEvent{Resource: framework.Pod, ActionType: framework.Update}},
-	}
+func (pl *SchedulingGates) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+	return []fwk.ClusterEventWithHint{
+		// Pods can be more schedulable once it's gates are removed
+		{Event: fwk.ClusterEvent{Resource: fwk.TargetPod, ActionType: fwk.UpdatePodSchedulingGatesEliminated}, QueueingHintFn: pl.isSchedulableAfterUpdateTargetPodSchedulingGatesEliminated},
+	}, nil
 }
 
 // New initializes a new plugin and returns it.
-func New(_ runtime.Object, _ framework.Handle, fts feature.Features) (framework.Plugin, error) {
-	return &SchedulingGates{enablePodSchedulingReadiness: fts.EnablePodSchedulingReadiness}, nil
+func New(_ context.Context, _ runtime.Object, _ fwk.Handle, _ feature.Features) (fwk.Plugin, error) {
+	return &SchedulingGates{}, nil
+}
+
+func (pl *SchedulingGates) isSchedulableAfterUpdateTargetPodSchedulingGatesEliminated(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
+	return fwk.Queue, nil
 }

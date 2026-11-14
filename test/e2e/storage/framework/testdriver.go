@@ -36,16 +36,15 @@ type TestDriver interface {
 	// information.
 	GetDriverInfo() *DriverInfo
 
-	// SkipUnsupportedTest skips test if Testpattern is not
+	// SkipUnsupportedTest returns the reason for skipping test if Testpattern is not
 	// suitable to test with the TestDriver. It gets called after
 	// parsing parameters of the test suite and before the
-	// framework is initialized. Cheap tests that just check
-	// parameters like the cloud provider can and should be
-	// done in SkipUnsupportedTest to avoid setting up more
-	// expensive resources like framework.Framework. Tests that
+	// framework is initialized.
+	//
+	// Tests that
 	// depend on a connection to the cluster can be done in
 	// PrepareTest once the framework is ready.
-	SkipUnsupportedTest(TestPattern)
+	SkipUnsupportedTest(TestPattern) string
 
 	// PrepareTest is called at test execution time each time a new test case is about to start.
 	// It sets up all necessary resources and returns the per-test configuration.
@@ -130,6 +129,26 @@ type SnapshottableTestDriver interface {
 	GetSnapshotClass(ctx context.Context, config *PerTestConfig, parameters map[string]string) *unstructured.Unstructured
 }
 
+type SnapshotMetadataTestDriver interface {
+	TestDriver
+}
+
+// VolumeGroupSnapshottableTestDriver represents an interface for a TestDriver that supports DynamicGroupSnapshot
+type VolumeGroupSnapshottableTestDriver interface {
+	TestDriver
+	// GetVolumeGroupSnapshotClass returns a VolumeGroupSnapshotClass to create group snapshot.
+	GetVolumeGroupSnapshotClass(ctx context.Context, config *PerTestConfig, parameters map[string]string) *unstructured.Unstructured
+}
+
+// VolumeAttributesClassTestDriver represents an interface for a TestDriver that supports
+// creating and modifying volumes via VolumeAttributesClass objects
+type VolumeAttributesClassTestDriver interface {
+	TestDriver
+	// GetVolumeAttributesClass returns a VolumeAttributesClass to create/modify PVCs
+	// It will return nil if the TestDriver does not support VACs
+	GetVolumeAttributesClass(ctx context.Context, config *PerTestConfig) *storagev1.VolumeAttributesClass
+}
+
 // CustomTimeoutsTestDriver represents an interface fo a TestDriver that supports custom timeouts.
 type CustomTimeoutsTestDriver interface {
 	TestDriver
@@ -149,13 +168,15 @@ type Capability string
 
 // Constants related to capabilities and behavior of the driver.
 const (
-	CapPersistence        Capability = "persistence"        // data is persisted across pod restarts
-	CapBlock              Capability = "block"              // raw block mode
-	CapFsGroup            Capability = "fsGroup"            // volume ownership via fsGroup
-	CapVolumeMountGroup   Capability = "volumeMountGroup"   // Driver has the VolumeMountGroup CSI node capability. Because this is a FSGroup feature, the fsGroup capability must also be set to true.
-	CapExec               Capability = "exec"               // exec a file in the volume
-	CapSnapshotDataSource Capability = "snapshotDataSource" // support populate data from snapshot
-	CapPVCDataSource      Capability = "pvcDataSource"      // support populate data from pvc
+	CapPersistence         Capability = "persistence"        // data is persisted across pod restarts
+	CapBlock               Capability = "block"              // raw block mode
+	CapFsGroup             Capability = "fsGroup"            // volume ownership via fsGroup
+	CapVolumeMountGroup    Capability = "volumeMountGroup"   // Driver has the VolumeMountGroup CSI node capability. Because this is a FSGroup feature, the fsGroup capability must also be set to true.
+	CapExec                Capability = "exec"               // exec a file in the volume
+	CapSnapshotDataSource  Capability = "snapshotDataSource" // support populate data from snapshot
+	CapSnapshotMetadata    Capability = "snapshotMetadata"   // support snapshot metadata
+	CapVolumeGroupSnapshot Capability = "groupSnapshot"      // support group snapshot
+	CapPVCDataSource       Capability = "pvcDataSource"      // support populate data from pvc
 
 	// multiple pods on a node can use the same volume concurrently;
 	// for CSI, see:
@@ -208,6 +229,9 @@ const (
 
 	// The driver supports ReadOnlyMany (ROX) access mode
 	CapReadOnlyMany Capability = "capReadOnlyMany"
+
+	// The driver supports SELinuxMount feature
+	CapSELinuxMount Capability = "seLinuxMount"
 )
 
 // DriverInfo represents static information about a TestDriver.
@@ -219,7 +243,7 @@ type DriverInfo struct {
 	// plugin if it exists and is empty if this DriverInfo represents a CSI
 	// Driver
 	InTreePluginName string
-	FeatureTag       string // FeatureTag for the driver
+	TestTags         []interface{} // tags for the driver (e.g. framework.WithSlow())
 
 	// Maximum single file size supported by this driver
 	MaxFileSize int64
@@ -247,8 +271,23 @@ type DriverInfo struct {
 	StressTestOptions *StressTestOptions
 	// [Optional] Scale parameters for volume snapshot stress tests.
 	VolumeSnapshotStressTestOptions *VolumeSnapshotStressTestOptions
+	// [Optional] Scale parameters for volume modify stress tests.
+	VolumeModifyStressTestOptions *VolumeModifyStressTestOptions
+	// [Optional] Scale parameters for snapshot metadata stress tests.
+	SnapshotMetadataStressTestOptions *SnapshotMetadataStressTestOptions
 	// [Optional] Parameters for performance tests
 	PerformanceTestOptions *PerformanceTestOptions
+	// [Optional] Scale parameters for volume group snapshot stress tests.
+	VolumeGroupSnapshotStressTestOptions *VolumeGroupSnapshotStressTestOptions
+	// [Optional] Scale parameters for volume cloning stress tests.
+	VolumeCloneStressTestOptions *VolumeCloneStressTestOptions
+}
+
+// VolumeCloneStressTestOptions contains parameters used for volume clone stress tests.
+type VolumeCloneStressTestOptions struct {
+	// Number of clones to create in parallel from a single source PVC.
+	// Values <= 0 are invalid; omit the field to use the test default.
+	NumClones int
 }
 
 // StressTestOptions contains parameters used for stress tests.
@@ -267,6 +306,21 @@ type VolumeSnapshotStressTestOptions struct {
 	NumPods int
 	// Number of snapshots to create for each volume.
 	NumSnapshots int
+}
+
+// VolumeModifyStressTestOptions contains parameters used for volume modify stress tests.
+type VolumeModifyStressTestOptions struct {
+	// Number of pods to create in the test. This may also create
+	// up to 1 volume with volumeAttributesClass per pod.
+	NumPods int
+}
+
+// SnapshotMetadataStressTestOptions contains parameters for snapshot metadata stress tests.
+type SnapshotMetadataStressTestOptions struct {
+	// Number of pods to create in the test. Each pod gets its own PVC and snapshots.
+	NumPods int
+	// Number of snapshot pairs per pod for delta verification.
+	NumSnapshotPairs int
 }
 
 // Metrics to evaluate performance of an operation
@@ -288,4 +342,13 @@ type PerformanceTestProvisioningOptions struct {
 // PerformanceTestOptions contains parameters used for performance tests
 type PerformanceTestOptions struct {
 	ProvisioningOptions *PerformanceTestProvisioningOptions
+}
+
+// VolumeGroupSnapshotStressTestOptions contains parameters used for volume group snapshot stress tests.
+type VolumeGroupSnapshotStressTestOptions struct {
+	// Number of pods to create in the StatefulSet. This will create
+	// that many PVCs with the same label for group snapshotting.
+	NumPods int
+	// Number of volume group snapshots to create.
+	NumSnapshots int
 }

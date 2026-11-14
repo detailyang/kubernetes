@@ -42,11 +42,11 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	clienttypedv1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration"
 	"k8s.io/kubernetes/test/integration/framework"
-	"k8s.io/kubernetes/test/utils/ktesting"
 )
 
 const (
@@ -56,7 +56,7 @@ const (
 )
 
 func testPrefix(t *testing.T, prefix string) {
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	transport, err := restclient.TransportFor(server.ClientConfig)
@@ -109,7 +109,7 @@ func TestKubernetesService(t *testing.T) {
 }
 
 func TestEmptyList(t *testing.T) {
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	transport, err := restclient.TransportFor(server.ClientConfig)
@@ -176,7 +176,7 @@ func TestStatus(t *testing.T) {
 			statusCode:    http.StatusForbidden,
 			reqPath:       "/apis",
 			reason:        "Forbidden",
-			message:       `forbidden: User "system:anonymous" cannot get path "/apis": Everything is forbidden.`,
+			message:       `forbidden: User "system:anonymous" cannot get path "/apis": alwaysdeny: Everything is forbidden.`,
 		},
 		{
 			name:          "401",
@@ -190,11 +190,8 @@ func TestStatus(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, ctx := ktesting.NewTestContext(t)
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-
-			_, kubeConfig, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
+			tCtx := ktesting.Init(t)
+			_, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
 				ModifyServerRunOptions: func(options *options.ServerRunOptions) {
 					if tc.modifyOptions != nil {
 						tc.modifyOptions(options)
@@ -296,21 +293,21 @@ func constructBody(val string, size int, field string, t *testing.T) *appsv1.Dep
 	switch field {
 	case "labels":
 		labelsMap := map[string]string{}
-		for i := 0; i < size; i++ {
+		for i := range size {
 			key := val + strconv.Itoa(i)
 			labelsMap[key] = val
 		}
 		deploymentObject.ObjectMeta.Labels = labelsMap
 	case "annotations":
 		annotationsMap := map[string]string{}
-		for i := 0; i < size; i++ {
+		for i := range size {
 			key := val + strconv.Itoa(i)
 			annotationsMap[key] = val
 		}
 		deploymentObject.ObjectMeta.Annotations = annotationsMap
 	case "finalizers":
 		finalizerString := []string{}
-		for i := 0; i < size; i++ {
+		for range size {
 			finalizerString = append(finalizerString, val)
 		}
 		deploymentObject.ObjectMeta.Finalizers = finalizerString
@@ -341,7 +338,7 @@ func TestObjectSizeResponses(t *testing.T) {
 	expectedMsgFor1MB := `etcdserver: request is too large`
 	expectedMsgFor2MB := `rpc error: code = ResourceExhausted desc = trying to send message larger than max`
 	expectedMsgFor3MB := `Request entity too large: limit is 3145728`
-	expectedMsgForLargeAnnotation := `metadata.annotations: Too long: must have at most 262144 bytes`
+	expectedMsgForLargeAnnotation := `metadata.annotations: Too long: may not be more than 262144 bytes`
 
 	deployment1 := constructBody("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", DeploymentMegabyteSize, "labels", t)      // >1.5 MB file
 	deployment2 := constructBody("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", DeploymentTwoMegabyteSize, "labels", t)   // >2 MB file
@@ -383,7 +380,7 @@ func TestObjectSizeResponses(t *testing.T) {
 }
 
 func TestWatchSucceedsWithoutArgs(t *testing.T) {
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	transport, err := restclient.TransportFor(server.ClientConfig)
@@ -474,7 +471,7 @@ func appsPath(resource, namespace, name string) string {
 }
 
 func TestAutoscalingGroupBackwardCompatibility(t *testing.T) {
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	transport, err := restclient.TransportFor(server.ClientConfig)
@@ -523,7 +520,7 @@ func TestAutoscalingGroupBackwardCompatibility(t *testing.T) {
 }
 
 func TestAppsGroupBackwardCompatibility(t *testing.T) {
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	transport, err := restclient.TransportFor(server.ClientConfig)
@@ -575,7 +572,7 @@ func TestAppsGroupBackwardCompatibility(t *testing.T) {
 }
 
 func TestAccept(t *testing.T) {
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	transport, err := restclient.TransportFor(server.ClientConfig)
@@ -735,9 +732,9 @@ func TestUpdateNodeObjects(t *testing.T) {
 		}
 	}
 
-	for k := 0; k < listers; k++ {
+	for k := range listers {
 		go func(lister int) {
-			for i := 0; i < iterations; i++ {
+			for i := range iterations {
 				_, err := c.Nodes().List(context.TODO(), metav1.ListOptions{})
 				if err != nil {
 					fmt.Printf("[list:%d] error after %d: %v\n", lister, i, err)
@@ -748,7 +745,7 @@ func TestUpdateNodeObjects(t *testing.T) {
 		}(k)
 	}
 
-	for k := 0; k < watchers; k++ {
+	for k := range watchers {
 		go func(lister int) {
 			w, err := c.Nodes().Watch(context.TODO(), metav1.ListOptions{})
 			if err != nil {
@@ -772,10 +769,10 @@ func TestUpdateNodeObjects(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(nodes - listers)
 
-	for j := 0; j < nodes; j++ {
+	for j := range nodes {
 		go func(node int) {
 			var lastCount int
-			for i := 0; i < iterations; i++ {
+			for i := range iterations {
 				if i%100 == 0 {
 					fmt.Printf("[%d] iteration %d ...\n", node, i)
 				}

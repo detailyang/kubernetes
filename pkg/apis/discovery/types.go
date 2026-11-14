@@ -17,6 +17,7 @@ limitations under the License.
 package discovery
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	api "k8s.io/kubernetes/pkg/apis/core"
 )
@@ -133,14 +134,24 @@ type EndpointConditions struct {
 
 // EndpointHints provides hints describing how an endpoint should be consumed.
 type EndpointHints struct {
-	// forZones indicates the zone(s) this endpoint should be consumed by to
-	// enable topology aware routing. May contain a maximum of 8 entries.
+	// forZones indicates the zone(s) this endpoint should be consumed by when
+	// using topology aware routing. May contain a maximum of 8 entries.
 	ForZones []ForZone
+
+	// forNodes indicates the node(s) this endpoint should be consumed by when
+	// using topology aware routing. May contain a maximum of 8 entries.
+	ForNodes []ForNode
 }
 
 // ForZone provides information about which zones should consume this endpoint.
 type ForZone struct {
 	// name represents the name of the zone.
+	Name string
+}
+
+// ForNode provides information about which nodes should consume this endpoint.
+type ForNode struct {
+	// name represents the name of the node.
 	Name string
 }
 
@@ -156,7 +167,7 @@ type EndpointPort struct {
 	Name *string
 	// The IP protocol for this port.
 	// Must be UDP, TCP, or SCTP.
-	Protocol *api.Protocol
+	Protocol *corev1.Protocol
 	// The port number of the endpoint.
 	// If this is not specified, ports are not restricted and must be
 	// interpreted in the context of the specific consumer.
@@ -170,7 +181,7 @@ type EndpointPort struct {
 	// RFC-6335 and https://www.iana.org/assignments/service-names).
 	//
 	// * Kubernetes-defined prefixed names:
-	//   * 'kubernetes.io/h2c' - HTTP/2 over cleartext as described in https://www.rfc-editor.org/rfc/rfc7540
+	//   * 'kubernetes.io/h2c' - HTTP/2 prior knowledge over cleartext as described in https://www.rfc-editor.org/rfc/rfc9113.html#name-starting-http-2-with-prior-
 	//   * 'kubernetes.io/ws'  - WebSocket over cleartext as described in https://www.rfc-editor.org/rfc/rfc6455
 	//   * 'kubernetes.io/wss' - WebSocket over TLS as described in https://www.rfc-editor.org/rfc/rfc6455
 	//

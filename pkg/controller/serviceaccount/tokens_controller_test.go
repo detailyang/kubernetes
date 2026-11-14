@@ -17,22 +17,24 @@ limitations under the License.
 package serviceaccount
 
 import (
+	"context"
 	"reflect"
 	"testing"
 	"time"
 
-	"gopkg.in/square/go-jose.v2/jwt"
+	"github.com/go-jose/go-jose/v4/jwt"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/dump"
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	core "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/pkg/controller"
-	"k8s.io/kubernetes/test/utils/ktesting"
+	"k8s.io/utils/dump"
 )
 
 type testGenerator struct {
@@ -40,7 +42,7 @@ type testGenerator struct {
 	Err   error
 }
 
-func (t *testGenerator) GenerateToken(sc *jwt.Claims, pc interface{}) (string, error) {
+func (t *testGenerator) GenerateToken(ctx context.Context, sc *jwt.Claims, pc interface{}) (string, error) {
 	return t.Token, t.Err
 }
 
@@ -179,7 +181,6 @@ func TestTokenCreation(t *testing.T) {
 		UpdatedServiceAccount *v1.ServiceAccount
 		DeletedServiceAccount *v1.ServiceAccount
 		AddedSecret           *v1.Secret
-		AddedSecretLocal      *v1.Secret
 		UpdatedSecret         *v1.Secret
 		DeletedSecret         *v1.Secret
 
@@ -195,13 +196,6 @@ func TestTokenCreation(t *testing.T) {
 			ClientObjects: []runtime.Object{serviceAccount(missingSecretReferences())},
 
 			AddedServiceAccount: serviceAccount(missingSecretReferences()),
-			ExpectedActions:     []core.Action{},
-		},
-		"new serviceaccount with missing secrets and a local secret in the cache": {
-			ClientObjects: []runtime.Object{serviceAccount(missingSecretReferences())},
-
-			AddedServiceAccount: serviceAccount(tokenSecretReferences()),
-			AddedSecretLocal:    serviceAccountTokenSecret(),
 			ExpectedActions:     []core.Action{},
 		},
 		"new serviceaccount with non-token secrets": {
@@ -454,7 +448,7 @@ func TestTokenCreation(t *testing.T) {
 			secretInformer := informers.Core().V1().Secrets().Informer()
 			secrets := secretInformer.GetStore()
 			serviceAccounts := informers.Core().V1().ServiceAccounts().Informer().GetStore()
-			controller, err := NewTokensController(informers.Core().V1().ServiceAccounts(), informers.Core().V1().Secrets(), client, TokensControllerOptions{TokenGenerator: generator, RootCA: []byte("CA Data"), MaxRetries: tc.MaxRetries})
+			controller, err := NewTokensController(ctx, informers.Core().V1().ServiceAccounts(), informers.Core().V1().Secrets(), client, TokensControllerOptions{TokenGenerator: generator, RootCA: []byte("CA Data"), MaxRetries: tc.MaxRetries})
 			if err != nil {
 				t.Fatalf("error creating Tokens controller: %v", err)
 			}
@@ -481,9 +475,6 @@ func TestTokenCreation(t *testing.T) {
 			if tc.AddedSecret != nil {
 				secrets.Add(tc.AddedSecret)
 				controller.queueSecretSync(tc.AddedSecret)
-			}
-			if tc.AddedSecretLocal != nil {
-				controller.updatedSecrets.Mutation(tc.AddedSecretLocal)
 			}
 			if tc.UpdatedSecret != nil {
 				secrets.Add(tc.UpdatedSecret)
@@ -559,5 +550,30 @@ func TestTokenCreation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestQueueServiceAccountSync_Tombstone(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	sa := serviceAccount(emptySecretReferences())
+	tombstone := cache.DeletedFinalStateUnknown{
+		Key: "default/default",
+		Obj: sa,
+	}
+
+	client := fake.NewClientset(sa)
+	informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
+	tokenController, err := NewTokensController(ctx, informerFactory.Core().V1().ServiceAccounts(), informerFactory.Core().V1().Secrets(), client, TokensControllerOptions{})
+	if err != nil {
+		t.Fatalf("error creating Tokens controller: %v", err)
+	}
+
+	tokenController.queueServiceAccountSync(tombstone)
+	if tokenController.syncServiceAccountQueue.Len() != 1 {
+		t.Errorf("expected 1 item in queue, got %d", tokenController.syncServiceAccountQueue.Len())
+	}
+	key, _ := tokenController.syncServiceAccountQueue.Get()
+	if key.uid != sa.UID {
+		t.Errorf("expected UID %s, got %s", sa.UID, key.uid)
 	}
 }

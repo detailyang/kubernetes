@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/transport"
@@ -42,11 +43,7 @@ import (
 )
 
 func TestCertRotation(t *testing.T) {
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-
 	transport.CertCallbackRefreshDuration = 1 * time.Second
-	transport.DialerStopCh = stopCh
 
 	certDir := os.TempDir()
 	clientCAFilename, clientSigningCert, clientSigningKey := writeCACertFiles(t, certDir)
@@ -84,7 +81,7 @@ func TestCertRotation(t *testing.T) {
 	// Should have had a rotation; connections will have been closed
 	select {
 	case _, ok := <-w.ResultChan():
-		assert.Equal(t, false, ok)
+		assert.False(t, ok)
 	default:
 		t.Fatal("Watch wasn't closed despite rotation")
 	}
@@ -100,11 +97,7 @@ func TestCertRotation(t *testing.T) {
 }
 
 func TestCertRotationContinuousRequests(t *testing.T) {
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-
 	transport.CertCallbackRefreshDuration = 1 * time.Second
-	transport.DialerStopCh = stopCh
 
 	certDir := os.TempDir()
 	clientCAFilename, clientSigningCert, clientSigningKey := writeCACertFiles(t, certDir)

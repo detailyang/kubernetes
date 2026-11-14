@@ -26,9 +26,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/apimachinery/pkg/util/resourceversion"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
+	apimachineryutils "k8s.io/kubernetes/test/e2e/common/apimachinery"
 	"k8s.io/kubernetes/test/e2e/framework"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 	admissionapi "k8s.io/pod-security-admission/api"
@@ -59,7 +61,7 @@ var _ = SIGDescribe("PodTemplates", func() {
 		podTemplateList, err := f.ClientSet.CoreV1().PodTemplates("").List(ctx, metav1.ListOptions{
 			LabelSelector: "podtemplate-static=true",
 		})
-		framework.ExpectNoError(err, "failed to list all PodTemplates")
+		framework.ExpectNoError(err, "list all PodTemplates")
 		gomega.Expect(podTemplateList.Items).To(gomega.BeEmpty(), "unable to find templates")
 
 		// create a PodTemplate
@@ -78,12 +80,13 @@ var _ = SIGDescribe("PodTemplates", func() {
 				},
 			},
 		}, metav1.CreateOptions{})
-		framework.ExpectNoError(err, "failed to create PodTemplate")
+		framework.ExpectNoError(err, "create PodTemplate")
 
 		// get template
 		podTemplateRead, err := f.ClientSet.CoreV1().PodTemplates(testNamespaceName).Get(ctx, podTemplateName, metav1.GetOptions{})
-		framework.ExpectNoError(err, "failed to get created PodTemplate")
+		framework.ExpectNoError(err, "get created PodTemplate")
 		gomega.Expect(podTemplateRead.ObjectMeta.Name).To(gomega.Equal(podTemplateName))
+		gomega.Expect(podTemplateRead).To(apimachineryutils.HaveValidResourceVersion())
 
 		// patch template
 		podTemplatePatch, err := json.Marshal(map[string]interface{}{
@@ -93,24 +96,25 @@ var _ = SIGDescribe("PodTemplates", func() {
 				},
 			},
 		})
-		framework.ExpectNoError(err, "failed to marshal patch data")
-		_, err = f.ClientSet.CoreV1().PodTemplates(testNamespaceName).Patch(ctx, podTemplateName, types.StrategicMergePatchType, []byte(podTemplatePatch), metav1.PatchOptions{})
-		framework.ExpectNoError(err, "failed to patch PodTemplate")
+		framework.ExpectNoError(err, "marshal patch data")
+		patchedPodTemplate, err := f.ClientSet.CoreV1().PodTemplates(testNamespaceName).Patch(ctx, podTemplateName, types.StrategicMergePatchType, []byte(podTemplatePatch), metav1.PatchOptions{})
+		framework.ExpectNoError(err, "patch PodTemplate")
+		gomega.Expect(resourceversion.CompareResourceVersion(podTemplateRead.ResourceVersion, patchedPodTemplate.ResourceVersion)).To(gomega.BeNumerically("==", -1), "patched object should have a larger resource version")
 
 		// get template (ensure label is there)
 		podTemplateRead, err = f.ClientSet.CoreV1().PodTemplates(testNamespaceName).Get(ctx, podTemplateName, metav1.GetOptions{})
-		framework.ExpectNoError(err, "failed to get PodTemplate")
-		gomega.Expect(podTemplateRead.ObjectMeta.Labels).To(gomega.HaveKeyWithValue("podtemplate", "patched"), "failed to patch template, new label not found")
+		framework.ExpectNoError(err, "get PodTemplate")
+		gomega.Expect(podTemplateRead.ObjectMeta.Labels).To(gomega.HaveKeyWithValue("podtemplate", "patched"), "patch template, new label not found")
 
 		// delete the PodTemplate
 		err = f.ClientSet.CoreV1().PodTemplates(testNamespaceName).Delete(ctx, podTemplateName, metav1.DeleteOptions{})
-		framework.ExpectNoError(err, "failed to delete PodTemplate")
+		framework.ExpectNoError(err, "delete PodTemplate")
 
 		// list the PodTemplates
 		podTemplateList, err = f.ClientSet.CoreV1().PodTemplates("").List(ctx, metav1.ListOptions{
 			LabelSelector: "podtemplate-static=true",
 		})
-		framework.ExpectNoError(err, "failed to list PodTemplate")
+		framework.ExpectNoError(err, "list PodTemplate")
 		gomega.Expect(podTemplateList.Items).To(gomega.BeEmpty(), "PodTemplate list returned items, failed to delete PodTemplate")
 	})
 
@@ -139,7 +143,7 @@ var _ = SIGDescribe("PodTemplates", func() {
 					},
 				},
 			}, metav1.CreateOptions{})
-			framework.ExpectNoError(err, "failed to create pod template")
+			framework.ExpectNoError(err, "create pod template")
 			framework.Logf("created %v", podTemplateName)
 		}
 
@@ -148,7 +152,7 @@ var _ = SIGDescribe("PodTemplates", func() {
 		podTemplateList, err := f.ClientSet.CoreV1().PodTemplates(f.Namespace.Name).List(ctx, metav1.ListOptions{
 			LabelSelector: "podtemplate-set=true",
 		})
-		framework.ExpectNoError(err, "failed to get a list of pod templates")
+		framework.ExpectNoError(err, "get a list of pod templates")
 
 		gomega.Expect(podTemplateList.Items).To(gomega.HaveLen(len(podTemplateNames)), "looking for expected number of pod templates")
 
@@ -158,12 +162,12 @@ var _ = SIGDescribe("PodTemplates", func() {
 		framework.Logf("requesting DeleteCollection of pod templates")
 		err = f.ClientSet.CoreV1().PodTemplates(f.Namespace.Name).DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{
 			LabelSelector: "podtemplate-set=true"})
-		framework.ExpectNoError(err, "failed to delete all pod templates")
+		framework.ExpectNoError(err, "delete all pod templates")
 
 		ginkgo.By("check that the list of pod templates matches the requested quantity")
 
 		err = wait.PollImmediate(podTemplateRetryPeriod, podTemplateRetryTimeout, checkPodTemplateListQuantity(ctx, f, "podtemplate-set=true", 0))
-		framework.ExpectNoError(err, "failed to count required pod templates")
+		framework.ExpectNoError(err, "count required pod templates")
 
 	})
 
@@ -191,7 +195,7 @@ var _ = SIGDescribe("PodTemplates", func() {
 				},
 			},
 		}, metav1.CreateOptions{})
-		framework.ExpectNoError(err, "failed to create pod template")
+		framework.ExpectNoError(err, "create pod template")
 
 		ginkgo.By("Replace a pod template")
 		var updatedPT *v1.PodTemplate
@@ -205,7 +209,7 @@ var _ = SIGDescribe("PodTemplates", func() {
 			updatedPT, err = ptClient.Update(ctx, ptResource, metav1.UpdateOptions{})
 			return err
 		})
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "update PodTemplate %q in namespace %q", ptResource.Name, f.Namespace.Name)
 		gomega.Expect(updatedPT.Annotations).To(gomega.HaveKeyWithValue("updated", "true"), "updated object should have the applied annotation")
 		framework.Logf("Found updated podtemplate annotation: %#v\n", updatedPT.Annotations["updated"])
 	})

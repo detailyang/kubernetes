@@ -23,39 +23,40 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	fuzz "github.com/google/gofuzz"
+	"sigs.k8s.io/randfill"
 
+	apiextensionsv1beta1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1beta1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	apiextensionsv1beta1conversion "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	"k8s.io/apimachinery/pkg/util/json"
 )
 
 func TestStructuralRoundtripOrError(t *testing.T) {
-	f := fuzz.New()
+	f := randfill.New()
 	seed := time.Now().UnixNano()
 	t.Logf("seed = %v", seed)
 	//seed = int64(1549012506261785182)
 	f.RandSource(rand.New(rand.NewSource(seed)))
 	f.Funcs(
-		func(s *apiextensions.JSON, c fuzz.Continue) {
+		func(s *apiextensions.JSON, c randfill.Continue) {
 			*s = apiextensions.JSON(map[string]interface{}{"foo": float64(42.2)})
 		},
-		func(s *apiextensions.JSONSchemaPropsOrArray, c fuzz.Continue) {
-			c.FuzzNoCustom(s)
+		func(s *apiextensions.JSONSchemaPropsOrArray, c randfill.Continue) {
+			c.FillNoCustom(s)
 			if s.Schema != nil {
 				s.JSONSchemas = nil
 			} else if s.JSONSchemas == nil {
 				s.Schema = &apiextensions.JSONSchemaProps{}
 			}
 		},
-		func(s *apiextensions.JSONSchemaPropsOrBool, c fuzz.Continue) {
-			c.FuzzNoCustom(s)
+		func(s *apiextensions.JSONSchemaPropsOrBool, c randfill.Continue) {
+			c.FillNoCustom(s)
 			if s.Schema != nil {
 				s.Allows = false
 			}
 		},
-		func(s **string, c fuzz.Continue) {
-			c.FuzzNoCustom(s)
+		func(s **string, c randfill.Continue) {
+			c.FillNoCustom(s)
 			if *s != nil && **s == "" {
 				*s = nil
 			}
@@ -70,11 +71,7 @@ func TestStructuralRoundtripOrError(t *testing.T) {
 		origSchema := &apiextensions.JSONSchemaProps{}
 		x := reflect.ValueOf(origSchema).Elem()
 		n := rand.Intn(x.NumField())
-		if name := x.Type().Field(n).Name; name == "Example" || name == "ExternalDocs" {
-			// we drop these intentionally
-			continue
-		}
-		f.Fuzz(x.Field(n).Addr().Interface())
+		f.Fill(x.Field(n).Addr().Interface())
 
 		// it roundtrips or NewStructural errors out. We should never drop anything
 		orig, err := NewStructural(origSchema)
@@ -94,7 +91,7 @@ func TestStructuralRoundtripOrError(t *testing.T) {
 			t.Fatal(err)
 		}
 		internalSchema := &apiextensions.JSONSchemaProps{}
-		err = apiextensionsv1beta1.Convert_v1beta1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(v1beta1Schema, internalSchema, nil)
+		err = apiextensionsv1beta1conversion.Convert_v1beta1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(v1beta1Schema, internalSchema, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

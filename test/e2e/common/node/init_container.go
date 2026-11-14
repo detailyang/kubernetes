@@ -159,7 +159,7 @@ func initContainersInvariants(pod *v1.Pod) error {
 	return nil
 }
 
-var _ = SIGDescribe("InitContainer [NodeConformance]", func() {
+var _ = SIGDescribe("InitContainer", framework.WithNodeConformance(), func() {
 	f := framework.NewDefaultFramework("init-container")
 	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 	var podClient *e2epod.PodClient
@@ -226,7 +226,7 @@ var _ = SIGDescribe("InitContainer [NodeConformance]", func() {
 		event, err := watchtools.Until(ctx, startedPod.ResourceVersion, w,
 			recordEvents(events, conditions.PodCompleted),
 		)
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "observe Pod %q complete after initialization", startedPod.Name)
 
 		checkInvariants(events, containerInitInvariant)
 		endPod := event.Object.(*v1.Pod)
@@ -305,7 +305,7 @@ var _ = SIGDescribe("InitContainer [NodeConformance]", func() {
 		ctx, cancel := watchtools.ContextWithOptionalTimeout(ctx, framework.PodStartTimeout)
 		defer cancel()
 		event, err := watchtools.Until(ctx, startedPod.ResourceVersion, w, recordEvents(events, conditions.PodRunning))
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "observe Pod %q run after initialization", startedPod.Name)
 
 		checkInvariants(events, containerInitInvariant)
 		endPod := event.Object.(*v1.Pod)
@@ -437,7 +437,7 @@ var _ = SIGDescribe("InitContainer [NodeConformance]", func() {
 				}
 			},
 		)
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "observe Pod %q restart its failing init container", startedPod.Name)
 
 		checkInvariants(events, containerInitInvariant)
 		endPod := event.Object.(*v1.Pod)
@@ -536,7 +536,7 @@ var _ = SIGDescribe("InitContainer [NodeConformance]", func() {
 							return false, nil
 						}
 						if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
-							return false, fmt.Errorf("first init container should have exitCode != 0: %s", toDebugJSON(status))
+							return false, fmt.Errorf("first init container should have exitCode == 0: %s", toDebugJSON(status))
 						}
 						status = t.Status.InitContainerStatuses[1]
 						if status.State.Terminated == nil {
@@ -552,7 +552,7 @@ var _ = SIGDescribe("InitContainer [NodeConformance]", func() {
 				}),
 			recordEvents(events, conditions.PodCompleted),
 		)
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "observe Pod %q complete after its init container fails", startedPod.Name)
 
 		checkInvariants(events, containerInitInvariant)
 		endPod := event.Object.(*v1.Pod)

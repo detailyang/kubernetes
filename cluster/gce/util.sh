@@ -20,6 +20,14 @@
 # config-default.sh.
 readonly GCE_MAX_LOCAL_SSD=8
 
+BASE64_HELP=$(base64 --help)
+BASE64_INPUT_FLAG=""
+if [[ $BASE64_HELP =~ "--input" ]]; then
+  BASE64_INPUT_FLAG="--input"
+else
+    BASE64_INPUT_FLAG=""
+fi
+
 KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/../..
 source "${KUBE_ROOT}/cluster/gce/${KUBE_CONFIG_FILE-"config-default.sh"}"
 source "${KUBE_ROOT}/cluster/common.sh"
@@ -46,54 +54,38 @@ if [[ ${NODE_LOCAL_SSDS:-} -ge 1 ]] && [[ -n ${NODE_LOCAL_SSDS_EXT:-} ]] ; then
   exit 2
 fi
 
-if [[ "${MASTER_OS_DISTRIBUTION}" == "gci" ]]; then
-    DEFAULT_GCI_PROJECT=google-containers
-    if [[ "${GCI_VERSION}" == "cos"* ]] || [[ "${MASTER_IMAGE_FAMILY}" == "cos"* ]]; then
-        DEFAULT_GCI_PROJECT=cos-cloud
-    fi
-    export MASTER_IMAGE_PROJECT=${KUBE_GCE_MASTER_PROJECT:-${DEFAULT_GCI_PROJECT}}
-
-    # If the master image is not set, we use the latest image based on image
-    # family.
-    kube_master_image="${KUBE_GCE_MASTER_IMAGE:-${GCI_VERSION}}"
-    if [[ -z "${kube_master_image}" ]]; then
-      kube_master_image=$(gcloud compute images list --project="${MASTER_IMAGE_PROJECT}" --no-standard-images --filter="family:${MASTER_IMAGE_FAMILY}" --format 'value(name)')
-    fi
-
-    echo "Using image: ${kube_master_image} from project: ${MASTER_IMAGE_PROJECT} as master image" >&2
-    export MASTER_IMAGE="${kube_master_image}"
+# If the master image is not set, we use the latest image based on image
+# family.
+kube_master_image="${KUBE_GCE_MASTER_IMAGE:-}"
+if [[ -z "${kube_master_image}" ]]; then
+  # remove architecture:X86_64 once we move on from ubuntu jammy as that image family has both X86_64 and ARM images
+  # a family may briefly contain more than one non-deprecated image; take the newest (the family head)
+  kube_master_image=$(gcloud compute images list --project="${MASTER_IMAGE_PROJECT}" --no-standard-images --filter="family:${MASTER_IMAGE_FAMILY} architecture:X86_64 status=(READY)" --sort-by='~creationTimestamp' --limit=1 --format 'value(name)')
 fi
+
+echo "Using image: ${kube_master_image} from project: ${MASTER_IMAGE_PROJECT} as master image" >&2
+export MASTER_IMAGE="${kube_master_image}"
+
 
 # Sets node image based on the specified os distro. Currently this function only
 # supports gci and debian.
 #
-# Requires:
-#   NODE_OS_DISTRIBUTION
 # Sets:
-#   DEFAULT_GCI_PROJECT
 #   NODE_IMAGE
-#   NODE_IMAGE_PROJECT
 function set-linux-node-image() {
-  if [[ "${NODE_OS_DISTRIBUTION}" == "gci" ]]; then
-    DEFAULT_GCI_PROJECT=google-containers
-    if [[ "${GCI_VERSION}" == "cos"* ]] || [[ "${NODE_IMAGE_FAMILY}" == "cos"* ]]; then
-      DEFAULT_GCI_PROJECT=cos-cloud
-    fi
 
-    # If the node image is not set, we use the latest image based on image
-    # family.
-    # Otherwise, we respect whatever is set by the user.
-    NODE_IMAGE_PROJECT=${KUBE_GCE_NODE_PROJECT:-${DEFAULT_GCI_PROJECT}}
-    local kube_node_image
+  # If the node image is not set, we use the latest image based on image
+  # family.
 
-    kube_node_image="${KUBE_GCE_NODE_IMAGE:-${GCI_VERSION}}"
-    if [[ -z "${kube_node_image}" ]]; then
-      kube_node_image=$(gcloud compute images list --project="${NODE_IMAGE_PROJECT}" --no-standard-images --filter="family:${NODE_IMAGE_FAMILY}" --format 'value(name)')
-    fi
-
-    echo "Using image: ${kube_node_image} from project: ${NODE_IMAGE_PROJECT} as node image" >&2
-    export NODE_IMAGE="${kube_node_image}"
+  kube_node_image="${KUBE_GCE_NODE_IMAGE:-}"
+  if [[ -z "${kube_node_image}" ]]; then
+    # remove architecture:X86_64 once we move on from ubuntu jammy as that image family has both X86_64 and ARM images
+    # a family may briefly contain more than one non-deprecated image; take the newest (the family head)
+    kube_node_image=$(gcloud compute images list --project="${NODE_IMAGE_PROJECT}" --no-standard-images --filter="family:${NODE_IMAGE_FAMILY} architecture:X86_64 status=(READY)" --sort-by='~creationTimestamp' --limit=1 --format 'value(name)')
   fi
+
+  echo "Using image: ${kube_node_image} from project: ${NODE_IMAGE_PROJECT} as node image" >&2
+  export NODE_IMAGE="${kube_node_image}"
 }
 
 # Requires:
@@ -150,6 +142,9 @@ PREEXISTING_NETWORK_MODE=""
 KUBE_PROMPT_FOR_UPDATE=${KUBE_PROMPT_FOR_UPDATE:-"n"}
 # How long (in seconds) to wait for cluster initialization.
 KUBE_CLUSTER_INITIALIZATION_TIMEOUT=${KUBE_CLUSTER_INITIALIZATION_TIMEOUT:-300}
+# Regions to choose from when neither KUBE_GCE_ZONE nor KUBE_GCE_REGION is set.
+# Keep to regions near the Prow build cluster: e2e.test talks to the apiserver
+KUBE_GCE_DEFAULT_REGIONS=(us-central1 us-west1 us-west-4 us-east1 us-east4)
 
 function join_csv() {
   local IFS=','; echo "$*";
@@ -178,14 +173,12 @@ function verify-prereqs() {
     exit 1
   fi
 
-  # we use gcloud to create the cluster, gsutil to stage binaries and data
-  for cmd in gcloud gsutil; do
-    if ! which "${cmd}" >/dev/null; then
-      echo "Can't find ${cmd} in PATH, please fix and retry. The Google Cloud " >&2
-      echo "SDK can be downloaded from https://cloud.google.com/sdk/." >&2
-      exit 1
-    fi
-  done
+  # we use gcloud both to create the cluster and to stage binaries and data
+  if ! which gcloud >/dev/null; then
+    echo "Can't find gcloud in PATH, please fix and retry. The Google Cloud " >&2
+    echo "SDK can be downloaded from https://cloud.google.com/sdk/." >&2
+    exit 1
+  fi
   update-or-verify-gcloud
 }
 
@@ -208,6 +201,7 @@ function detect-project() {
     echo "'gcloud config set project <PROJECT>'" >&2
     exit 1
   fi
+  detect-zone-in-region
   if [[ -z "${PROJECT_REPORTED-}" ]]; then
     echo "Project: ${PROJECT}" >&2
     echo "Network Project: ${NETWORK_PROJECT}" >&2
@@ -216,15 +210,82 @@ function detect-project() {
   fi
 }
 
-# Use gsutil to get the md5 hash for a particular tar
-function gsutil_get_tar_md5() {
+# Prints the UP zones of the given regions, one per line.
+#
+# Assumed vars:
+#   PROJECT
+function list-region-zones() {
+  local regions_re
+  regions_re=$(IFS='|'; echo "$*")
+  gcloud compute zones list \
+    --project "${PROJECT}" \
+    --filter "name ~ '^(${regions_re})-[a-z]+$' AND status=UP" \
+    --format 'value(name)' \
+    --sort-by name
+}
+
+# When KUBE_GCE_ZONE is unset, sets REGION and ZONE to where the master instance
+# or disk already is. Otherwise uses REGION if set, or a region from
+# KUBE_GCE_DEFAULT_REGIONS, and the first zone in it.
+#
+# Assumed vars:
+#   PROJECT
+#   MASTER_NAME
+#   KUBE_GCE_DEFAULT_REGIONS
+# Vars set:
+#   REGION
+#   ZONE
+function detect-zone-in-region() {
+  if [[ -n "${ZONE:-}" ]]; then
+    return
+  fi
+
+  local -a regions=("${KUBE_GCE_DEFAULT_REGIONS[@]}")
+  if [[ -n "${REGION:-}" ]]; then
+    regions=("${REGION}")
+  fi
+
+  local zones
+  zones=$(list-region-zones "${regions[@]}")
+  if [[ -z "${zones}" ]]; then
+    echo -e "${color_red:-}Could not find any zones in regions ${regions[*]} for project ${PROJECT}${color_norm:-}" >&2
+    exit 1
+  fi
+  # Deliberately split on whitespace
+  # shellcheck disable=SC2086
+  local -r zones_csv=$(join_csv ${zones})
+
+  local zone
+  zone=$(gcloud compute instances list --project "${PROJECT}" --zones "${zones_csv}" \
+    --filter "name=${MASTER_NAME}" --format 'value(zone.basename())' --limit 1 2>/dev/null || true)
+  if [[ -z "${zone}" ]]; then
+    zone=$(gcloud compute disks list --project "${PROJECT}" --zones "${zones_csv}" \
+      --filter "name=${MASTER_NAME}-pd" --format 'value(zone.basename())' --limit 1 2>/dev/null || true)
+  fi
+
+  if [[ -z "${zone}" ]]; then
+    # Only regions with UP zones are candidates.
+    local -a available
+    read -r -a available <<< "$(echo "${zones}" | sed 's/-[a-z]*$//' | sort -u | tr '\n' ' ')"
+    # Hash MASTER_NAME so separate kube-up/kube-down/log-dump runs agree on the region.
+    local hash
+    hash=$(cksum <<< "${MASTER_NAME}" | cut -d' ' -f1)
+    local -r region="${available[hash % ${#available[@]}]}"
+    zone=$(echo "${zones}" | grep -m1 "^${region}-")
+  fi
+
+  ZONE="${zone}"
+  REGION="${zone%-*}"
+}
+
+# Use gcloud storage to get the md5 hash for a particular tar
+function get_tar_md5() {
   # location_tar could be local or in the cloud
   # local tar_location example ./_output/release-tars/kubernetes-server-linux-amd64.tar.gz
   # cloud tar_location example gs://kubernetes-staging-PROJECT/kubernetes-devel/kubernetes-server-linux-amd64.tar.gz
   local -r tar_location=$1
-  #parse the output and return the md5 hash
-  #the sed command at the end removes whitespace
-  local -r tar_md5=$(gsutil hash -h -m "${tar_location}" 2>/dev/null | grep "Hash (md5):" | awk -F ':' '{print $2}' | sed 's/^[[:space:]]*//g')
+  #print an empty string if the tar does not exist, so the caller uploads it
+  local -r tar_md5=$(gcloud storage hash --hex --skip-crc32c --format='value(md5_hash)' "${tar_location}" 2>/dev/null)
   echo "${tar_md5}"
 }
 
@@ -242,11 +303,11 @@ function copy-to-staging() {
   #remote_tar_md5 checks the remote location for the existing tarball and its md5
   #staging_path example gs://kubernetes-staging-PROJECT/kubernetes-devel
   #basename_tar example kubernetes-server-linux-amd64.tar.gz
-  local -r remote_tar_md5=$(gsutil_get_tar_md5 "${staging_path}/${basename_tar}")
+  local -r remote_tar_md5=$(get_tar_md5 "${staging_path}/${basename_tar}")
   if [[ -n ${remote_tar_md5} ]]; then
     #local_tar_md5 checks the remote location for the existing tarball and its md5 hash
     #tar example ./_output/release-tars/kubernetes-server-linux-amd64.tar.gz
-    local -r local_tar_md5=$(gsutil_get_tar_md5 "${tar}")
+    local -r local_tar_md5=$(get_tar_md5 "${tar}")
     if [[ "${remote_tar_md5}" == "${local_tar_md5}" ]]; then
       echo "+++ ${basename_tar} uploaded earlier, cloud and local file md5 match (md5 = ${local_tar_md5})"
       return 0
@@ -254,8 +315,8 @@ function copy-to-staging() {
   fi
 
   echo "${hash}" > "${tar}.sha512"
-  gsutil -m -q -h "Cache-Control:private, max-age=0" cp "${tar}" "${tar}.sha512" "${staging_path}"
-  gsutil -m acl ch -g all:R "${gs_url}" "${gs_url}.sha512" >/dev/null 2>&1 || true
+  gcloud storage cp --no-user-output-enabled --cache-control="private, max-age=0" "${tar}" "${tar}.sha512" "${staging_path}"
+  gcloud storage objects update --add-acl-grant=entity=allUsers,role=READER "${gs_url}" "${gs_url}.sha512" >/dev/null 2>&1 || true
   echo "+++ ${basename_tar} uploaded (sha512 = ${hash})"
 }
 
@@ -346,9 +407,9 @@ function upload-tars() {
     local staging_bucket="gs://kubernetes-staging-${project_hash}${suffix}"
 
     # Ensure the buckets are created
-    if ! gsutil ls "${staging_bucket}" >/dev/null; then
+    if ! gcloud storage buckets describe "${staging_bucket}" >/dev/null; then
       echo "Creating ${staging_bucket}"
-      gsutil mb -l "${region}" -p "${PROJECT}" "${staging_bucket}"
+      gcloud storage buckets create --location="${region}" --project="${PROJECT}" "${staging_bucket}"
     fi
 
     local staging_path="${staging_bucket}/${INSTANCE_PREFIX}-devel"
@@ -412,7 +473,7 @@ function detect-node-names() {
     for group in "${INSTANCE_GROUPS[@]}"; do
       kube::util::read-array NODE_NAMES < <(gcloud compute instance-groups managed list-instances \
         "${group}" --zone "${ZONE}" --project "${PROJECT}" \
-        --format='value(instance)')
+        --format='value(name)')
     done
   fi
   # Add heapster node name to the list too (if it exists).
@@ -425,7 +486,7 @@ function detect-node-names() {
     for group in "${WINDOWS_INSTANCE_GROUPS[@]}"; do
       kube::util::read-array WINDOWS_NODE_NAMES < <(gcloud compute instance-groups managed \
         list-instances "${group}" --zone "${ZONE}" --project "${PROJECT}" \
-        --format='value(instance)')
+        --format='value(name)')
     done
   fi
   export WINDOWS_NODE_NAMES
@@ -637,11 +698,6 @@ function write-windows-node-env {
 function build-linux-node-labels {
   local node_type=$1
   local node_labels=""
-  if [[ "${KUBE_PROXY_DAEMONSET:-}" == "true" && "${node_type}" != "master" ]]; then
-    # Add kube-proxy daemonset label to node to avoid situation during cluster
-    # upgrade/downgrade when there are two instances of kube-proxy running on a node.
-    node_labels="node.kubernetes.io/kube-proxy-ds-ready=true"
-  fi
   if [[ -n "${NODE_LABELS:-}" ]]; then
     node_labels="${node_labels:+${node_labels},}${NODE_LABELS}"
   fi
@@ -745,7 +801,7 @@ function yaml-map-string-string {
 # Returns kubelet flags used on both Linux and Windows nodes.
 function construct-common-kubelet-flags {
   local flags="${KUBELET_TEST_LOG_LEVEL:-"--v=2"} ${KUBELET_TEST_ARGS:-}"
-  flags+=" --cloud-provider=${CLOUD_PROVIDER_FLAG:-gce}"
+  flags+=" --cloud-provider=${CLOUD_PROVIDER_FLAG:-external}"
   # TODO(mtaufen): ROTATE_CERTIFICATES seems unused; delete it?
   if [[ -n "${ROTATE_CERTIFICATES:-}" ]]; then
     flags+=" --rotate-certificates=true"
@@ -767,10 +823,10 @@ function construct-linux-kubelet-flags {
   # Keep in sync with the mkdir command in configure-helper.sh (until the TODO is resolved)
   flags+=" --cert-dir=/var/lib/kubelet/pki/"
 
-  # If ENABLE_AUTH_PROVIDER_GCP is set to true, kubelet is enabled to use out-of-tree auth 
+  # If ENABLE_AUTH_PROVIDER_GCP is set to true, kubelet is enabled to use out-of-tree auth
   # credential provider instead of in-tree auth credential provider.
   # https://kubernetes.io/docs/tasks/kubelet-credential-provider/kubelet-credential-provider
-  if [[ "${ENABLE_AUTH_PROVIDER_GCP:-false}" == "true" ]]; then
+  if [[ "${ENABLE_AUTH_PROVIDER_GCP:-true}" == "true" ]]; then
     # Keep the values of --image-credential-provider-config and --image-credential-provider-bin-dir
     # in sync with value of auth_config_file and auth_provider_dir set in install-auth-provider-gcp function
     # in gci/configure.sh.
@@ -786,7 +842,6 @@ function construct-linux-kubelet-flags {
       #flags+=" --kubeconfig=/var/lib/kubelet/kubeconfig"
       flags+=" --register-with-taints=node-role.kubernetes.io/control-plane=:NoSchedule"
       flags+=" --kubeconfig=/var/lib/kubelet/bootstrap-kubeconfig"
-      flags+=" --register-schedulable=false"
     fi
     if [[ "${MASTER_OS_DISTRIBUTION}" == "ubuntu" ]]; then
       # Configure the file path for host dns configuration
@@ -882,7 +937,7 @@ function construct-windows-kubelet-flags {
 
   # If ENABLE_AUTH_PROVIDER_GCP is set to true, kubelet is enabled to use out-of-tree auth
   # credential provider. https://kubernetes.io/docs/tasks/kubelet-credential-provider/kubelet-credential-provider
-  if [[ "${ENABLE_AUTH_PROVIDER_GCP:-false}" == "true" ]]; then
+  if [[ "${ENABLE_AUTH_PROVIDER_GCP:-true}" == "true" ]]; then
     flags+="  --image-credential-provider-config=${AUTH_PROVIDER_GCP_WINDOWS_CONF_FILE}"
     flags+="  --image-credential-provider-bin-dir=${AUTH_PROVIDER_GCP_WINDOWS_BIN_DIR}"
   fi
@@ -906,7 +961,7 @@ function construct-windows-kubeproxy-flags {
   # port usage for services.
   # https://techcommunity.microsoft.com/t5/networking-blog/direct-server-return-dsr-in-a-nutshell/ba-p/693710
   if [[ "${WINDOWS_ENABLE_DSR:-}" == "true" ]]; then
-    flags+=" --feature-gates=WinDSR=true --enable-dsr=true "
+    flags+=" --enable-dsr=true "
   fi
 
   # Configure flags with explicit empty string values. We can't escape
@@ -1029,6 +1084,18 @@ authentication:
   x509:
     clientCAFile: /etc/srv/kubernetes/pki/ca-certificates.crt
 EOF
+
+  if [[ -n "${SHUTDOWN_GRACE_PERIOD:-}" ]]; then
+  cat <<EOF
+shutdownGracePeriod: ${SHUTDOWN_GRACE_PERIOD}
+EOF
+  fi
+
+  if [[ -n "${SHUTDOWN_GRACE_PERIOD_CRITICAL_PODS:-}" ]]; then
+  cat <<EOF
+shutdownGracePeriodCriticalPods: ${SHUTDOWN_GRACE_PERIOD_CRITICAL_PODS}
+EOF
+  fi
 }
 
 # cat the Kubelet config yaml for windows nodes
@@ -1072,6 +1139,10 @@ ETCD_APISERVER_SERVER_KEY: $(yaml-quote "${ETCD_APISERVER_SERVER_KEY_BASE64:-}")
 ETCD_APISERVER_SERVER_CERT: $(yaml-quote "${ETCD_APISERVER_SERVER_CERT_BASE64:-}")
 ETCD_APISERVER_CLIENT_KEY: $(yaml-quote "${ETCD_APISERVER_CLIENT_KEY_BASE64:-}")
 ETCD_APISERVER_CLIENT_CERT: $(yaml-quote "${ETCD_APISERVER_CLIENT_CERT_BASE64:-}")
+CLOUD_PVL_ADMISSION_CA_KEY: $(yaml-quote "${CLOUD_PVL_ADMISSION_CA_KEY_BASE64:-}")
+CLOUD_PVL_ADMISSION_CA_CERT: $(yaml-quote "${CLOUD_PVL_ADMISSION_CA_CERT_BASE64:-}")
+CLOUD_PVL_ADMISSION_CERT: $(yaml-quote "${CLOUD_PVL_ADMISSION_CERT_BASE64:-}")
+CLOUD_PVL_ADMISSION_KEY: $(yaml-quote "${CLOUD_PVL_ADMISSION_KEY_BASE64:-}")
 KONNECTIVITY_SERVER_CA_KEY: $(yaml-quote "${KONNECTIVITY_SERVER_CA_KEY_BASE64:-}")
 KONNECTIVITY_SERVER_CA_CERT: $(yaml-quote "${KONNECTIVITY_SERVER_CA_CERT_BASE64:-}")
 KONNECTIVITY_SERVER_CERT: $(yaml-quote "${KONNECTIVITY_SERVER_CERT_BASE64:-}")
@@ -1127,12 +1198,7 @@ METADATA_AGENT_CLUSTER_LEVEL_MEMORY_REQUEST: $(yaml-quote "${METADATA_AGENT_CLUS
 DOCKER_REGISTRY_MIRROR_URL: $(yaml-quote "${DOCKER_REGISTRY_MIRROR_URL:-}")
 ENABLE_L7_LOADBALANCING: $(yaml-quote "${ENABLE_L7_LOADBALANCING:-none}")
 ENABLE_CLUSTER_LOGGING: $(yaml-quote "${ENABLE_CLUSTER_LOGGING:-false}")
-ENABLE_AUTH_PROVIDER_GCP: $(yaml-quote "${ENABLE_AUTH_PROVIDER_GCP:-false}")
-ENABLE_NODE_PROBLEM_DETECTOR: $(yaml-quote "${ENABLE_NODE_PROBLEM_DETECTOR:-none}")
-NODE_PROBLEM_DETECTOR_VERSION: $(yaml-quote "${NODE_PROBLEM_DETECTOR_VERSION:-}")
-NODE_PROBLEM_DETECTOR_TAR_HASH: $(yaml-quote "${NODE_PROBLEM_DETECTOR_TAR_HASH:-}")
-NODE_PROBLEM_DETECTOR_RELEASE_PATH: $(yaml-quote "${NODE_PROBLEM_DETECTOR_RELEASE_PATH:-}")
-NODE_PROBLEM_DETECTOR_CUSTOM_FLAGS: $(yaml-quote "${NODE_PROBLEM_DETECTOR_CUSTOM_FLAGS:-}")
+ENABLE_AUTH_PROVIDER_GCP: $(yaml-quote "${ENABLE_AUTH_PROVIDER_GCP:-true}")
 CNI_STORAGE_URL_BASE: $(yaml-quote "${CNI_STORAGE_URL_BASE:-}")
 CNI_TAR_PREFIX: $(yaml-quote "${CNI_TAR_PREFIX:-}")
 CNI_VERSION: $(yaml-quote "${CNI_VERSION:-}")
@@ -1148,11 +1214,9 @@ LOCAL_DNS_IP: $(yaml-quote "${LOCAL_DNS_IP:-}")
 DNS_DOMAIN: $(yaml-quote "${DNS_DOMAIN:-}")
 DNS_MEMORY_LIMIT: $(yaml-quote "${DNS_MEMORY_LIMIT:-}")
 ENABLE_DNS_HORIZONTAL_AUTOSCALER: $(yaml-quote "${ENABLE_DNS_HORIZONTAL_AUTOSCALER:-false}")
-KUBE_PROXY_DAEMONSET: $(yaml-quote "${KUBE_PROXY_DAEMONSET:-false}")
 KUBE_PROXY_TOKEN: $(yaml-quote "${KUBE_PROXY_TOKEN:-}")
 KUBE_PROXY_MODE: $(yaml-quote "${KUBE_PROXY_MODE:-iptables}")
 DETECT_LOCAL_MODE: $(yaml-quote "${DETECT_LOCAL_MODE:-}")
-NODE_PROBLEM_DETECTOR_TOKEN: $(yaml-quote "${NODE_PROBLEM_DETECTOR_TOKEN:-}")
 ADMISSION_CONTROL: $(yaml-quote "${ADMISSION_CONTROL:-}")
 MASTER_IP_RANGE: $(yaml-quote "${MASTER_IP_RANGE}")
 RUNTIME_CONFIG: $(yaml-quote "${RUNTIME_CONFIG}")
@@ -1173,6 +1237,8 @@ ENABLE_VOLUME_SNAPSHOTS: $(yaml-quote "${ENABLE_VOLUME_SNAPSHOTS:-}")
 ENABLE_APISERVER_ADVANCED_AUDIT: $(yaml-quote "${ENABLE_APISERVER_ADVANCED_AUDIT:-}")
 ENABLE_APISERVER_DYNAMIC_AUDIT: $(yaml-quote "${ENABLE_APISERVER_DYNAMIC_AUDIT:-}")
 ENABLE_CACHE_MUTATION_DETECTOR: $(yaml-quote "${ENABLE_CACHE_MUTATION_DETECTOR:-false}")
+ENABLE_KUBE_WATCHCACHE_CONSISTENCY_CHECKER: $(yaml-quote "${ENABLE_KUBE_WATCHCACHE_CONSISTENCY_CHECKER:-false}")
+ENABLE_KUBE_WATCHLIST_INCONSISTENCY_DETECTOR: $(yaml-quote "${ENABLE_KUBE_WATCHLIST_INCONSISTENCY_DETECTOR:-false}")
 ENABLE_PATCH_CONVERSION_DETECTOR: $(yaml-quote "${ENABLE_PATCH_CONVERSION_DETECTOR:-false}")
 ADVANCED_AUDIT_POLICY: $(yaml-quote "${ADVANCED_AUDIT_POLICY:-}")
 ADVANCED_AUDIT_BACKEND: $(yaml-quote "${ADVANCED_AUDIT_BACKEND:-log}")
@@ -1206,6 +1272,8 @@ CONTAINER_RUNTIME_TEST_HANDLER: $(yaml-quote "${CONTAINER_RUNTIME_TEST_HANDLER:-
 CONTAINERD_INFRA_CONTAINER: $(yaml-quote "${CONTAINER_INFRA_CONTAINER:-}")
 UBUNTU_INSTALL_CONTAINERD_VERSION: $(yaml-quote "${UBUNTU_INSTALL_CONTAINERD_VERSION:-}")
 UBUNTU_INSTALL_RUNC_VERSION: $(yaml-quote "${UBUNTU_INSTALL_RUNC_VERSION:-}")
+COS_INSTALL_CONTAINERD_VERSION: $(yaml-quote "${COS_INSTALL_CONTAINERD_VERSION:-}")
+COS_INSTALL_RUNC_VERSION: $(yaml-quote "${COS_INSTALL_RUNC_VERSION:-}")
 NODE_LOCAL_SSDS_EXT: $(yaml-quote "${NODE_LOCAL_SSDS_EXT:-}")
 NODE_LOCAL_SSDS_EPHEMERAL: $(yaml-quote "${NODE_LOCAL_SSDS_EPHEMERAL:-}")
 LOAD_IMAGE_COMMAND: $(yaml-quote "${LOAD_IMAGE_COMMAND:-}")
@@ -1226,7 +1294,13 @@ AUTH_PROVIDER_GCP_STORAGE_PATH: $(yaml-quote "${AUTH_PROVIDER_GCP_STORAGE_PATH}"
 AUTH_PROVIDER_GCP_VERSION: $(yaml-quote "${AUTH_PROVIDER_GCP_VERSION}")
 AUTH_PROVIDER_GCP_LINUX_BIN_DIR: $(yaml-quote "${AUTH_PROVIDER_GCP_LINUX_BIN_DIR}")
 AUTH_PROVIDER_GCP_LINUX_CONF_FILE: $(yaml-quote "${AUTH_PROVIDER_GCP_LINUX_CONF_FILE}")
+KUBERNETES_REGISTRY_PULL_THROUGH_HOST: $(yaml-quote "${KUBERNETES_REGISTRY_PULL_THROUGH_HOST:-}")
 EOF
+  if [[ -n "${KUBERNETES_REGISTRY_PULL_THROUGH_BASIC_AUTH_TOKEN_PATH:-}" ]]; then
+    cat >>"$file" <<EOF
+KUBERNETES_REGISTRY_PULL_THROUGH_BASIC_AUTH_TOKEN: $(yaml-quote "$(cat "${KUBERNETES_REGISTRY_PULL_THROUGH_BASIC_AUTH_TOKEN_PATH}")")
+EOF
+  fi
   if [[ "${master}" == "true" && "${MASTER_OS_DISTRIBUTION}" == "gci" ]] || \
      [[ "${master}" == "false" && "${NODE_OS_DISTRIBUTION}" == "gci" ]]  || \
      [[ "${master}" == "true" && "${MASTER_OS_DISTRIBUTION}" == "cos" ]] || \
@@ -1356,6 +1430,11 @@ KUBE_POD_LOG_READERS_GROUP: 2007
 KONNECTIVITY_SERVER_RUNASUSER: 2008
 KONNECTIVITY_SERVER_RUNASGROUP: 2008
 KONNECTIVITY_SERVER_SOCKET_WRITER_GROUP: 2008
+CLOUD_CONTROLLER_MANAGER_RUNASUSER: 2009
+CLOUD_CONTROLLER_MANAGER_RUNASGROUP: 2009
+CLUSTER_AUTOSCALER_RUNASUSER: 2010
+CLUSTER_AUTOSCALER_RUNASGROUP: 2010
+
 EOF
     # KUBE_APISERVER_REQUEST_TIMEOUT_SEC (if set) controls the --request-timeout
     # flag
@@ -1440,6 +1519,11 @@ EOF
 CONTROLLER_MANAGER_TEST_ARGS: $(yaml-quote "${CONTROLLER_MANAGER_TEST_ARGS}")
 EOF
     fi
+    if [ -n "${KUBE_CONTROLLER_MANAGER_TEST_ARGS:-}" ]; then
+      cat >>"$file" <<EOF
+KUBE_CONTROLLER_MANAGER_TEST_ARGS: $(yaml-quote "${KUBE_CONTROLLER_MANAGER_TEST_ARGS}")
+EOF
+    fi
     if [ -n "${CONTROLLER_MANAGER_TEST_LOG_LEVEL:-}" ]; then
       cat >>"$file" <<EOF
 CONTROLLER_MANAGER_TEST_LOG_LEVEL: $(yaml-quote "${CONTROLLER_MANAGER_TEST_LOG_LEVEL}")
@@ -1468,11 +1552,6 @@ EOF
     if [ -n "${CLUSTER_SIGNING_DURATION:-}" ]; then
       cat >>"$file" <<EOF
 CLUSTER_SIGNING_DURATION: $(yaml-quote "${CLUSTER_SIGNING_DURATION}")
-EOF
-    fi
-    if [[ "${NODE_ACCELERATORS:-}" == *"type=nvidia"* ]]; then
-      cat >>"$file" <<EOF
-ENABLE_NVIDIA_GPU_DEVICE_PLUGIN: $(yaml-quote "true")
 EOF
     fi
     if [ -n "${ADDON_MANAGER_LEADER_ELECTION:-}" ]; then
@@ -1601,13 +1680,6 @@ WINDOWS_INFRA_CONTAINER: $(yaml-quote "${WINDOWS_INFRA_CONTAINER}")
 WINDOWS_ENABLE_PIGZ: $(yaml-quote "${WINDOWS_ENABLE_PIGZ}")
 WINDOWS_ENABLE_HYPERV: $(yaml-quote "${WINDOWS_ENABLE_HYPERV}")
 ENABLE_AUTH_PROVIDER_GCP: $(yaml-quote "${ENABLE_AUTH_PROVIDER_GCP}")
-ENABLE_NODE_PROBLEM_DETECTOR: $(yaml-quote "${WINDOWS_ENABLE_NODE_PROBLEM_DETECTOR}")
-NODE_PROBLEM_DETECTOR_VERSION: $(yaml-quote "${NODE_PROBLEM_DETECTOR_VERSION}")
-NODE_PROBLEM_DETECTOR_TAR_HASH: $(yaml-quote "${NODE_PROBLEM_DETECTOR_TAR_HASH}")
-NODE_PROBLEM_DETECTOR_RELEASE_PATH: $(yaml-quote "${NODE_PROBLEM_DETECTOR_RELEASE_PATH}")
-NODE_PROBLEM_DETECTOR_CUSTOM_FLAGS: $(yaml-quote "${WINDOWS_NODE_PROBLEM_DETECTOR_CUSTOM_FLAGS}")
-NODE_PROBLEM_DETECTOR_TOKEN: $(yaml-quote "${NODE_PROBLEM_DETECTOR_TOKEN:-}")
-WINDOWS_NODEPROBLEMDETECTOR_KUBECONFIG_FILE: $(yaml-quote "${WINDOWS_NODEPROBLEMDETECTOR_KUBECONFIG_FILE}")
 AUTH_PROVIDER_GCP_STORAGE_PATH: $(yaml-quote "${AUTH_PROVIDER_GCP_STORAGE_PATH}")
 AUTH_PROVIDER_GCP_VERSION: $(yaml-quote "${AUTH_PROVIDER_GCP_VERSION}")
 AUTH_PROVIDER_GCP_HASH_WINDOWS_AMD64: $(yaml-quote "${AUTH_PROVIDER_GCP_HASH_WINDOWS_AMD64}")
@@ -1679,43 +1751,49 @@ function create-certs {
   PRIMARY_CN="${primary_cn}" SANS="${sans}" generate-certs
   AGGREGATOR_PRIMARY_CN="${primary_cn}" AGGREGATOR_SANS="${sans}" generate-aggregator-certs
   KONNECTIVITY_SERVER_PRIMARY_CN="${primary_cn}" KONNECTIVITY_SERVER_SANS="${sans}" generate-konnectivity-server-certs
+  CLOUD_PVL_ADMISSION_PRIMARY_CN="${primary_cn}" CLOUD_PVL_ADMISSION_SANS="${sans}" generate-cloud-pvl-admission-certs
 
   # By default, linux wraps base64 output every 76 cols, so we use 'tr -d' to remove whitespaces.
   # Note 'base64 -w0' doesn't work on Mac OS X, which has different flags.
-  CA_KEY_BASE64=$(base64 "${CERT_DIR}/pki/private/ca.key" | tr -d '\r\n')
-  CA_CERT_BASE64=$(base64 "${CERT_DIR}/pki/ca.crt" | tr -d '\r\n')
-  MASTER_CERT_BASE64=$(base64 "${CERT_DIR}/pki/issued/${MASTER_NAME}.crt" | tr -d '\r\n')
-  MASTER_KEY_BASE64=$(base64 "${CERT_DIR}/pki/private/${MASTER_NAME}.key" | tr -d '\r\n')
-  KUBELET_CERT_BASE64=$(base64 "${CERT_DIR}/pki/issued/kubelet.crt" | tr -d '\r\n')
-  KUBELET_KEY_BASE64=$(base64 "${CERT_DIR}/pki/private/kubelet.key" | tr -d '\r\n')
-  KUBECFG_CERT_BASE64=$(base64 "${CERT_DIR}/pki/issued/kubecfg.crt" | tr -d '\r\n')
-  KUBECFG_KEY_BASE64=$(base64 "${CERT_DIR}/pki/private/kubecfg.key" | tr -d '\r\n')
-  KUBEAPISERVER_CERT_BASE64=$(base64 "${CERT_DIR}/pki/issued/kube-apiserver.crt" | tr -d '\r\n')
-  KUBEAPISERVER_KEY_BASE64=$(base64 "${CERT_DIR}/pki/private/kube-apiserver.key" | tr -d '\r\n')
+  CA_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${CERT_DIR}/pki/private/ca.key" | tr -d '\r\n')
+  CA_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${CERT_DIR}/pki/ca.crt" | tr -d '\r\n')
+  MASTER_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${CERT_DIR}/pki/issued/${MASTER_NAME}.crt" | tr -d '\r\n')
+  MASTER_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${CERT_DIR}/pki/private/${MASTER_NAME}.key" | tr -d '\r\n')
+  KUBELET_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${CERT_DIR}/pki/issued/kubelet.crt" | tr -d '\r\n')
+  KUBELET_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${CERT_DIR}/pki/private/kubelet.key" | tr -d '\r\n')
+  KUBECFG_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${CERT_DIR}/pki/issued/kubecfg.crt" | tr -d '\r\n')
+  KUBECFG_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${CERT_DIR}/pki/private/kubecfg.key" | tr -d '\r\n')
+  KUBEAPISERVER_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${CERT_DIR}/pki/issued/kube-apiserver.crt" | tr -d '\r\n')
+  KUBEAPISERVER_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${CERT_DIR}/pki/private/kube-apiserver.key" | tr -d '\r\n')
 
   # Setting up an addition directory (beyond pki) as it is the simplest way to
   # ensure we get a different CA pair to sign the proxy-client certs and which
   # we can send CA public key to the user-apiserver to validate communication.
-  AGGREGATOR_CA_KEY_BASE64=$(base64 "${AGGREGATOR_CERT_DIR}/pki/private/ca.key" | tr -d '\r\n')
-  REQUESTHEADER_CA_CERT_BASE64=$(base64 "${AGGREGATOR_CERT_DIR}/pki/ca.crt" | tr -d '\r\n')
-  PROXY_CLIENT_CERT_BASE64=$(base64 "${AGGREGATOR_CERT_DIR}/pki/issued/proxy-client.crt" | tr -d '\r\n')
-  PROXY_CLIENT_KEY_BASE64=$(base64 "${AGGREGATOR_CERT_DIR}/pki/private/proxy-client.key" | tr -d '\r\n')
+  AGGREGATOR_CA_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${AGGREGATOR_CERT_DIR}/pki/private/ca.key" | tr -d '\r\n')
+  REQUESTHEADER_CA_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${AGGREGATOR_CERT_DIR}/pki/ca.crt" | tr -d '\r\n')
+  PROXY_CLIENT_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${AGGREGATOR_CERT_DIR}/pki/issued/proxy-client.crt" | tr -d '\r\n')
+  PROXY_CLIENT_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${AGGREGATOR_CERT_DIR}/pki/private/proxy-client.key" | tr -d '\r\n')
 
   # Setting up the Kubernetes API Server Konnectivity Server auth.
   # This includes certs for both API Server to Konnectivity Server and
   # Konnectivity Agent to Konnectivity Server.
-  KONNECTIVITY_SERVER_CA_KEY_BASE64=$(base64 "${KONNECTIVITY_SERVER_CERT_DIR}/pki/private/ca.key" | tr -d '\r\n')
-  KONNECTIVITY_SERVER_CA_CERT_BASE64=$(base64 "${KONNECTIVITY_SERVER_CERT_DIR}/pki/ca.crt" | tr -d '\r\n')
-  KONNECTIVITY_SERVER_CERT_BASE64=$(base64 "${KONNECTIVITY_SERVER_CERT_DIR}/pki/issued/server.crt" | tr -d '\r\n')
-  KONNECTIVITY_SERVER_KEY_BASE64=$(base64 "${KONNECTIVITY_SERVER_CERT_DIR}/pki/private/server.key" | tr -d '\r\n')
-  KONNECTIVITY_SERVER_CLIENT_CERT_BASE64=$(base64 "${KONNECTIVITY_SERVER_CERT_DIR}/pki/issued/client.crt" | tr -d '\r\n')
-  KONNECTIVITY_SERVER_CLIENT_KEY_BASE64=$(base64 "${KONNECTIVITY_SERVER_CERT_DIR}/pki/private/client.key" | tr -d '\r\n')
-  KONNECTIVITY_AGENT_CA_KEY_BASE64=$(base64 "${KONNECTIVITY_AGENT_CERT_DIR}/pki/private/ca.key" | tr -d '\r\n')
-  KONNECTIVITY_AGENT_CA_CERT_BASE64=$(base64 "${KONNECTIVITY_AGENT_CERT_DIR}/pki/ca.crt" | tr -d '\r\n')
-  KONNECTIVITY_AGENT_CERT_BASE64=$(base64 "${KONNECTIVITY_AGENT_CERT_DIR}/pki/issued/server.crt" | tr -d '\r\n')
-  KONNECTIVITY_AGENT_KEY_BASE64=$(base64 "${KONNECTIVITY_AGENT_CERT_DIR}/pki/private/server.key" | tr -d '\r\n')
-  KONNECTIVITY_AGENT_CLIENT_CERT_BASE64=$(base64 "${KONNECTIVITY_AGENT_CERT_DIR}/pki/issued/client.crt" | tr -d '\r\n')
-  KONNECTIVITY_AGENT_CLIENT_KEY_BASE64=$(base64 "${KONNECTIVITY_AGENT_CERT_DIR}/pki/private/client.key" | tr -d '\r\n')
+  KONNECTIVITY_SERVER_CA_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${KONNECTIVITY_SERVER_CERT_DIR}/pki/private/ca.key" | tr -d '\r\n')
+  KONNECTIVITY_SERVER_CA_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${KONNECTIVITY_SERVER_CERT_DIR}/pki/ca.crt" | tr -d '\r\n')
+  KONNECTIVITY_SERVER_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${KONNECTIVITY_SERVER_CERT_DIR}/pki/issued/server.crt" | tr -d '\r\n')
+  KONNECTIVITY_SERVER_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${KONNECTIVITY_SERVER_CERT_DIR}/pki/private/server.key" | tr -d '\r\n')
+  KONNECTIVITY_SERVER_CLIENT_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${KONNECTIVITY_SERVER_CERT_DIR}/pki/issued/client.crt" | tr -d '\r\n')
+  KONNECTIVITY_SERVER_CLIENT_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${KONNECTIVITY_SERVER_CERT_DIR}/pki/private/client.key" | tr -d '\r\n')
+  KONNECTIVITY_AGENT_CA_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${KONNECTIVITY_AGENT_CERT_DIR}/pki/private/ca.key" | tr -d '\r\n')
+  KONNECTIVITY_AGENT_CA_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${KONNECTIVITY_AGENT_CERT_DIR}/pki/ca.crt" | tr -d '\r\n')
+  KONNECTIVITY_AGENT_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${KONNECTIVITY_AGENT_CERT_DIR}/pki/issued/server.crt" | tr -d '\r\n')
+  KONNECTIVITY_AGENT_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${KONNECTIVITY_AGENT_CERT_DIR}/pki/private/server.key" | tr -d '\r\n')
+  KONNECTIVITY_AGENT_CLIENT_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${KONNECTIVITY_AGENT_CERT_DIR}/pki/issued/client.crt" | tr -d '\r\n')
+  KONNECTIVITY_AGENT_CLIENT_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${KONNECTIVITY_AGENT_CERT_DIR}/pki/private/client.key" | tr -d '\r\n')
+
+  CLOUD_PVL_ADMISSION_CA_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${CLOUD_PVL_ADMISSION_CERT_DIR}/pki/private/ca.key" | tr -d '\r\n')
+  CLOUD_PVL_ADMISSION_CA_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${CLOUD_PVL_ADMISSION_CERT_DIR}/pki/ca.crt" | tr -d '\r\n')
+  CLOUD_PVL_ADMISSION_CERT_BASE64=$(base64 $BASE64_INPUT_FLAG "${CLOUD_PVL_ADMISSION_CERT_DIR}/pki/issued/server.crt" | tr -d '\r\n')
+  CLOUD_PVL_ADMISSION_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "${CLOUD_PVL_ADMISSION_CERT_DIR}/pki/private/server.key" | tr -d '\r\n')
 }
 
 # Set up easy-rsa directory structure.
@@ -1731,20 +1809,26 @@ function setup-easyrsa {
   # Note: This was heavily cribbed from make-ca-cert.sh
   (set -x
     cd "${KUBE_TEMP}"
-    curl -L -O --connect-timeout 20 --retry 6 --retry-delay 2 https://dl.k8s.io/easy-rsa/easy-rsa.tar.gz
-    tar xzf easy-rsa.tar.gz
-    mkdir easy-rsa-master/kubelet
-    cp -r easy-rsa-master/easyrsa3/* easy-rsa-master/kubelet
-    mkdir easy-rsa-master/aggregator
-    cp -r easy-rsa-master/easyrsa3/* easy-rsa-master/aggregator
-    mkdir easy-rsa-master/konnectivity-server
-    cp -r easy-rsa-master/easyrsa3/* easy-rsa-master/konnectivity-server
-    mkdir easy-rsa-master/konnectivity-agent
-    cp -r easy-rsa-master/easyrsa3/* easy-rsa-master/konnectivity-agent) &>"${cert_create_debug_output}" || true
-  CERT_DIR="${KUBE_TEMP}/easy-rsa-master/easyrsa3"
-  AGGREGATOR_CERT_DIR="${KUBE_TEMP}/easy-rsa-master/aggregator"
-  KONNECTIVITY_SERVER_CERT_DIR="${KUBE_TEMP}/easy-rsa-master/konnectivity-server"
-  KONNECTIVITY_AGENT_CERT_DIR="${KUBE_TEMP}/easy-rsa-master/konnectivity-agent"
+    curl -L -o easy-rsa.tar.gz --connect-timeout 20 --retry 6 --retry-delay 2 https://github.com/OpenVPN/easy-rsa/releases/download/v3.1.7/EasyRSA-3.1.7.tgz
+    mkdir -p easy-rsa && tar xzf easy-rsa.tar.gz -C easy-rsa --strip-components 1
+    local -r files_to_copy=(easyrsa openssl-easyrsa.cnf  x509-types vars.example)
+    mkdir easy-rsa/aggregator
+    # shellcheck disable=SC2145
+    cp -r easy-rsa/"${files_to_copy[@]}" easy-rsa/aggregator
+    mkdir easy-rsa/cloud-pvl-admission
+    # shellcheck disable=SC2145
+    cp -r easy-rsa/"${files_to_copy[@]}" easy-rsa/cloud-pvl-admission
+    mkdir easy-rsa/konnectivity-server
+    # shellcheck disable=SC2145
+    cp -r easy-rsa/"${files_to_copy[@]}" easy-rsa/konnectivity-server
+    mkdir easy-rsa/konnectivity-agent
+    # shellcheck disable=SC2145
+    cp -r easy-rsa/"${files_to_copy[@]}" easy-rsa/konnectivity-agent) &>"${cert_create_debug_output}" || true
+  CERT_DIR="${KUBE_TEMP}/easy-rsa"
+  AGGREGATOR_CERT_DIR="${KUBE_TEMP}/easy-rsa/aggregator"
+  CLOUD_PVL_ADMISSION_CERT_DIR="${KUBE_TEMP}/easy-rsa/cloud-pvl-admission"
+  KONNECTIVITY_SERVER_CERT_DIR="${KUBE_TEMP}/easy-rsa/konnectivity-server"
+  KONNECTIVITY_AGENT_CERT_DIR="${KUBE_TEMP}/easy-rsa/konnectivity-agent"
   if [ ! -x "${CERT_DIR}/easyrsa" ] || [ ! -x "${AGGREGATOR_CERT_DIR}/easyrsa" ]; then
     # TODO(roberthbailey,porridge): add better error handling here,
     # see https://github.com/kubernetes/kubernetes/issues/55229
@@ -1777,22 +1861,22 @@ function generate-certs {
     ./easyrsa --batch "--req-cn=${PRIMARY_CN}@$(date +%s)" build-ca nopass
     # SANS (expected to be) defined by caller
     # shellcheck disable=SC2153
-    ./easyrsa --subject-alt-name="${SANS}" build-server-full "${MASTER_NAME}" nopass
-    ./easyrsa build-client-full kube-apiserver nopass
+    ./easyrsa --batch --subject-alt-name="${SANS}" build-server-full "${MASTER_NAME}" nopass
+    ./easyrsa --batch build-client-full kube-apiserver nopass
 
     kube::util::ensure-cfssl "${KUBE_TEMP}/cfssl"
 
     # make the config for the signer
     echo '{"signing":{"default":{"expiry":"43800h","usages":["signing","key encipherment","client auth"]}}}' > "ca-config.json"
     # create the kubelet client cert with the correct groups
-    echo '{"CN":"kubelet","names":[{"O":"system:nodes"}],"hosts":[""],"key":{"algo":"rsa","size":2048}}' | "${CFSSL_BIN}" gencert -ca=pki/ca.crt -ca-key=pki/private/ca.key -config=ca-config.json - | "${CFSSLJSON_BIN}" -bare kubelet
+    echo '{"CN":"kubelet","names":[{"O":"system:nodes"}],"hosts":[],"key":{"algo":"rsa","size":2048}}' | "${CFSSL_BIN}" gencert -ca=pki/ca.crt -ca-key=pki/private/ca.key -config=ca-config.json - | "${CFSSLJSON_BIN}" -bare kubelet
     mv "kubelet-key.pem" "pki/private/kubelet.key"
     mv "kubelet.pem" "pki/issued/kubelet.crt"
     rm -f "kubelet.csr"
 
     # Make a superuser client cert with subject "O=system:masters, CN=kubecfg"
-    ./easyrsa --dn-mode=org \
-      --req-cn=kubecfg --req-org=system:masters \
+    ./easyrsa --batch --dn-mode=org \
+      --req-org=system:masters \
       --req-c= --req-st= --req-city= --req-email= --req-ou= \
       build-client-full kubecfg nopass) &>"${cert_create_debug_output}" || true
   local output_file_missing=0
@@ -1838,26 +1922,26 @@ function generate-aggregator-certs {
   local -r cert_create_debug_output=$(mktemp "${KUBE_TEMP}/cert_create_debug_output.XXX")
   # Note: This was heavily cribbed from make-ca-cert.sh
   (set -x
-    cd "${KUBE_TEMP}/easy-rsa-master/aggregator"
+    cd "${KUBE_TEMP}/easy-rsa/aggregator"
     ./easyrsa init-pki
     # this puts the cert into pki/ca.crt and the key into pki/private/ca.key
     ./easyrsa --batch "--req-cn=${AGGREGATOR_PRIMARY_CN}@$(date +%s)" build-ca nopass
-    ./easyrsa --subject-alt-name="${AGGREGATOR_SANS}" build-server-full "${AGGREGATOR_MASTER_NAME}" nopass
-    ./easyrsa build-client-full aggregator-apiserver nopass
+    ./easyrsa --batch --subject-alt-name="${AGGREGATOR_SANS}" build-server-full "${AGGREGATOR_MASTER_NAME}" nopass
+    ./easyrsa --batch build-client-full aggregator-apiserver nopass
 
     kube::util::ensure-cfssl "${KUBE_TEMP}/cfssl"
 
     # make the config for the signer
     echo '{"signing":{"default":{"expiry":"43800h","usages":["signing","key encipherment","client auth"]}}}' > "ca-config.json"
     # create the aggregator client cert with the correct groups
-    echo '{"CN":"aggregator","hosts":[""],"key":{"algo":"rsa","size":2048}}' | "${CFSSL_BIN}" gencert -ca=pki/ca.crt -ca-key=pki/private/ca.key -config=ca-config.json - | "${CFSSLJSON_BIN}" -bare proxy-client
+    echo '{"CN":"aggregator","hosts":[],"key":{"algo":"rsa","size":2048}}' | "${CFSSL_BIN}" gencert -ca=pki/ca.crt -ca-key=pki/private/ca.key -config=ca-config.json - | "${CFSSLJSON_BIN}" -bare proxy-client
     mv "proxy-client-key.pem" "pki/private/proxy-client.key"
     mv "proxy-client.pem" "pki/issued/proxy-client.crt"
     rm -f "proxy-client.csr"
 
     # Make a superuser client cert with subject "O=system:masters, CN=kubecfg"
-    ./easyrsa --dn-mode=org \
-      --req-cn=proxy-clientcfg --req-org=system:aggregator \
+    ./easyrsa --batch --dn-mode=org \
+      --req-org=system:aggregator \
       --req-c= --req-st= --req-city= --req-email= --req-ou= \
       build-client-full proxy-clientcfg nopass) &>"${cert_create_debug_output}" || true
   local output_file_missing=0
@@ -1899,35 +1983,35 @@ function generate-konnectivity-server-certs {
   # Note: This was heavily cribbed from make-ca-cert.sh
   (set -x
     # Make the client <-> konnectivity server side certificates.
-    cd "${KUBE_TEMP}/easy-rsa-master/konnectivity-server"
+    cd "${KUBE_TEMP}/easy-rsa/konnectivity-server"
     ./easyrsa init-pki
     # this puts the cert into pki/ca.crt and the key into pki/private/ca.key
     ./easyrsa --batch "--req-cn=${KONNECTIVITY_SERVER_PRIMARY_CN}@$(date +%s)" build-ca nopass
-    ./easyrsa --subject-alt-name="IP:127.0.0.1,${KONNECTIVITY_SERVER_SANS}" build-server-full server nopass
-    ./easyrsa build-client-full client nopass
+    ./easyrsa --batch --subject-alt-name="IP:127.0.0.1,${KONNECTIVITY_SERVER_SANS}" build-server-full server nopass
+    ./easyrsa --batch build-client-full client nopass
 
     kube::util::ensure-cfssl "${KUBE_TEMP}/cfssl"
 
     # make the config for the signer
     echo '{"signing":{"default":{"expiry":"43800h","usages":["signing","key encipherment","client auth"]}}}' > "ca-config.json"
     # create the konnectivity server cert with the correct groups
-    echo '{"CN":"konnectivity-server","hosts":[""],"key":{"algo":"rsa","size":2048}}' | "${CFSSL_BIN}" gencert -ca=pki/ca.crt -ca-key=pki/private/ca.key -config=ca-config.json - | "${CFSSLJSON_BIN}" -bare konnectivity-server
+    echo '{"CN":"konnectivity-server","hosts":[],"key":{"algo":"rsa","size":2048}}' | "${CFSSL_BIN}" gencert -ca=pki/ca.crt -ca-key=pki/private/ca.key -config=ca-config.json - | "${CFSSLJSON_BIN}" -bare konnectivity-server
     rm -f "konnectivity-server.csr"
 
     # Make the agent <-> konnectivity server side certificates.
-    cd "${KUBE_TEMP}/easy-rsa-master/konnectivity-agent"
+    cd "${KUBE_TEMP}/easy-rsa/konnectivity-agent"
     ./easyrsa init-pki
     # this puts the cert into pki/ca.crt and the key into pki/private/ca.key
     ./easyrsa --batch "--req-cn=${KONNECTIVITY_SERVER_PRIMARY_CN}@$(date +%s)" build-ca nopass
-    ./easyrsa --subject-alt-name="${KONNECTIVITY_SERVER_SANS}" build-server-full server nopass
-    ./easyrsa build-client-full client nopass
+    ./easyrsa --batch --subject-alt-name="${KONNECTIVITY_SERVER_SANS}" build-server-full server nopass
+    ./easyrsa --batch build-client-full client nopass
 
     kube::util::ensure-cfssl "${KUBE_TEMP}/cfssl"
 
     # make the config for the signer
     echo '{"signing":{"default":{"expiry":"43800h","usages":["signing","key encipherment","agent auth"]}}}' > "ca-config.json"
     # create the konnectivity server cert with the correct groups
-    echo '{"CN":"koonectivity-server","hosts":[""],"key":{"algo":"rsa","size":2048}}' | "${CFSSL_BIN}" gencert -ca=pki/ca.crt -ca-key=pki/private/ca.key -config=ca-config.json - | "${CFSSLJSON_BIN}" -bare konnectivity-agent
+    echo '{"CN":"koonectivity-server","hosts":[],"key":{"algo":"rsa","size":2048}}' | "${CFSSL_BIN}" gencert -ca=pki/ca.crt -ca-key=pki/private/ca.key -config=ca-config.json - | "${CFSSLJSON_BIN}" -bare konnectivity-agent
     rm -f "konnectivity-agent.csr"
 
     echo "completed main certificate section") &>"${cert_create_debug_output}" || true
@@ -1962,6 +2046,78 @@ function generate-konnectivity-server-certs {
   fi
 }
 
+# Runs the easy RSA commands to generate server side certificate files
+# for the cloud-pvl-admission webhook.
+# The generated files are in ${CLOUD_PVL_ADMISSION_CERT_DIR}
+#
+# Assumed vars
+#   KUBE_TEMP
+#   CLOUD_PVL_ADMISSION_CERT_DIR
+#   CLOUD_PVL_ADMISSION_PRIMARY_CN: Primary canonical name
+#   CLOUD_PVL_ADMISSION_SANS: Subject alternate names
+#
+function generate-cloud-pvl-admission-certs {
+  local -r cert_create_debug_output=$(mktemp "${KUBE_TEMP}/cert_create_debug_output.XXX")
+  # Note: This was heavily cribbed from make-ca-cert.sh
+  (set -x
+    # Make the client <-> cloud-pvl-admission server side certificates.
+    cd "${KUBE_TEMP}/easy-rsa/cloud-pvl-admission"
+    ./easyrsa init-pki
+    # this puts the cert into pki/ca.crt and the key into pki/private/ca.key
+    ./easyrsa --batch "--req-cn=${CLOUD_PVL_ADMISSION_PRIMARY_CN}@$(date +%s)" build-ca nopass
+    ./easyrsa --batch --subject-alt-name="IP:127.0.0.1,${CLOUD_PVL_ADMISSION_SANS}" build-server-full server nopass
+    ./easyrsa --batch build-client-full client nopass
+
+    kube::util::ensure-cfssl "${KUBE_TEMP}/cfssl"
+
+    # make the config for the signer
+    echo '{"signing":{"default":{"expiry":"43800h","usages":["signing","key encipherment","client auth"]}}}' > "ca-config.json"
+    # create the cloud-pvl-admission cert with the correct groups
+    echo '{"CN":"cloud-pvl-admission","hosts":[],"key":{"algo":"rsa","size":2048}}' | "${CFSSL_BIN}" gencert -ca=pki/ca.crt -ca-key=pki/private/ca.key -config=ca-config.json - | "${CFSSLJSON_BIN}" -bare cloud-pvl-admission
+    rm -f "cloud-pvl-admission.csr"
+
+    # Make the cloud-pvl-admission server side certificates.
+    cd "${KUBE_TEMP}/easy-rsa/cloud-pvl-admission"
+    ./easyrsa init-pki
+    # this puts the cert into pki/ca.crt and the key into pki/private/ca.key
+    ./easyrsa --batch "--req-cn=${CLOUD_PVL_ADMISSION_PRIMARY_CN}@$(date +%s)" build-ca nopass
+    ./easyrsa --batch --subject-alt-name="${CLOUD_PVL_ADMISSION_SANS}" build-server-full server nopass
+    ./easyrsa --batch build-client-full client nopass
+
+    kube::util::ensure-cfssl "${KUBE_TEMP}/cfssl"
+
+    # make the config for the signer
+    echo '{"signing":{"default":{"expiry":"43800h","usages":["signing","key encipherment","agent auth"]}}}' > "ca-config.json"
+    # create the cloud-pvl-admission server cert with the correct groups
+    echo '{"CN":"cloud-pvl-admission","hosts":[],"key":{"algo":"rsa","size":2048}}' | "${CFSSL_BIN}" gencert -ca=pki/ca.crt -ca-key=pki/private/ca.key -config=ca-config.json - | "${CFSSLJSON_BIN}" -bare konnectivity-agent
+    rm -f "konnectivity-agent.csr"
+
+    echo "completed main certificate section") &>"${cert_create_debug_output}" || true
+
+  local output_file_missing=0
+  local output_file
+  for output_file in \
+    "${CLOUD_PVL_ADMISSION_CERT_DIR}/pki/private/ca.key" \
+    "${CLOUD_PVL_ADMISSION_CERT_DIR}/pki/ca.crt" \
+    "${CLOUD_PVL_ADMISSION_CERT_DIR}/pki/issued/server.crt" \
+    "${CLOUD_PVL_ADMISSION_CERT_DIR}/pki/private/server.key" \
+    "${CLOUD_PVL_ADMISSION_CERT_DIR}/pki/issued/client.crt" \
+    "${CLOUD_PVL_ADMISSION_CERT_DIR}/pki/private/client.key"
+  do
+    if [[ ! -s "${output_file}" ]]; then
+      echo "Expected file ${output_file} not created" >&2
+      output_file_missing=1
+    fi
+  done
+  if (( output_file_missing )); then
+    # TODO(roberthbailey,porridge): add better error handling here,
+    # see https://github.com/kubernetes/kubernetes/issues/55229
+    cat "${cert_create_debug_output}" >&2
+    echo "=== Failed to generate cloud-pvl-admission certificates: Aborting ===" >&2
+    exit 2
+  fi
+}
+
 # Using provided master env, extracts value from provided key.
 #
 # Args:
@@ -1982,7 +2138,6 @@ function parse-master-env() {
   local master_env
   master_env=$(get-master-env)
   KUBE_PROXY_TOKEN=$(get-env-val "${master_env}" "KUBE_PROXY_TOKEN")
-  NODE_PROBLEM_DETECTOR_TOKEN=$(get-env-val "${master_env}" "NODE_PROBLEM_DETECTOR_TOKEN")
   CA_CERT_BASE64=$(get-env-val "${master_env}" "CA_CERT")
   CA_KEY_BASE64=$(get-env-val "${master_env}" "CA_KEY")
   KUBEAPISERVER_CERT_BASE64=$(get-env-val "${master_env}" "KUBEAPISERVER_CERT")
@@ -2003,6 +2158,10 @@ function parse-master-env() {
   ETCD_APISERVER_SERVER_CERT_BASE64=$(get-env-val "${master_env}" "ETCD_APISERVER_SERVER_CERT")
   ETCD_APISERVER_CLIENT_KEY_BASE64=$(get-env-val "${master_env}" "ETCD_APISERVER_CLIENT_KEY")
   ETCD_APISERVER_CLIENT_CERT_BASE64=$(get-env-val "${master_env}" "ETCD_APISERVER_CLIENT_CERT")
+  CLOUD_PVL_ADMISSION_CA_KEY_BASE64=$(get-env-val "${master_env}" "CLOUD_PVL_ADMISSION_CA_KEY")
+  CLOUD_PVL_ADMISSION_CA_CERT_BASE64=$(get-env-val "${master_env}" "CLOUD_PVL_ADMISSION_CA_CERT")
+  CLOUD_PVL_ADMISSION_CERT_BASE64=$(get-env-val "${master_env}" "CLOUD_PVL_ADMISSION_CERT")
+  CLOUD_PVL_ADMISSION_KEY_BASE64=$(get-env-val "${master_env}" "CLOUD_PVL_ADMISSION_KEY")
   KONNECTIVITY_SERVER_CA_KEY_BASE64=$(get-env-val "${master_env}" "KONNECTIVITY_SERVER_CA_KEY")
   KONNECTIVITY_SERVER_CA_CERT_BASE64=$(get-env-val "${master_env}" "KONNECTIVITY_SERVER_CA_CERT")
   KONNECTIVITY_SERVER_CERT_BASE64=$(get-env-val "${master_env}" "KONNECTIVITY_SERVER_CERT")
@@ -2036,18 +2195,14 @@ function update-or-verify-gcloud() {
     version=$(gcloud version --format=json)
     python3 -c"
 import json,sys
-from distutils import version
 
-minVersion = version.LooseVersion('1.3.0')
 required = [ 'alpha', 'beta', 'core' ]
 data = json.loads(sys.argv[1])
 rel = data.get('Google Cloud SDK')
 if 'CL @' in rel:
   print('Using dev version of gcloud: %s' %rel)
   exit(0)
-if rel != 'HEAD' and version.LooseVersion(rel) < minVersion:
-  print('gcloud version out of date ( < %s )' % minVersion)
-  exit(1)
+
 missing = []
 for c in required:
   if not data.get(c):
@@ -2716,9 +2871,9 @@ function create-etcd-certs {
     generate-etcd-cert "${KUBE_TEMP}/cfssl" "${host}" "peer" "peer"
 
   pushd "${KUBE_TEMP}/cfssl"
-  ETCD_CA_KEY_BASE64=$(base64 "ca-key.pem" | tr -d '\r\n')
+  ETCD_CA_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "ca-key.pem" | tr -d '\r\n')
   ETCD_CA_CERT_BASE64=$(gzip -c "ca.pem" | base64 | tr -d '\r\n')
-  ETCD_PEER_KEY_BASE64=$(base64 "peer-key.pem" | tr -d '\r\n')
+  ETCD_PEER_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "peer-key.pem" | tr -d '\r\n')
   ETCD_PEER_CERT_BASE64=$(gzip -c "peer.pem" | base64 | tr -d '\r\n')
   popd
 }
@@ -2755,11 +2910,11 @@ function create-etcd-apiserver-certs {
     generate-etcd-cert "${KUBE_TEMP}/cfssl" "${hostClient}" "client" "etcd-apiserver-client"
 
   pushd "${KUBE_TEMP}/cfssl"
-  ETCD_APISERVER_CA_KEY_BASE64=$(base64 "ca-key.pem" | tr -d '\r\n')
+  ETCD_APISERVER_CA_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "ca-key.pem" | tr -d '\r\n')
   ETCD_APISERVER_CA_CERT_BASE64=$(gzip -c "ca.pem" | base64 | tr -d '\r\n')
-  ETCD_APISERVER_SERVER_KEY_BASE64=$(base64 "etcd-apiserver-server-key.pem" | tr -d '\r\n')
+  ETCD_APISERVER_SERVER_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "etcd-apiserver-server-key.pem" | tr -d '\r\n')
   ETCD_APISERVER_SERVER_CERT_BASE64=$(gzip -c "etcd-apiserver-server.pem" | base64 | tr -d '\r\n')
-  ETCD_APISERVER_CLIENT_KEY_BASE64=$(base64 "etcd-apiserver-client-key.pem" | tr -d '\r\n')
+  ETCD_APISERVER_CLIENT_KEY_BASE64=$(base64 $BASE64_INPUT_FLAG "etcd-apiserver-client-key.pem" | tr -d '\r\n')
   ETCD_APISERVER_CLIENT_CERT_BASE64=$(gzip -c "etcd-apiserver-client.pem" | base64 | tr -d '\r\n')
   popd
 }
@@ -2782,13 +2937,20 @@ function create-master() {
       --allow tcp:8132 &
   fi
 
+  local zone_fallback=false
+  if [[ -z "${KUBE_GCE_ZONE:-}" ]]; then
+    zone_fallback=true
+  fi
+
   # We have to make sure the disk is created before creating the master VM, so
-  # run this in the foreground.
-  gcloud compute disks create "${MASTER_NAME}-pd" \
-    --project "${PROJECT}" \
-    --zone "${ZONE}" \
-    --type "${MASTER_DISK_TYPE}" \
-    --size "${MASTER_DISK_SIZE}"
+  # run this in the foreground. With zone fallback the disk is created per zone.
+  if [[ "${zone_fallback}" != "true" ]]; then
+    gcloud compute disks create "${MASTER_NAME}-pd" \
+      --project "${PROJECT}" \
+      --zone "${ZONE}" \
+      --type "${MASTER_DISK_TYPE}" \
+      --size "${MASTER_DISK_SIZE}"
+  fi
 
   # Create rule for accessing and securing etcd servers.
   if ! gcloud compute firewall-rules --project "${NETWORK_PROJECT}" describe "${MASTER_NAME}-etcd" &>/dev/null; then
@@ -2805,9 +2967,6 @@ function create-master() {
   # computer) can forget it later. This should disappear with
   # http://issue.k8s.io/3168
   KUBE_PROXY_TOKEN=$(dd if=/dev/urandom bs=128 count=1 2>/dev/null | base64 | tr -d "=+/" | dd bs=32 count=1 2>/dev/null)
-  if [[ "${ENABLE_NODE_PROBLEM_DETECTOR:-}" == "standalone" ]]; then
-    NODE_PROBLEM_DETECTOR_TOKEN=$(dd if=/dev/urandom bs=128 count=1 2>/dev/null | base64 | tr -d "=+/" | dd bs=32 count=1 2>/dev/null)
-  fi
 
   # Reserve the master's IP so that it can later be transferred to another VM
   # without disrupting the kubelets.
@@ -2835,7 +2994,10 @@ function create-master() {
   create-etcd-certs "${MASTER_NAME}"
   create-etcd-apiserver-certs "etcd-${MASTER_NAME}" "${MASTER_NAME}"
 
-  if [[ "$(get-num-nodes)" -ge "50" ]]; then
+  if [[ "${zone_fallback}" == "true" ]]; then
+    # Must run in the foreground so the chosen ZONE is visible to node creation.
+    create-master-in-region "${MASTER_RESERVED_IP}" "${MASTER_INTERNAL_IP}" || exit 1
+  elif [[ "$(get-num-nodes)" -ge "50" ]]; then
     # We block on master creation for large clusters to avoid doing too much
     # unnecessary work in case master start-up fails (like creation of nodes).
     create-master-instance "${MASTER_RESERVED_IP}" "${MASTER_INTERNAL_IP}"
@@ -2843,6 +3005,64 @@ function create-master() {
     create-master-instance "${MASTER_RESERVED_IP}" "${MASTER_INTERNAL_IP}" &
   fi
 
+}
+
+# Tries each zone of REGION in turn: creates the master disk, then makes two
+# attempts to create the master instance. Sets ZONE to the first zone that succeeds.
+#
+# Assumed vars:
+#   PROJECT
+#   REGION
+#   MASTER_NAME
+#   MASTER_DISK_TYPE
+#   MASTER_DISK_SIZE
+# Vars set:
+#   ZONE
+#
+# $1: master reserved IP
+# $2: master internal IP (may be empty)
+function create-master-in-region() {
+  local -r address="${1}"
+  local -r internal_address="${2:-}"
+
+  local zones
+  zones=$(list-region-zones "${REGION}")
+  if [[ -z "${zones}" ]]; then
+    echo -e "${color_red}Could not find any zones in region ${REGION}${color_norm}" >&2
+    return 1
+  fi
+
+  local zone
+  for zone in ${zones}; do
+    ZONE="${zone}"
+    echo "Attempting to create master in zone ${ZONE}" >&2
+    # Both embed ZONE, so regenerate them for the zone being tried.
+    write-cluster-location
+    create-autoscaler-config
+
+    if ! gcloud compute disks create "${MASTER_NAME}-pd" \
+        --project "${PROJECT}" \
+        --zone "${ZONE}" \
+        --type "${MASTER_DISK_TYPE}" \
+        --size "${MASTER_DISK_SIZE}"; then
+      echo -e "${color_yellow}Failed to create master disk in zone ${ZONE}, trying next zone.${color_norm}" >&2
+      continue
+    fi
+
+    if MASTER_CREATE_ATTEMPTS_PER_ZONE=2 create-master-instance "${address}" "${internal_address}"; then
+      echo "Created master in zone ${ZONE}" >&2
+      return 0
+    fi
+
+    echo -e "${color_yellow}Failed to create master in zone ${ZONE}, trying next zone.${color_norm}" >&2
+    gcloud compute disks delete "${MASTER_NAME}-pd" \
+      --project "${PROJECT}" \
+      --zone "${ZONE}" \
+      --quiet || true
+  done
+
+  echo -e "${color_red}Failed to create master in any zone of region ${REGION}.${color_norm}" >&2
+  return 1
 }
 
 # Adds master replica to etcd cluster.
@@ -3550,6 +3770,77 @@ function remove-replica-from-etcd() {
   return "${res}"
 }
 
+# Robustly try to delete a managed instance group.
+# Retry transient gcloud failures. A failed delete only counts as success once
+# list confirms the group is gone, which covers a group that never existed and
+# a delete that succeeded but whose response was lost.
+# $1: The name of the managed instance group.
+# $2: The zone of the managed instance group.
+function delete-managed-instance-group-with-retries() {
+  local -r group_name="${1}"
+  local -r zone="${2}"
+  local attempt=0
+  local found
+
+  while true; do
+    gcloud compute instance-groups managed delete \
+      --project "${PROJECT}" \
+      --quiet \
+      --zone "${zone}" \
+      "${group_name}" && break
+
+    if found=$(gcloud compute instance-groups managed list \
+        --project "${PROJECT}" \
+        --filter="name=${group_name} AND zone:(${zone})" \
+        --format="value(name)") && [[ -z "${found}" ]]; then
+      return 0
+    fi
+
+    if (( attempt >= 3 )); then
+      echo -e "${color_red}Failed to delete managed instance group ${group_name}.${color_norm}" >&2
+      return 1
+    fi
+
+    attempt=$((attempt + 1))
+    echo -e "${color_yellow}Attempt ${attempt} failed to delete managed instance group ${group_name}. Retrying.${color_norm}" >&2
+    sleep $((attempt * 15))
+  done
+}
+
+# Robustly try to delete an instance template.
+# Retry transient gcloud failures. A failed delete only counts as success once
+# list confirms the template is gone, which covers a template that never
+# existed and a delete that succeeded but whose response was lost.
+# $1: The name of the instance template.
+function delete-instance-template-with-retries() {
+  local -r template_name="${1}"
+  local attempt=0
+  local found
+
+  while true; do
+    gcloud compute instance-templates delete \
+      --project "${PROJECT}" \
+      --quiet \
+      "${template_name}" && break
+
+    if found=$(gcloud compute instance-templates list \
+        --project "${PROJECT}" \
+        --filter="name=${template_name}" \
+        --format="value(name)") && [[ -z "${found}" ]]; then
+      return 0
+    fi
+
+    if (( attempt >= 3 )); then
+      echo -e "${color_red}Failed to delete instance template ${template_name}.${color_norm}" >&2
+      return 1
+    fi
+
+    attempt=$((attempt + 1))
+    echo -e "${color_yellow}Attempt ${attempt} failed to delete instance template ${template_name}. Retrying.${color_norm}" >&2
+    sleep $((attempt * 15))
+  done
+}
+
 # Delete a kubernetes cluster. This is called from test-teardown.
 #
 # Assumed vars:
@@ -3582,39 +3873,9 @@ function kube-down() {
     # Deliberately do not quote, do not change unless a bug is found
     # shellcheck disable=SC2068
     for group in ${all_instance_groups[@]:-}; do
-      {
-        if gcloud compute instance-groups managed describe "${group}" --project "${PROJECT}" --zone "${ZONE}" &>/dev/null; then
-          gcloud compute instance-groups managed delete \
-            --project "${PROJECT}" \
-            --quiet \
-            --zone "${ZONE}" \
-            "${group}"
-        fi
-      } &
+      delete-managed-instance-group-with-retries "${group}" "${ZONE}" &
     done
 
-    # Wait for last batch of jobs
-    kube::util::wait-for-jobs || {
-      echo -e "Failed to delete instance group(s)." >&2
-    }
-
-    # Deliberately do not quote, do not change unless a bug is found
-    # shellcheck disable=SC2068
-    for template in ${templates[@]:-}; do
-      {
-        if gcloud compute instance-templates describe --project "${PROJECT}" "${template}" &>/dev/null; then
-          gcloud compute instance-templates delete \
-            --project "${PROJECT}" \
-            --quiet \
-            "${template}"
-        fi
-      } &
-    done
-
-    # Wait for last batch of jobs
-    kube::util::wait-for-jobs || {
-      echo -e "Failed to delete instance template(s)." >&2
-    }
 
     # Delete the special heapster node (if it exists).
     if [[ -n "${HEAPSTER_MACHINE_TYPE:-}" ]]; then
@@ -3627,6 +3888,10 @@ function kube-down() {
           --delete-disks all \
           --zone "${ZONE}" \
           "${heapster_machine_name}"
+        # ^^^ The invocation above continues to be blocking.
+        # It may be worth it for some scalability jobs to
+        # also make it non-blocking, but that is left to
+        # owners of those jobs.
       fi
     fi
   fi
@@ -3658,7 +3923,20 @@ function kube-down() {
       --quiet \
       --delete-disks all \
       --zone "${ZONE}" \
-      "${REPLICA_NAME}"
+      "${REPLICA_NAME}" &
+  fi
+
+  # Wait for last batch of jobs
+  kube::util::wait-for-jobs || {
+    echo -e "Failed to delete instance group(s) and replica(s)." >&2
+  }
+
+  if [[ "${KUBE_DELETE_NODES:-}" != "false" ]]; then
+    # Deliberately do not quote, do not change unless a bug is found
+    # shellcheck disable=SC2068
+    for template in ${templates[@]:-}; do
+      delete-instance-template-with-retries "${template}" &
+    done
   fi
 
   # Delete the master replica pd (possibly leaked by kube-up if master create failed).
@@ -3669,8 +3947,14 @@ function kube-down() {
       --project "${PROJECT}" \
       --quiet \
       --zone "${ZONE}" \
-      "${replica_pd}"
+      "${replica_pd}" &&
+    echo "Deleted ${replica_pd}" & # "gcloud compute disks delete --quiet" does not print anything, in contrast to other sub-commands.
   fi
+
+  # Wait for last batch of jobs
+  kube::util::wait-for-jobs || {
+    echo -e "Failed to delete instance templates and/or replica pd." >&2
+  }
 
   # Check if this are any remaining master replicas.
   local REMAINING_MASTER_COUNT
@@ -3778,7 +4062,7 @@ function kube-down() {
         --project "${PROJECT}" \
         --quiet \
         --zone "${ZONE}" \
-        "${INSTANCE_PREFIX}"-influxdb-pd
+        "${INSTANCE_PREFIX}"-influxdb-pd && echo "Deleted ${INSTANCE_PREFIX}-influxdb-pd."
     fi
 
     # Delete all remaining firewall rules and network.

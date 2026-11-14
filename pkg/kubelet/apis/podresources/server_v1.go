@@ -20,11 +20,14 @@ import (
 	"context"
 	"fmt"
 
+	v1 "k8s.io/api/core/v1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/klog/v2"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
 
-	"k8s.io/kubelet/pkg/apis/podresources/v1"
+	podresourcesv1 "k8s.io/kubelet/pkg/apis/podresources/v1"
 )
 
 // v1PodResourcesServer implements PodResourcesListerServer
@@ -34,80 +37,97 @@ type v1PodResourcesServer struct {
 	cpusProvider             CPUsProvider
 	memoryProvider           MemoryProvider
 	dynamicResourcesProvider DynamicResourcesProvider
+	useActivePods            bool
+	podresourcesv1.UnsafePodResourcesListerServer
 }
 
 // NewV1PodResourcesServer returns a PodResourcesListerServer which lists pods provided by the PodsProvider
 // with device information provided by the DevicesProvider
-func NewV1PodResourcesServer(providers PodResourcesProviders) v1.PodResourcesListerServer {
+func NewV1PodResourcesServer(ctx context.Context, providers PodResourcesProviders) podresourcesv1.PodResourcesListerServer {
+	logger := klog.FromContext(ctx)
+	useActivePods := utilfeature.DefaultFeatureGate.Enabled(kubefeatures.KubeletPodResourcesListUseActivePods)
+	logger.Info("podresources", "method", "list", "useActivePods", useActivePods)
 	return &v1PodResourcesServer{
 		podsProvider:             providers.Pods,
 		devicesProvider:          providers.Devices,
 		cpusProvider:             providers.Cpus,
 		memoryProvider:           providers.Memory,
 		dynamicResourcesProvider: providers.DynamicResources,
+		useActivePods:            useActivePods,
 	}
 }
 
 // List returns information about the resources assigned to pods on the node
-func (p *v1PodResourcesServer) List(ctx context.Context, req *v1.ListPodResourcesRequest) (*v1.ListPodResourcesResponse, error) {
+func (p *v1PodResourcesServer) List(ctx context.Context, req *podresourcesv1.ListPodResourcesRequest) (*podresourcesv1.ListPodResourcesResponse, error) {
 	metrics.PodResourcesEndpointRequestsTotalCount.WithLabelValues("v1").Inc()
 	metrics.PodResourcesEndpointRequestsListCount.WithLabelValues("v1").Inc()
 
-	pods := p.podsProvider.GetPods()
-	podResources := make([]*v1.PodResources, len(pods))
-	p.devicesProvider.UpdateAllocatedDevices()
+	logger := klog.FromContext(ctx)
+
+	var pods []*v1.Pod
+	if p.useActivePods {
+		// GetActivePods already filters out terminal pods, so no need for additional filtering.
+		pods = p.podsProvider.GetActivePods()
+	} else {
+		pods = p.podsProvider.GetPods()
+	}
+
+	podResources := make([]*podresourcesv1.PodResources, len(pods))
+	p.devicesProvider.UpdateAllocatedDevices(logger)
 
 	for i, pod := range pods {
-		pRes := v1.PodResources{
+		pRes := podresourcesv1.PodResources{
 			Name:       pod.Name,
 			Namespace:  pod.Namespace,
-			Containers: make([]*v1.ContainerResources, len(pod.Spec.Containers)),
+			Containers: make([]*podresourcesv1.ContainerResources, 0, len(pod.Spec.Containers)),
+		}
+		if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.PodLevelResourceManagers) {
+			pRes.CpuIds = p.cpusProvider.GetPodCPUs(string(pod.UID))
+			pRes.Memory = p.memoryProvider.GetPodMemory(logger, string(pod.UID))
 		}
 
-		for j, container := range pod.Spec.Containers {
-			pRes.Containers[j] = &v1.ContainerResources{
-				Name:    container.Name,
-				Devices: p.devicesProvider.GetDevices(string(pod.UID), container.Name),
-				CpuIds:  p.cpusProvider.GetCPUs(string(pod.UID), container.Name),
-				Memory:  p.memoryProvider.GetMemory(string(pod.UID), container.Name),
-			}
-			if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.KubeletPodResourcesDynamicResources) {
-				pRes.Containers[j].DynamicResources = p.dynamicResourcesProvider.GetDynamicResources(pod, &container)
+		pRes.Containers = make([]*podresourcesv1.ContainerResources, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers))
+		for _, container := range pod.Spec.InitContainers {
+			if !podutil.IsRestartableInitContainer(&container) {
+				continue
 			}
 
+			pRes.Containers = append(pRes.Containers, p.getContainerResources(logger, pod, &container))
+		}
+
+		for _, container := range pod.Spec.Containers {
+			pRes.Containers = append(pRes.Containers, p.getContainerResources(logger, pod, &container))
 		}
 		podResources[i] = &pRes
 	}
 
-	response := &v1.ListPodResourcesResponse{
+	response := &podresourcesv1.ListPodResourcesResponse{
 		PodResources: podResources,
 	}
 	return response, nil
 }
 
 // GetAllocatableResources returns information about all the resources known by the server - this more like the capacity, not like the current amount of free resources.
-func (p *v1PodResourcesServer) GetAllocatableResources(ctx context.Context, req *v1.AllocatableResourcesRequest) (*v1.AllocatableResourcesResponse, error) {
+func (p *v1PodResourcesServer) GetAllocatableResources(ctx context.Context, req *podresourcesv1.AllocatableResourcesRequest) (*podresourcesv1.AllocatableResourcesResponse, error) {
+	logger := klog.FromContext(ctx)
 	metrics.PodResourcesEndpointRequestsTotalCount.WithLabelValues("v1").Inc()
 	metrics.PodResourcesEndpointRequestsGetAllocatableCount.WithLabelValues("v1").Inc()
 
-	response := &v1.AllocatableResourcesResponse{
-		Devices: p.devicesProvider.GetAllocatableDevices(),
+	response := &podresourcesv1.AllocatableResourcesResponse{
+		Devices: p.devicesProvider.GetAllocatableDevices(logger),
 		CpuIds:  p.cpusProvider.GetAllocatableCPUs(),
-		Memory:  p.memoryProvider.GetAllocatableMemory(),
+		Memory:  p.memoryProvider.GetAllocatableMemory(logger),
 	}
 
 	return response, nil
 }
 
 // Get returns information about the resources assigned to a specific pod
-func (p *v1PodResourcesServer) Get(ctx context.Context, req *v1.GetPodResourcesRequest) (*v1.GetPodResourcesResponse, error) {
+func (p *v1PodResourcesServer) Get(ctx context.Context, req *podresourcesv1.GetPodResourcesRequest) (*podresourcesv1.GetPodResourcesResponse, error) {
 	metrics.PodResourcesEndpointRequestsTotalCount.WithLabelValues("v1").Inc()
 	metrics.PodResourcesEndpointRequestsGetCount.WithLabelValues("v1").Inc()
 
-	if !utilfeature.DefaultFeatureGate.Enabled(kubefeatures.KubeletPodResourcesGet) {
-		metrics.PodResourcesEndpointErrorsGetCount.WithLabelValues("v1").Inc()
-		return nil, fmt.Errorf("PodResources API Get method disabled")
-	}
+	logger := klog.FromContext(ctx)
 
 	pod, exist := p.podsProvider.GetPodByName(req.PodNamespace, req.PodName)
 	if !exist {
@@ -115,26 +135,42 @@ func (p *v1PodResourcesServer) Get(ctx context.Context, req *v1.GetPodResourcesR
 		return nil, fmt.Errorf("pod %s in namespace %s not found", req.PodName, req.PodNamespace)
 	}
 
-	podResources := &v1.PodResources{
+	podResources := &podresourcesv1.PodResources{
 		Name:       pod.Name,
 		Namespace:  pod.Namespace,
-		Containers: make([]*v1.ContainerResources, len(pod.Spec.Containers)),
+		Containers: make([]*podresourcesv1.ContainerResources, 0, len(pod.Spec.Containers)),
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.PodLevelResourceManagers) {
+		podResources.CpuIds = p.cpusProvider.GetPodCPUs(string(pod.UID))
+		podResources.Memory = p.memoryProvider.GetPodMemory(logger, string(pod.UID))
 	}
 
-	for i, container := range pod.Spec.Containers {
-		podResources.Containers[i] = &v1.ContainerResources{
-			Name:    container.Name,
-			Devices: p.devicesProvider.GetDevices(string(pod.UID), container.Name),
-			CpuIds:  p.cpusProvider.GetCPUs(string(pod.UID), container.Name),
-			Memory:  p.memoryProvider.GetMemory(string(pod.UID), container.Name),
+	podResources.Containers = make([]*podresourcesv1.ContainerResources, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers))
+	for _, container := range pod.Spec.InitContainers {
+		if !podutil.IsRestartableInitContainer(&container) {
+			continue
 		}
-		if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.KubeletPodResourcesDynamicResources) {
-			podResources.Containers[i].DynamicResources = p.dynamicResourcesProvider.GetDynamicResources(pod, &container)
-		}
+
+		podResources.Containers = append(podResources.Containers, p.getContainerResources(logger, pod, &container))
 	}
 
-	response := &v1.GetPodResourcesResponse{
+	for _, container := range pod.Spec.Containers {
+		podResources.Containers = append(podResources.Containers, p.getContainerResources(logger, pod, &container))
+	}
+
+	response := &podresourcesv1.GetPodResourcesResponse{
 		PodResources: podResources,
 	}
 	return response, nil
+}
+
+func (p *v1PodResourcesServer) getContainerResources(logger klog.Logger, pod *v1.Pod, container *v1.Container) *podresourcesv1.ContainerResources {
+	containerResources := &podresourcesv1.ContainerResources{
+		Name:             container.Name,
+		Devices:          p.devicesProvider.GetDevices(string(pod.UID), container.Name),
+		CpuIds:           p.cpusProvider.GetCPUs(pod, container),
+		Memory:           p.memoryProvider.GetMemory(logger, pod, container),
+		DynamicResources: p.dynamicResourcesProvider.GetDynamicResources(logger, pod, container),
+	}
+	return containerResources
 }

@@ -6,6 +6,7 @@ package runtimeutil
 import (
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -73,12 +74,7 @@ func (ce *ContainerEnv) AddKeyValue(key, value string) {
 
 // HasExportedKey returns true if the key is a exported key
 func (ce *ContainerEnv) HasExportedKey(key string) bool {
-	for _, k := range ce.VarsToExport {
-		if k == key {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(ce.VarsToExport, key)
 }
 
 // AddKey adds a key into the envs
@@ -132,15 +128,18 @@ type FunctionSpec struct {
 	// Container is the spec for running a function as a container
 	Container ContainerSpec `json:"container,omitempty" yaml:"container,omitempty"`
 
-	// Starlark is the spec for running a function as a starlark script
-	Starlark StarlarkSpec `json:"starlark,omitempty" yaml:"starlark,omitempty"`
-
 	// ExecSpec is the spec for running a function as an executable
 	Exec ExecSpec `json:"exec,omitempty" yaml:"exec,omitempty"`
 }
 
 type ExecSpec struct {
 	Path string `json:"path,omitempty" yaml:"path,omitempty"`
+
+	// Args is a slice of args that will be passed as arguments to script
+	Args []string `json:"args,omitempty" yaml:"args,omitempty"`
+
+	// Env is a slice of env string that will be exposed to container
+	Env []string `json:"envs,omitempty" yaml:"envs,omitempty"`
 }
 
 // ContainerSpec defines a spec for running a function as a container
@@ -156,17 +155,6 @@ type ContainerSpec struct {
 
 	// Env is a slice of env string that will be exposed to container
 	Env []string `json:"envs,omitempty" yaml:"envs,omitempty"`
-}
-
-// StarlarkSpec defines how to run a function as a starlark program
-type StarlarkSpec struct {
-	Name string `json:"name,omitempty" yaml:"name,omitempty"`
-
-	// Path specifies a path to a starlark script
-	Path string `json:"path,omitempty" yaml:"path,omitempty"`
-
-	// URL specifies a url containing a starlark script
-	URL string `json:"url,omitempty" yaml:"url,omitempty"`
 }
 
 // StorageMount represents a container's mounted storage option(s)

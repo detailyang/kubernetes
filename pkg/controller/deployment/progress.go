@@ -25,9 +25,22 @@ import (
 	apps "k8s.io/api/apps/v1"
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controller/deployment/util"
 )
+
+// syncRolloutStatusAfter keeps reconciliation errors from skipping progress deadline checks.
+func (dc *DeploymentController) syncRolloutStatusAfter(ctx context.Context, reconcileErr error, allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, d *apps.Deployment) error {
+	statusErr := dc.syncRolloutStatus(ctx, allRSs, newRS, d)
+	if reconcileErr == nil {
+		return statusErr
+	}
+	if statusErr == nil {
+		return reconcileErr
+	}
+	return utilerrors.NewAggregate([]error{reconcileErr, statusErr})
+}
 
 // syncRolloutStatus updates the status of a deployment during a rollout. There are
 // cases this helper will run that cannot be prevented from the scaling detection,
@@ -152,7 +165,7 @@ func (dc *DeploymentController) getReplicaFailures(allRSs []*apps.ReplicaSet, ne
 }
 
 // used for unit testing
-var nowFn = func() time.Time { return time.Now() }
+var nowFn = time.Now
 
 // requeueStuckDeployment checks whether the provided deployment needs to be synced for a progress
 // check. It returns the time after the deployment will be requeued for the progress check, 0 if it

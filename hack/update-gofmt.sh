@@ -23,7 +23,7 @@ set -o pipefail
 KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
-kube::golang::verify_go_version
+kube::golang::setup_env
 
 cd "${KUBE_ROOT}"
 
@@ -36,8 +36,16 @@ function git_find() {
         ':!:*/vendor/*'      `# catches any subdir/vendor/...` \
         ':!:third_party/*'   `# catches third_party/...` \
         ':!:*/third_party/*' `# catches third_party/...` \
+        ':!:*/testdata/*'    `# catches any subdir/testdata/...` \
         ':(glob)**/*.go' \
         "$@"
 }
+# GOTOOLCHAIN has no effect on the version of gofmt.
+# We need to find right gofmt, otherwise the one in PATH will be used.
+gofmt="$(go env GOROOT)/bin/gofmt"
+if [[ ! -x "${gofmt}" ]]; then
+  echo "Failed to find $gofmt" >&2
+  exit 1
+fi
 
-git_find -z | xargs -0 gofmt -s -w
+git_find -z | xargs -0 "${gofmt}" -s -w

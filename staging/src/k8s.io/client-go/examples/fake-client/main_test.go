@@ -29,6 +29,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 )
 
 // TestFakeClient demonstrates how to use a fake client with SharedInformerFactory in tests.
@@ -41,9 +42,13 @@ func TestFakeClient(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	// A catch-all watch reactor that allows us to inject the watcherStarted channel.
 	client.PrependWatchReactor("*", func(action clienttesting.Action) (handled bool, ret watch.Interface, err error) {
+		var opts metav1.ListOptions
+		if watchAction, ok := action.(clienttesting.WatchActionImpl); ok {
+			opts = watchAction.ListOptions
+		}
 		gvr := action.GetResource()
 		ns := action.GetNamespace()
-		watch, err := client.Tracker().Watch(gvr, ns)
+		watch, err := client.Tracker().Watch(gvr, ns, opts)
 		if err != nil {
 			return false, nil, err
 		}
@@ -55,16 +60,17 @@ func TestFakeClient(t *testing.T) {
 	pods := make(chan *v1.Pod, 1)
 	informers := informers.NewSharedInformerFactory(client, 0)
 	podInformer := informers.Core().V1().Pods().Informer()
-	podInformer.AddEventHandler(&cache.ResourceEventHandlerFuncs{
+	logger := klog.FromContext(ctx)
+	_, _ = podInformer.AddEventHandlerWithOptions(&cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			pod := obj.(*v1.Pod)
 			t.Logf("pod added: %s/%s", pod.Namespace, pod.Name)
 			pods <- pod
 		},
-	})
+	}, cache.HandlerOptions{Logger: &logger})
 
 	// Make sure informers are running.
-	informers.Start(ctx.Done())
+	informers.StartWithContext(ctx)
 
 	// This is not required in tests, but it serves as a proof-of-concept by
 	// ensuring that the informer goroutine have warmed up and called List before

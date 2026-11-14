@@ -18,21 +18,21 @@ package validation
 
 import (
 	"fmt"
-	"net"
 	"reflect"
-	"strconv"
-	"strings"
 
-	"github.com/google/go-cmp/cmp"
 	v1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/util/feature"
 	componentbasevalidation "k8s.io/component-base/config/validation"
 	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+	schedfeature "k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 )
 
 // ValidateKubeSchedulerConfiguration ensures validation of the KubeSchedulerConfiguration struct
@@ -68,34 +68,9 @@ func ValidateKubeSchedulerConfiguration(cc *config.KubeSchedulerConfiguration) u
 		}
 		errs = append(errs, validateCommonQueueSort(profilesPath, cc.Profiles)...)
 	}
-	if len(cc.HealthzBindAddress) > 0 {
-		host, port, err := splitHostIntPort(cc.HealthzBindAddress)
-		if err != nil {
-			errs = append(errs, field.Invalid(field.NewPath("healthzBindAddress"), cc.HealthzBindAddress, err.Error()))
-		} else {
-			if errMsgs := validation.IsValidIP(host); errMsgs != nil {
-				errs = append(errs, field.Invalid(field.NewPath("healthzBindAddress"), cc.HealthzBindAddress, strings.Join(errMsgs, ",")))
-			}
-			if port != 0 {
-				errs = append(errs, field.Invalid(field.NewPath("healthzBindAddress"), cc.HealthzBindAddress, "must be empty or with an explicit 0 port"))
-			}
-		}
-	}
-	if len(cc.MetricsBindAddress) > 0 {
-		host, port, err := splitHostIntPort(cc.MetricsBindAddress)
-		if err != nil {
-			errs = append(errs, field.Invalid(field.NewPath("metricsBindAddress"), cc.MetricsBindAddress, err.Error()))
-		} else {
-			if errMsgs := validation.IsValidIP(host); errMsgs != nil {
-				errs = append(errs, field.Invalid(field.NewPath("metricsBindAddress"), cc.MetricsBindAddress, strings.Join(errMsgs, ",")))
-			}
-			if port != 0 {
-				errs = append(errs, field.Invalid(field.NewPath("metricsBindAddress"), cc.MetricsBindAddress, "must be empty or with an explicit 0 port"))
-			}
-		}
-	}
 
-	errs = append(errs, validatePercentageOfNodesToScore(field.NewPath("percentageOfNodesToScore"), cc.PercentageOfNodesToScore))
+	errs = append(errs, ValidatePercentage(field.NewPath("percentageOfNodesToScore"), cc.PercentageOfNodesToScore))
+	errs = append(errs, ValidatePercentageOfPlacementsToScore(field.NewPath("percentageOfPlacementsToScore"), cc.PercentageOfPlacementsToScore))
 
 	if cc.PodInitialBackoffSeconds <= 0 {
 		errs = append(errs, field.Invalid(field.NewPath("podInitialBackoffSeconds"),
@@ -110,25 +85,24 @@ func ValidateKubeSchedulerConfiguration(cc *config.KubeSchedulerConfiguration) u
 	return utilerrors.Flatten(utilerrors.NewAggregate(errs))
 }
 
-func splitHostIntPort(s string) (string, int, error) {
-	host, port, err := net.SplitHostPort(s)
-	if err != nil {
-		return "", 0, err
-	}
-	portInt, err := strconv.Atoi(port)
-	if err != nil {
-		return "", 0, err
-	}
-	return host, portInt, err
-}
-
-func validatePercentageOfNodesToScore(path *field.Path, percentageOfNodesToScore *int32) error {
-	if percentageOfNodesToScore != nil {
-		if *percentageOfNodesToScore < 0 || *percentageOfNodesToScore > 100 {
-			return field.Invalid(path, *percentageOfNodesToScore, "not in valid range [0-100]")
+// ValidatePercentage checks that percentage, if set, is in the range [0, 100].
+func ValidatePercentage(path *field.Path, percentage *int32) error {
+	if percentage != nil {
+		if *percentage < 0 || *percentage > 100 {
+			return field.Invalid(path, *percentage, "not in valid range [0-100]")
 		}
 	}
 	return nil
+}
+
+// ValidatePercentageOfPlacementsToScore checks, if percentageOfPlacementsToScore is set, that TopologyAwareScheduling is enabled and that percentageOfPlacementsToScore value is valid.
+func ValidatePercentageOfPlacementsToScore(path *field.Path, percentageOfPlacementsToScore *int32) error {
+	if percentageOfPlacementsToScore != nil {
+		if !feature.DefaultFeatureGate.Enabled(features.TopologyAwareWorkloadScheduling) {
+			return field.Forbidden(path, "percentageOfPlacementsToScore requires TopologyAwareWorkloadScheduling feature gate to be enabled")
+		}
+	}
+	return ValidatePercentage(path, percentageOfPlacementsToScore)
 }
 
 type invalidPlugins struct {
@@ -142,7 +116,12 @@ type invalidPlugins struct {
 var invalidPluginsByVersion = []invalidPlugins{
 	{
 		schemeGroupVersion: v1.SchemeGroupVersion.String(),
-		plugins:            []string{},
+		plugins: []string{
+			"AzureDiskLimits",
+			"CinderLimits",
+			"EBSLimits",
+			"GCEPDLimits",
+		},
 	},
 }
 
@@ -177,7 +156,8 @@ func validateKubeSchedulerProfile(path *field.Path, apiVersion string, profile *
 	if len(profile.SchedulerName) == 0 {
 		errs = append(errs, field.Required(path.Child("schedulerName"), ""))
 	}
-	errs = append(errs, validatePercentageOfNodesToScore(path.Child("percentageOfNodesToScore"), profile.PercentageOfNodesToScore))
+	errs = append(errs, ValidatePercentage(path.Child("percentageOfNodesToScore"), profile.PercentageOfNodesToScore))
+	errs = append(errs, ValidatePercentageOfPlacementsToScore(path.Child("percentageOfPlacementsToScore"), profile.PercentageOfPlacementsToScore))
 	errs = append(errs, validatePluginConfig(path, apiVersion, profile)...)
 	return errs
 }
@@ -192,22 +172,29 @@ func validatePluginConfig(path *field.Path, apiVersion string, profile *config.K
 		"NodeResourcesFitArgs":            ValidateNodeResourcesFitArgs,
 		"PodTopologySpread":               ValidatePodTopologySpreadArgs,
 		"VolumeBinding":                   ValidateVolumeBindingArgs,
+		"DynamicResources": func(path *field.Path, args *config.DynamicResourcesArgs) error {
+			return ValidateDynamicResourcesArgs(path, args, schedfeature.NewSchedulerFeaturesFromGates(feature.DefaultFeatureGate))
+		},
 	}
 
 	if profile.Plugins != nil {
 		stagesToPluginSet := map[string]config.PluginSet{
-			"preEnqueue": profile.Plugins.PreEnqueue,
-			"queueSort":  profile.Plugins.QueueSort,
-			"preFilter":  profile.Plugins.PreFilter,
-			"filter":     profile.Plugins.Filter,
-			"postFilter": profile.Plugins.PostFilter,
-			"preScore":   profile.Plugins.PreScore,
-			"score":      profile.Plugins.Score,
-			"reserve":    profile.Plugins.Reserve,
-			"permit":     profile.Plugins.Permit,
-			"preBind":    profile.Plugins.PreBind,
-			"bind":       profile.Plugins.Bind,
-			"postBind":   profile.Plugins.PostBind,
+			"preEnqueue":         profile.Plugins.PreEnqueue,
+			"queueSort":          profile.Plugins.QueueSort,
+			"preFilter":          profile.Plugins.PreFilter,
+			"filter":             profile.Plugins.Filter,
+			"postFilter":         profile.Plugins.PostFilter,
+			"preScore":           profile.Plugins.PreScore,
+			"score":              profile.Plugins.Score,
+			"reserve":            profile.Plugins.Reserve,
+			"permit":             profile.Plugins.Permit,
+			"preBind":            profile.Plugins.PreBind,
+			"bind":               profile.Plugins.Bind,
+			"postBind":           profile.Plugins.PostBind,
+			"placementGenerate":  profile.Plugins.PlacementGenerate,
+			"placementScore":     profile.Plugins.PlacementScore,
+			"placementFeasible":  profile.Plugins.PlacementFeasible,
+			"podGroupPostFilter": profile.Plugins.PodGroupPostFilter,
 		}
 
 		pluginsPath := path.Child("plugins")
@@ -272,12 +259,12 @@ func validateCommonQueueSort(path *field.Path, profiles []config.KubeSchedulerPr
 		if profiles[i].Plugins != nil {
 			curr = profiles[i].Plugins.QueueSort
 		}
-		if !cmp.Equal(canon, curr) {
-			errs = append(errs, field.Invalid(path.Index(i).Child("plugins", "queueSort"), curr, "has to match for all profiles"))
+		if !apiequality.Semantic.DeepEqual(canon, curr) {
+			errs = append(errs, field.Invalid(path.Index(i).Child("plugins", "queueSort"), curr, "must be the same for all profiles"))
 		}
 		for _, cfg := range profiles[i].PluginConfig {
-			if cfg.Name == queueSortName && !cmp.Equal(queueSortArgs, cfg.Args) {
-				errs = append(errs, field.Invalid(path.Index(i).Child("pluginConfig", "args"), cfg.Args, "has to match for all profiles"))
+			if cfg.Name == queueSortName && !apiequality.Semantic.DeepEqual(queueSortArgs, cfg.Args) {
+				errs = append(errs, field.Invalid(path.Index(i).Child("pluginConfig", "args"), cfg.Args, "queueSort must be the same for all profiles"))
 			}
 		}
 	}

@@ -22,18 +22,23 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	k8snet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
-
+	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2epodoutput "k8s.io/kubernetes/test/e2e/framework/pod/output"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -43,6 +48,8 @@ const (
 	kubeControllerManagerPort = 10257
 	// snapshotControllerPort is the port for the snapshot controller
 	snapshotControllerPort = 9102
+	// kubeProxyPort is the default port for the kube-proxy status server.
+	kubeProxyPort = 10249
 )
 
 // MetricsGrabbingDisabledError is an error that is wrapped by the
@@ -65,7 +72,6 @@ type Collection struct {
 // Grabber provides functions which grab metrics from components
 type Grabber struct {
 	client                             clientset.Interface
-	externalClient                     clientset.Interface
 	config                             *rest.Config
 	grabFromAPIServer                  bool
 	grabFromControllerManager          bool
@@ -89,11 +95,8 @@ type Grabber struct {
 // Collecting metrics data is an optional debug feature. Not all clusters will
 // support it. If disabled for a component, the corresponding Grab function
 // will immediately return an error derived from MetricsGrabbingDisabledError.
-func NewMetricsGrabber(ctx context.Context, c clientset.Interface, ec clientset.Interface, config *rest.Config, kubelets bool, scheduler bool, controllers bool, apiServer bool, clusterAutoscaler bool, snapshotController bool) (*Grabber, error) {
-
-	kubeScheduler := ""
-	kubeControllerManager := ""
-	snapshotControllerManager := ""
+func NewMetricsGrabber(ctx context.Context, c clientset.Interface, config *rest.Config, kubelets bool, scheduler bool, controllers bool, apiServer bool, clusterAutoscaler bool, snapshotController bool) (*Grabber, error) {
+	var kubeSchedulers, kubeControllerManagers, snapshotControllers []v1.Pod
 
 	regKubeScheduler := regexp.MustCompile("kube-scheduler-.*")
 	regKubeControllerManager := regexp.MustCompile("kube-controller-manager-.*")
@@ -112,25 +115,21 @@ func NewMetricsGrabber(ctx context.Context, c clientset.Interface, ec clientset.
 	}
 	for _, pod := range podList.Items {
 		if regKubeScheduler.MatchString(pod.Name) {
-			kubeScheduler = pod.Name
+			kubeSchedulers = append(kubeSchedulers, pod)
 		}
 		if regKubeControllerManager.MatchString(pod.Name) {
-			kubeControllerManager = pod.Name
+			kubeControllerManagers = append(kubeControllerManagers, pod)
 		}
 		if regSnapshotController.MatchString(pod.Name) {
-			snapshotControllerManager = pod.Name
-		}
-		if kubeScheduler != "" && kubeControllerManager != "" && snapshotControllerManager != "" {
-			break
+			snapshotControllers = append(snapshotControllers, pod)
 		}
 	}
-	if clusterAutoscaler && ec == nil {
-		klog.Warningf("Did not receive an external client interface. Grabbing metrics from ClusterAutoscaler is disabled.")
-	}
+	kubeScheduler := leaderPod(ctx, c, scheduler, "kube-scheduler", kubeSchedulers)
+	kubeControllerManager := leaderPod(ctx, c, controllers, "kube-controller-manager", kubeControllerManagers)
+	snapshotControllerManager := leaderPod(ctx, c, snapshotController, "snapshot-controller-leader", snapshotControllers)
 
 	return &Grabber{
 		client:                     c,
-		externalClient:             ec,
 		config:                     config,
 		grabFromAPIServer:          apiServer,
 		grabFromControllerManager:  checkPodDebugHandlers(ctx, c, controllers, "kube-controller-manager", kubeControllerManager),
@@ -164,6 +163,36 @@ func checkPodDebugHandlers(ctx context.Context, c clientset.Interface, requested
 
 	// Metrics gathering enabled.
 	return true
+}
+
+// leaderPod returns the name of the pod to grab metrics from, or "" if there are none. With
+// several instances of a component, only the leader does the work, so the metrics of the others
+// are mostly empty. If requested and the leader can be determined, the pod holding the leader
+// election Lease kube-system/<leaseName> is returned, the first pod otherwise.
+func leaderPod(ctx context.Context, c clientset.Interface, requested bool, leaseName string, pods []v1.Pod) string {
+	if len(pods) == 0 {
+		return ""
+	}
+	if !requested || len(pods) == 1 {
+		return pods[0].Name
+	}
+	lease, err := c.CoordinationV1().Leases(metav1.NamespaceSystem).Get(ctx, leaseName, metav1.GetOptions{})
+	if err != nil {
+		klog.Infof("Can't get Lease %s/%s, using pod %s: %v", metav1.NamespaceSystem, leaseName, pods[0].Name, err)
+		return pods[0].Name
+	}
+	// The holder identity is the hostname of the leader, followed by "_<uuid>" for kube-scheduler
+	// and kube-controller-manager. The hostname is normally the node name for static pods with
+	// host networking, and the pod name otherwise.
+	holder := ptr.Deref(lease.Spec.HolderIdentity, "")
+	hostname, _, _ := strings.Cut(holder, "_")
+	for _, pod := range pods {
+		if hostname != "" && (strings.EqualFold(pod.Spec.NodeName, hostname) || pod.Name == hostname) {
+			return pod.Name
+		}
+	}
+	klog.Warningf("Can't find a %s pod for Lease holder %q, using pod %s", leaseName, holder, pods[0].Name)
+	return pods[0].Name
 }
 
 // HasControlPlanePods returns true if metrics grabber was able to find control-plane pods
@@ -209,28 +238,68 @@ func (g *Grabber) grabFromKubeletInternal(ctx context.Context, nodeName string, 
 }
 
 func (g *Grabber) getMetricsFromNode(ctx context.Context, nodeName string, kubeletPort int, pathSuffix string) (string, error) {
-	// There's a problem with timing out during proxy. Wrapping this in a goroutine to prevent deadlock.
-	finished := make(chan struct{}, 1)
+	// There's a problem with timing out during proxy. We are going to set a 45 second client timeout, and issue a retry.
 	var err error
-	var rawOutput []byte
-	go func() {
-		rawOutput, err = g.client.CoreV1().RESTClient().Get().
+	var output []byte
+	err = wait.PollUntilContextTimeout(ctx, 15*time.Second, 2*time.Minute, true, func(ctx context.Context) (done bool, retErr error) {
+		rawOutput, err := g.client.CoreV1().RESTClient().Get().
 			Resource("nodes").
 			SubResource("proxy").
 			Name(fmt.Sprintf("%v:%v", nodeName, kubeletPort)).
 			Suffix(pathSuffix).
+			Timeout(45 * time.Second).
 			Do(ctx).Raw()
-		finished <- struct{}{}
-	}()
-	select {
-	case <-time.After(proxyTimeout):
-		return "", fmt.Errorf("Timed out when waiting for proxy to gather metrics from %v", nodeName)
-	case <-finished:
 		if err != nil {
-			return "", err
+			if k8snet.IsTimeout(err) {
+				klog.Warningf("Metrics rest call timed out")
+				return false, nil
+			}
+			klog.Warningf("Metrics rest call errored: %v", err)
+			return false, nil
 		}
-		return string(rawOutput), nil
+		output = rawOutput
+		return true, nil
+	})
+	return string(output), err
+}
+
+// GrabFromKubeProxy returns metrics from kube-proxy
+func (g *Grabber) GrabFromKubeProxy(ctx context.Context, nodeName string) (KubeProxyMetrics, error) {
+	nodes, err := g.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{FieldSelector: fields.Set{"metadata.name": nodeName}.AsSelector().String()})
+	if err != nil {
+		return KubeProxyMetrics{}, err
 	}
+
+	if len(nodes.Items) != 1 {
+		return KubeProxyMetrics{}, fmt.Errorf("error listing nodes with name %v, got %v", nodeName, nodes.Items)
+	}
+	output, err := g.grabFromKubeProxy(ctx, nodeName)
+	if err != nil {
+		return KubeProxyMetrics{}, err
+	}
+	return parseKubeProxyMetrics(output)
+}
+
+func (g *Grabber) grabFromKubeProxy(ctx context.Context, nodeName string) (string, error) {
+	hostCmdPodName := fmt.Sprintf("grab-kube-proxy-metrics-%s", framework.RandomSuffix())
+	hostCmdPod := e2epod.NewExecPodSpec(metav1.NamespaceSystem, hostCmdPodName, true)
+	nodeSelection := e2epod.NodeSelection{Name: nodeName}
+	e2epod.SetNodeSelection(&hostCmdPod.Spec, nodeSelection)
+	if _, err := g.client.CoreV1().Pods(metav1.NamespaceSystem).Create(ctx, hostCmdPod, metav1.CreateOptions{}); err != nil {
+		return "", fmt.Errorf("failed to create pod to fetch metrics: %w", err)
+	}
+	if err := e2epod.WaitTimeoutForPodReadyInNamespace(ctx, g.client, hostCmdPodName, metav1.NamespaceSystem, 5*time.Minute); err != nil {
+		return "", fmt.Errorf("error waiting for pod to be up: %w", err)
+	}
+
+	host := "127.0.0.1"
+	if framework.TestContext.ClusterIsIPv6() {
+		host = "::1"
+	}
+
+	stdout, err := e2epodoutput.RunHostCmd(metav1.NamespaceSystem, hostCmdPodName, fmt.Sprintf("curl --silent %s/metrics", net.JoinHostPort(host, strconv.Itoa(kubeProxyPort))))
+	_ = g.client.CoreV1().Pods(metav1.NamespaceSystem).Delete(ctx, hostCmdPodName, metav1.DeleteOptions{})
+	return stdout, err
 }
 
 // GrabFromScheduler returns metrics from scheduler
@@ -252,7 +321,7 @@ func (g *Grabber) GrabFromScheduler(ctx context.Context) (SchedulerMetrics, erro
 
 	var lastMetricsFetchErr error
 	var output string
-	if metricsWaitErr := wait.PollImmediateWithContext(ctx, time.Second, time.Minute, func(ctx context.Context) (bool, error) {
+	if metricsWaitErr := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
 		output, lastMetricsFetchErr = g.getSecureMetricsFromPod(ctx, g.kubeScheduler, metav1.NamespaceSystem, kubeSchedulerPort)
 		return lastMetricsFetchErr == nil, nil
 	}); metricsWaitErr != nil {
@@ -265,19 +334,10 @@ func (g *Grabber) GrabFromScheduler(ctx context.Context) (SchedulerMetrics, erro
 
 // GrabFromClusterAutoscaler returns metrics from cluster autoscaler
 func (g *Grabber) GrabFromClusterAutoscaler(ctx context.Context) (ClusterAutoscalerMetrics, error) {
-	if !g.HasControlPlanePods() && g.externalClient == nil {
+	if !g.HasControlPlanePods() {
 		return ClusterAutoscalerMetrics{}, fmt.Errorf("ClusterAutoscaler: %w", MetricsGrabbingDisabledError)
 	}
-	var client clientset.Interface
-	var namespace string
-	if g.externalClient != nil {
-		client = g.externalClient
-		namespace = "kubemark"
-	} else {
-		client = g.client
-		namespace = metav1.NamespaceSystem
-	}
-	output, err := g.getMetricsFromPod(ctx, client, "cluster-autoscaler", namespace, 8085)
+	output, err := g.getMetricsFromPod(ctx, g.client, "cluster-autoscaler", metav1.NamespaceSystem, 8085)
 	if err != nil {
 		return ClusterAutoscalerMetrics{}, err
 	}
@@ -303,7 +363,7 @@ func (g *Grabber) GrabFromControllerManager(ctx context.Context) (ControllerMana
 
 	var output string
 	var lastMetricsFetchErr error
-	if metricsWaitErr := wait.PollImmediateWithContext(ctx, time.Second, time.Minute, func(ctx context.Context) (bool, error) {
+	if metricsWaitErr := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
 		output, lastMetricsFetchErr = g.getSecureMetricsFromPod(ctx, g.kubeControllerManager, metav1.NamespaceSystem, kubeControllerManagerPort)
 		return lastMetricsFetchErr == nil, nil
 	}); metricsWaitErr != nil {
@@ -342,7 +402,7 @@ func (g *Grabber) GrabFromSnapshotController(ctx context.Context, podName string
 
 	var output string
 	var lastMetricsFetchErr error
-	if metricsWaitErr := wait.PollImmediateWithContext(ctx, time.Second, time.Minute, func(ctx context.Context) (bool, error) {
+	if metricsWaitErr := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
 		output, lastMetricsFetchErr = g.getMetricsFromPod(ctx, g.client, podName, metav1.NamespaceSystem, port)
 		return lastMetricsFetchErr == nil, nil
 	}); metricsWaitErr != nil {

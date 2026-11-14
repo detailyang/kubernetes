@@ -54,7 +54,6 @@ func TestIsNativeResource(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(fmt.Sprintf("resourceName input=%s, expected value=%v", tc.resourceName, tc.expectVal), func(t *testing.T) {
 			t.Parallel()
 			v := IsNativeResource(tc.resourceName)
@@ -95,8 +94,6 @@ func TestHugePageSizeFromResourceName(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		i := i
-		tc := tc
 		t.Run(fmt.Sprintf("resourceName input=%s, expected value=%v", tc.resourceName, tc.expectVal), func(t *testing.T) {
 			t.Parallel()
 			v, err := HugePageSizeFromResourceName(tc.resourceName)
@@ -164,8 +161,6 @@ func TestHugePageSizeFromMedium(t *testing.T) {
 		},
 	}
 	for i, tc := range testCases {
-		i := i
-		tc := tc
 		t.Run(tc.description, func(t *testing.T) {
 			t.Parallel()
 			v, err := HugePageSizeFromMedium(tc.medium)
@@ -206,7 +201,6 @@ func TestIsOvercommitAllowed(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(fmt.Sprintf("resourceName input=%s, expected value=%v", tc.resourceName, tc.expectVal), func(t *testing.T) {
 			t.Parallel()
 			v := IsOvercommitAllowed(tc.resourceName)
@@ -721,88 +715,5 @@ func TestHugePageUnitSizeFromByteSize(t *testing.T) {
 		if test.expected != result {
 			t.Errorf("HugePageUnitSizeFromByteSize() expected %v but got %v", test.expected, result)
 		}
-	}
-}
-
-func TestLoadBalancerStatusEqual(t *testing.T) {
-
-	testCases := []struct {
-		left      *v1.LoadBalancerStatus
-		right     *v1.LoadBalancerStatus
-		name      string
-		expectVal bool
-	}{{
-		name: "left equals right",
-		left: &v1.LoadBalancerStatus{
-			Ingress: []v1.LoadBalancerIngress{{
-				IP:       "1.1.1.1",
-				Hostname: "host1",
-			}},
-		},
-		right: &v1.LoadBalancerStatus{
-			Ingress: []v1.LoadBalancerIngress{{
-				IP:       "1.1.1.1",
-				Hostname: "host1",
-			}},
-		},
-		expectVal: true,
-	}, {
-		name: "length of LoadBalancerIngress slice is not equal",
-		left: &v1.LoadBalancerStatus{
-			Ingress: []v1.LoadBalancerIngress{{
-				IP:       "1.1.1.1",
-				Hostname: "host1",
-			}, {
-				IP:       "1.1.1.2",
-				Hostname: "host1",
-			}},
-		},
-		right: &v1.LoadBalancerStatus{
-			Ingress: []v1.LoadBalancerIngress{{
-				IP:       "1.1.1.1",
-				Hostname: "host1",
-			}},
-		},
-		expectVal: false,
-	}, {
-		name: "LoadBalancerIngress ip is not equal",
-		left: &v1.LoadBalancerStatus{
-			Ingress: []v1.LoadBalancerIngress{{
-				IP:       "1.1.1.2",
-				Hostname: "host1",
-			}},
-		},
-		right: &v1.LoadBalancerStatus{
-			Ingress: []v1.LoadBalancerIngress{{
-				IP:       "1.1.1.1",
-				Hostname: "host1",
-			}},
-		},
-		expectVal: false,
-	}, {
-		name: "LoadBalancerIngress hostname is not equal",
-		left: &v1.LoadBalancerStatus{
-			Ingress: []v1.LoadBalancerIngress{{
-				IP:       "1.1.1.1",
-				Hostname: "host2",
-			}},
-		},
-		right: &v1.LoadBalancerStatus{
-			Ingress: []v1.LoadBalancerIngress{{
-				IP:       "1.1.1.1",
-				Hostname: "host1",
-			}},
-		},
-		expectVal: false,
-	}}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			v := LoadBalancerStatusEqual(tc.left, tc.right)
-			if v != tc.expectVal {
-				t.Errorf("test %s failed. left input=%v, right input=%v, Got %v but expected %v",
-					tc.name, tc.left, tc.right, v, tc.expectVal)
-			}
-		})
 	}
 }

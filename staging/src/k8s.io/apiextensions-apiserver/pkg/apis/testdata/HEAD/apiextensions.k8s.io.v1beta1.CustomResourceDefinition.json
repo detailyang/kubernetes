@@ -136,7 +136,8 @@
             "message": "messageValue",
             "messageExpression": "messageExpressionValue",
             "reason": "reasonValue",
-            "fieldPath": "fieldPathValue"
+            "fieldPath": "fieldPathValue",
+            "optionalOldSelf": true
           }
         ]
       }
@@ -233,7 +234,8 @@
                 "message": "messageValue",
                 "messageExpression": "messageExpressionValue",
                 "reason": "reasonValue",
-                "fieldPath": "fieldPathValue"
+                "fieldPath": "fieldPathValue",
+                "optionalOldSelf": true
               }
             ]
           }
@@ -255,6 +257,11 @@
             "priority": 5,
             "JSONPath": "JSONPathValue"
           }
+        ],
+        "selectableFields": [
+          {
+            "jsonPath": "jsonPathValue"
+          }
         ]
       }
     ],
@@ -266,6 +273,11 @@
         "description": "descriptionValue",
         "priority": 5,
         "JSONPath": "JSONPathValue"
+      }
+    ],
+    "selectableFields": [
+      {
+        "jsonPath": "jsonPathValue"
       }
     ],
     "conversion": {
@@ -293,7 +305,8 @@
         "status": "statusValue",
         "lastTransitionTime": "2003-01-01T01:01:01Z",
         "reason": "reasonValue",
-        "message": "messageValue"
+        "message": "messageValue",
+        "observedGeneration": 6
       }
     ],
     "acceptedNames": {
@@ -310,6 +323,7 @@
     },
     "storedVersions": [
       "storedVersionsValue"
-    ]
+    ],
+    "observedGeneration": 4
   }
 }

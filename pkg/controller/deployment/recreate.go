@@ -37,17 +37,9 @@ func (dc *DeploymentController) rolloutRecreate(ctx context.Context, d *apps.Dep
 
 	// scale down old replica sets.
 	scaledDown, err := dc.scaleDownOldReplicaSetsForRecreate(ctx, activeOldRSs, d)
-	if err != nil {
-		return err
-	}
-	if scaledDown {
-		// Update DeploymentStatus.
-		return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
-	}
-
-	// Do not process a deployment when it has old pods running.
-	if oldPodsRunning(newRS, oldRSs, podMap) {
-		return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
+	// Old pods must be gone before the new RS is scaled up.
+	if err != nil || scaledDown || oldPodsRunning(newRS, oldRSs, podMap) {
+		return dc.syncRolloutStatusAfter(ctx, err, allRSs, newRS, d)
 	}
 
 	// If we need to create a new RS, create it now.
@@ -60,18 +52,15 @@ func (dc *DeploymentController) rolloutRecreate(ctx context.Context, d *apps.Dep
 	}
 
 	// scale up new replica set.
-	if _, err := dc.scaleUpNewReplicaSetForRecreate(ctx, newRS, d); err != nil {
-		return err
-	}
-
-	if util.DeploymentComplete(d, &d.Status) {
+	_, err = dc.scaleUpNewReplicaSetForRecreate(ctx, newRS, d)
+	if err == nil && util.DeploymentComplete(d, &d.Status) {
 		if err := dc.cleanupDeployment(ctx, oldRSs, d); err != nil {
 			return err
 		}
 	}
 
 	// Sync deployment status.
-	return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
+	return dc.syncRolloutStatusAfter(ctx, err, allRSs, newRS, d)
 }
 
 // scaleDownOldReplicaSetsForRecreate scales down old replica sets when deployment strategy is "Recreate".
@@ -83,7 +72,7 @@ func (dc *DeploymentController) scaleDownOldReplicaSetsForRecreate(ctx context.C
 		if *(rs.Spec.Replicas) == 0 {
 			continue
 		}
-		scaledRS, updatedRS, err := dc.scaleReplicaSetAndRecordEvent(ctx, rs, 0, deployment)
+		scaledRS, updatedRS, err := dc.scaleReplicaSet(ctx, rs, 0, deployment, false)
 		if err != nil {
 			return false, err
 		}
@@ -127,6 +116,6 @@ func oldPodsRunning(newRS *apps.ReplicaSet, oldRSs []*apps.ReplicaSet, podMap ma
 
 // scaleUpNewReplicaSetForRecreate scales up new replica set when deployment strategy is "Recreate".
 func (dc *DeploymentController) scaleUpNewReplicaSetForRecreate(ctx context.Context, newRS *apps.ReplicaSet, deployment *apps.Deployment) (bool, error) {
-	scaled, _, err := dc.scaleReplicaSetAndRecordEvent(ctx, newRS, *(deployment.Spec.Replicas), deployment)
+	scaled, _, err := dc.scaleReplicaSet(ctx, newRS, *(deployment.Spec.Replicas), deployment, false)
 	return scaled, err
 }

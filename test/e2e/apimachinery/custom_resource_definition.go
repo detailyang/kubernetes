@@ -23,9 +23,10 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 
-	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	v1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	"k8s.io/apiextensions-api/pkg/client/clientset/clientset"
 	"k8s.io/apiextensions-apiserver/test/integration/fixtures"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,11 +34,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/resourceversion"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/util/retry"
+	apimachineryutils "k8s.io/kubernetes/test/e2e/common/apimachinery"
 	"k8s.io/kubernetes/test/e2e/framework"
 	admissionapi "k8s.io/pod-security-admission/api"
 )
@@ -55,7 +58,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 			Create the custom resource definition and then delete it. The creation and deletion MUST
 			be successful.
 		*/
-		framework.ConformanceIt("creating/deleting custom resource definition objects works ", func(ctx context.Context) {
+		framework.ConformanceIt("creating/deleting custom resource definition objects works", func(ctx context.Context) {
 
 			config, err := framework.LoadConfig()
 			framework.ExpectNoError(err, "loading config")
@@ -82,7 +85,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 			custom resource definitions via delete collection; the delete MUST be successful and MUST delete only the
 			labeled custom resource definitions.
 		*/
-		framework.ConformanceIt("listing custom resource definition objects works ", func(ctx context.Context) {
+		framework.ConformanceIt("listing custom resource definition objects works", func(ctx context.Context) {
 			testListSize := 10
 			config, err := framework.LoadConfig()
 			framework.ExpectNoError(err, "loading config")
@@ -94,7 +97,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 
 			// Create CRD and wait for the resource to be recognized and available.
 			crds := make([]*v1.CustomResourceDefinition, testListSize)
-			for i := 0; i < testListSize; i++ {
+			for i := range testListSize {
 				crd := fixtures.NewRandomNameV1CustomResourceDefinition(v1.ClusterScoped)
 				crd.Labels = map[string]string{"e2e-list-test-uuid": testUUID}
 				crd, err = fixtures.CreateNewV1CustomResourceDefinitionWatchUnsafe(crd, apiExtensionClient)
@@ -114,7 +117,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 			selectorListOpts := metav1.ListOptions{LabelSelector: "e2e-list-test-uuid=" + testUUID}
 			list, err := apiExtensionClient.ApiextensionsV1().CustomResourceDefinitions().List(ctx, selectorListOpts)
 			framework.ExpectNoError(err, "listing CustomResourceDefinitions")
-			framework.ExpectEqual(len(list.Items), testListSize)
+			gomega.Expect(list.Items).To(gomega.HaveLen(testListSize))
 			for _, actual := range list.Items {
 				var expected *v1.CustomResourceDefinition
 				for _, e := range crds {
@@ -122,7 +125,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 						expected = e
 					}
 				}
-				framework.ExpectNotEqual(expected, nil)
+				gomega.Expect(expected).ToNot(gomega.BeNil())
 				if !equality.Semantic.DeepEqual(actual.Spec, expected.Spec) {
 					framework.Failf("Expected CustomResourceDefinition in list with name %s to match crd created with same name, but got different specs:\n%s",
 						actual.Name, cmp.Diff(expected.Spec, actual.Spec))
@@ -142,7 +145,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 			Description: Create a custom resource definition. Attempt to read, update and patch its status sub-resource;
 			all mutating sub-resource operations MUST be visible to subsequent reads.
 		*/
-		framework.ConformanceIt("getting/updating/patching custom resource definition status sub-resource works ", func(ctx context.Context) {
+		framework.ConformanceIt("getting/updating/patching custom resource definition status sub-resource works", func(ctx context.Context) {
 			config, err := framework.LoadConfig()
 			framework.ExpectNoError(err, "loading config")
 			apiExtensionClient, err := clientset.NewForConfig(config)
@@ -210,7 +213,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 					break
 				}
 			}
-			framework.ExpectNotEqual(group, nil, "apiextensions.k8s.io API group not found in /apis discovery document")
+			gomega.Expect(group).ToNot(gomega.BeNil(), "apiextensions.k8s.io API group not found in /apis discovery document")
 
 			ginkgo.By("finding the apiextensions.k8s.io/v1 API group/version in the /apis discovery document")
 			var version *metav1.GroupVersionForDiscovery
@@ -220,7 +223,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 					break
 				}
 			}
-			framework.ExpectNotEqual(version, nil, "apiextensions.k8s.io/v1 API group version not found in /apis discovery document")
+			gomega.Expect(version).ToNot(gomega.BeNil(), "apiextensions.k8s.io/v1 API group version not found in /apis discovery document")
 		}
 
 		{
@@ -228,7 +231,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 			group := &metav1.APIGroup{}
 			err := f.ClientSet.Discovery().RESTClient().Get().AbsPath("/apis/apiextensions.k8s.io").Do(ctx).Into(group)
 			framework.ExpectNoError(err, "fetching /apis/apiextensions.k8s.io")
-			framework.ExpectEqual(group.Name, v1.GroupName, "verifying API group name in /apis/apiextensions.k8s.io discovery document")
+			gomega.Expect(group.Name).To(gomega.Equal(v1.GroupName), "verifying API group name in /apis/apiextensions.k8s.io discovery document")
 
 			ginkgo.By("finding the apiextensions.k8s.io/v1 API group/version in the /apis/apiextensions.k8s.io discovery document")
 			var version *metav1.GroupVersionForDiscovery
@@ -238,7 +241,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 					break
 				}
 			}
-			framework.ExpectNotEqual(version, nil, "apiextensions.k8s.io/v1 API group version not found in /apis/apiextensions.k8s.io discovery document")
+			gomega.Expect(version).ToNot(gomega.BeNil(), "apiextensions.k8s.io/v1 API group version not found in /apis/apiextensions.k8s.io discovery document")
 		}
 
 		{
@@ -246,7 +249,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 			apiResourceList := &metav1.APIResourceList{}
 			err := f.ClientSet.Discovery().RESTClient().Get().AbsPath("/apis/apiextensions.k8s.io/v1").Do(ctx).Into(apiResourceList)
 			framework.ExpectNoError(err, "fetching /apis/apiextensions.k8s.io/v1")
-			framework.ExpectEqual(apiResourceList.GroupVersion, v1.SchemeGroupVersion.String(), "verifying API group/version in /apis/apiextensions.k8s.io/v1 discovery document")
+			gomega.Expect(apiResourceList.GroupVersion).To(gomega.Equal(v1.SchemeGroupVersion.String()), "verifying API group/version in /apis/apiextensions.k8s.io/v1 discovery document")
 
 			ginkgo.By("finding customresourcedefinitions resources in the /apis/apiextensions.k8s.io/v1 discovery document")
 			var crdResource *metav1.APIResource
@@ -255,7 +258,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 					crdResource = &apiResourceList.APIResources[i]
 				}
 			}
-			framework.ExpectNotEqual(crdResource, nil, "customresourcedefinitions resource not found in /apis/apiextensions.k8s.io/v1 discovery document")
+			gomega.Expect(crdResource).ToNot(gomega.BeNil(), "customresourcedefinitions resource not found in /apis/apiextensions.k8s.io/v1 discovery document")
 		}
 	})
 
@@ -266,7 +269,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 		the default is applied. Create another CR. Remove default, add default for another field and read CR until
 		new field is defaulted, but old default stays.
 	*/
-	framework.ConformanceIt("custom resource defaulting for requests and from storage works ", func(ctx context.Context) {
+	framework.ConformanceIt("custom resource defaulting for requests and from storage works", func(ctx context.Context) {
 		config, err := framework.LoadConfig()
 		framework.ExpectNoError(err, "loading config")
 		apiExtensionClient, err := clientset.NewForConfig(config)
@@ -296,7 +299,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 			Resource: crd.Spec.Names.Plural,
 		}
 		crClient := dynamicClient.Resource(gvr)
-		_, err = crClient.Create(ctx, &unstructured.Unstructured{Object: map[string]interface{}{
+		u1, err := crClient.Create(ctx, &unstructured.Unstructured{Object: map[string]interface{}{
 			"apiVersion": gvr.Group + "/" + gvr.Version,
 			"kind":       crd.Spec.Names.Kind,
 			"metadata": map[string]interface{}{
@@ -304,7 +307,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 			},
 		}}, metav1.CreateOptions{})
 		framework.ExpectNoError(err, "creating CR")
-
+		gomega.Expect(u1).To(apimachineryutils.HaveValidResourceVersion())
 		// Setting default for a to "A" and waiting for the CR to get defaulted on read
 		crd, err = apiExtensionClient.ApiextensionsV1().CustomResourceDefinitions().Patch(ctx, crd.Name, types.JSONPatchType, []byte(`[
 			{"op":"add","path":"/spec/versions/0/schema/openAPIV3Schema/properties/a/default", "value": "A"}
@@ -312,7 +315,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 		framework.ExpectNoError(err, "setting default for a to \"A\" in schema")
 
 		err = wait.PollImmediate(time.Millisecond*100, wait.ForeverTestTimeout, func() (bool, error) {
-			u1, err := crClient.Get(ctx, name1, metav1.GetOptions{})
+			u1, err = crClient.Get(ctx, name1, metav1.GetOptions{})
 			if err != nil {
 				return false, err
 			}
@@ -344,7 +347,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 		if !found {
 			framework.Failf("field `a` should have been defaulted in %+v", u2.Object)
 		}
-		framework.ExpectEqual(v, "A", "\"a\" is defaulted to \"A\"")
+		gomega.Expect(v).To(gomega.Equal("A"), "\"a\" is defaulted to \"A\"")
 
 		// Deleting default for a, adding default "B" for b and waiting for the CR to get defaulted on read for b
 		crd, err = apiExtensionClient.ApiextensionsV1().CustomResourceDefinitions().Patch(ctx, crd.Name, types.JSONPatchType, []byte(`[
@@ -381,6 +384,7 @@ var _ = SIGDescribe("CustomResourceDefinition resources [Privileged:ClusterAdmin
 			return true, nil
 		})
 		framework.ExpectNoError(err, "waiting for CR to be defaulted on read for b and a staying the same")
+		gomega.Expect(resourceversion.CompareResourceVersion(u1.GetResourceVersion(), u2.GetResourceVersion())).To(gomega.BeNumerically("==", -1), "second created object should have a larger resource version")
 	})
 
 })

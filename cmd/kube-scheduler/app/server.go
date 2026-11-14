@@ -23,45 +23,64 @@ import (
 	"net/http"
 	"os"
 	goruntime "runtime"
+	"time"
 
+	"github.com/blang/semver/v4"
 	"github.com/spf13/cobra"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	genericapifilters "k8s.io/apiserver/pkg/endpoints/filters"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/apiserver/pkg/server"
 	genericfilters "k8s.io/apiserver/pkg/server/filters"
+	"k8s.io/apiserver/pkg/server/flagz"
 	"k8s.io/apiserver/pkg/server/healthz"
 	"k8s.io/apiserver/pkg/server/mux"
 	"k8s.io/apiserver/pkg/server/routes"
+	"k8s.io/apiserver/pkg/server/signals"
+	"k8s.io/apiserver/pkg/server/statusz"
+	"k8s.io/apiserver/pkg/util/compatibility"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/tools/leaderelection"
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/cli/globalflag"
+	basecompatibility "k8s.io/component-base/compatibility"
 	"k8s.io/component-base/configz"
+	"k8s.io/component-base/featuregate"
 	"k8s.io/component-base/logs"
 	logsapi "k8s.io/component-base/logs/api/v1"
 	"k8s.io/component-base/metrics/features"
 	"k8s.io/component-base/metrics/legacyregistry"
+	featuremetrics "k8s.io/component-base/metrics/prometheus/feature"
 	"k8s.io/component-base/metrics/prometheus/slis"
 	"k8s.io/component-base/term"
-	"k8s.io/component-base/version"
+	utilversion "k8s.io/component-base/version"
 	"k8s.io/component-base/version/verflag"
+	zpagesfeatures "k8s.io/component-base/zpages/features"
 	"k8s.io/klog/v2"
+	configv1 "k8s.io/kube-scheduler/config/v1"
 	schedulerserverconfig "k8s.io/kubernetes/cmd/kube-scheduler/app/config"
 	"k8s.io/kubernetes/cmd/kube-scheduler/app/options"
+	kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler"
 	kubeschedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/latest"
+	conversionv1 "k8s.io/kubernetes/pkg/scheduler/apis/config/v1"
 	"k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/metrics/resources"
 	"k8s.io/kubernetes/pkg/scheduler/profile"
+)
+
+const (
+	kubeScheduler = "kube-scheduler"
 )
 
 func init() {
@@ -86,6 +105,10 @@ suitable Node. Multiple different schedulers may be used within a cluster;
 kube-scheduler is the reference implementation.
 See [scheduling](https://kubernetes.io/docs/concepts/scheduling-eviction/)
 for more information about scheduling and the kube-scheduler component.`,
+		PersistentPreRunE: func(*cobra.Command, []string) error {
+			// makes sure feature gates are set before RunE.
+			return opts.ComponentGlobalsRegistry.Set()
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCommand(cmd, opts, registryOptions...)
 		},
@@ -120,19 +143,27 @@ for more information about scheduling and the kube-scheduler component.`,
 // runCommand runs the scheduler.
 func runCommand(cmd *cobra.Command, opts *options.Options, registryOptions ...Option) error {
 	verflag.PrintAndExitIfRequested()
-
+	fg := opts.ComponentGlobalsRegistry.FeatureGateFor(basecompatibility.DefaultKubeComponent)
 	// Activate logging as soon as possible, after that
 	// show flags with the final logging configuration.
-	if err := logsapi.ValidateAndApply(opts.Logs, utilfeature.DefaultFeatureGate); err != nil {
+	if err := logsapi.ValidateAndApply(opts.Logs, fg); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 	cliflag.PrintFlags(cmd.Flags())
 
+	if opts.InformerName == nil {
+		informerName, err := cache.NewInformerName("kube-scheduler")
+		if err != nil {
+			return err
+		}
+		opts.InformerName = informerName
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		stopCh := server.SetupSignalHandler()
+		stopCh := signals.SetupSignalHandler()
 		<-stopCh
 		cancel()
 	}()
@@ -142,7 +173,10 @@ func runCommand(cmd *cobra.Command, opts *options.Options, registryOptions ...Op
 		return err
 	}
 	// add feature enablement metrics
-	utilfeature.DefaultMutableFeatureGate.AddMetrics()
+	fg.(featuregate.MutableFeatureGate).AddMetrics(featuremetrics.RecordFeatureInfo)
+	// add component version metrics
+	opts.ComponentGlobalsRegistry.AddMetrics()
+
 	return Run(ctx, cc, sched)
 }
 
@@ -151,15 +185,21 @@ func Run(ctx context.Context, cc *schedulerserverconfig.CompletedConfig, sched *
 	logger := klog.FromContext(ctx)
 
 	// To help debugging, immediately log version
-	logger.Info("Starting Kubernetes Scheduler", "version", version.Get())
+	logger.Info("Starting Kubernetes Scheduler", "version", utilversion.Get())
 
 	logger.Info("Golang settings", "GOGC", os.Getenv("GOGC"), "GOMAXPROCS", os.Getenv("GOMAXPROCS"), "GOTRACEBACK", os.Getenv("GOTRACEBACK"))
 
+	externalConfig := &configv1.KubeSchedulerConfiguration{}
+	if err := conversionv1.Convert_config_KubeSchedulerConfiguration_To_v1_KubeSchedulerConfiguration(&cc.ComponentConfig, externalConfig, nil); err != nil {
+		return fmt.Errorf("unable to convert configz: %w", err)
+	}
+	externalConfig.SetGroupVersionKind(configv1.SchemeGroupVersion.WithKind("KubeSchedulerConfiguration"))
+
 	// Configz registration.
-	if cz, err := configz.New("componentconfig"); err == nil {
-		cz.Set(cc.ComponentConfig)
-	} else {
-		return fmt.Errorf("unable to register configz: %s", err)
+	if cz, err := configz.New("componentconfig"); err != nil {
+		return fmt.Errorf("unable to register configz: %w", err)
+	} else if err := cz.Set(externalConfig); err != nil {
+		return fmt.Errorf("unable to set configz: %w", err)
 	}
 
 	// Start events processing pipeline.
@@ -167,10 +207,12 @@ func Run(ctx context.Context, cc *schedulerserverconfig.CompletedConfig, sched *
 	defer cc.EventBroadcaster.Shutdown()
 
 	// Setup healthz checks.
-	var checks []healthz.HealthChecker
+	var checks, readyzChecks []healthz.HealthChecker
 	if cc.ComponentConfig.LeaderElection.LeaderElect {
 		checks = append(checks, cc.LeaderElection.WatchDog)
+		readyzChecks = append(readyzChecks, cc.LeaderElection.WatchDog)
 	}
+	readyzChecks = append(readyzChecks, healthz.NewShutdownHealthz(ctx.Done()))
 
 	waitingForLeader := make(chan struct{})
 	isLeader := func() bool {
@@ -184,36 +226,91 @@ func Run(ctx context.Context, cc *schedulerserverconfig.CompletedConfig, sched *
 		}
 	}
 
-	// Start up the healthz server.
+	handlerSyncReadyCh := make(chan struct{})
+	handlerSyncCheck := healthz.NamedCheck("sched-handler-sync", func(_ *http.Request) error {
+		select {
+		case <-handlerSyncReadyCh:
+			return nil
+		default:
+		}
+		return fmt.Errorf("handlers are not fully synchronized")
+	})
+	readyzChecks = append(readyzChecks, handlerSyncCheck)
+
+	if cc.LeaderElection != nil && utilfeature.DefaultFeatureGate.Enabled(kubefeatures.CoordinatedLeaderElection) {
+		binaryVersion, err := semver.ParseTolerant(cc.ComponentGlobalsRegistry.EffectiveVersionFor(basecompatibility.DefaultKubeComponent).BinaryVersion().String())
+		if err != nil {
+			return err
+		}
+		emulationVersion, err := semver.ParseTolerant(cc.ComponentGlobalsRegistry.EffectiveVersionFor(basecompatibility.DefaultKubeComponent).EmulationVersion().String())
+		if err != nil {
+			return err
+		}
+
+		// Start lease candidate controller for coordinated leader election
+		leaseCandidate, waitForSync, err := leaderelection.NewCandidateWithConfig(leaderelection.CandidateConfig{
+			Clientset:          cc.Client,
+			CandidateNamespace: metav1.NamespaceSystem,
+			CandidateName:      cc.LeaderElection.Lock.Identity(),
+			TargetLease:        kubeScheduler,
+			BinaryVersion:      binaryVersion.FinalizeVersion(),
+			EmulationVersion:   emulationVersion.FinalizeVersion(),
+			Strategy:           coordinationv1.OldestEmulationVersion,
+			Logger:             &logger,
+		})
+		if err != nil {
+			return err
+		}
+		readyzChecks = append(readyzChecks, healthz.NewInformerSyncHealthz(waitForSync))
+		go leaseCandidate.Run(ctx)
+	}
+
+	// Start up the server for endpoints.
+	gracefulShutdownSecureServer := func() {}
 	if cc.SecureServing != nil {
-		handler := buildHandlerChain(newHealthzAndMetricsHandler(&cc.ComponentConfig, cc.InformerFactory, isLeader, checks...), cc.Authentication.Authenticator, cc.Authorization.Authorizer)
-		// TODO: handle stoppedCh and listenerStoppedCh returned by c.SecureServing.Serve
-		if _, _, err := cc.SecureServing.Serve(handler, 0, ctx.Done()); err != nil {
+		handler := buildHandlerChain(newEndpointsHandler(&cc.ComponentConfig, cc.InformerFactory, isLeader, checks, readyzChecks, cc.Flagz), cc.Authentication.Authenticator, cc.Authorization.Authorizer)
+		internalStopCh := make(chan struct{})
+		shutdownTimeout := 5 * time.Second
+		stoppedCh, listenerStoppedCh, err := cc.SecureServing.Serve(handler, shutdownTimeout, internalStopCh)
+		if err != nil {
 			// fail early for secure handlers, removing the old error loop from above
+			close(internalStopCh)
 			return fmt.Errorf("failed to start secure server: %v", err)
+		}
+		gracefulShutdownSecureServer = func() {
+			close(internalStopCh)
+			<-listenerStoppedCh
+			logger.Info("[graceful-termination] secure server has stopped listening")
+			<-stoppedCh
+			logger.Info("[graceful-termination] secure server is exiting")
 		}
 	}
 
 	startInformersAndWaitForSync := func(ctx context.Context) {
 		// Start all informers.
-		cc.InformerFactory.Start(ctx.Done())
+		cc.InformerFactory.StartWithContext(ctx)
 		// DynInformerFactory can be nil in tests.
 		if cc.DynInformerFactory != nil {
-			cc.DynInformerFactory.Start(ctx.Done())
+			cc.DynInformerFactory.StartWithContext(ctx)
 		}
 
 		// Wait for all caches to sync before scheduling.
-		cc.InformerFactory.WaitForCacheSync(ctx.Done())
+		if err := cc.InformerFactory.WaitForCacheSyncWithContext(ctx).AsError(); err != nil {
+			logger.Error(err, "informers are not fully synced")
+		}
 		// DynInformerFactory can be nil in tests.
 		if cc.DynInformerFactory != nil {
-			cc.DynInformerFactory.WaitForCacheSync(ctx.Done())
+			if err := cc.DynInformerFactory.WaitForCacheSyncWithContext(ctx).AsError(); err != nil {
+				logger.Error(err, "dynamic informers are not fully synced")
+			}
 		}
 
 		// Wait for all handlers to sync (all items in the initial list delivered) before scheduling.
 		if err := sched.WaitForHandlersSync(ctx); err != nil {
-			logger.Error(err, "waiting for handlers to sync")
+			logger.Error(err, "handlers are not fully synchronized")
 		}
 
+		close(handlerSyncReadyCh)
 		logger.V(3).Info("Handlers synced")
 	}
 	if !cc.ComponentConfig.DelayCacheUntilActive || cc.LeaderElection == nil {
@@ -221,6 +318,9 @@ func Run(ctx context.Context, cc *schedulerserverconfig.CompletedConfig, sched *
 	}
 	// If leader election is enabled, runCommand via LeaderElector until done and exit.
 	if cc.LeaderElection != nil {
+		if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.CoordinatedLeaderElection) {
+			cc.LeaderElection.Coordinated = true
+		}
 		cc.LeaderElection.Callbacks = leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
 				close(waitingForLeader)
@@ -232,6 +332,7 @@ func Run(ctx context.Context, cc *schedulerserverconfig.CompletedConfig, sched *
 				sched.Run(ctx)
 			},
 			OnStoppedLeading: func() {
+				gracefulShutdownSecureServer()
 				select {
 				case <-ctx.Done():
 					// We were asked to terminate. Exit 0.
@@ -257,11 +358,12 @@ func Run(ctx context.Context, cc *schedulerserverconfig.CompletedConfig, sched *
 	// Leader election is disabled, so runCommand inline until done.
 	close(waitingForLeader)
 	sched.Run(ctx)
+	gracefulShutdownSecureServer()
 	return fmt.Errorf("finished without leader elect")
 }
 
 // buildHandlerChain wraps the given handler with the standard filters.
-func buildHandlerChain(handler http.Handler, authn authenticator.Request, authz authorizer.Authorizer) http.Handler {
+func buildHandlerChain(handler http.Handler, authn authenticator.Request, authz authorizer.UnconditionalAuthorizer) http.Handler {
 	requestInfoResolver := &apirequest.RequestInfoFactory{}
 	failedHandler := genericapifilters.Unauthorized(scheme.Codecs)
 
@@ -288,15 +390,17 @@ func installMetricHandler(pathRecorderMux *mux.PathRecorderMux, informers inform
 	})
 }
 
-// newHealthzAndMetricsHandler creates a healthz server from the config, and will also
-// embed the metrics handler.
-func newHealthzAndMetricsHandler(config *kubeschedulerconfig.KubeSchedulerConfiguration, informers informers.SharedInformerFactory, isLeader func() bool, checks ...healthz.HealthChecker) http.Handler {
-	pathRecorderMux := mux.NewPathRecorderMux("kube-scheduler")
-	healthz.InstallHandler(pathRecorderMux, checks...)
+// newEndpointsHandler creates an API health server from the config, and will also
+// embed the metrics handler and z-pages handler.
+// TODO: healthz check is deprecated, please use livez and readyz instead. Will be removed in the future.
+func newEndpointsHandler(config *kubeschedulerconfig.KubeSchedulerConfiguration, informers informers.SharedInformerFactory, isLeader func() bool, healthzChecks, readyzChecks []healthz.HealthChecker, flagReader flagz.Reader) http.Handler {
+	pathRecorderMux := mux.NewPathRecorderMux(kubeScheduler)
+	healthz.InstallHandler(pathRecorderMux, healthzChecks...)
+	healthz.InstallLivezHandler(pathRecorderMux)
+	healthz.InstallReadyzHandler(pathRecorderMux, readyzChecks...)
 	installMetricHandler(pathRecorderMux, informers, isLeader)
-	if utilfeature.DefaultFeatureGate.Enabled(features.ComponentSLIs) {
-		slis.SLIMetricsWithReset{}.Install(pathRecorderMux)
-	}
+	slis.SLIMetricsWithReset{}.Install(pathRecorderMux)
+
 	if config.EnableProfiling {
 		routes.Profiling{}.Install(pathRecorderMux)
 		if config.EnableContentionProfiling {
@@ -304,11 +408,22 @@ func newHealthzAndMetricsHandler(config *kubeschedulerconfig.KubeSchedulerConfig
 		}
 		routes.DebugFlags{}.Install(pathRecorderMux, "v", routes.StringFlagPutHandler(logs.GlogSetter))
 	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(zpagesfeatures.ComponentFlagz) {
+		if flagReader != nil {
+			flagz.Install(pathRecorderMux, kubeScheduler, flagReader)
+		}
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(zpagesfeatures.ComponentStatusz) {
+		statusz.Install(pathRecorderMux, kubeScheduler, statusz.NewRegistry(compatibility.DefaultBuildEffectiveVersion(), statusz.WithListedPaths(pathRecorderMux.ListedPaths())))
+	}
+
 	return pathRecorderMux
 }
 
 func getRecorderFactory(cc *schedulerserverconfig.CompletedConfig) profile.RecorderFactory {
-	return func(name string) events.EventRecorder {
+	return func(name string) events.EventRecorderLogger {
 		return cc.EventBroadcaster.NewRecorder(name)
 	}
 }
@@ -360,6 +475,7 @@ func Setup(ctx context.Context, opts *options.Options, outOfTreeRegistryOptions 
 		scheduler.WithKubeConfig(cc.KubeConfig),
 		scheduler.WithProfiles(cc.ComponentConfig.Profiles...),
 		scheduler.WithPercentageOfNodesToScore(cc.ComponentConfig.PercentageOfNodesToScore),
+		scheduler.WithPercentageOfPlacementsToScore(cc.ComponentConfig.PercentageOfPlacementsToScore),
 		scheduler.WithFrameworkOutOfTreeRegistry(outOfTreeRegistry),
 		scheduler.WithPodMaxBackoffSeconds(cc.ComponentConfig.PodMaxBackoffSeconds),
 		scheduler.WithPodInitialBackoffSeconds(cc.ComponentConfig.PodInitialBackoffSeconds),

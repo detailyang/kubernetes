@@ -16,8 +16,6 @@
 
 # shellcheck disable=SC2034 # Variables sourced in other scripts.
 
-# The golang package that we are building.
-readonly KUBE_GO_PACKAGE=k8s.io/kubernetes
 readonly KUBE_GOPATH="${KUBE_GOPATH:-"${KUBE_OUTPUT}/go"}"
 export KUBE_GOPATH
 
@@ -76,9 +74,9 @@ kube::golang::server_targets() {
     cmd/kubelet
     cmd/kubeadm
     cmd/kube-scheduler
-    vendor/k8s.io/component-base/logs/kube-log-runner
-    vendor/k8s.io/kube-aggregator
-    vendor/k8s.io/apiextensions-apiserver
+    staging/src/k8s.io/component-base/logs/kube-log-runner
+    staging/src/k8s.io/kube-aggregator
+    staging/src/k8s.io/apiextensions-apiserver
     cluster/gce/gci/mounter
   )
   echo "${targets[@]}"
@@ -91,7 +89,11 @@ readonly KUBE_SERVER_BINARIES=("${KUBE_SERVER_TARGETS[@]##*/}")
 # The set of server targets we build docker images for
 kube::golang::server_image_targets() {
   # NOTE: this contains cmd targets for kube::build::get_docker_wrapped_binaries
+  # NOTE: kube-log-runner should NOT be in kube::build::get_docker_wrapped_binaries
+  # This binary is used across all images
+  # kube-log-runner should be the first target so it can be skipped
   local targets=(
+    staging/src/k8s.io/component-base/logs/kube-log-runner
     cmd/kube-apiserver
     cmd/kube-controller-manager
     cmd/kube-scheduler
@@ -126,7 +128,7 @@ kube::golang::node_targets() {
     cmd/kube-proxy
     cmd/kubeadm
     cmd/kubelet
-    vendor/k8s.io/component-base/logs/kube-log-runner
+    staging/src/k8s.io/component-base/logs/kube-log-runner
   )
   echo "${targets[@]}"
 }
@@ -275,7 +277,6 @@ readonly KUBE_TEST_BINARIES=("${KUBE_TEST_TARGETS[@]##*/}")
 readonly KUBE_TEST_BINARIES_WIN=("${KUBE_TEST_BINARIES[@]/%/.exe}")
 readonly KUBE_TEST_PORTABLE=(
   test/e2e/testing-manifests
-  test/kubemark
   hack/e2e-internal
   hack/get-build.sh
   hack/ginkgo-e2e.sh
@@ -287,7 +288,6 @@ readonly KUBE_TEST_PORTABLE=(
 # These binaries will be distributed in the kubernetes-test tarball.
 kube::golang::server_test_targets() {
   local targets=(
-    cmd/kubemark
     ginkgo
   )
 
@@ -318,19 +318,7 @@ readonly KUBE_ALL_TARGETS=(
 )
 readonly KUBE_ALL_BINARIES=("${KUBE_ALL_TARGETS[@]##*/}")
 
-readonly KUBE_STATIC_LIBRARIES=(
-  apiextensions-apiserver
-  kube-aggregator
-  kube-apiserver
-  kube-controller-manager
-  kube-scheduler
-  kube-proxy
-  kube-log-runner
-  kubeadm
-  kubectl
-  kubectl-convert
-  kubemark
-)
+readonly KUBE_CGO_BINARIES=()
 
 # Fully-qualified package names that we want to instrument for coverage information.
 readonly KUBE_COVERAGE_INSTRUMENTED_PACKAGES=(
@@ -343,16 +331,15 @@ readonly KUBE_COVERAGE_INSTRUMENTED_PACKAGES=(
 
 # KUBE_CGO_OVERRIDES is a space-separated list of binaries which should be built
 # with CGO enabled, assuming CGO is supported on the target platform.
-# This overrides any entry in KUBE_STATIC_LIBRARIES.
+# This overrides KUBE_STATIC_OVERRIDES.
 IFS=" " read -ra KUBE_CGO_OVERRIDES_LIST <<< "${KUBE_CGO_OVERRIDES:-}"
 readonly KUBE_CGO_OVERRIDES_LIST
 # KUBE_STATIC_OVERRIDES is a space-separated list of binaries which should be
-# built with CGO disabled. This is in addition to the list in
-# KUBE_STATIC_LIBRARIES.
+# built with CGO disabled even if they are listed in KUBE_CGO_BINARIES.
 IFS=" " read -ra KUBE_STATIC_OVERRIDES_LIST <<< "${KUBE_STATIC_OVERRIDES:-}"
 readonly KUBE_STATIC_OVERRIDES_LIST
 
-kube::golang::is_statically_linked_library() {
+kube::golang::is_statically_linked() {
   local e
   # Explicitly enable cgo when building kubectl for darwin from darwin.
   [[ "$(go env GOHOSTOS)" == "darwin" && "$(go env GOOS)" == "darwin" &&
@@ -360,16 +347,18 @@ kube::golang::is_statically_linked_library() {
   if [[ -n "${KUBE_CGO_OVERRIDES_LIST:+x}" ]]; then
     for e in "${KUBE_CGO_OVERRIDES_LIST[@]}"; do [[ "${1}" == *"/${e}" ]] && return 1; done;
   fi
-  for e in "${KUBE_STATIC_LIBRARIES[@]}"; do [[ "${1}" == *"/${e}" ]] && return 0; done;
   if [[ -n "${KUBE_STATIC_OVERRIDES_LIST:+x}" ]]; then
     for e in "${KUBE_STATIC_OVERRIDES_LIST[@]}"; do [[ "${1}" == *"/${e}" ]] && return 0; done;
   fi
-  return 1;
+  for e in "${KUBE_CGO_BINARIES[@]}"; do [[ "${1}" == *"/${e}" ]] && return 1; done;
+  return 0;
 }
 
-# kube::binaries_from_targets take a list of build targets and return the
-# full go package to be built
-kube::golang::binaries_from_targets() {
+# kube::golang::best_guess_go_targets takes a list of build targets, which might
+# be Go-style names (e.g. example.com/foo/bar or ./foo/bar) or just local paths
+# (e.g. foo/bar) and produces a respective list (on stdout) of our best guess at
+# Go target names.
+kube::golang::best_guess_go_targets() {
   local target
   for target; do
     if [ "${target}" = "ginkgo" ] ||
@@ -379,17 +368,85 @@ kube::golang::binaries_from_targets() {
       # "ginkgo" is the one that is documented in the Makefile. The others
       # are for backwards compatibility.
       echo "github.com/onsi/ginkgo/v2/ginkgo"
-    elif [[ "${target}" =~ ^([[:alnum:]]+".")+[[:alnum:]]+"/" ]]; then
-      # If the target starts with what looks like a domain name, assume it has a
-      # fully-qualified package name rather than one that needs the Kubernetes
-      # package prepended.
-      echo "${target}"
-    elif [[ "${target}" =~ ^vendor/ ]]; then
-      # Strip vendor/ prefix, since we're building in gomodule mode.
-      echo "${target#"vendor/"}"
-    else
-      echo "${KUBE_GO_PACKAGE}/${target}"
+      continue
     fi
+
+    if [[ "${target}" =~ ^([[:alnum:]]+".")+[[:alnum:]]+"/".+ ]]; then
+      # If the target starts with what looks like a domain name, assume it has a
+      # fully-qualified Go package name.
+      echo "${target}"
+      continue
+    fi
+
+    if [[ "${target}" =~ ^vendor/ ]]; then
+      # Strip vendor/ prefix, since we're building in gomodule mode.  This is
+      # for backwards compatibility.
+      echo "${target#"vendor/"}"
+      continue
+    fi
+
+    # If the target starts with "./", assume it is a local path which qualifies
+    # as a Go target name.
+    if [[ "${target}" =~ ^\./ ]]; then
+      echo "${target}"
+      continue
+    fi
+
+    # Otherwise assume it's a relative path (e.g. foo/bar or foo/bar/bar.test).
+    # We probably SHOULDN'T accept this, but we did in the past and it would be
+    # rude to break things if we don't NEED to.  We can't really test if it
+    # exists or not, because the last element might be an output file (e.g.
+    # bar.test) or even "...".
+    echo "./${target}"
+  done
+}
+
+kube::golang::internal::lazy_normalize() {
+  target="$1"
+
+  if [[ "${target}" =~ ^([[:alnum:]]+".")+[[:alnum:]]+"/".+ ]]; then
+    # If the target starts with what looks like a domain name, assume it has a
+    # fully-qualified Go package name.
+    echo "${target}"
+    return
+  fi
+
+  go list -find -e "${target}"
+}
+
+# kube::golang::normalize_go_targets takes a list of build targets, which might
+# be Go-style names (e.g. example.com/foo/bar or ./foo/bar) or just local paths
+# (e.g. foo/bar) and produces a respective list (on stdout) of Go package
+# names.
+#
+# If this cannot find (go list -find -e) one or more inputs, it will emit the
+# them on stdout, so callers can at least get a useful error.
+kube::golang::normalize_go_targets() {
+  local targets=()
+  kube::util::read-array targets < <(kube::golang::best_guess_go_targets "$@")
+  kube::util::read-array targets < <(kube::golang::dedup "${targets[@]}")
+  set -- "${targets[@]}"
+
+  for target; do
+    if [[ "${target}" =~ ".test"$ ]]; then
+      local dir
+      dir="$(dirname "${target}")"
+      local tst
+      tst="$(basename "${target}")"
+      local pkg
+      pkg="$(kube::golang::internal::lazy_normalize "${dir}")"
+      echo "${pkg}/${tst}"
+      continue
+    fi
+    if [[ "${target}" =~ "/..."$ ]]; then
+      local dir
+      dir="$(dirname "${target}")"
+      local pkg
+      pkg="$(kube::golang::internal::lazy_normalize "${dir}")"
+      echo "${pkg}/..."
+      continue
+    fi
+    kube::golang::internal::lazy_normalize "${target}"
   done
 }
 
@@ -439,23 +496,9 @@ kube::golang::set_platform_envs() {
 
   # if CC is defined for platform then always enable it
   ccenv=$(echo "$platform" | awk -F/ '{print "KUBE_" toupper($1) "_" toupper($2) "_CC"}')
-  if [ -n "${!ccenv-}" ]; then 
+  if [ -n "${!ccenv-}" ]; then
     export CGO_ENABLED=1
     export CC="${!ccenv}"
-  fi
-}
-
-# Create the GOPATH tree under $KUBE_OUTPUT
-kube::golang::create_gopath_tree() {
-  local go_pkg_dir="${KUBE_GOPATH}/src/${KUBE_GO_PACKAGE}"
-  local go_pkg_basedir
-  go_pkg_basedir=$(dirname "${go_pkg_dir}")
-
-  mkdir -p "${go_pkg_basedir}"
-
-  # TODO: This symlink should be relative.
-  if [[ ! -e "${go_pkg_dir}" || "$(readlink "${go_pkg_dir}")" != "${KUBE_ROOT}" ]]; then
-    ln -snf "${KUBE_ROOT}" "${go_pkg_dir}"
   fi
 }
 
@@ -463,16 +506,43 @@ kube::golang::create_gopath_tree() {
 # Inputs:
 #   env-var GO_VERSION is the desired go version to use, downloading it if needed (defaults to content of .go-version)
 #   env-var FORCE_HOST_GO set to a non-empty value uses the go version in the $PATH and skips ensuring $GO_VERSION is used
-kube::golang::verify_go_version() {
+kube::golang::internal::verify_go_version() {
   # default GO_VERSION to content of .go-version
   GO_VERSION="${GO_VERSION:-"$(cat "${KUBE_ROOT}/.go-version")"}"
-  # only setup go if we haven't set FORCE_HOST_GO, or `go version` doesn't match GO_VERSION
-  if ! ([ -n "${FORCE_HOST_GO:-}" ] || \
-      (command -v go >/dev/null && [ "$(go version | cut -d' ' -f3)" = "go${GO_VERSION}" ])); then
+  if [ "${GOTOOLCHAIN:-auto}" != 'auto' ]; then
+    # no-op, just respect GOTOOLCHAIN
+    :
+  elif [ "${GO_VERSION:-}" == 'devel' ]; then
+    # get the latest master version of Go, build and use that version
+    export GOTOOLCHAIN='local'
+    if [[ ! -f "${KUBE_ROOT}/.gimme/envs/gomaster.env" && ! -f "${HOME}/.gimme/envs/gomaster.env" ]]; then
+      # gimme tries to write to $HOME directory, in CI environments this may not be writable.
+      if [ ! -w "${HOME:?Variable HOME is not set}" ]; then
+        tmp_home="$(mktemp -d)"
+        export HOME="${tmp_home}"
+      fi
+      GOROOT_BOOTSTRAP="${GOROOT_BOOTSTRAP:-/usr/local/go}" "${KUBE_ROOT}/third_party/gimme/gimme" "master" >/dev/null 2>&1
+    fi
+
+    if [[ -f "${KUBE_ROOT}/.gimme/envs/gomaster.env" ]]; then
+      source "${KUBE_ROOT}/.gimme/envs/gomaster.env"
+    elif [[ -f "${HOME}/.gimme/envs/gomaster.env" ]]; then
+      source "${HOME}/.gimme/envs/gomaster.env"
+    fi
+  elif [ -n "${FORCE_HOST_GO:-}" ]; then
+    # ensure existing host version is used, like before GOTOOLCHAIN existed
+    export GOTOOLCHAIN='local'
+  else
+    # otherwise, we want to ensure the go version matches GO_VERSION
+    GOTOOLCHAIN="go${GO_VERSION}"
+    export GOTOOLCHAIN
+    # if go is either not installed or too old to respect GOTOOLCHAIN then use gimme
+    if ! (command -v go >/dev/null && [ "$(go version | cut -d' ' -f3)" = "${GOTOOLCHAIN}" ]); then
       export GIMME_ENV_PREFIX=${GIMME_ENV_PREFIX:-"${KUBE_OUTPUT}/.gimme/envs"}
       export GIMME_VERSION_PREFIX=${GIMME_VERSION_PREFIX:-"${KUBE_OUTPUT}/.gimme/versions"}
       # eval because the output of this is shell to set PATH etc.
       eval "$("${KUBE_ROOT}/third_party/gimme/gimme" "${GO_VERSION}")"
+    fi
   fi
 
   if [[ -z "$(command -v go)" ]]; then
@@ -486,7 +556,7 @@ EOF
   local go_version
   IFS=" " read -ra go_version <<< "$(GOFLAGS='' go version)"
   local minimum_go_version
-  minimum_go_version=go1.20
+  minimum_go_version=go1.27
   if [[ "${minimum_go_version}" != $(echo -e "${minimum_go_version}\n${go_version[2]}" | sort -s -t. -k 1,1 -k 2,2n -k 3,3n | head -n1) && "${go_version[2]}" != "devel" ]]; then
     kube::log::usage_from_stdin <<EOF
 Detected go version: ${go_version[*]}.
@@ -504,20 +574,14 @@ EOF
 # Outputs:
 #   env-var GOPATH points to our local output dir
 #   env-var GOBIN is unset (we want binaries in a predictable place)
-#   env-var GO15VENDOREXPERIMENT=1
-#   current directory is within GOPATH
+#   env-var PATH includes the local GOPATH
 kube::golang::setup_env() {
-  kube::golang::verify_go_version
-
-  # Set up GOPATH.  We have tools which depend on being in a GOPATH (see
-  # hack/run-in-gopath.sh).
-  #
   # Even in module mode, we need to set GOPATH for `go build` and `go install`
   # to work.  We build various tools (usually via `go install`) from a lot of
   # scripts.
-  #   * We can't set GOBIN because that does not work on cross-compiles.
-  #   * We could use `go build -o <something>`, but it's subtle when it comes
-  #     to cross-compiles and whether the <something> is a file or a directory,
+  #   * We can't just set GOBIN because that does not work on cross-compiles.
+  #   * We could always use `go build -o <something>`, but it's subtle wrt
+  #     cross-compiles and whether the <something> is a file or a directory,
   #     and EVERY caller has to get it *just* right.
   #   * We could leave GOPATH alone and let `go install` write binaries
   #     wherever the user's GOPATH says (or doesn't say).
@@ -525,10 +589,6 @@ kube::golang::setup_env() {
   # Instead we set it to a phony local path and process the results ourselves.
   # In particular, GOPATH[0]/bin will be used for `go install`, with
   # cross-compiles adding an extra directory under that.
-  #
-  # Eventually, when we no longer rely on run-in-gopath.sh we may be able to
-  # simplify this some.
-  kube::golang::create_gopath_tree
   export GOPATH="${KUBE_GOPATH}"
 
   # If these are not set, set them now.  This ensures that any subsequent
@@ -539,49 +599,38 @@ kube::golang::setup_env() {
   # Make sure our own Go binaries are in PATH.
   export PATH="${KUBE_GOPATH}/bin:${PATH}"
 
-  # Change directories so that we are within the GOPATH.  Some tools get really
-  # upset if this is not true.  We use a whole fake GOPATH here to collect the
-  # resultant binaries.
-  local subdir
-  subdir=$(kube::realpath . | sed "s|${KUBE_ROOT}||")
-  cd "${KUBE_GOPATH}/src/${KUBE_GO_PACKAGE}/${subdir}" || return 1
-
-  # Set GOROOT so binaries that parse code can work properly.
-  GOROOT=$(go env GOROOT)
-  export GOROOT
-
   # Unset GOBIN in case it already exists in the current session.
   # Cross-compiles will not work with it set.
   unset GOBIN
 
-  # This seems to matter to some tools
-  export GO15VENDOREXPERIMENT=1
+  # Turn on modules and workspaces (both are default-on).
+  unset GO111MODULE
+  unset GOWORK
+
+  # This may try to download our specific Go version.  Do it last so it uses
+  # the above-configured environment.
+  kube::golang::internal::verify_go_version
 }
 
-kube::golang::setup_gomaxprocs() {
-  # GOMAXPROCS by default does not reflect the number of cpu(s) available
-  # when running in a container, please see https://github.com/golang/go/issues/33803
-  if [[ -z "${GOMAXPROCS:-}" ]]; then
-    if ! command -v ncpu >/dev/null 2>&1; then
-      # shellcheck disable=SC2164
-      pushd "${KUBE_ROOT}/hack/tools" >/dev/null
-      GO111MODULE=on go install ./ncpu || echo "Will not automatically set GOMAXPROCS"
-      # shellcheck disable=SC2164
-      popd >/dev/null
-    fi
-    if command -v ncpu >/dev/null 2>&1; then
-      GOMAXPROCS=$(ncpu)
-      export GOMAXPROCS
-      kube::log::status "Set GOMAXPROCS automatically to ${GOMAXPROCS}"
-    fi
+# kube::golang::hack_tools_gotoolchain outputs the value to use for $GOTOOLCHAIN,
+# using $KUBE_HACK_TOOLS_GOTOOLCHAIN if set, falling back to $GOTOOLCHAIN if set,
+# or outputting the empty string.
+#
+# Use this when installing / building tools specified in the hack/tools module:
+# GOTOOLCHAIN="$(kube::golang::hack_tools_gotoolchain)" go install ...
+kube::golang::hack_tools_gotoolchain() {
+  local hack_tools_gotoolchain="${GOTOOLCHAIN:-}"
+  if [ -n "${KUBE_HACK_TOOLS_GOTOOLCHAIN:-}" ]; then
+     hack_tools_gotoolchain="${KUBE_HACK_TOOLS_GOTOOLCHAIN}";
   fi
+  echo -n "${hack_tools_gotoolchain}"
 }
 
 # This will take binaries from $GOPATH/bin and copy them to the appropriate
-# place in ${KUBE_OUTPUT_BINDIR}
+# place in ${KUBE_OUTPUT_BIN}
 #
 # Ideally this wouldn't be necessary and we could just set GOBIN to
-# KUBE_OUTPUT_BINDIR but that won't work in the face of cross compilation.  'go
+# KUBE_OUTPUT_BIN but that won't work in the face of cross compilation.  'go
 # install' will place binaries that match the host platform directly in $GOBIN
 # while placing cross compiled binaries into `platform_arch` subdirs.  This
 # complicates pretty much everything else we do around packaging and such.
@@ -598,15 +647,23 @@ kube::golang::place_bins() {
     local platform_src="/${platform//\//_}"
     if [[ "${platform}" == "${host_platform}" ]]; then
       platform_src=""
-      rm -f "${THIS_PLATFORM_BIN}"
-      ln -s "${KUBE_OUTPUT_BINPATH}/${platform}" "${THIS_PLATFORM_BIN}"
+      # For compatibility with the old rsync behavior, only setup the symlink
+      # when we're doing a "local" build, not a "dockerized" build
+      # if KUBE_OUTPUT_SUBPATH is set then we're not writing to the default local path
+      if [[ -z "${KUBE_OUTPUT_SUBPATH+x}" ]]; then
+        V=4 kube::log::status "Creating ${THIS_PLATFORM_BIN} symlink for non-dockerized build"
+        rm -f "${THIS_PLATFORM_BIN}"
+        mkdir -p "$(dirname "${THIS_PLATFORM_BIN}")"
+        ln -s "../${_KUBE_OUTPUT_SUBPATH:?}/${_KUBE_OUTPUT_BIN_SUBPATH:?}/${platform}" "${THIS_PLATFORM_BIN}"
+      fi
     fi
 
+    V=3 kube::log::status "Placing binaries for ${platform} in ${KUBE_OUTPUT_BIN}/${platform}"
     local full_binpath_src="${KUBE_GOPATH}/bin${platform_src}"
     if [[ -d "${full_binpath_src}" ]]; then
-      mkdir -p "${KUBE_OUTPUT_BINPATH}/${platform}"
+      mkdir -p "${KUBE_OUTPUT_BIN}/${platform}"
       find "${full_binpath_src}" -maxdepth 1 -type f -exec \
-        rsync -pc {} "${KUBE_OUTPUT_BINPATH}/${platform}" \;
+        cp -p {} "${KUBE_OUTPUT_BIN}/${platform}" \;
     fi
   done
 }
@@ -649,7 +706,8 @@ kube::golang::is_instrumented_package() {
 # Echos the path to a dummy test used for coverage information.
 kube::golang::path_for_coverage_dummy_test() {
   local package="$1"
-  local path="${KUBE_GOPATH}/src/${package}"
+  local path
+  path=$(go list -find -f '{{.Dir}}' "${package}")
   local name
   name=$(basename "${package}")
   echo "${path}/zz_generated_${name}_test.go"
@@ -716,7 +774,7 @@ kube::golang::build_some_binaries() {
 
         go test -c -o "$(kube::golang::outfile_for_binary "${package}" "${platform}")" \
           -covermode count \
-          -coverpkg k8s.io/...,k8s.io/kubernetes/vendor/k8s.io/... \
+          -coverpkg k8s.io/... \
           "${build_args[@]}" \
           -tags coverage \
           "${package}"
@@ -726,14 +784,14 @@ kube::golang::build_some_binaries() {
     done
     if [[ "${#uncovered[@]}" != 0 ]]; then
       V=2 kube::log::info "Building ${uncovered[*]} without coverage..."
-      GO111MODULE=on GOPROXY=off go install "${build_args[@]}" "${uncovered[@]}"
+      GOPROXY=off go install "${build_args[@]}" "${uncovered[@]}"
     else
       V=2 kube::log::info "Nothing to build without coverage."
-     fi
-   else
+    fi
+  else
     V=2 kube::log::info "Coverage is disabled."
-    GO111MODULE=on GOPROXY=off go install "${build_args[@]}" "$@"
-   fi
+    GOPROXY=off go install "${build_args[@]}" "$@"
+  fi
 }
 
 # Args:
@@ -747,22 +805,29 @@ kube::golang::build_binaries_for_platform() {
   local -a statics=()
   local -a nonstatics=()
   local -a tests=()
+  local -A static_tests=()
 
   for binary in "${binaries[@]}"; do
     if [[ "${binary}" =~ ".test"$ ]]; then
       tests+=("${binary}")
-      kube::log::info "    ${binary} (test)"
-    elif kube::golang::is_statically_linked_library "${binary}"; then
+      # -race needs cgo.
+      if [[ -z "${KUBE_RACE:-}" ]] && kube::golang::is_statically_linked "${binary}"; then
+        static_tests["${binary}"]=1
+        kube::log::info "    ${binary} (test, static)"
+      else
+        kube::log::info "    ${binary} (test${KUBE_RACE:+, race detection})"
+      fi
+    elif kube::golang::is_statically_linked "${binary}"; then
       statics+=("${binary}")
       kube::log::info "    ${binary} (static)"
     else
       nonstatics+=("${binary}")
-      kube::log::info "    ${binary} (non-static)"
+      kube::log::info "    ${binary} (non-static${KUBE_RACE:+, race detection})"
     fi
-  done
+   done
 
-  V=2 kube::log::info "Env for ${platform}: GOOS=${GOOS-} GOARCH=${GOARCH-} GOROOT=${GOROOT-} CGO_ENABLED=${CGO_ENABLED-} CC=${CC-}"
-  V=3 kube::log::info "Building binaries with GCFLAGS=${gogcflags} ASMFLAGS=${goasmflags} LDFLAGS=${goldflags}"
+  V=2 kube::log::info "Env for ${platform}: GOPATH=${GOPATH-} GOOS=${GOOS-} GOARCH=${GOARCH-} GOROOT=${GOROOT-} CGO_ENABLED=${CGO_ENABLED-} CC=${CC-}"
+  V=3 kube::log::info "Building binaries with GCFLAGS=${gogcflags} LDFLAGS=${goldflags} and -tags=${gotags:-}"
 
   local -a build_args
   if [[ "${#statics[@]}" != 0 ]]; then
@@ -770,7 +835,6 @@ kube::golang::build_binaries_for_platform() {
       -installsuffix=static
       ${goflags:+"${goflags[@]}"}
       -gcflags="${gogcflags}"
-      -asmflags="${goasmflags}"
       -ldflags="${goldflags}"
       -tags="${gotags:-}"
     )
@@ -781,10 +845,12 @@ kube::golang::build_binaries_for_platform() {
     build_args=(
       ${goflags:+"${goflags[@]}"}
       -gcflags="${gogcflags}"
-      -asmflags="${goasmflags}"
       -ldflags="${goldflags}"
       -tags="${gotags:-}"
     )
+    if [[ -n "${KUBE_RACE:-}" ]]; then
+      build_args+=("${KUBE_RACE}")
+    fi
     kube::golang::build_some_binaries "${nonstatics[@]}"
   fi
 
@@ -794,14 +860,22 @@ kube::golang::build_binaries_for_platform() {
     testpkg=$(dirname "${test}")
 
     mkdir -p "$(dirname "${outfile}")"
-    go test -c \
-      ${goflags:+"${goflags[@]}"} \
-      -gcflags="${gogcflags}" \
-      -asmflags="${goasmflags}" \
-      -ldflags="${goldflags}" \
-      -tags="${gotags:-}" \
-      -o "${outfile}" \
-      "${testpkg}"
+    build_args=(
+      -c
+      ${goflags:+"${goflags[@]}"}
+      -gcflags="${gogcflags}"
+      -ldflags="${goldflags}"
+      -tags="${gotags:-}"
+      -o "${outfile}"
+    )
+    if [[ -n "${KUBE_RACE:-}" ]]; then
+      build_args+=("${KUBE_RACE}")
+    fi
+    if [[ -n "${static_tests[${test}]:-}" ]]; then
+      CGO_ENABLED=0 go test "${build_args[@]}" "${testpkg}"
+    else
+      go test "${build_args[@]}" "${testpkg}"
+    fi
   done
 }
 
@@ -842,111 +916,107 @@ kube::golang::get_physmem() {
 #   KUBE_BUILD_PLATFORMS - Incoming variable of targets to build for.  If unset
 #     then just the host architecture is built.
 kube::golang::build_binaries() {
-  # Create a sub-shell so that we don't pollute the outer environment
-  (
-    # Check for `go` binary and set ${GOPATH}.
-    kube::golang::setup_env
-    V=2 kube::log::info "Go version: $(GOFLAGS='' go version)"
+  V=2 kube::log::info "Go version: $(GOFLAGS='' go version)"
 
-    local host_platform
-    host_platform=$(kube::golang::host_platform)
+  local host_platform
+  host_platform=$(kube::golang::host_platform)
 
-    # These are "local" but are visible to and relied on by functions this
-    # function calls.  They are effectively part of the calling API to
-    # build_binaries_for_platform.
-    local goflags goldflags goasmflags gogcflags gotags
+  # These are "local" but are visible to and relied on by functions this
+  # function calls.  They are effectively part of the calling API to
+  # build_binaries_for_platform.
+  local goflags goldflags gogcflags gotags
 
-    # This is $(pwd) because we use run-in-gopath to build.  Once that is
-    # excised, this can become ${KUBE_ROOT}.
-    local trimroot # two lines to appease shellcheck SC2155
-    trimroot=$(pwd)
+  goflags=()
+  gogcflags="${GOGCFLAGS:-}"
+  goldflags="all=$(kube::version::ldflags) ${GOLDFLAGS:-}"
 
-    goasmflags="all=-trimpath=${trimroot}"
+  local grpcnotrace
+  grpcnotrace=""
 
-    gogcflags="all=-trimpath=${trimroot} ${GOGCFLAGS:-}"
-    if [[ "${DBG:-}" == 1 ]]; then
-        # Debugging - disable optimizations and inlining and trimPath
-        gogcflags="${GOGCFLAGS:-} all=-N -l"
-        goasmflags=""
+  if [[ "${DBG:-}" == 1 ]]; then
+      # Debugging - disable optimizations and inlining and trimPath
+      gogcflags="${gogcflags} all=-N -l"
+  else
+      # Not debugging - disable symbols and DWARF, trim embedded paths
+      goldflags="${goldflags} -s -w"
+      goflags+=("-trimpath")
+      # build non-debug binaries with "grpcnotrace" tag to avoid x/net trace usage and enable dead code elimination
+      grpcnotrace=",grpcnotrace"
+  fi
+
+  # Extract tags if any specified in GOFLAGS. kubectl never enables kustomize Go
+  # plugins; the std plugin package plus cgo makes the linker keep every method.
+  gotags="selinux,notest,kustomize_disable_go_plugin_support${grpcnotrace},$(echo "${GOFLAGS:-}" | sed -ne 's|.*-tags=\([^-]*\).*|\1|p')"
+
+  local -a targets=()
+  local arg
+
+  for arg; do
+    if [[ "${arg}" == -* ]]; then
+      # Assume arguments starting with a dash are flags to pass to go.
+      goflags+=("${arg}")
+    else
+      targets+=("${arg}")
     fi
+  done
 
-    goldflags="all=$(kube::version::ldflags) ${GOLDFLAGS:-}"
-    if [[ "${DBG:-}" != 1 ]]; then
-        # Not debugging - disable symbols and DWARF.
-        goldflags="${goldflags} -s -w"
+  local -a platforms
+  IFS=" " read -ra platforms <<< "${KUBE_BUILD_PLATFORMS:-}"
+  if [[ ${#platforms[@]} -eq 0 ]]; then
+    platforms=("${host_platform}")
+  fi
+
+  if [[ ${#targets[@]} -eq 0 ]]; then
+    targets=("${KUBE_ALL_TARGETS[@]}")
+  fi
+  kube::util::read-array targets < <(kube::golang::dedup "${targets[@]}")
+
+  local -a binaries
+  kube::util::read-array binaries < <(kube::golang::normalize_go_targets "${targets[@]}")
+  kube::util::read-array binaries < <(kube::golang::dedup "${binaries[@]}")
+
+  local parallel=false
+  if [[ ${#platforms[@]} -gt 1 ]]; then
+    local gigs
+    gigs=$(kube::golang::get_physmem)
+
+    if [[ ${gigs} -ge ${KUBE_PARALLEL_BUILD_MEMORY} ]]; then
+      kube::log::status "Multiple platforms requested and available ${gigs}G >= threshold ${KUBE_PARALLEL_BUILD_MEMORY}G, building platforms in parallel"
+      parallel=true
+    else
+      kube::log::status "Multiple platforms requested, but available ${gigs}G < threshold ${KUBE_PARALLEL_BUILD_MEMORY}G, building platforms in serial"
+      parallel=false
     fi
+  fi
 
-    # Extract tags if any specified in GOFLAGS
-    gotags="selinux,notest,$(echo "${GOFLAGS:-}" | sed -ne 's|.*-tags=\([^-]*\).*|\1|p')"
-
-    local -a targets=()
-    local arg
-
-    for arg; do
-      if [[ "${arg}" == -* ]]; then
-        # Assume arguments starting with a dash are flags to pass to go.
-        goflags+=("${arg}")
-      else
-        targets+=("${arg}")
-      fi
+  if [[ "${parallel}" == "true" ]]; then
+    kube::log::status "Building go targets for {${platforms[*]}} in parallel (output will appear in a burst when complete):" "${targets[@]}"
+    local platform
+    for platform in "${platforms[@]}"; do (
+        kube::golang::set_platform_envs "${platform}"
+        kube::log::status "${platform}: build started"
+        kube::golang::build_binaries_for_platform "${platform}"
+        kube::log::status "${platform}: build finished"
+      ) &> "/tmp//${platform//\//_}.build" &
     done
 
-    if [[ ${#targets[@]} -eq 0 ]]; then
-      targets=("${KUBE_ALL_TARGETS[@]}")
-    fi
+    local fails=0
+    for job in $(jobs -p); do
+      wait "${job}" || (( fails+=1 ))
+    done
 
-    local -a platforms
-    IFS=" " read -ra platforms <<< "${KUBE_BUILD_PLATFORMS:-}"
-    if [[ ${#platforms[@]} -eq 0 ]]; then
-      platforms=("${host_platform}")
-    fi
+    for platform in "${platforms[@]}"; do
+      cat "/tmp//${platform//\//_}.build"
+    done
 
-    local -a binaries
-    while IFS="" read -r binary; do binaries+=("$binary"); done < <(kube::golang::binaries_from_targets "${targets[@]}")
-
-    local parallel=false
-    if [[ ${#platforms[@]} -gt 1 ]]; then
-      local gigs
-      gigs=$(kube::golang::get_physmem)
-
-      if [[ ${gigs} -ge ${KUBE_PARALLEL_BUILD_MEMORY} ]]; then
-        kube::log::status "Multiple platforms requested and available ${gigs}G >= threshold ${KUBE_PARALLEL_BUILD_MEMORY}G, building platforms in parallel"
-        parallel=true
-      else
-        kube::log::status "Multiple platforms requested, but available ${gigs}G < threshold ${KUBE_PARALLEL_BUILD_MEMORY}G, building platforms in serial"
-        parallel=false
-      fi
-    fi
-
-    if [[ "${parallel}" == "true" ]]; then
-      kube::log::status "Building go targets for {${platforms[*]}} in parallel (output will appear in a burst when complete):" "${targets[@]}"
-      local platform
-      for platform in "${platforms[@]}"; do (
-          kube::golang::set_platform_envs "${platform}"
-          kube::log::status "${platform}: build started"
-          kube::golang::build_binaries_for_platform "${platform}"
-          kube::log::status "${platform}: build finished"
-        ) &> "/tmp//${platform//\//_}.build" &
-      done
-
-      local fails=0
-      for job in $(jobs -p); do
-        wait "${job}" || (( fails+=1 ))
-      done
-
-      for platform in "${platforms[@]}"; do
-        cat "/tmp//${platform//\//_}.build"
-      done
-
-      exit "${fails}"
-    else
-      for platform in "${platforms[@]}"; do
-        kube::log::status "Building go targets for ${platform}"
-        (
-          kube::golang::set_platform_envs "${platform}"
-          kube::golang::build_binaries_for_platform "${platform}"
-        )
-      done
-    fi
-  )
+    return "${fails}"
+  else
+    for platform in "${platforms[@]}"; do
+      kube::log::status "Building go targets for ${platform}"
+      (
+        kube::golang::set_platform_envs "${platform}"
+        kube::golang::build_binaries_for_platform "${platform}"
+      )
+    done
+  fi
 }

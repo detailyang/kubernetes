@@ -1,3 +1,5 @@
+//go:build linux
+
 /*
 Copyright 2017 The Kubernetes Authors.
 
@@ -275,9 +277,9 @@ type runner struct {
 }
 
 // New returns a new Interface which will exec ipset.
-func New(exec utilexec.Interface) Interface {
+func New() Interface {
 	return &runner{
-		exec: exec,
+		exec: utilexec.New(),
 	}
 }
 
@@ -399,7 +401,7 @@ func (runner *runner) ListEntries(set string) ([]string, error) {
 	memberMatcher := regexp.MustCompile(EntryMemberPattern)
 	list := memberMatcher.ReplaceAllString(string(out[:]), "")
 	strs := strings.Split(list, "\n")
-	results := make([]string, 0)
+	results := make([]string, 0, len(strs))
 	for i := range strs {
 		if len(strs[i]) > 0 {
 			results = append(results, strs[i])

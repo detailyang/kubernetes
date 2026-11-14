@@ -21,13 +21,16 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/lithammer/dedent"
+
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/version"
 	apimachineryversion "k8s.io/apimachinery/pkg/version"
+	"sigs.k8s.io/yaml"
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	kubeadmapiv1old "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
@@ -35,79 +38,88 @@ import (
 
 const KubeadmGroupName = "kubeadm.k8s.io"
 
+var formats = []struct {
+	name    string
+	marshal func(interface{}) ([]byte, error)
+}{
+	{name: "JSON", marshal: json.Marshal},
+	{name: "YAML", marshal: yaml.Marshal},
+}
+
 func TestValidateSupportedVersion(t *testing.T) {
 	tests := []struct {
-		gv                schema.GroupVersion
+		gvk               schema.GroupVersionKind
 		allowDeprecated   bool
 		allowExperimental bool
 		expectedErr       bool
 	}{
 		{
-			gv: schema.GroupVersion{
+			gvk: schema.GroupVersionKind{
 				Group:   KubeadmGroupName,
 				Version: "v1alpha1",
+				Kind:    "InitConfiguration",
 			},
 			expectedErr: true,
 		},
 		{
-			gv: schema.GroupVersion{
+			gvk: schema.GroupVersionKind{
 				Group:   KubeadmGroupName,
 				Version: "v1alpha2",
+				Kind:    "InitConfiguration",
 			},
 			expectedErr: true,
 		},
 		{
-			gv: schema.GroupVersion{
+			gvk: schema.GroupVersionKind{
 				Group:   KubeadmGroupName,
 				Version: "v1alpha3",
+				Kind:    "InitConfiguration",
 			},
 			expectedErr: true,
 		},
 		{
-			gv: schema.GroupVersion{
+			gvk: schema.GroupVersionKind{
 				Group:   KubeadmGroupName,
 				Version: "v1beta1",
+				Kind:    "InitConfiguration",
 			},
 			expectedErr: true,
 		},
 		{
-			gv: schema.GroupVersion{
+			gvk: schema.GroupVersionKind{
 				Group:   KubeadmGroupName,
 				Version: "v1beta2",
+				Kind:    "InitConfiguration",
 			},
 			expectedErr: true,
 		},
 		{
-			gv: schema.GroupVersion{
+			gvk: schema.GroupVersionKind{
 				Group:   KubeadmGroupName,
 				Version: "v1beta3",
-			},
-		},
-		{
-			gv: schema.GroupVersion{
-				Group:   "foo.k8s.io",
-				Version: "v1",
-			},
-		},
-		{
-			gv: schema.GroupVersion{
-				Group:   KubeadmGroupName,
-				Version: "v1beta4",
-			},
-			allowExperimental: true,
-		},
-		{
-			gv: schema.GroupVersion{
-				Group:   KubeadmGroupName,
-				Version: "v1beta4",
+				Kind:    "ClusterConfiguration",
 			},
 			expectedErr: true,
+		},
+		{
+			gvk: schema.GroupVersionKind{
+				Group:   "foo.k8s.io",
+				Version: "v1",
+				Kind:    "InitConfiguration",
+			},
+		},
+		{
+			gvk: schema.GroupVersionKind{
+				Group:   KubeadmGroupName,
+				Version: "v1beta4",
+				Kind:    "ResetConfiguration",
+			},
 		},
 	}
 
 	for _, rt := range tests {
-		t.Run(fmt.Sprintf("%s/allowDeprecated:%t", rt.gv, rt.allowDeprecated), func(t *testing.T) {
-			err := validateSupportedVersion(rt.gv, rt.allowDeprecated, rt.allowExperimental)
+		t.Run(fmt.Sprintf("%s/allowDeprecated:%t", rt.gvk.GroupVersion(), rt.allowDeprecated), func(t *testing.T) {
+			err := validateSupportedVersion(rt.gvk, rt.allowDeprecated, rt.allowExperimental)
 			if rt.expectedErr && err == nil {
 				t.Error("unexpected success")
 			} else if !rt.expectedErr && err != nil {
@@ -217,13 +229,14 @@ func TestVerifyAPIServerBindAddress(t *testing.T) {
 }
 
 // NOTE: do not delete this test once an older API is removed and there is only one API left.
-// Update the inline "gv" and "gvExperimental" variables, to have the GroupVersion String of
-// the API to be tested. If there are no experimental APIs make "gvExperimental" point to
-// an non-experimental API.
+// Update the inline "gv" and "gvNew" variables, to have the GroupVersion String of
+// the API to be tested. If there are no new APIs make "gvNew" point to the old API.
+// If an experimental API has to be tested, use the 'allowExperimental' option
+// and add negative and positive test cases for the experimental API.
 func TestMigrateOldConfig(t *testing.T) {
 	var (
-		gv             = kubeadmapiv1old.SchemeGroupVersion.String()
-		gvExperimental = kubeadmapiv1.SchemeGroupVersion.String()
+		gv    = kubeadmapiv1.SchemeGroupVersion.String()
+		gvNew = kubeadmapiv1.SchemeGroupVersion.String()
 	)
 	tests := []struct {
 		name              string
@@ -269,6 +282,7 @@ func TestMigrateOldConfig(t *testing.T) {
 			oldCfg: dedent.Dedent(fmt.Sprintf(`
 			apiVersion: %s
 			kind: ClusterConfiguration
+			kubernetesVersion: v1.10.0
 			`, gv)),
 			expectedKinds: []string{
 				constants.InitConfigurationKind,
@@ -300,6 +314,7 @@ func TestMigrateOldConfig(t *testing.T) {
 			---
 			apiVersion: %[1]s
 			kind: ClusterConfiguration
+			kubernetesVersion: v1.10.0
 			`, gv)),
 			expectedKinds: []string{
 				constants.InitConfigurationKind,
@@ -333,6 +348,7 @@ func TestMigrateOldConfig(t *testing.T) {
 			oldCfg: dedent.Dedent(fmt.Sprintf(`
 			apiVersion: %s
 			kind: ClusterConfiguration
+			kubernetesVersion: v1.10.0
 			---
 			apiVersion: %[1]s
 			kind: JoinConfiguration
@@ -357,6 +373,7 @@ func TestMigrateOldConfig(t *testing.T) {
 			---
 			apiVersion: %[1]s
 			kind: ClusterConfiguration
+			kubernetesVersion: v1.10.0
 			---
 			apiVersion: %[1]s
 			kind: JoinConfiguration
@@ -381,6 +398,7 @@ func TestMigrateOldConfig(t *testing.T) {
 			---
 			apiVersion: %[1]s
 			kind: ClusterConfiguration
+			kubernetesVersion: v1.10.0
 			---
 			apiVersion: %[1]s
 			kind: JoinConfiguration
@@ -403,87 +421,34 @@ func TestMigrateOldConfig(t *testing.T) {
 			},
 			expectErr: false,
 		},
-		{
-			name: "ClusterConfiguration gets migrated from experimental API",
-			oldCfg: dedent.Dedent(fmt.Sprintf(`
-			apiVersion: %s
-			kind: ClusterConfiguration
-			`, gvExperimental)),
-			expectedKinds: []string{
-				constants.InitConfigurationKind,
-				constants.ClusterConfigurationKind,
-			},
-			allowExperimental: true,
-			expectErr:         false,
-		},
-		{
-			name: "ClusterConfiguration from experimental API cannot be migrated",
-			oldCfg: dedent.Dedent(fmt.Sprintf(`
-			apiVersion: %s
-			kind: ClusterConfiguration
-			`, gvExperimental)),
-			allowExperimental: false,
-			expectErr:         true,
-		},
-		{
-			name: "ResetConfiguration gets migrated from experimental API",
-			oldCfg: dedent.Dedent(fmt.Sprintf(`
-			apiVersion: %s
-			kind: ResetConfiguration
-			force: true
-			cleanupTmpDir: true
-			criSocket: unix:///var/run/containerd/containerd.sock
-			certificatesDir: /etc/kubernetes/pki
-			`, gvExperimental)),
-			expectedKinds: []string{
-				constants.ResetConfigurationKind,
-			},
-			allowExperimental: true,
-			expectErr:         false,
-		},
-		{
-			name: "ResetConfiguration from experimental API cannot be migrated",
-			oldCfg: dedent.Dedent(fmt.Sprintf(`
-			apiVersion: %s
-			kind: ResetConfiguration
-			`, gvExperimental)),
-			allowExperimental: false,
-			expectErr:         true,
-		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			b, err := MigrateOldConfig([]byte(test.oldCfg), test.allowExperimental)
-			if test.expectErr {
-				if err == nil {
-					t.Fatalf("unexpected success:\n%s", b)
+			b, err := MigrateOldConfig([]byte(test.oldCfg), test.allowExperimental, defaultEmptyMigrateMutators())
+			if test.expectErr != (err != nil) {
+				t.Fatalf("expected error: %v, got: %v", test.expectErr, err != nil)
+			}
+			gvks, err := kubeadmutil.GroupVersionKindsFromBytes(b)
+			if err != nil {
+				t.Fatalf("unexpected error returned by GroupVersionKindsFromBytes: %v", err)
+			}
+			if len(gvks) != len(test.expectedKinds) {
+				t.Fatalf("length mismatch between resulting gvks and expected kinds:\n\tlen(gvks)=%d\n\tlen(expectedKinds)=%d",
+					len(gvks), len(test.expectedKinds))
+			}
+			for _, expectedKind := range test.expectedKinds {
+				if !kubeadmutil.GroupVersionKindsHasKind(gvks, expectedKind) {
+					t.Fatalf("migration failed to produce config kind: %s", expectedKind)
 				}
-			} else {
-				if err != nil {
-					t.Fatalf("unexpected failure: %v", err)
-				}
-				gvks, err := kubeadmutil.GroupVersionKindsFromBytes(b)
-				if err != nil {
-					t.Fatalf("unexpected error returned by GroupVersionKindsFromBytes: %v", err)
-				}
-				if len(gvks) != len(test.expectedKinds) {
-					t.Fatalf("length mismatch between resulting gvks and expected kinds:\n\tlen(gvks)=%d\n\tlen(expectedKinds)=%d",
-						len(gvks), len(test.expectedKinds))
-				}
-				for _, expectedKind := range test.expectedKinds {
-					if !kubeadmutil.GroupVersionKindsHasKind(gvks, expectedKind) {
-						t.Fatalf("migration failed to produce config kind: %s", expectedKind)
-					}
-				}
-				expectedGV := gv
-				if test.allowExperimental {
-					expectedGV = gvExperimental
-				}
-				for _, gvk := range gvks {
-					if gvk.GroupVersion().String() != expectedGV {
-						t.Errorf("GV mismatch, expected GV: %s, got GV: %s", expectedGV, gvk.GroupVersion().String())
-					}
+			}
+			expectedGV := gvNew
+			if test.allowExperimental {
+				expectedGV = gvNew
+			}
+			for _, gvk := range gvks {
+				if gvk.GroupVersion().String() != expectedGV {
+					t.Errorf("GV mismatch, expected GV: %s, got GV: %s", expectedGV, gvk.GroupVersion().String())
 				}
 			}
 		})
@@ -491,13 +456,13 @@ func TestMigrateOldConfig(t *testing.T) {
 }
 
 // NOTE: do not delete this test once an older API is removed and there is only one API left.
-// Update the inline "gv" and "gvExperimental" variables, to have the GroupVersion String of
-// the API to be tested. If there are no experimental APIs make "gvExperimental" point to
+// Update the inline "gv" and "gvNew" variables, to have the GroupVersion String of
+// the API to be tested. If there are no experimental APIs make "gvNew" point to
 // an non-experimental API.
 func TestValidateConfig(t *testing.T) {
 	var (
-		gv             = kubeadmapiv1old.SchemeGroupVersion.String()
-		gvExperimental = kubeadmapiv1.SchemeGroupVersion.String()
+		gv    = kubeadmapiv1.SchemeGroupVersion.String()
+		gvNew = kubeadmapiv1.SchemeGroupVersion.String()
 	)
 	tests := []struct {
 		name              string
@@ -510,30 +475,24 @@ func TestValidateConfig(t *testing.T) {
 			cfg: dedent.Dedent(fmt.Sprintf(`
 			apiVersion: %s
 			kind: InitConfiguration
-			nodeRegistration:
-			  criSocket: %s
 			  name: foo bar # not a valid subdomain
-			`, gv, constants.UnknownCRISocket)),
+			`, gv)),
 			expectedError: true,
 		},
 		{
 			name: "unknown API GVK",
-			cfg: dedent.Dedent(fmt.Sprintf(`
+			cfg: dedent.Dedent(`
 			apiVersion: foo/bar # not a valid GroupVersion
 			kind: zzz # not a valid Kind
-			nodeRegistration:
-			  criSocket: %s
-			`, constants.UnknownCRISocket)),
+			`),
 			expectedError: true,
 		},
 		{
 			name: "legacy API GVK",
-			cfg: dedent.Dedent(fmt.Sprintf(`
+			cfg: dedent.Dedent(`
 			apiVersion: kubeadm.k8s.io/v1beta1 # legacy API
 			kind: InitConfiguration
-			nodeRegistration:
-			  criSocket: %s
-			`, constants.UnknownCRISocket)),
+			`),
 			expectedError: true,
 		},
 		{
@@ -542,9 +501,7 @@ func TestValidateConfig(t *testing.T) {
 			apiVersion: %s
 			kind: InitConfiguration
 			foo: bar
-			nodeRegistration:
-			  criSocket: %s
-			`, gv, constants.UnknownCRISocket)),
+			`, gv)),
 			expectedError: true,
 		},
 		{
@@ -552,9 +509,7 @@ func TestValidateConfig(t *testing.T) {
 			cfg: dedent.Dedent(fmt.Sprintf(`
 			apiVersion: %s
 			kind: InitConfiguration
-			nodeRegistration:
-			  criSocket: %s
-			`, gv, constants.UnknownCRISocket)),
+			`, gv)),
 			expectedError: false,
 		},
 		{
@@ -562,18 +517,8 @@ func TestValidateConfig(t *testing.T) {
 			cfg: dedent.Dedent(fmt.Sprintf(`
 			apiVersion: %s
 			kind: InitConfiguration
-			`, gvExperimental)),
-			expectedError:     false,
-			allowExperimental: true,
-		},
-		{
-			name: "invalid: experimental API",
-			cfg: dedent.Dedent(fmt.Sprintf(`
-			apiVersion: %s
-			kind: InitConfiguration
-			`, gvExperimental)),
-			expectedError:     true,
-			allowExperimental: false,
+			`, gvNew)),
+			expectedError: false,
 		},
 		{
 			name: "valid ResetConfiguration",
@@ -581,9 +526,8 @@ func TestValidateConfig(t *testing.T) {
 			apiVersion: %s
 			kind: ResetConfiguration
 			force: true
-			`, gvExperimental)),
-			expectedError:     false,
-			allowExperimental: true,
+			`, gvNew)),
+			expectedError: false,
 		},
 		{
 			name: "invalid field in ResetConfiguration",
@@ -591,24 +535,14 @@ func TestValidateConfig(t *testing.T) {
 			apiVersion: %s
 			kind: ResetConfiguration
 			foo: bar
-			`, gvExperimental)),
-			expectedError:     true,
-			allowExperimental: true,
-		},
-		{
-			name: "experimental API is not allowed in ResetConfiguration",
-			cfg: dedent.Dedent(fmt.Sprintf(`
-			apiVersion: %s
-			kind: ResetConfiguration
-			`, gvExperimental)),
-			expectedError:     true,
-			allowExperimental: false,
+			`, gvNew)),
+			expectedError: true,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := ValidateConfig([]byte(test.cfg), test.allowExperimental)
+			err := ValidateConfig([]byte(test.cfg), true, test.allowExperimental)
 			if (err != nil) != test.expectedError {
 				t.Fatalf("expected error: %v, got: %v, error: %v", test.expectedError, (err != nil), err)
 			}
@@ -757,6 +691,97 @@ func TestNormalizeKubernetesVersion(t *testing.T) {
 			}
 			if !tc.expectErr && err != nil {
 				t.Errorf("unexpected failure: %v", err)
+			}
+		})
+	}
+}
+
+func TestMigrateMutators(t *testing.T) {
+	testMutators := &migrateMutators{
+		migrateMutator{
+			in: []any{(*kubeadmapi.ClusterConfiguration)(nil)},
+			mutateFunc: func(in []any) error {
+				a := in[0].(*kubeadmapi.ClusterConfiguration)
+				a.DNS.Disabled = true
+				return nil
+			},
+		},
+	}
+
+	tests := []struct {
+		name          string
+		mutators      migrateMutators
+		input         []any
+		expected      []any
+		expectedDiff  bool
+		expectedError bool
+	}{
+		{
+			name:     "test mutation of ClusterConfiguration",
+			mutators: *testMutators,
+			input: []any{&kubeadmapi.ClusterConfiguration{
+				DNS: kubeadmapi.DNS{
+					Disabled: false,
+				},
+			},
+			},
+			expected: []any{&kubeadmapi.ClusterConfiguration{
+				DNS: kubeadmapi.DNS{
+					Disabled: true,
+				},
+			},
+			},
+		},
+		{
+			name:     "support mutation of InitConfiguration",
+			mutators: defaultMigrateMutators(),
+			input: []any{
+				&kubeadmapi.InitConfiguration{},
+			},
+			expected: []any{
+				&kubeadmapi.InitConfiguration{},
+			},
+		},
+		{
+			name:     "support mutation of ResetConfiguration",
+			mutators: defaultMigrateMutators(),
+			input: []any{
+				&kubeadmapi.ResetConfiguration{},
+			},
+			expected: []any{
+				&kubeadmapi.ResetConfiguration{},
+			},
+		},
+		{
+			name:     "support mutation of UpgradeConfiguration",
+			mutators: defaultMigrateMutators(),
+			input: []any{
+				&kubeadmapi.UpgradeConfiguration{},
+			},
+			expected: []any{
+				&kubeadmapi.UpgradeConfiguration{},
+			},
+		},
+		{
+			name:          "expect an error for a missing mutator",
+			mutators:      migrateMutators{}, // empty list of mutators
+			input:         []any{&kubeadmapi.ResetConfiguration{}},
+			expectedError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.mutators.mutate(tc.input)
+			if (err != nil) != tc.expectedError {
+				t.Fatalf("expected error: %v, got: %v, error: %v", tc.expectedError, (err != nil), err)
+			}
+			if err != nil {
+				return
+			}
+			diff := cmp.Diff(tc.expected, tc.input)
+			if (len(diff) > 0) != tc.expectedDiff {
+				t.Fatalf("got a diff with the expected config (-want,+got):\n%s", diff)
 			}
 		})
 	}

@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 /*
 Copyright 2016 The Kubernetes Authors.
@@ -27,8 +26,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"path/filepath"
+	"strings"
 
-	"math/rand"
 	"os"
 	"os/exec"
 	"syscall"
@@ -41,23 +41,31 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientset "k8s.io/client-go/kubernetes"
 	cliflag "k8s.io/component-base/cli/flag"
-	"k8s.io/component-base/logs"
+	mounter "k8s.io/kubernetes/cluster/gce/gci/mounter/pkg"
 	"k8s.io/kubernetes/pkg/util/rlimit"
 	commontest "k8s.io/kubernetes/test/e2e/common"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2econfig "k8s.io/kubernetes/test/e2e/framework/config"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	e2etestfiles "k8s.io/kubernetes/test/e2e/framework/testfiles"
 	e2etestingmanifests "k8s.io/kubernetes/test/e2e/testing-manifests"
+	"k8s.io/kubernetes/test/e2e_node/criproxy"
+	gcpcredentialprovider "k8s.io/kubernetes/test/e2e_node/plugins/gcp-credential-provider/pkg"
+	"k8s.io/kubernetes/test/e2e_node/runner/node"
 	"k8s.io/kubernetes/test/e2e_node/services"
 	e2enodetestingmanifests "k8s.io/kubernetes/test/e2e_node/testing-manifests"
 	system "k8s.io/system-validators/validators"
 
+	// define and freeze constants
+	_ "k8s.io/kubernetes/test/e2e/feature"
+
 	// reconfigure framework
+	"k8s.io/ktesting"
+	_ "k8s.io/ktesting/format"
 	_ "k8s.io/kubernetes/test/e2e/framework/debug/init"
 	_ "k8s.io/kubernetes/test/e2e/framework/metrics/init"
 	_ "k8s.io/kubernetes/test/e2e/framework/node/init"
-	_ "k8s.io/kubernetes/test/utils/format"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
@@ -66,7 +74,8 @@ import (
 )
 
 var (
-	e2es *services.E2EServices
+	e2eCriProxy *criproxy.RemoteRuntime
+	e2es        *services.E2EServices
 	// featureGates is a map of feature names to bools that enable or disable alpha/experimental features.
 	featureGates map[string]bool
 	// serviceFeatureGates is a map of feature names to bools that enable or
@@ -86,6 +95,7 @@ func registerNodeFlags(flags *flag.FlagSet) {
 	framework.TestContext.NodeE2E = true
 	flags.StringVar(&framework.TestContext.BearerToken, "bearer-token", "", "The bearer token to authenticate with. If not specified, it would be a random token. Currently this token is only used in node e2e tests.")
 	flags.StringVar(&framework.TestContext.NodeName, "node-name", "", "Name of the node to run tests on.")
+	flags.StringVar(&framework.TestContext.KubeletConfigDropinDir, "config-dir", "", "Path to a directory containing drop-in configurations for the kubelet.")
 	// TODO(random-liu): Move kubelet start logic out of the test.
 	// TODO(random-liu): Move log fetch logic out of the test.
 	// There are different ways to start kubelet (systemd, initd, docker, manually started etc.)
@@ -105,6 +115,7 @@ func registerNodeFlags(flags *flag.FlagSet) {
 	flags.Var(cliflag.NewMapStringBool(&featureGates), "feature-gates", "A set of key=value pairs that describe feature gates for alpha/experimental features.")
 	flags.Var(cliflag.NewMapStringBool(&serviceFeatureGates), "service-feature-gates", "A set of key=value pairs that describe feature gates for alpha/experimental features for API service.")
 	flags.BoolVar(&framework.TestContext.StandaloneMode, "standalone-mode", false, "If true, starts kubelet in standalone mode.")
+	flags.BoolVar(&framework.TestContext.CriProxyEnabled, "cri-proxy-enabled", false, "If true, enable CRI API proxy for failure injection.")
 }
 
 func init() {
@@ -114,11 +125,46 @@ func init() {
 }
 
 func TestMain(m *testing.M) {
+	// e2e_node.test can behave like several other commands which are required
+	// when doing node testing on a remote virtual machine.
+	//
+	// e2e_node.test owns pflag.CommandLine and flag.CommandLine.
+	// Other commands must use separate FlagSets.
+	pflag.Usage = func() {
+		fmt.Fprint(pflag.CommandLine.Output(), `Usage when invoked under a different name:
+    gcp-credential-provider (no flags) - emulate test/e2e_node/plugins/gcp-credential-provider
+    mounter (no flags) - emulate cluster/gce/gci/mounter
+
+Usage as e2e_node.test:
+    e2e_node.test remote <remote flags> - run remote testing, replacing "testgrid2 noop -test=node", see "remote -help" for flags
+    e2e_node.test <test flags> - execute Ginkgo test suite, see following flags
+
+`)
+		pflag.CommandLine.PrintDefaults()
+	}
+	cmdName := filepath.Base(os.Args[0])
+	switch {
+	case strings.HasPrefix(cmdName, "gcp-credential-provider"):
+		gcpcredentialprovider.Main()
+	case strings.HasPrefix(cmdName, "mounter"):
+		mounter.Main()
+	case len(os.Args) > 1 && os.Args[1] == "remote":
+		// The hard-coded verbosity in `make test-e2e-node` is 4
+		// (https://github.com/kubernetes/kubernetes/blob/17e2eda6119170e6ce1a065716432b1d37d028dd/hack/make-rules/test-e2e-node.sh#L248).
+		// Pre-pending -v4 emulates that behavior, with the difference that an explicit
+		// -v passed by the caller (typically kubetest2) could be used to override it.
+		args := append([]string{"-v=4"}, os.Args[2:]...)
+		node.Main(args)
+	default:
+		testMain(m)
+	}
+}
+
+func testMain(m *testing.M) {
 	// Copy go flags in TestMain, to ensure go test flags are registered (no longer available in init() as of go1.13)
 	e2econfig.CopyFlags(e2econfig.Flags, flag.CommandLine)
 	framework.RegisterCommonFlags(flag.CommandLine)
 	registerNodeFlags(flag.CommandLine)
-	logs.AddFlags(pflag.CommandLine)
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	// Mark the run-services-mode flag as hidden to prevent user from using it.
 	pflag.CommandLine.MarkHidden("run-services-mode")
@@ -128,7 +174,6 @@ func TestMain(m *testing.M) {
 	// into TestContext.
 	// TODO(pohly): remove RegisterNodeFlags from test_context.go enable Viper config support here?
 
-	rand.Seed(time.Now().UnixNano())
 	pflag.Parse()
 	if pflag.CommandLine.NArg() > 0 {
 		fmt.Fprintf(os.Stderr, "unknown additional command line arguments: %s", pflag.CommandLine.Args())
@@ -154,6 +199,7 @@ func TestMain(m *testing.M) {
 const rootfs = "/rootfs"
 
 func TestE2eNode(t *testing.T) {
+	tCtx := ktesting.Init(t)
 	// Make sure we are not limited by sshd when it comes to open files
 	if err := rlimit.SetNumFiles(1000000); err != nil {
 		klog.Infof("failed to set rlimit on max file handles: %v", err)
@@ -166,7 +212,7 @@ func TestE2eNode(t *testing.T) {
 	}
 	if *runKubeletMode {
 		// If run-kubelet-mode is specified, only start kubelet.
-		services.RunKubelet(featureGates)
+		services.RunKubelet(tCtx, featureGates)
 		return
 	}
 	if *systemValidateMode {
@@ -188,14 +234,26 @@ func TestE2eNode(t *testing.T) {
 				klog.Exitf("chroot %q failed: %v", rootfs, err)
 			}
 		}
-		if _, err := system.ValidateSpec(*spec, "remote"); len(err) != 0 {
-			klog.Exitf("system validation failed: %v", err)
+		warns, errs := system.ValidateSpec(*spec, "remote")
+		if len(warns) != 0 {
+			klog.Warningf("system validation warns: %v", warns)
+		}
+		if len(errs) != 0 {
+			klog.Exitf("system validation failed: %v", errs)
 		}
 		return
 	}
 
 	// We're not running in a special mode so lets run tests.
 	gomega.RegisterFailHandler(ginkgo.Fail)
+	// Initialize the KubeletConfigDropinDir again if the test doesn't run in run-kubelet-mode.
+	if framework.TestContext.KubeletConfigDropinDir == "" {
+		var err error
+		framework.TestContext.KubeletConfigDropinDir, err = services.KubeletConfigDirCWDDir()
+		if err != nil {
+			klog.Errorf("failed to create kubelet config directory: %v", err)
+		}
+	}
 	reportDir := framework.TestContext.ReportDir
 	if reportDir != "" {
 		// Create the directory if it doesn't already exist
@@ -204,6 +262,11 @@ func TestE2eNode(t *testing.T) {
 			klog.Errorf("Failed creating report directory: %v", err)
 		}
 	}
+
+	// annotate created pods with source code location to make it easier to find tests
+	// which do insufficient cleanup and pollute the node state with lingering pods
+	e2epod.GlobalOwnerTracking = true
+
 	suiteConfig, reporterConfig := framework.CreateGinkgoConfig()
 	ginkgo.RunSpecs(t, "E2eNode Suite", suiteConfig, reporterConfig)
 }
@@ -218,7 +281,7 @@ var _ = ginkgo.SynchronizedBeforeSuite(func(ctx context.Context) []byte {
 	if framework.TestContext.PrepullImages {
 		klog.Infof("Pre-pulling images so that they are cached for the tests.")
 		updateImageAllowList(ctx)
-		err := PrePullAllImages()
+		err := PrePullAllImages(ctx)
 		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
 	}
 
@@ -227,11 +290,27 @@ var _ = ginkgo.SynchronizedBeforeSuite(func(ctx context.Context) []byte {
 	// We should mask locksmithd when provisioning the machine.
 	maskLocksmithdOnCoreos()
 
+	if framework.TestContext.CriProxyEnabled {
+		framework.Logf("Start cri proxy")
+		rs, is, err := getCRIClient(ctx)
+		framework.ExpectNoError(err)
+
+		e2eCriProxy = criproxy.NewRemoteRuntimeProxy(rs, is)
+		endpoint, err := criproxy.GenerateEndpoint()
+		framework.ExpectNoError(err)
+
+		err = e2eCriProxy.Start(endpoint)
+		framework.ExpectNoError(err)
+
+		framework.TestContext.ContainerRuntimeEndpoint = endpoint
+		framework.TestContext.ImageServiceEndpoint = endpoint
+	}
+
 	if *startServices {
 		// If the services are expected to stop after test, they should monitor the test process.
 		// If the services are expected to keep running after test, they should not monitor the test process.
 		e2es = services.NewE2EServices(*stopServices)
-		gomega.Expect(e2es.Start(featureGates)).To(gomega.Succeed(), "should be able to start node services.")
+		gomega.Expect(e2es.Start(ctx, featureGates)).To(gomega.Succeed(), "should be able to start node services.")
 	} else {
 		klog.Infof("Running tests without starting services.")
 	}
@@ -268,6 +347,11 @@ var _ = ginkgo.SynchronizedAfterSuite(func() {}, func() {
 			klog.Infof("Stopping node services...")
 			e2es.Stop()
 		}
+	}
+
+	if e2eCriProxy != nil {
+		framework.Logf("Stopping cri proxy service...")
+		e2eCriProxy.Stop()
 	}
 
 	klog.Infof("Tests Finished")
@@ -329,6 +413,13 @@ func updateTestContext(ctx context.Context) error {
 	setExtraEnvs()
 	updateImageAllowList(ctx)
 
+	// Set KubeletRootDir to match the kubelet configuration used in node e2e tests.
+	// This ensures tests that use framework.TestContext.KubeletRootDir (e.g., for HostPath volumes)
+	// use the correct path.
+	if framework.TestContext.KubeletRootDir == "" {
+		framework.TestContext.KubeletRootDir = services.KubeletRootDirectory
+	}
+
 	client, err := getAPIServerClient()
 	if err != nil {
 		return fmt.Errorf("failed to get apiserver client: %w", err)
@@ -355,7 +446,7 @@ func getNode(c *clientset.Clientset) (*v1.Node, error) {
 	if nodes == nil {
 		return nil, fmt.Errorf("the node list is nil")
 	}
-	framework.ExpectEqual(len(nodes.Items) > 1, false, "the number of nodes is more than 1.")
+	gomega.Expect(len(nodes.Items)).To(gomega.BeNumerically("<=", 1), "the number of nodes is more than 1.")
 	if len(nodes.Items) == 0 {
 		return nil, fmt.Errorf("empty node list: %+v", nodes)
 	}
@@ -391,16 +482,6 @@ func loadSystemSpecFromFile(filename string) (*system.SysSpec, error) {
 		return nil, err
 	}
 	return spec, nil
-}
-
-// isNodeReady returns true if a node is ready; false otherwise.
-func isNodeReady(node *v1.Node) bool {
-	for _, c := range node.Status.Conditions {
-		if c.Type == v1.NodeReady {
-			return c.Status == v1.ConditionTrue
-		}
-	}
-	return false
 }
 
 func setExtraEnvs() {

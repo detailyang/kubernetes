@@ -1,3 +1,8 @@
+> ⚠️ **This is an automatically published [staged repository](https://git.k8s.io/kubernetes/staging#external-repository-staging-area) for Kubernetes**.   
+> Contributions, including issues and pull requests, should be made to the main Kubernetes repository: [https://github.com/kubernetes/kubernetes](https://github.com/kubernetes/kubernetes).  
+> This repository is read-only for importing, and not used for direct contributions.  
+> See [CONTRIBUTING.md](./CONTRIBUTING.md) for more details.
+
 # sample-cli-plugin
 
 This repository implements a single kubectl plugin for switching the namespace
@@ -31,7 +36,7 @@ This is an example of how to build a kubectl plugin using the same set of tools 
 
 ```sh
 # assumes you have a working KUBECONFIG
-$ GO111MODULE="on" go build cmd/kubectl-ns.go
+$ go build cmd/kubectl-ns.go
 # place the built binary somewhere in your PATH
 $ cp ./kubectl-ns /usr/local/bin
 

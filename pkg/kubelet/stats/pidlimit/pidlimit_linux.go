@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -36,7 +35,7 @@ func Stats() (*statsapi.RlimitStats, error) {
 	rlimit := &statsapi.RlimitStats{}
 
 	taskMax := int64(-1)
-	// Calculate the mininum of kernel.pid_max and kernel.threads-max as they both specify the
+	// Calculate the minimum of kernel.pid_max and kernel.threads-max as they both specify the
 	// system-wide limit on the number of tasks.
 	for _, file := range []string{"/proc/sys/kernel/pid_max", "/proc/sys/kernel/threads-max"} {
 		if content, err := os.ReadFile(file); err == nil {

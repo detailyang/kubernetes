@@ -28,6 +28,7 @@ import (
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2edaemonset "k8s.io/kubernetes/test/e2e/framework/daemonset"
 	"k8s.io/kubernetes/test/e2e/upgrades"
+	imageutils "k8s.io/kubernetes/test/utils/image"
 )
 
 // DaemonSetUpgradeTest tests that a DaemonSet is running before and after
@@ -43,7 +44,7 @@ func (DaemonSetUpgradeTest) Name() string { return "[sig-apps] daemonset-upgrade
 func (t *DaemonSetUpgradeTest) Setup(ctx context.Context, f *framework.Framework) {
 	daemonSetName := "ds1"
 	labelSet := map[string]string{"ds-name": daemonSetName}
-	image := framework.ServeHostnameImage
+	image := imageutils.GetE2EImage(imageutils.Agnhost)
 
 	ns := f.Namespace
 
@@ -59,10 +60,10 @@ func (t *DaemonSetUpgradeTest) Setup(ctx context.Context, f *framework.Framework
 	}
 
 	ginkgo.By("Waiting for DaemonSet pods to become ready")
-	err = wait.PollWithContext(ctx, framework.Poll, framework.PodStartTimeout, func(ctx context.Context) (bool, error) {
+	err = wait.PollUntilContextTimeout(ctx, framework.Poll, framework.PodStartTimeout, false, func(ctx context.Context) (bool, error) {
 		return e2edaemonset.CheckRunningOnAllNodes(ctx, f, t.daemonSet)
 	})
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "wait for DaemonSet %q to run on all eligible nodes", t.daemonSet.Name)
 
 	ginkgo.By("Validating the DaemonSet after creation")
 	t.validateRunningDaemonSet(ctx, f)
@@ -86,13 +87,15 @@ func (t *DaemonSetUpgradeTest) Teardown(ctx context.Context, f *framework.Framew
 func (t *DaemonSetUpgradeTest) validateRunningDaemonSet(ctx context.Context, f *framework.Framework) {
 	ginkgo.By("confirming the DaemonSet pods are running on all expected nodes")
 	res, err := e2edaemonset.CheckRunningOnAllNodes(ctx, f, t.daemonSet)
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "verify DaemonSet %q is running on all eligible nodes", t.daemonSet.Name)
 	if !res {
 		framework.Failf("expected DaemonSet pod to be running on all nodes, it was not")
 	}
 
 	// DaemonSet resource itself should be good
 	ginkgo.By("confirming the DaemonSet resource is in a good state")
+
 	err = e2edaemonset.CheckDaemonStatus(ctx, f, t.daemonSet.Name)
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "wait for DaemonSet %q in namespace %q to have all desired pods scheduled and ready", t.daemonSet.Name, f.Namespace.Name)
+
 }

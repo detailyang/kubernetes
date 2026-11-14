@@ -18,6 +18,7 @@ package create
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -385,6 +386,9 @@ func NewCmdCreateServiceExternalName(f cmdutil.Factory, ioStreams genericiooptio
 
 func parsePorts(portString string) (int32, intstr.IntOrString, error) {
 	portStringSlice := strings.Split(portString, ":")
+	if len(portStringSlice) > 2 {
+		return 0, intstr.FromInt32(0), fmt.Errorf("invalid port mapping %q: expected port or port:targetPort", portString)
+	}
 
 	port, err := utilsnet.ParsePort(portStringSlice[0], true)
 	if err != nil {
@@ -399,12 +403,12 @@ func parsePorts(portString string) (int32, intstr.IntOrString, error) {
 	var targetPort intstr.IntOrString
 	if portNum, err := strconv.Atoi(portStringSlice[1]); err != nil {
 		if errs := validation.IsValidPortName(portStringSlice[1]); len(errs) != 0 {
-			return 0, intstr.FromInt32(0), fmt.Errorf(strings.Join(errs, ","))
+			return 0, intstr.FromInt32(0), errors.New(strings.Join(errs, ","))
 		}
 		targetPort = intstr.FromString(portStringSlice[1])
 	} else {
 		if errs := validation.IsValidPortNum(portNum); len(errs) != 0 {
-			return 0, intstr.FromInt32(0), fmt.Errorf(strings.Join(errs, ","))
+			return 0, intstr.FromInt32(0), errors.New(strings.Join(errs, ","))
 		}
 		targetPort = intstr.FromInt32(int32(portNum))
 	}

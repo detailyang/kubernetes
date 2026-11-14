@@ -21,7 +21,7 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
-	utilptr "k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 func TestAddNoNewPrivileges(t *testing.T) {
@@ -73,11 +73,11 @@ func TestConvertToRuntimeMaskedPaths(t *testing.T) {
 	}{
 		"procMount nil": {
 			pm:     nil,
-			expect: defaultMaskedPaths,
+			expect: defaultMaskedPaths(),
 		},
 		"procMount default": {
 			pm:     &dPM,
-			expect: defaultMaskedPaths,
+			expect: defaultMaskedPaths(),
 		},
 		"procMount unmasked": {
 			pm:     &uPM,
@@ -119,6 +119,40 @@ func TestConvertToRuntimeReadonlyPaths(t *testing.T) {
 		if !reflect.DeepEqual(actual, v.expect) {
 			t.Errorf("%s failed, expected %#v but received %#v", k, v.expect, actual)
 		}
+	}
+}
+
+func TestDetermineEffectiveSecurityContextCgroupOptions(t *testing.T) {
+	readWrite := v1.CgroupMountModeReadWrite
+	containerSc := &v1.SecurityContext{CgroupOptions: &v1.CgroupOptions{MountMode: &readWrite}}
+
+	tests := []struct {
+		name   string
+		podSc  *v1.PodSecurityContext
+		expect *v1.CgroupOptions
+	}{
+		{
+			name:   "no pod security context",
+			podSc:  nil,
+			expect: &v1.CgroupOptions{MountMode: &readWrite},
+		},
+		{
+			name:   "pod security context set",
+			podSc:  &v1.PodSecurityContext{RunAsNonRoot: new(true)},
+			expect: &v1.CgroupOptions{MountMode: &readWrite},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &v1.Pod{Spec: v1.PodSpec{SecurityContext: tc.podSc}}
+			container := &v1.Container{Name: "test", SecurityContext: containerSc}
+
+			effectiveSc := DetermineEffectiveSecurityContext(pod, container)
+			if !reflect.DeepEqual(effectiveSc.CgroupOptions, tc.expect) {
+				t.Errorf("expected cgroupOptions %v, got %v", tc.expect, effectiveSc.CgroupOptions)
+			}
+		})
 	}
 }
 
@@ -188,10 +222,10 @@ func TestDetermineEffectiveRunAsUser(t *testing.T) {
 			},
 			container: &v1.Container{
 				SecurityContext: &v1.SecurityContext{
-					RunAsUser: utilptr.Int64Ptr(1),
+					RunAsUser: ptr.To[int64](1),
 				},
 			},
-			wantRunAsUser: utilptr.Int64Ptr(1),
+			wantRunAsUser: ptr.To[int64](1),
 		},
 	}
 

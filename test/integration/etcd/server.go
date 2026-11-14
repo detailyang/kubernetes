@@ -18,40 +18,46 @@ package etcd
 
 import (
 	"context"
-	"encoding/json"
 	"net"
 	"net/http"
 	"os"
 	"strings"
-	"testing"
 	"time"
-
-	utiltesting "k8s.io/client-go/util/testing"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	apiextensionsclientset "k8s.io/apiextensions-api/pkg/client/clientset/clientset"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/wait"
 	genericapiserveroptions "k8s.io/apiserver/pkg/server/options"
+	"k8s.io/apiserver/pkg/util/compatibility"
+	"k8s.io/apiserver/pkg/util/feature"
 	cacheddiscovery "k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
+	utiltesting "k8s.io/client-go/util/testing"
+	basecompatibility "k8s.io/component-base/compatibility"
+	"k8s.io/component-base/featuregate"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	"k8s.io/kubernetes/test/integration"
 	"k8s.io/kubernetes/test/integration/framework"
+	testutils "k8s.io/kubernetes/test/utils"
 	netutils "k8s.io/utils/net"
 
 	// install all APIs
+	featuremetrics "k8s.io/component-base/metrics/prometheus/feature"
 	_ "k8s.io/kubernetes/pkg/controlplane"
 )
 
@@ -63,8 +69,11 @@ AwEHoUQDQgAEH6cuzP8XuD5wal6wf9M6xDljTOPLX2i8uIp/C/ASqiIGUeeKQtX0
 -----END EC PRIVATE KEY-----`
 
 // StartRealAPIServerOrDie starts an API server that is appropriate for use in tests that require one of every resource
-func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRunOptions)) *APIServer {
-	certDir, err := os.MkdirTemp("", t.Name())
+func StartRealAPIServerOrDie(t ktesting.TB, configFuncs ...func(*options.ServerRunOptions)) *APIServer {
+	tCtx := ktesting.Init(t)
+
+	// Strip out "/" in subtests
+	certDir, err := os.MkdirTemp("", strings.ReplaceAll(t.Name(), "/", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,6 +98,17 @@ func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRu
 	}
 
 	opts := options.NewServerRunOptions()
+	// If EmulationVersion of DefaultFeatureGate is set during test, we need to propagate it to the apiserver ComponentGlobalsRegistry.
+	featureGate := feature.DefaultMutableFeatureGate.DeepCopy()
+	effectiveVersion := compatibility.DefaultKubeEffectiveVersionForTest()
+	effectiveVersion.SetEmulationVersion(featureGate.EmulationVersion())
+	// set up new instance of ComponentGlobalsRegistry instead of using the DefaultComponentGlobalsRegistry to avoid contention in parallel tests.
+	componentGlobalsRegistry := basecompatibility.NewComponentGlobalsRegistry()
+	if err := componentGlobalsRegistry.Register(basecompatibility.DefaultKubeComponent, effectiveVersion, featureGate); err != nil {
+		t.Fatal(err)
+	}
+	opts.GenericServerRunOptions.ComponentGlobalsRegistry = componentGlobalsRegistry
+
 	opts.Options.SecureServing.Listener = listener
 	opts.Options.SecureServing.ServerCert.CertDirectory = certDir
 	opts.Options.ServiceAccountSigningKeyFile = saSigningKeyFile.Name()
@@ -104,7 +124,24 @@ func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRu
 	for _, f := range configFuncs {
 		f(opts)
 	}
-	completedOptions, err := opts.Complete()
+
+	// If the local ComponentGlobalsRegistry is changed by configFuncs,
+	// we need to copy the new feature values back to the DefaultFeatureGate because most feature checks still use the DefaultFeatureGate.
+	if !featureGate.EmulationVersion().EqualTo(feature.DefaultMutableFeatureGate.EmulationVersion()) || !featureGate.MinCompatibilityVersion().EqualTo(feature.DefaultMutableFeatureGate.MinCompatibilityVersion()) {
+		featuregatetesting.SetFeatureGateVersionsDuringTest(t, feature.DefaultMutableFeatureGate, effectiveVersion.EmulationVersion(), effectiveVersion.MinCompatibilityVersion())
+	}
+	featureOverrides := map[featuregate.Feature]bool{}
+	for f := range feature.DefaultMutableFeatureGate.GetAll() {
+		if featureGate.Enabled(f) != feature.DefaultFeatureGate.Enabled(f) {
+			featureOverrides[f] = featureGate.Enabled(f)
+		}
+	}
+	if len(featureOverrides) > 0 {
+		featuregatetesting.SetFeatureGatesDuringTest(t, feature.DefaultFeatureGate, featureOverrides)
+	}
+	feature.DefaultMutableFeatureGate.AddMetrics(featuremetrics.RecordFeatureInfo)
+
+	completedOptions, err := opts.Complete(tCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +185,6 @@ func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRu
 
 	kubeClient := clientset.NewForConfigOrDie(kubeClientConfig)
 
-	stopCh := make(chan struct{})
 	errCh := make(chan error)
 	go func() {
 		// Catch panics that occur in this go routine so we get a comprehensible failure
@@ -164,7 +200,7 @@ func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRu
 			errCh <- err
 			return
 		}
-		if err := prepared.Run(stopCh); err != nil {
+		if err := prepared.Run(tCtx); err != nil {
 			errCh <- err
 			t.Error(err)
 			return
@@ -214,13 +250,8 @@ func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRu
 		t.Fatal(err)
 	}
 
-	cleanup := func() {
-		// Closing stopCh is stopping apiserver and cleaning up
-		// after itself, including shutting down its storage layer.
-		close(stopCh)
-
-		// If the apiserver was started, let's wait for it to
-		// shutdown clearly.
+	tCtx.Cleanup(func() {
+		// Wait for the apiserver to shut down after the test context gets canceled.
 		err, ok := <-errCh
 		if ok && err != nil {
 			t.Error(err)
@@ -229,7 +260,7 @@ func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRu
 		if err := os.RemoveAll(certDir); err != nil {
 			t.Log(err)
 		}
-	}
+	})
 
 	return &APIServer{
 		Client:    kubeClient,
@@ -238,12 +269,10 @@ func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRu
 		KV:        kvClient,
 		Mapper:    restMapper,
 		Resources: GetResources(t, serverResources),
-		Cleanup:   cleanup,
 	}
 }
 
-// APIServer represents a running API server that is ready for use
-// The Cleanup func must be deferred to prevent resource leaks
+// APIServer represents a running API server that is ready for use.
 type APIServer struct {
 	Client    clientset.Interface
 	Dynamic   dynamic.Interface
@@ -251,7 +280,6 @@ type APIServer struct {
 	KV        clientv3.KV
 	Mapper    meta.RESTMapper
 	Resources []Resource
-	Cleanup   func()
 }
 
 // Resource contains REST mapping information for a specific resource and extra metadata such as delete collection support
@@ -261,7 +289,7 @@ type Resource struct {
 }
 
 // GetResources fetches the Resources associated with serverResources that support get and create
-func GetResources(t *testing.T, serverResources []*metav1.APIResourceList) []Resource {
+func GetResources(t testutils.TB, serverResources []*metav1.APIResourceList) []Resource {
 	var resources []Resource
 
 	for _, discoveryGroup := range serverResources {
@@ -345,13 +373,13 @@ func JSONToUnstructured(stub, namespace string, mapping *meta.RESTMapping, dynam
 // CreateTestCRDs creates the given CRDs, any failure causes the test to Fatal.
 // If skipCrdExistsInDiscovery is true, the CRDs are only checked for the Established condition via their Status.
 // If skipCrdExistsInDiscovery is false, the CRDs are checked via discovery, see CrdExistsInDiscovery.
-func CreateTestCRDs(t *testing.T, client apiextensionsclientset.Interface, skipCrdExistsInDiscovery bool, crds ...*apiextensionsv1.CustomResourceDefinition) {
+func CreateTestCRDs(t testutils.TB, client apiextensionsclientset.Interface, skipCrdExistsInDiscovery bool, crds ...*apiextensionsv1.CustomResourceDefinition) {
 	for _, crd := range crds {
 		createTestCRD(t, client, skipCrdExistsInDiscovery, crd)
 	}
 }
 
-func createTestCRD(t *testing.T, client apiextensionsclientset.Interface, skipCrdExistsInDiscovery bool, crd *apiextensionsv1.CustomResourceDefinition) {
+func createTestCRD(t testutils.TB, client apiextensionsclientset.Interface, skipCrdExistsInDiscovery bool, crd *apiextensionsv1.CustomResourceDefinition) {
 	if _, err := client.ApiextensionsV1().CustomResourceDefinitions().Create(context.TODO(), crd, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("Failed to create %s CRD; %v", crd.Name, err)
 	}

@@ -21,10 +21,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
-
-	"github.com/pkg/errors"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
@@ -36,6 +35,7 @@ import (
 	"k8s.io/kubernetes/cmd/kubeadm/app/images"
 	certphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 	staticpodutil "k8s.io/kubernetes/cmd/kubeadm/app/util/staticpod"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/users"
 )
@@ -48,12 +48,13 @@ func CreateInitStaticPodManifestFiles(manifestDir, patchesDir string, cfg *kubea
 
 // GetStaticPodSpecs returns all staticPodSpecs actualized to the context of the current configuration
 // NB. this method holds the information about how kubeadm creates static pod manifests.
-func GetStaticPodSpecs(cfg *kubeadmapi.ClusterConfiguration, endpoint *kubeadmapi.APIEndpoint, proxyEnvs []v1.EnvVar) map[string]v1.Pod {
+func GetStaticPodSpecs(cfg *kubeadmapi.ClusterConfiguration, endpoint *kubeadmapi.APIEndpoint, proxyEnvs []kubeadmapi.EnvVar) map[string]v1.Pod {
 	// Get the required hostpath mounts
 	mounts := getHostPathVolumesForTheControlPlane(cfg)
 	if proxyEnvs == nil {
-		proxyEnvs = kubeadmutil.GetProxyEnvVars()
+		proxyEnvs = kubeadmutil.GetProxyEnvVars(nil)
 	}
+	componentHealthCheckTimeout := kubeadmapi.GetActiveTimeouts().ControlPlaneComponentHealthCheck
 
 	// Prepare static pod specs
 	staticPodSpecs := map[string]v1.Pod{
@@ -63,11 +64,18 @@ func GetStaticPodSpecs(cfg *kubeadmapi.ClusterConfiguration, endpoint *kubeadmap
 			ImagePullPolicy: v1.PullIfNotPresent,
 			Command:         getAPIServerCommand(cfg, endpoint),
 			VolumeMounts:    staticpodutil.VolumeMountMapToSlice(mounts.GetVolumeMounts(kubeadmconstants.KubeAPIServer)),
-			LivenessProbe:   staticpodutil.LivenessProbe(staticpodutil.GetAPIServerProbeAddress(endpoint), "/livez", endpoint.BindPort, v1.URISchemeHTTPS),
-			ReadinessProbe:  staticpodutil.ReadinessProbe(staticpodutil.GetAPIServerProbeAddress(endpoint), "/readyz", endpoint.BindPort, v1.URISchemeHTTPS),
-			StartupProbe:    staticpodutil.StartupProbe(staticpodutil.GetAPIServerProbeAddress(endpoint), "/livez", endpoint.BindPort, v1.URISchemeHTTPS, cfg.APIServer.TimeoutForControlPlane),
+			LivenessProbe:   staticpodutil.LivenessProbe(staticpodutil.GetAPIServerProbeAddress(endpoint), "/livez", kubeadmconstants.ProbePort, v1.URISchemeHTTPS),
+			ReadinessProbe:  staticpodutil.ReadinessProbe(staticpodutil.GetAPIServerProbeAddress(endpoint), "/readyz", kubeadmconstants.ProbePort, v1.URISchemeHTTPS),
+			StartupProbe:    staticpodutil.StartupProbe(staticpodutil.GetAPIServerProbeAddress(endpoint), "/livez", kubeadmconstants.ProbePort, v1.URISchemeHTTPS, componentHealthCheckTimeout),
 			Resources:       staticpodutil.ComponentResources("250m"),
-			Env:             kubeadmutil.MergeEnv(proxyEnvs, cfg.APIServer.ExtraEnvs),
+			Env:             kubeadmutil.MergeKubeadmEnvVars(proxyEnvs, cfg.APIServer.ExtraEnvs),
+			Ports: []v1.ContainerPort{
+				{
+					Name:          kubeadmconstants.ProbePort,
+					ContainerPort: endpoint.BindPort,
+					Protocol:      v1.ProtocolTCP,
+				},
+			},
 		}, mounts.GetVolumes(kubeadmconstants.KubeAPIServer),
 			map[string]string{kubeadmconstants.KubeAPIServerAdvertiseAddressEndpointAnnotationKey: endpoint.String()}),
 		kubeadmconstants.KubeControllerManager: staticpodutil.ComponentPod(v1.Container{
@@ -76,10 +84,17 @@ func GetStaticPodSpecs(cfg *kubeadmapi.ClusterConfiguration, endpoint *kubeadmap
 			ImagePullPolicy: v1.PullIfNotPresent,
 			Command:         getControllerManagerCommand(cfg),
 			VolumeMounts:    staticpodutil.VolumeMountMapToSlice(mounts.GetVolumeMounts(kubeadmconstants.KubeControllerManager)),
-			LivenessProbe:   staticpodutil.LivenessProbe(staticpodutil.GetControllerManagerProbeAddress(cfg), "/healthz", kubeadmconstants.KubeControllerManagerPort, v1.URISchemeHTTPS),
-			StartupProbe:    staticpodutil.StartupProbe(staticpodutil.GetControllerManagerProbeAddress(cfg), "/healthz", kubeadmconstants.KubeControllerManagerPort, v1.URISchemeHTTPS, cfg.APIServer.TimeoutForControlPlane),
+			LivenessProbe:   staticpodutil.LivenessProbe(staticpodutil.GetControllerManagerProbeAddress(cfg), "/healthz", kubeadmconstants.ProbePort, v1.URISchemeHTTPS),
+			StartupProbe:    staticpodutil.StartupProbe(staticpodutil.GetControllerManagerProbeAddress(cfg), "/healthz", kubeadmconstants.ProbePort, v1.URISchemeHTTPS, componentHealthCheckTimeout),
 			Resources:       staticpodutil.ComponentResources("200m"),
-			Env:             kubeadmutil.MergeEnv(proxyEnvs, cfg.ControllerManager.ExtraEnvs),
+			Env:             kubeadmutil.MergeKubeadmEnvVars(proxyEnvs, cfg.ControllerManager.ExtraEnvs),
+			Ports: []v1.ContainerPort{
+				{
+					Name:          kubeadmconstants.ProbePort,
+					ContainerPort: kubeadmconstants.KubeControllerManagerPort,
+					Protocol:      v1.ProtocolTCP,
+				},
+			},
 		}, mounts.GetVolumes(kubeadmconstants.KubeControllerManager), nil),
 		kubeadmconstants.KubeScheduler: staticpodutil.ComponentPod(v1.Container{
 			Name:            kubeadmconstants.KubeScheduler,
@@ -87,10 +102,18 @@ func GetStaticPodSpecs(cfg *kubeadmapi.ClusterConfiguration, endpoint *kubeadmap
 			ImagePullPolicy: v1.PullIfNotPresent,
 			Command:         getSchedulerCommand(cfg),
 			VolumeMounts:    staticpodutil.VolumeMountMapToSlice(mounts.GetVolumeMounts(kubeadmconstants.KubeScheduler)),
-			LivenessProbe:   staticpodutil.LivenessProbe(staticpodutil.GetSchedulerProbeAddress(cfg), "/healthz", kubeadmconstants.KubeSchedulerPort, v1.URISchemeHTTPS),
-			StartupProbe:    staticpodutil.StartupProbe(staticpodutil.GetSchedulerProbeAddress(cfg), "/healthz", kubeadmconstants.KubeSchedulerPort, v1.URISchemeHTTPS, cfg.APIServer.TimeoutForControlPlane),
+			LivenessProbe:   staticpodutil.LivenessProbe(staticpodutil.GetSchedulerProbeAddress(cfg), "/livez", kubeadmconstants.ProbePort, v1.URISchemeHTTPS),
+			ReadinessProbe:  staticpodutil.ReadinessProbe(staticpodutil.GetSchedulerProbeAddress(cfg), "/readyz", kubeadmconstants.ProbePort, v1.URISchemeHTTPS),
+			StartupProbe:    staticpodutil.StartupProbe(staticpodutil.GetSchedulerProbeAddress(cfg), "/livez", kubeadmconstants.ProbePort, v1.URISchemeHTTPS, componentHealthCheckTimeout),
 			Resources:       staticpodutil.ComponentResources("100m"),
-			Env:             kubeadmutil.MergeEnv(proxyEnvs, cfg.Scheduler.ExtraEnvs),
+			Env:             kubeadmutil.MergeKubeadmEnvVars(proxyEnvs, cfg.Scheduler.ExtraEnvs),
+			Ports: []v1.ContainerPort{
+				{
+					Name:          kubeadmconstants.ProbePort,
+					ContainerPort: kubeadmconstants.KubeSchedulerPort,
+					Protocol:      v1.ProtocolTCP,
+				},
+			},
 		}, mounts.GetVolumes(kubeadmconstants.KubeScheduler), nil),
 	}
 	return staticPodSpecs
@@ -131,11 +154,9 @@ func CreateStaticPodFiles(manifestDir, patchesDir string, cfg *kubeadmapi.Cluste
 		if features.Enabled(cfg.FeatureGates, features.RootlessControlPlane) {
 			if isDryRun {
 				fmt.Printf("[control-plane] Would update static pod manifest for %q to run run as non-root\n", componentName)
-			} else {
-				if usersAndGroups != nil {
-					if err := staticpodutil.RunComponentAsNonRoot(componentName, &spec, usersAndGroups, cfg); err != nil {
-						return errors.Wrapf(err, "failed to run component %q as non-root", componentName)
-					}
+			} else if usersAndGroups != nil {
+				if err := staticpodutil.RunComponentAsNonRoot(componentName, &spec, usersAndGroups, cfg); err != nil {
+					return errors.Wrapf(err, "failed to run component %q as non-root", componentName)
 				}
 			}
 		}
@@ -178,7 +199,7 @@ func getAPIServerCommand(cfg *kubeadmapi.ClusterConfiguration, localAPIEndpoint 
 		{Name: "secure-port", Value: fmt.Sprintf("%d", localAPIEndpoint.BindPort)},
 		{Name: "allow-privileged", Value: "true"},
 		{Name: "kubelet-preferred-address-types", Value: "InternalIP,ExternalIP,Hostname"},
-		// add options to configure the front proxy.  Without the generated client cert, this will never be useable
+		// add options to configure the front proxy.  Without the generated client cert, this will never be usable
 		// so add it unconditionally with recommended values
 		{Name: "requestheader-username-headers", Value: "X-Remote-User"},
 		{Name: "requestheader-group-headers", Value: "X-Remote-Group"},
@@ -211,15 +232,24 @@ func getAPIServerCommand(cfg *kubeadmapi.ClusterConfiguration, localAPIEndpoint 
 		if utilsnet.IsIPv6String(localAPIEndpoint.AdvertiseAddress) {
 			etcdLocalhostAddress = "::1"
 		}
-		defaultArguments = kubeadmapi.SetArgValues(defaultArguments, "etcd-servers", fmt.Sprintf("https://%s", net.JoinHostPort(etcdLocalhostAddress, strconv.Itoa(kubeadmconstants.EtcdListenClientPort))), 1)
+		etcdServers := fmt.Sprintf("https://%s", net.JoinHostPort(etcdLocalhostAddress, strconv.Itoa(kubeadmconstants.EtcdListenClientPort)))
+		defaultArguments = kubeadmapi.SetArgValues(defaultArguments, "etcd-servers", etcdServers, 1)
 		defaultArguments = kubeadmapi.SetArgValues(defaultArguments, "etcd-cafile", filepath.Join(cfg.CertificatesDir, kubeadmconstants.EtcdCACertName), 1)
 		defaultArguments = kubeadmapi.SetArgValues(defaultArguments, "etcd-certfile", filepath.Join(cfg.CertificatesDir, kubeadmconstants.APIServerEtcdClientCertName), 1)
 		defaultArguments = kubeadmapi.SetArgValues(defaultArguments, "etcd-keyfile", filepath.Join(cfg.CertificatesDir, kubeadmconstants.APIServerEtcdClientKeyName), 1)
 
 		// Apply user configurations for local etcd
 		if cfg.Etcd.Local != nil {
-			if value, idx := kubeadmapi.GetArgValue(cfg.Etcd.Local.ExtraArgs, "advertise-client-urls", -1); idx > -1 {
-				defaultArguments = kubeadmapi.SetArgValues(defaultArguments, "etcd-servers", value, 1)
+			if _, idx := kubeadmapi.GetArgValue(cfg.Etcd.Local.ExtraArgs, "advertise-client-urls", -1); idx > -1 {
+				// advertise-client-urls may replace or for append/prepend extend the etcd
+				// client URLs. Apply the same merge onto the default etcd-servers.
+				arg := cfg.Etcd.Local.ExtraArgs[idx]
+				if arg.MergeMethod != "" {
+					klog.Warningf("the local etcd --advertise-client-urls flag has a merge method %q and value %q; merging it with --etcd-servers %q",
+						arg.MergeMethod, arg.Value, etcdServers)
+				}
+				etcdServers = kubeadmapi.MergeArgWithBase(etcdServers, arg)
+				defaultArguments = kubeadmapi.SetArgValues(defaultArguments, "etcd-servers", etcdServers, 1)
 			}
 		}
 	}
@@ -227,8 +257,15 @@ func getAPIServerCommand(cfg *kubeadmapi.ClusterConfiguration, localAPIEndpoint 
 	if cfg.APIServer.ExtraArgs == nil {
 		cfg.APIServer.ExtraArgs = []kubeadmapi.Arg{}
 	}
-	authzVal, _ := kubeadmapi.GetArgValue(cfg.APIServer.ExtraArgs, "authorization-mode", -1)
-	cfg.APIServer.ExtraArgs = kubeadmapi.SetArgValues(cfg.APIServer.ExtraArgs, "authorization-mode", getAuthzModes(authzVal), 1)
+	_, authzIdx := kubeadmapi.GetArgValue(cfg.APIServer.ExtraArgs, "authorization-mode", -1)
+	_, hasStructuredAuthzVal := kubeadmapi.GetArgValue(cfg.APIServer.ExtraArgs, "authorization-config", -1)
+	if hasStructuredAuthzVal == -1 {
+		var authzArg *kubeadmapi.Arg
+		if authzIdx > -1 {
+			authzArg = &cfg.APIServer.ExtraArgs[authzIdx]
+		}
+		defaultArguments = kubeadmapi.SetArgValues(defaultArguments, "authorization-mode", getAuthzModes(authzArg), 1)
+	}
 	command = append(command, kubeadmutil.ArgumentsToCommand(defaultArguments, cfg.APIServer.ExtraArgs)...)
 
 	return command
@@ -237,34 +274,44 @@ func getAPIServerCommand(cfg *kubeadmapi.ClusterConfiguration, localAPIEndpoint 
 // getAuthzModes gets the authorization-related parameters to the api server
 // Node,RBAC is the default mode if nothing is passed to kubeadm. User provided modes override
 // the default.
-func getAuthzModes(authzModeExtraArgs string) string {
+func getAuthzModes(arg *kubeadmapi.Arg) string {
 	defaultMode := []string{
 		kubeadmconstants.ModeNode,
 		kubeadmconstants.ModeRBAC,
 	}
+	defaultModeString := strings.Join(defaultMode, ",")
 
-	if len(authzModeExtraArgs) > 0 {
-		mode := []string{}
-		for _, requested := range strings.Split(authzModeExtraArgs, ",") {
-			if isValidAuthzMode(requested) {
-				mode = append(mode, requested)
-			} else {
-				klog.Warningf("ignoring unknown kube-apiserver authorization-mode %q", requested)
-			}
+	if arg == nil || len(arg.Value) == 0 {
+		return defaultModeString
+	}
+
+	mode := []string{}
+	for requested := range strings.SplitSeq(arg.Value, ",") {
+		if len(requested) == 0 { // Skip empty values.
+			continue
 		}
-
-		// only return the user provided mode if at least one was valid
-		if len(mode) > 0 {
-			if !compareAuthzModes(defaultMode, mode) {
-				klog.Warningf("the default kube-apiserver authorization-mode is %q; using %q",
-					strings.Join(defaultMode, ","),
-					strings.Join(mode, ","),
-				)
-			}
-			return strings.Join(mode, ",")
+		if isValidAuthzMode(requested) {
+			mode = append(mode, requested)
+		} else {
+			klog.Warningf("ignoring unknown kube-apiserver authorization-mode %q", requested)
 		}
 	}
-	return strings.Join(defaultMode, ",")
+
+	if len(mode) == 0 {
+		return defaultModeString
+	}
+
+	// Only validate the whole list of modes if there is no merge method.
+	if arg.MergeMethod == "" && !compareAuthzModes(defaultMode, mode) {
+		modeString := strings.Join(mode, ",")
+		klog.Warningf("the default kube-apiserver authorization-mode is %q; using %q",
+			defaultModeString,
+			modeString,
+		)
+		return modeString
+	}
+
+	return defaultModeString
 }
 
 // compareAuthzModes compares two given authz modes and returns false if they do not match
@@ -290,12 +337,7 @@ func isValidAuthzMode(authzMode string) bool {
 		kubeadmconstants.ModeAlwaysDeny,
 	}
 
-	for _, mode := range allModes {
-		if authzMode == mode {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(allModes, authzMode)
 }
 
 // getControllerManagerCommand builds the right controller manager command from the given config object and version

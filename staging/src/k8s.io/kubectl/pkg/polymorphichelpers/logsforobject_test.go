@@ -46,6 +46,7 @@ func TestLogsForObject(t *testing.T) {
 		obj           runtime.Object
 		opts          *corev1.PodLogOptions
 		allContainers bool
+		allPods       bool
 		clientsetPods []runtime.Object
 		actions       []testclient.Action
 
@@ -73,6 +74,7 @@ func TestLogsForObject(t *testing.T) {
 			obj:           testPodWithTwoContainersAndTwoInitAndOneEphemeralContainers(),
 			opts:          &corev1.PodLogOptions{},
 			allContainers: true,
+			allPods:       false,
 			actions: []testclient.Action{
 				getLogsAction("test", &corev1.PodLogOptions{Container: "foo-2-and-2-and-1-initc1"}),
 				getLogsAction("test", &corev1.PodLogOptions{Container: "foo-2-and-2-and-1-initc2"}),
@@ -221,6 +223,7 @@ func TestLogsForObject(t *testing.T) {
 			},
 			opts:          &corev1.PodLogOptions{},
 			allContainers: true,
+			allPods:       false,
 			actions: []testclient.Action{
 				getLogsAction("test", &corev1.PodLogOptions{Container: "foo-2-and-2-initc1"}),
 				getLogsAction("test", &corev1.PodLogOptions{Container: "foo-2-and-2-initc2"}),
@@ -381,11 +384,17 @@ func TestLogsForObject(t *testing.T) {
 				FieldPath:  fmt.Sprintf("spec.containers{%s}", testPodWithOneContainers().Spec.Containers[0].Name),
 			}},
 		},
+		{
+			name:        "pod logs: invalid container name",
+			obj:         testPodWithTwoContainers(),
+			opts:        &corev1.PodLogOptions{Container: "nonexistent"},
+			expectedErr: "container nonexistent is not valid for pod foo-two-containers out of: foo-2-c1, foo-2-c2",
+		},
 	}
 
 	for _, test := range tests {
 		fakeClientset := fakeexternal.NewSimpleClientset(test.clientsetPods...)
-		responses, err := logsForObjectWithClient(fakeClientset.CoreV1(), test.obj, test.opts, 20*time.Second, test.allContainers)
+		responses, err := logsForObjectWithClient(fakeClientset.CoreV1(), test.obj, test.opts, 20*time.Second, test.allContainers, test.allPods)
 		if test.expectedErr == "" && err != nil {
 			t.Errorf("%s: unexpected error: %v", test.name, err)
 			continue
@@ -504,6 +513,7 @@ func TestLogsForObjectWithClient(t *testing.T) {
 		podLogOptions     *corev1.PodLogOptions
 		expectedFieldPath string
 		allContainers     bool
+		allPods           bool
 		expectedError     string
 	}{
 		{
@@ -552,6 +562,7 @@ func TestLogsForObjectWithClient(t *testing.T) {
 				return pod
 			},
 			allContainers:     true,
+			allPods:           false,
 			podLogOptions:     &corev1.PodLogOptions{},
 			expectedFieldPath: `spec.containers{foo-2-c2}`,
 		},
@@ -561,7 +572,7 @@ func TestLogsForObjectWithClient(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := tc.podFn()
 			fakeClientset := fakeexternal.NewSimpleClientset(pod)
-			responses, err := logsForObjectWithClient(fakeClientset.CoreV1(), pod, tc.podLogOptions, 20*time.Second, tc.allContainers)
+			responses, err := logsForObjectWithClient(fakeClientset.CoreV1(), pod, tc.podLogOptions, 20*time.Second, tc.allContainers, tc.allPods)
 			if err != nil {
 				if len(tc.expectedError) > 0 {
 					if err.Error() == tc.expectedError {

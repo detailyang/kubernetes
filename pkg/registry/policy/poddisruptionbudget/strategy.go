@@ -19,29 +19,29 @@ package poddisruptionbudget
 import (
 	"context"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/apis/policy"
 	"k8s.io/kubernetes/pkg/apis/policy/validation"
-	"k8s.io/kubernetes/pkg/features"
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 // podDisruptionBudgetStrategy implements verification logic for PodDisruptionBudgets.
 type podDisruptionBudgetStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating PodDisruptionBudget objects.
-var Strategy = podDisruptionBudgetStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = podDisruptionBudgetStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 // NamespaceScoped returns true because all PodDisruptionBudget' need to be within a namespace.
 func (podDisruptionBudgetStrategy) NamespaceScoped() bool {
@@ -71,7 +71,7 @@ func (podDisruptionBudgetStrategy) PrepareForCreate(ctx context.Context, obj run
 
 	podDisruptionBudget.Generation = 1
 
-	dropDisabledFields(&podDisruptionBudget.Spec, nil)
+	dropDisabledFields(podDisruptionBudget, nil)
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
@@ -88,7 +88,23 @@ func (podDisruptionBudgetStrategy) PrepareForUpdate(ctx context.Context, obj, ol
 		newPodDisruptionBudget.Generation = oldPodDisruptionBudget.Generation + 1
 	}
 
-	dropDisabledFields(&newPodDisruptionBudget.Spec, &oldPodDisruptionBudget.Spec)
+	dropDisabledFields(newPodDisruptionBudget, oldPodDisruptionBudget)
+}
+
+func dropDisabledFields(pdb, oldPDB *policy.PodDisruptionBudget) {
+	if oldPDB != nil && apiequality.Semantic.DeepEqual(oldPDB.Spec.Selector, pdb.Spec.Selector) {
+		return
+	}
+	switch {
+	case apiequality.Semantic.DeepEqual(pdb.Spec.Selector, policy.NonV1beta1MatchNoneSelector):
+		// no-op, preserve
+	case apiequality.Semantic.DeepEqual(pdb.Spec.Selector, policy.NonV1beta1MatchAllSelector):
+		// no-op, preserve
+	default:
+		// otherwise, make sure the label intended to be used in a match-all or match-none selector
+		// never gets combined with user-specified fields
+		policy.StripPDBV1beta1Label(pdb.Spec.Selector)
+	}
 }
 
 // Validate validates a new PodDisruptionBudget.
@@ -110,7 +126,7 @@ func (podDisruptionBudgetStrategy) Canonicalize(obj runtime.Object) {
 }
 
 // AllowCreateOnUpdate is true for PodDisruptionBudget; this means you may create one with a PUT request.
-func (podDisruptionBudgetStrategy) AllowCreateOnUpdate() bool {
+func (podDisruptionBudgetStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -129,7 +145,7 @@ func (podDisruptionBudgetStrategy) WarningsOnUpdate(ctx context.Context, obj, ol
 
 // AllowUnconditionalUpdate is the default update policy for PodDisruptionBudget objects. Status update should
 // only be allowed if version match.
-func (podDisruptionBudgetStrategy) AllowUnconditionalUpdate() bool {
+func (podDisruptionBudgetStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -185,26 +201,6 @@ func hasInvalidLabelValueInLabelSelector(pdb *policy.PodDisruptionBudget) bool {
 	if pdb.Spec.Selector != nil {
 		labelSelectorValidationOptions := metav1validation.LabelSelectorValidationOptions{AllowInvalidLabelValueInSelector: false}
 		return len(metav1validation.ValidateLabelSelector(pdb.Spec.Selector, labelSelectorValidationOptions, nil)) > 0
-	}
-	return false
-}
-
-// dropDisabledFields removes disabled fields from the pod disruption budget spec.
-// This should be called from PrepareForCreate/PrepareForUpdate for all resources containing a pod disruption budget spec.
-func dropDisabledFields(pdbSpec, oldPDBSpec *policy.PodDisruptionBudgetSpec) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.PDBUnhealthyPodEvictionPolicy) {
-		if !unhealthyPodEvictionPolicyInUse(oldPDBSpec) {
-			pdbSpec.UnhealthyPodEvictionPolicy = nil
-		}
-	}
-}
-
-func unhealthyPodEvictionPolicyInUse(oldPDBSpec *policy.PodDisruptionBudgetSpec) bool {
-	if oldPDBSpec == nil {
-		return false
-	}
-	if oldPDBSpec.UnhealthyPodEvictionPolicy != nil {
-		return true
 	}
 	return false
 }

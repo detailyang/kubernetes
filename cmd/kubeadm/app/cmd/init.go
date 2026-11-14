@@ -21,17 +21,20 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/klog/v2"
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
-	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/validation"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	phases "k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/init"
@@ -43,6 +46,7 @@ import (
 	kubeconfigphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/kubeconfig"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
 	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 	kubeconfigutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
 )
 
@@ -63,7 +67,19 @@ type initOptions struct {
 	uploadCerts             bool
 	skipCertificateKeyPrint bool
 	patchesDir              string
+	skipCRIDetect           bool
 }
+
+const (
+	// CoreDNSPhase is the name of CoreDNS subphase in "kubeadm init"
+	coreDNSPhase = "addon/coredns"
+
+	// KubeProxyPhase is the name of kube-proxy subphase during "kubeadm init"
+	kubeProxyPhase = "addon/kube-proxy"
+
+	// AddonPhase is the name of addon phase during "kubeadm init"
+	addonPhase = "addon"
+)
 
 // compile-time assert that the local data object satisfies the phases data interface.
 var _ phases.InitData = &initData{}
@@ -71,20 +87,23 @@ var _ phases.InitData = &initData{}
 // initData defines all the runtime information used when running the kubeadm init workflow;
 // this data is shared across all the phases that are included in the workflow.
 type initData struct {
-	cfg                     *kubeadmapi.InitConfiguration
-	skipTokenPrint          bool
-	dryRun                  bool
-	kubeconfigDir           string
-	kubeconfigPath          string
-	ignorePreflightErrors   sets.Set[string]
-	certificatesDir         string
-	dryRunDir               string
-	externalCA              bool
-	client                  clientset.Interface
-	outputWriter            io.Writer
-	uploadCerts             bool
-	skipCertificateKeyPrint bool
-	patchesDir              string
+	cfg                         *kubeadmapi.InitConfiguration
+	skipTokenPrint              bool
+	dryRun                      bool
+	kubeconfig                  *clientcmdapi.Config
+	kubeconfigOriginal          *clientcmdapi.Config
+	kubeconfigDir               string
+	kubeconfigPath              string
+	ignorePreflightErrors       sets.Set[string]
+	certificatesDir             string
+	dryRunDir                   string
+	externalCA                  bool
+	client                      clientset.Interface
+	outputWriter                io.Writer
+	uploadCerts                 bool
+	skipCertificateKeyPrint     bool
+	patchesDir                  string
+	adminKubeConfigBootstrapped bool
 }
 
 // newCmdInit returns "kubeadm init" command.
@@ -105,7 +124,11 @@ func newCmdInit(out io.Writer, initOptions *initOptions) *cobra.Command {
 				return err
 			}
 
-			data := c.(*initData)
+			data, ok := c.(*initData)
+			if !ok {
+				return errors.New("invalid data struct")
+			}
+
 			fmt.Printf("[init] Using Kubernetes version: %s\n", data.cfg.KubernetesVersion)
 
 			return initRunner.Run(args)
@@ -150,9 +173,9 @@ func newCmdInit(out io.Writer, initOptions *initOptions) *cobra.Command {
 	// both when running the entire workflow or single phases
 	initRunner.SetDataInitializer(func(cmd *cobra.Command, args []string) (workflow.RunData, error) {
 		if cmd.Flags().Lookup(options.NodeCRISocket) == nil {
-			// avoid CRI detection
+			// skip CRI detection
 			// assume that the command execution does not depend on CRISocket when --cri-socket flag is not set
-			initOptions.externalInitCfg.NodeRegistration.CRISocket = kubeadmconstants.UnknownCRISocket
+			initOptions.skipCRIDetect = true
 		}
 		data, err := newInitData(cmd, args, initOptions, out)
 		if err != nil {
@@ -162,6 +185,8 @@ func newCmdInit(out io.Writer, initOptions *initOptions) *cobra.Command {
 		if len(initRunner.Options.SkipPhases) == 0 {
 			initRunner.Options.SkipPhases = data.cfg.SkipPhases
 		}
+
+		initRunner.Options.SkipPhases = manageSkippedAddons(&data.cfg.ClusterConfiguration, initRunner.Options.SkipPhases)
 		return data, nil
 	})
 
@@ -188,7 +213,7 @@ func AddInitConfigFlags(flagSet *flag.FlagSet, cfg *kubeadmapiv1.InitConfigurati
 	)
 	flagSet.StringVar(
 		&cfg.CertificateKey, options.CertificateKey, "",
-		"Key used to encrypt the control-plane certificates in the kubeadm-certs Secret.",
+		"Key used to encrypt the control-plane certificates in the kubeadm-certs Secret. The certificate key is a hex encoded string that is an AES key of size 32 bytes.",
 	)
 	cmdutil.AddCRISocketFlag(flagSet, &cfg.NodeRegistration.CRISocket)
 }
@@ -301,7 +326,9 @@ func newInitData(cmd *cobra.Command, args []string, initOptions *initOptions, ou
 
 	// Either use the config file if specified, or convert public kubeadm API to the internal InitConfiguration
 	// and validates InitConfiguration
-	cfg, err := configutil.LoadOrDefaultInitConfiguration(initOptions.cfgPath, initOptions.externalInitCfg, initOptions.externalClusterCfg)
+	cfg, err := configutil.LoadOrDefaultInitConfiguration(initOptions.cfgPath, initOptions.externalInitCfg, initOptions.externalClusterCfg, configutil.LoadOrDefaultConfigurationOptions{
+		SkipCRIDetect: initOptions.skipCRIDetect,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -325,14 +352,11 @@ func newInitData(cmd *cobra.Command, args []string, initOptions *initOptions, ou
 		return nil, err
 	}
 
-	// if dry running creates a temporary folder for saving kubeadm generated files
+	// If dry running creates a temporary directory for saving kubeadm generated files.
 	dryRunDir := ""
 	if initOptions.dryRun || cfg.DryRun {
-		// the KUBEADM_INIT_DRYRUN_DIR environment variable allows overriding the dry-run temporary
-		// directory from the command line. This makes it possible to run "kubeadm init" integration
-		// tests without root.
-		if dryRunDir, err = kubeadmconstants.CreateTempDirForKubeadm(os.Getenv("KUBEADM_INIT_DRYRUN_DIR"), "kubeadm-init-dryrun"); err != nil {
-			return nil, errors.Wrap(err, "couldn't create a temporary directory")
+		if dryRunDir, err = kubeadmconstants.GetDryRunDir(kubeadmconstants.EnvVarInitDryRunDir, "kubeadm-init-dryrun", klog.Warningf); err != nil {
+			return nil, errors.Wrap(err, "could not create a temporary directory on dryrun")
 		}
 	}
 
@@ -437,7 +461,41 @@ func (d *initData) CertificateDir() string {
 	return d.certificatesDir
 }
 
-// KubeConfigDir returns the path of the Kubernetes configuration folder or the temporary folder path in case of DryRun.
+// KubeConfig returns a kubeconfig after loading it from KubeConfigPath().
+// If the default kubeconfig path is used (admin.conf), instead of constructing
+// a kubeconfig that points to the control plane endpoint, make it point to the localAPIEndpoint.
+// This would allow 'kubeadm init' to only talk to the local kube-apiserver instance.
+func (d *initData) KubeConfig() (*clientcmdapi.Config, error) {
+	if d.kubeconfig != nil {
+		return d.kubeconfig, nil
+	}
+
+	var err error
+	d.kubeconfig, err = clientcmd.LoadFromFile(d.KubeConfigPath())
+	if err != nil {
+		return nil, err
+	}
+	d.kubeconfigOriginal = d.kubeconfig.DeepCopy()
+
+	if d.kubeconfigPath == kubeadmconstants.GetAdminKubeConfigPath() {
+		kubeconfigutil.PointKubeConfigToLocalAPIEndpoint(d.kubeconfig, &d.Cfg().LocalAPIEndpoint)
+	}
+
+	return d.kubeconfig, nil
+}
+
+// KubeConfigOriginal returns the original kubeconfig loaded from file, without any modifications.
+func (d *initData) KubeConfigOriginal() (*clientcmdapi.Config, error) {
+	if d.kubeconfigOriginal == nil {
+		if _, err := d.KubeConfig(); err != nil {
+			return nil, err
+		}
+	}
+
+	return d.kubeconfigOriginal, nil
+}
+
+// KubeConfigDir returns the Kubernetes configuration directory or the temporary directory if DryRun is true.
 func (d *initData) KubeConfigDir() string {
 	if d.dryRun {
 		return d.dryRunDir
@@ -453,7 +511,7 @@ func (d *initData) KubeConfigPath() string {
 	return d.kubeconfigPath
 }
 
-// ManifestDir returns the path where manifest should be stored or the temporary folder path in case of DryRun.
+// ManifestDir returns the path where manifest should be stored or the temporary directory if DryRun is true.
 func (d *initData) ManifestDir() string {
 	if d.dryRun {
 		return d.dryRunDir
@@ -461,7 +519,7 @@ func (d *initData) ManifestDir() string {
 	return kubeadmconstants.GetStaticPodDirectory()
 }
 
-// KubeletDir returns path of the kubelet configuration folder or the temporary folder in case of DryRun.
+// KubeletDir returns the kubelet configuration directory or the temporary directory if DryRun is true.
 func (d *initData) KubeletDir() string {
 	if d.dryRun {
 		return d.dryRunDir
@@ -479,25 +537,60 @@ func (d *initData) OutputWriter() io.Writer {
 	return d.outputWriter
 }
 
+// getDryRunClient creates a fake client that answers some GET calls in order to be able to do the full init flow in dry-run mode.
+func getDryRunClient(d *initData) (clientset.Interface, error) {
+	kubeconfig, err := d.KubeConfig()
+	if err != nil {
+		return nil, err
+	}
+	dryRun := apiclient.NewDryRun()
+	if err := dryRun.WithKubeConfig(kubeconfig); err != nil {
+		return nil, err
+	}
+	dryRun.WithDefaultMarshalFunction().
+		WithWriter(os.Stdout).
+		PrependReactor(dryRun.GetNodeReactor()).
+		PrependReactor(dryRun.PatchNodeReactor())
+
+	return dryRun.FakeClient(), nil
+}
+
 // Client returns a Kubernetes client to be used by kubeadm.
 // This function is implemented as a singleton, thus avoiding to recreate the client when it is used by different phases.
 // Important. This function must be called after the admin.conf kubeconfig file is created.
 func (d *initData) Client() (clientset.Interface, error) {
+	var err error
 	if d.client == nil {
 		if d.dryRun {
-			svcSubnetCIDR, err := kubeadmconstants.GetKubernetesServiceCIDR(d.cfg.Networking.ServiceSubnet)
-			if err != nil {
-				return nil, errors.Wrapf(err, "unable to get internal Kubernetes Service IP from the given service CIDR (%s)", d.cfg.Networking.ServiceSubnet)
-			}
-			// If we're dry-running, we should create a faked client that answers some GETs in order to be able to do the full init flow and just logs the rest of requests
-			dryRunGetter := apiclient.NewInitDryRunGetter(d.cfg.NodeRegistration.Name, svcSubnetCIDR.String())
-			d.client = apiclient.NewDryRunClient(dryRunGetter, os.Stdout)
-		} else {
-			// If we're acting for real, we should create a connection to the API server and wait for it to come up
-			var err error
-			d.client, err = kubeconfigutil.ClientSetFromFile(d.KubeConfigPath())
+			d.client, err = getDryRunClient(d)
 			if err != nil {
 				return nil, err
+			}
+		} else { // Use a real client
+			isDefaultKubeConfigPath := d.KubeConfigPath() == kubeadmconstants.GetAdminKubeConfigPath()
+			// Only bootstrap the admin.conf if it's used by the user (i.e. --kubeconfig has its default value)
+			// and if the bootstrapping was not already done
+			if !d.adminKubeConfigBootstrapped && isDefaultKubeConfigPath {
+				// Call EnsureAdminClusterRoleBinding() to obtain a working client from admin.conf.
+				d.client, err = kubeconfigphase.EnsureAdminClusterRoleBinding(
+					kubeadmconstants.KubernetesDir,
+					&d.Cfg().LocalAPIEndpoint,
+					nil,
+				)
+				if err != nil {
+					return nil, errors.Wrapf(err, "could not bootstrap the admin user in file %s", kubeadmconstants.AdminKubeConfigFileName)
+				}
+				d.adminKubeConfigBootstrapped = true
+			} else {
+				// Alternatively, just load the config pointed at the --kubeconfig path
+				cfg, err := d.KubeConfig()
+				if err != nil {
+					return nil, err
+				}
+				d.client, err = kubeconfigutil.ToClientSet(cfg)
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -506,7 +599,7 @@ func (d *initData) Client() (clientset.Interface, error) {
 
 // Tokens returns an array of token strings.
 func (d *initData) Tokens() []string {
-	tokens := []string{}
+	tokens := make([]string, 0, len(d.cfg.BootstrapTokens))
 	for _, bt := range d.cfg.BootstrapTokens {
 		tokens = append(tokens, bt.Token.String())
 	}
@@ -523,4 +616,39 @@ func (d *initData) PatchesDir() string {
 		return d.cfg.Patches.Directory
 	}
 	return ""
+}
+
+// manageSkippedAddons syncs proxy and DNS "Disabled" status and skipPhases.
+func manageSkippedAddons(cfg *kubeadmapi.ClusterConfiguration, skipPhases []string) []string {
+	var (
+		skipDNSPhase   = false
+		skipProxyPhase = false
+	)
+	// If the DNS or Proxy addons are disabled, skip the corresponding phase.
+	// Alternatively, update the proxy and DNS "Disabled" status based on skipped addon phases.
+	if isPhaseInSkipPhases(addonPhase, skipPhases) {
+		skipDNSPhase = true
+		skipProxyPhase = true
+		cfg.DNS.Disabled = true
+		cfg.Proxy.Disabled = true
+	}
+	if isPhaseInSkipPhases(coreDNSPhase, skipPhases) {
+		skipDNSPhase = true
+		cfg.DNS.Disabled = true
+	}
+	if isPhaseInSkipPhases(kubeProxyPhase, skipPhases) {
+		skipProxyPhase = true
+		cfg.Proxy.Disabled = true
+	}
+	if cfg.DNS.Disabled && !skipDNSPhase {
+		skipPhases = append(skipPhases, coreDNSPhase)
+	}
+	if cfg.Proxy.Disabled && !skipProxyPhase {
+		skipPhases = append(skipPhases, kubeProxyPhase)
+	}
+	return skipPhases
+}
+
+func isPhaseInSkipPhases(phase string, skipPhases []string) bool {
+	return slices.Contains(skipPhases, phase)
 }

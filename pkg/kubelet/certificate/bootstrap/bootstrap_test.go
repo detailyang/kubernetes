@@ -17,7 +17,6 @@ limitations under the License.
 package bootstrap
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -26,6 +25,7 @@ import (
 	"testing"
 
 	utiltesting "k8s.io/client-go/util/testing"
+	"k8s.io/ktesting"
 
 	"github.com/google/go-cmp/cmp"
 	certificatesv1 "k8s.io/api/certificates/v1"
@@ -195,7 +195,8 @@ users:
 		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
 	}
 
-	store, err := certificate.NewFileStore("kubelet-client", dir, dir, "", "")
+	logger, _ := ktesting.NewTestContext(t)
+	store, err := certificate.NewFileStoreWithLogger(logger, "kubelet-client", dir, dir, "", "")
 	if err != nil {
 		t.Errorf("unable to build bootstrap cert store")
 	}
@@ -275,7 +276,7 @@ users:
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			certConfig, clientConfig, err := LoadClientConfig(test.kubeconfigPath, test.bootstrapPath, test.certDir)
+			certConfig, clientConfig, err := LoadClientConfig(logger, test.kubeconfigPath, test.bootstrapPath, test.certDir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -348,7 +349,8 @@ users:
 }
 
 func TestRequestNodeCertificateNoKeyData(t *testing.T) {
-	certData, err := requestNodeCertificate(context.TODO(), newClientset(fakeClient{}), []byte{}, "fake-node-name")
+	tCtx := ktesting.Init(t)
+	certData, err := requestNodeCertificate(tCtx, newClientset(tCtx, fakeClient{}), []byte{}, "fake-node-name")
 	if err == nil {
 		t.Errorf("Got no error, wanted error an error because there was an empty private key passed in.")
 	}
@@ -358,7 +360,8 @@ func TestRequestNodeCertificateNoKeyData(t *testing.T) {
 }
 
 func TestRequestNodeCertificateErrorCreatingCSR(t *testing.T) {
-	client := newClientset(fakeClient{
+	tCtx := ktesting.Init(t)
+	client := newClientset(tCtx, fakeClient{
 		failureType: createError,
 	})
 	privateKeyData, err := keyutil.MakeEllipticPrivateKeyPEM()
@@ -366,7 +369,7 @@ func TestRequestNodeCertificateErrorCreatingCSR(t *testing.T) {
 		t.Fatalf("Unable to generate a new private key: %v", err)
 	}
 
-	certData, err := requestNodeCertificate(context.TODO(), client, privateKeyData, "fake-node-name")
+	certData, err := requestNodeCertificate(tCtx, client, privateKeyData, "fake-node-name")
 	if err == nil {
 		t.Errorf("Got no error, wanted error an error because client.Create failed.")
 	}
@@ -376,12 +379,13 @@ func TestRequestNodeCertificateErrorCreatingCSR(t *testing.T) {
 }
 
 func TestRequestNodeCertificate(t *testing.T) {
+	tCtx := ktesting.Init(t)
 	privateKeyData, err := keyutil.MakeEllipticPrivateKeyPEM()
 	if err != nil {
 		t.Fatalf("Unable to generate a new private key: %v", err)
 	}
 
-	certData, err := requestNodeCertificate(context.TODO(), newClientset(fakeClient{}), privateKeyData, "fake-node-name")
+	certData, err := requestNodeCertificate(tCtx, newClientset(tCtx, fakeClient{}), privateKeyData, "fake-node-name")
 	if err != nil {
 		t.Errorf("Got %v, wanted no error.", err)
 	}
@@ -393,7 +397,7 @@ func TestRequestNodeCertificate(t *testing.T) {
 type failureType int
 
 const (
-	noError failureType = iota //nolint:deadcode,varcheck
+	noError failureType = iota
 	createError
 	certificateSigningRequestDenied
 )
@@ -403,7 +407,7 @@ type fakeClient struct {
 	failureType failureType
 }
 
-func newClientset(opts fakeClient) *fake.Clientset {
+func newClientset(tCtx ktesting.TContext, opts fakeClient) *fake.Clientset {
 	f := fake.NewSimpleClientset()
 	switch opts.failureType {
 	case createError:
@@ -435,7 +439,7 @@ func newClientset(opts fakeClient) *fake.Clientset {
 		f.PrependWatchReactor("certificatesigningrequests", func(action clienttesting.Action) (handled bool, ret watch.Interface, err error) {
 			switch action.GetResource().Version {
 			case "v1":
-				w := watch.NewFakeWithChanSize(1, false)
+				w := watch.NewFakeWithOptions(watch.FakeOptions{ChannelSize: 1, Logger: new(tCtx.Logger())})
 				w.Add(opts.generateCSR())
 				w.Stop()
 				return true, w, nil

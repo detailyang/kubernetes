@@ -47,6 +47,11 @@ func (fakeTestDeps) ImportPath() string {
 }
 
 //nolint:unused // U1000 see comment above, we know it's unused normally.
+func (fakeTestDeps) ModulePath() string {
+	return ""
+}
+
+//nolint:unused // U1000 see comment above, we know it's unused normally.
 func (fakeTestDeps) MatchString(pat, str string) (bool, error) {
 	return false, nil
 }
@@ -105,3 +110,8 @@ func (fakeTestDeps) ResetCoverage() {}
 
 //nolint:unused // U1000 see comment above, we know it's unused normally.
 func (fakeTestDeps) SnapshotCoverage() {}
+
+//nolint:unused // U1000 see comment above, we know it's unused normally.
+func (fakeTestDeps) InitRuntimeCoverage() (mode string, tearDown func(string, string) (string, error), snapcov func() float64) {
+	return "", nil, nil
+}

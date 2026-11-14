@@ -19,7 +19,7 @@ package main
 import (
 	"os"
 
-	genericapiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/server/signals"
 	"k8s.io/component-base/cli"
 	"k8s.io/kube-aggregator/pkg/cmd/server"
 
@@ -32,9 +32,9 @@ import (
 )
 
 func main() {
-	stopCh := genericapiserver.SetupSignalHandler()
+	ctx := signals.SetupSignalContext()
 	options := server.NewDefaultOptions(os.Stdout, os.Stderr)
-	cmd := server.NewCommandStartAggregator(options, stopCh)
+	cmd := server.NewCommandStartAggregator(ctx, options)
 	code := cli.Run(cmd)
 	os.Exit(code)
 }

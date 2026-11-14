@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2eendpointslice "k8s.io/kubernetes/test/e2e/framework/endpointslice"
 	e2ekubectl "k8s.io/kubernetes/test/e2e/framework/kubectl"
 	e2enetwork "k8s.io/kubernetes/test/e2e/framework/network"
 	e2eoutput "k8s.io/kubernetes/test/e2e/framework/pod/output"
@@ -81,7 +82,7 @@ func DescribeSvc(ns string) {
 	framework.Logf("\nOutput of kubectl describe svc:\n")
 	desc, _ := e2ekubectl.RunKubectl(
 		ns, "describe", "svc", fmt.Sprintf("--namespace=%v", ns))
-	framework.Logf(desc)
+	framework.Logf("%s", desc)
 }
 
 // CheckSCTPModuleLoadedOnNodes checks whether any node on the list has the
@@ -182,6 +183,36 @@ func execHostnameTest(sourcePod v1.Pod, targetAddr, targetHostname string) {
 	gomega.Expect(hostname).To(gomega.Equal(targetHostname))
 }
 
+// execNodenameTest executes curl to access "/envvar?var=NODE_NAME" endpoint on target address
+// from given Pod. Unlike execHostnameTest it does not strip FQDN suffixes because Kubernetes
+// node names are always short identifiers, not FQDNs.
+// xref: https://issues.k8s.io/121018
+func execNodenameTest(sourcePod v1.Pod, targetAddr, expectedNodeName string) {
+	var (
+		err     error
+		stdout  string
+		timeout = 2 * time.Minute
+	)
+
+	framework.Logf("Waiting up to %v to get response from %s", timeout, targetAddr)
+	cmd := fmt.Sprintf(`curl -q -s --max-time 30 '%s/envvar?var=NODE_NAME'`, targetAddr)
+	for start := time.Now(); time.Since(start) < timeout; time.Sleep(2 * time.Second) {
+		stdout, err = e2eoutput.RunHostCmd(sourcePod.Namespace, sourcePod.Name, cmd)
+		if err != nil {
+			framework.Logf("got err: %v, retry until timeout", err)
+			continue
+		}
+		if strings.TrimSpace(stdout) == "" {
+			framework.Logf("got empty stdout, retry until timeout")
+			continue
+		}
+		break
+	}
+
+	framework.ExpectNoError(err, "not able to connect to %s after %v", targetAddr, timeout)
+	gomega.Expect(strings.TrimSpace(stdout)).To(gomega.Equal(expectedNodeName))
+}
+
 // createSecondNodePortService creates a service with the same selector as config.NodePortService and same HTTP Port
 func createSecondNodePortService(ctx context.Context, f *framework.Framework, config *e2enetwork.NetworkingTestConfig) (*v1.Service, int) {
 	svc := &v1.Service{
@@ -204,7 +235,7 @@ func createSecondNodePortService(ctx context.Context, f *framework.Framework, co
 
 	createdService := config.CreateService(ctx, svc)
 
-	err := framework.WaitForServiceEndpointsNum(ctx, f.ClientSet, config.Namespace, secondNodePortSvcName, len(config.EndpointPods), time.Second, wait.ForeverTestTimeout)
+	err := e2eendpointslice.WaitForEndpointCount(ctx, f.ClientSet, config.Namespace, secondNodePortSvcName, len(config.EndpointPods))
 	framework.ExpectNoError(err, "failed to validate endpoints for service %s in namespace: %s", secondNodePortSvcName, config.Namespace)
 
 	var httpPort int
@@ -233,7 +264,7 @@ func testEndpointReachability(ctx context.Context, endpoint string, port int32, 
 		return fmt.Errorf("service reachability check is not supported for %v", protocol)
 	}
 
-	err := wait.PollImmediateWithContext(ctx, framework.Poll, timeout, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, framework.Poll, timeout, true, func(ctx context.Context) (bool, error) {
 		stdout, err := e2eoutput.RunHostCmd(execPod.Namespace, execPod.Name, cmd)
 		if err != nil {
 			framework.Logf("Service reachability failing with error: %v\nRetrying...", err)

@@ -26,10 +26,6 @@ import (
 )
 
 const (
-	// SchedulerPolicyConfigMapKey defines the key of the element in the
-	// scheduler's policy ConfigMap that contains scheduler's policy config.
-	SchedulerPolicyConfigMapKey = "policy.cfg"
-
 	// DefaultKubeSchedulerPort is the default port for the scheduler status server.
 	// May be overridden by a flag at startup.
 	DefaultKubeSchedulerPort = 10259
@@ -58,10 +54,6 @@ type KubeSchedulerConfiguration struct {
 	// ClientConnection specifies the kubeconfig file and client connection
 	// settings for the proxy server to use when communicating with the apiserver.
 	ClientConnection componentbaseconfig.ClientConnectionConfiguration
-	// HealthzBindAddress is the IP address and port for the health check server to serve on.
-	HealthzBindAddress string
-	// MetricsBindAddress is the IP address and port for the metrics server to serve on.
-	MetricsBindAddress string
 
 	// DebuggingConfiguration holds configuration for Debugging related features
 	// TODO: We might wanna make this a substruct like Debugging componentbaseconfig.DebuggingConfiguration
@@ -76,6 +68,23 @@ type KubeSchedulerConfiguration struct {
 	// When the value is 0, default percentage (5%--50% based on the size of the cluster) of the
 	// nodes will be scored. It is overridden by profile level PercentageOfNodesToScore.
 	PercentageOfNodesToScore *int32
+
+	// PercentageOfPlacementsToScore is the percentage of generated placements that the scheduler
+	// tries to find feasible for a PodGroup or CompositePodGroup before it stops searching and
+	// scores them. Valid values are from 0 to 100.
+	// The scheduler always tries to find at least one feasible placement.
+	// Example: if 500 placements are generated and the value is 30, the scheduler stops after
+	// finding 150 feasible placements.
+	// When unset or 0, the scheduler calculates an adaptive percentage based on the sum of node
+	// counts across all generated placements. If placements overlap, a node present in multiple
+	// placements is counted once per placement. The adaptive percentage decreases linearly from
+	// 100% at 0 summed nodes to 10% at 5000 summed nodes, and continues decreasing for larger
+	// sums down to a minimum of 5%.
+	// It is overridden by profile level PercentageOfPlacementsToScore.
+	// This field is only available when the TopologyAwareWorkloadScheduling feature gate is enabled.
+	// +featureGate=TopologyAwareWorkloadScheduling
+	// +optional
+	PercentageOfPlacementsToScore *int32
 
 	// PodInitialBackoffSeconds is the initial backoff for unschedulable pods.
 	// If specified, it must be greater than 0. If this value is null, the default value (1s)
@@ -121,6 +130,24 @@ type KubeSchedulerProfile struct {
 	// nodes will be scored. It will override global PercentageOfNodesToScore. If it is empty,
 	// global PercentageOfNodesToScore will be used.
 	PercentageOfNodesToScore *int32
+
+	// PercentageOfPlacementsToScore is the percentage of generated placements that the scheduler
+	// tries to find feasible for a PodGroup or CompositePodGroup before it stops searching and
+	// scores them. Valid values are from 0 to 100.
+	// The scheduler always tries to find at least one feasible placement.
+	// Example: if 500 placements are generated and the value is 30, the scheduler stops after
+	// finding 150 feasible placements.
+	// When the value is 0, the scheduler calculates an adaptive percentage based on the sum of node
+	// counts across all generated placements. If placements overlap, a node present in multiple
+	// placements is counted once per placement. The adaptive percentage decreases linearly from
+	// 100% at 0 summed nodes to 10% at 5000 summed nodes, and continues decreasing for larger
+	// sums down to a minimum of 5%.
+	// It overrides global PercentageOfPlacementsToScore. If empty, the global
+	// PercentageOfPlacementsToScore is used.
+	// This field is only available when the TopologyAwareWorkloadScheduling feature gate is enabled.
+	// +featureGate=TopologyAwareWorkloadScheduling
+	// +optional
+	PercentageOfPlacementsToScore *int32
 
 	// Plugins specify the set of plugins that should be enabled or disabled.
 	// Enabled plugins are the ones that should be enabled in addition to the
@@ -184,6 +211,19 @@ type Plugins struct {
 
 	// MultiPoint is a simplified config field for enabling plugins for all valid extension points
 	MultiPoint PluginSet
+
+	// PlacementGenerate is a list of plugins that should be invoked during pod group scheduling cycle when determining placements for a pod group.
+	PlacementGenerate PluginSet
+
+	// PlacementScore is a list of plugins that should be invoked during workload scheduling cycle when ranking pod group assignments.
+	PlacementScore PluginSet
+
+	// PlacementFeasible is a list of plugins that should be invoked when evaluating if a placement is feasible for a pod group.
+	PlacementFeasible PluginSet
+
+	// PodGroupPostFilter is a list of plugins that are invoked after the workload scheduling phase,
+	// but only when the PodGroup cannot be scheduled (equivalent to PostFilter for single pods).
+	PodGroupPostFilter PluginSet
 }
 
 // PluginSet specifies enabled and disabled plugins for an extension point.
@@ -197,11 +237,11 @@ type PluginSet struct {
 	Disabled []Plugin
 }
 
-// Plugin specifies a plugin name and its weight when applicable. Weight is used only for Score plugins.
+// Plugin specifies a plugin name and its weight when applicable. Weight is used only for Score and PlacementScore plugins.
 type Plugin struct {
 	// Name defines the name of plugin
 	Name string
-	// Weight defines the weight of plugin, only used for Score plugins.
+	// Weight defines the weight of plugin, only used for Score and PlacementScore plugins.
 	Weight int32
 }
 
@@ -224,6 +264,11 @@ const (
 	// A value of 0 means adaptive, meaning the scheduler figures out a proper default.
 	DefaultPercentageOfNodesToScore = 0
 
+	// DefaultPercentageOfPlacementsToScore is the default percentage of generated placements that
+	// the scheduler tries to find feasible before it stops searching.
+	// A value of 0 means adaptive, meaning the scheduler figures out a proper default.
+	DefaultPercentageOfPlacementsToScore = 0
+
 	// MaxCustomPriorityScore is the max score UtilizationShapePoint expects.
 	MaxCustomPriorityScore int64 = 10
 
@@ -240,6 +285,7 @@ func (p *Plugins) Names() []string {
 		return nil
 	}
 	extensions := []PluginSet{
+		p.MultiPoint,
 		p.PreEnqueue,
 		p.PreFilter,
 		p.Filter,
@@ -252,6 +298,10 @@ func (p *Plugins) Names() []string {
 		p.PostBind,
 		p.Permit,
 		p.QueueSort,
+		p.PlacementGenerate,
+		p.PlacementScore,
+		p.PlacementFeasible,
+		p.PodGroupPostFilter,
 	}
 	n := sets.New[string]()
 	for _, e := range extensions {

@@ -20,9 +20,9 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/common/types/traits"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/types/traits"
 
 	"k8s.io/kube-openapi/pkg/validation/spec"
 )
@@ -97,6 +97,9 @@ var (
 			Type:                 []string{"object"},
 			AdditionalProperties: &spec.SchemaOrBool{Schema: stringSchema},
 		}}
+	emptyObjectSchema = &spec.Schema{
+		SchemaProps: spec.SchemaProps{Type: []string{"object"}},
+	}
 )
 
 func TestEquality(t *testing.T) {
@@ -332,6 +335,12 @@ func TestEquality(t *testing.T) {
 			equal: false,
 		},
 		{
+			name:  "empty objects are equal",
+			lhs:   UnstructuredToVal(map[string]interface{}{}, emptyObjectSchema),
+			rhs:   UnstructuredToVal(map[string]interface{}{}, emptyObjectSchema),
+			equal: true,
+		},
+		{
 			name:  "identical objects are equal",
 			lhs:   UnstructuredToVal(map[string]interface{}{"field1": "a", "field2": "b"}, objectSchema),
 			rhs:   UnstructuredToVal(map[string]interface{}{"field1": "a", "field2": "b"}, objectSchema),
@@ -521,9 +530,18 @@ func TestLister(t *testing.T) {
 			}
 
 			addition := UnstructuredToVal(tc.addition, tc.schema).(traits.Lister)
-			added := lister.Add(addition).Value()
-			if !reflect.DeepEqual(added, tc.expectAdded) {
-				t.Errorf("Expected Add to return %v but got %v", tc.expectAdded, added)
+			added, ok := lister.Add(addition).(traits.Lister)
+			if !ok {
+				t.Fatal("Expected Add to return a list")
+			}
+			if added.Size().Value() != int64(len(tc.expectAdded)) {
+				t.Errorf("Expected Add to return a list of size %d but got %d", len(tc.expectAdded), added.Size().Value())
+			}
+			for i := range tc.expectAdded {
+				expect := UnstructuredToVal(tc.expectAdded[i], tc.itemSchema)
+				if got := added.Get(types.Int(i)); expect.Equal(got) != types.True {
+					t.Errorf("Expected Add result at index %d to equal %v but got %v", i, expect.Value(), got.Value())
+				}
 			}
 		})
 	}
@@ -655,6 +673,27 @@ func BenchmarkUnstructuredToValWithEscape(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		if val := UnstructuredToVal(u, mapListSchema); val == nil {
 			b.Fatal(val)
+		}
+	}
+}
+
+func BenchmarkUnstructuredMapFind(b *testing.B) {
+	obj := map[string]interface{}{
+		"field1": "a",
+		"field2": "b",
+	}
+	mapper := UnstructuredToVal(obj, objectSchema).(traits.Mapper)
+	k1 := types.String("field1")
+	k2 := types.String("field2")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		if _, ok := mapper.Find(k1); !ok {
+			b.Fatal("expected field1")
+		}
+		if _, ok := mapper.Find(k2); !ok {
+			b.Fatal("expected field2")
 		}
 	}
 }

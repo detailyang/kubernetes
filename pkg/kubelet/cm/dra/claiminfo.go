@@ -17,171 +17,454 @@ limitations under the License.
 package dra
 
 import (
+	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 
-	resourcev1alpha2 "k8s.io/api/resource/v1alpha2"
+	"github.com/go-logr/logr"
+
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/component-base/metrics"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cm/dra/state"
-	"k8s.io/kubernetes/pkg/kubelet/cm/util/cdi"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
+	kubeletmetrics "k8s.io/kubernetes/pkg/kubelet/metrics"
 )
 
 // ClaimInfo holds information required
 // to prepare and unprepare a resource claim.
+// +k8s:deepcopy-gen=true
 type ClaimInfo struct {
-	sync.RWMutex
 	state.ClaimInfoState
-	// annotations is a list of container annotations associated with
-	// a prepared resource
-	annotations []kubecontainer.Annotation
+	prepared bool
+	// unpreparing is true from the moment unprepareResources commits to
+	// calling NodeUnprepareResources for the last referencing pod until
+	// the cache entry is deleted. While set, prepareResources must not
+	// attach new pods to this claim: the claim resources are being unprepared
+	// and new pods shouldn't prepare this claim until it has been fully unprepared.
+	unpreparing bool
 }
 
-func (info *ClaimInfo) addPodReference(podUID types.UID) {
-	info.Lock()
-	defer info.Unlock()
+// claimInfoCache is a cache of processed resource claims keyed by namespace/claimname.
+type claimInfoCache struct {
+	sync.RWMutex
+	checkpointer state.Checkpointer
+	claimInfo    map[string]*ClaimInfo
+}
 
+// newClaimInfoFromClaim creates a new claim info from a resource claim.
+// It verifies that the kubelet can handle the claim.
+func newClaimInfoFromClaim(claim *resourceapi.ResourceClaim) (*ClaimInfo, error) {
+	if claim.Status.Allocation == nil {
+		return nil, errors.New("not allocated")
+	}
+
+	driverState, err := computeDriverStates(claim)
+	if err != nil {
+		return nil, err
+	}
+
+	info := &ClaimInfo{
+		ClaimInfoState: state.ClaimInfoState{
+			ClaimUID:    claim.UID,
+			ClaimName:   claim.Name,
+			Namespace:   claim.Namespace,
+			PodUIDs:     sets.New[string](),
+			DriverState: driverState,
+		},
+		prepared: false,
+	}
+	return info, nil
+}
+
+func computeDriverStates(claim *resourceapi.ResourceClaim) (map[string]state.DriverState, error) {
+	devicesPerDriver := make(map[string]int)
+	opCountsPerDriver := make(map[string]map[resourceapi.SkipNodeOperation]int)
+
+	for _, result := range claim.Status.Allocation.Devices.Results {
+		devicesPerDriver[result.Driver]++
+		if len(result.SkipNodeOperations) == 0 {
+			continue
+		}
+		if opCountsPerDriver[result.Driver] == nil {
+			opCountsPerDriver[result.Driver] = make(map[resourceapi.SkipNodeOperation]int)
+		}
+		// SkipNodeOperationAll already subsumes all individual operations for this result.
+		if slices.Contains(result.SkipNodeOperations, resourceapi.SkipNodeOperationAll) {
+			opCountsPerDriver[result.Driver][resourceapi.SkipNodeOperationAll]++
+			continue
+		}
+		// API validation (+listType=set) guarantees slice items are unique.
+		for _, op := range result.SkipNodeOperations {
+			opCountsPerDriver[result.Driver][op]++
+		}
+	}
+
+	driverStates := make(map[string]state.DriverState, len(devicesPerDriver))
+	for driver, total := range devicesPerDriver {
+		var skippedOps []resourceapi.SkipNodeOperation
+		driverOpCounts := opCountsPerDriver[driver]
+		if driverOpCounts != nil {
+			allCount := driverOpCounts[resourceapi.SkipNodeOperationAll]
+			if allCount == total {
+				skippedOps = []resourceapi.SkipNodeOperation{resourceapi.SkipNodeOperationAll}
+			} else {
+				for op, count := range driverOpCounts {
+					if op == resourceapi.SkipNodeOperationAll {
+						continue
+					}
+					if count+allCount == total {
+						skippedOps = append(skippedOps, op)
+					}
+				}
+				slices.Sort(skippedOps)
+			}
+		}
+
+		if len(skippedOps) > 0 && !utilfeature.DefaultFeatureGate.Enabled(features.DRAOptionalNodeOperations) {
+			return nil, errors.New("DRAOptionalNodeOperations feature gate is disabled on kubelet")
+		}
+
+		driverStates[driver] = state.DriverState{
+			SkipNodeOperations: skippedOps,
+		}
+	}
+
+	return driverStates, nil
+}
+
+// newClaimInfoFromClaim creates a new claim info from a checkpointed claim info state object.
+func newClaimInfoFromState(state *state.ClaimInfoState) *ClaimInfo {
+	info := &ClaimInfo{
+		ClaimInfoState: *state.DeepCopy(),
+		prepared:       false,
+	}
+	return info
+}
+
+// setCDIDevices adds a set of CDI devices to the claim info.
+func (info *ClaimInfo) addDevice(driverName string, deviceState state.Device) {
+	if info.DriverState == nil {
+		info.DriverState = make(map[string]state.DriverState)
+	}
+	driverState := info.DriverState[driverName]
+	driverState.Devices = append(driverState.Devices, deviceState)
+	info.DriverState[driverName] = driverState
+}
+
+// resetDevices clears the device list for a given driver, keeping the
+// entry present in DriverState. Used to discard stale devices left over
+// from a previous NodePrepareResources attempt before applying the
+// new response.
+func (info *ClaimInfo) resetDevices(driverName string) {
+	if info.DriverState == nil {
+		return
+	}
+	driverState, ok := info.DriverState[driverName]
+	if !ok {
+		return
+	}
+	driverState.Devices = nil
+	info.DriverState[driverName] = driverState
+}
+
+// addPodReference adds a pod reference to the claim info.
+func (info *ClaimInfo) addPodReference(podUID types.UID) {
 	info.PodUIDs.Insert(string(podUID))
 }
 
-func (info *ClaimInfo) deletePodReference(podUID types.UID) {
-	info.Lock()
-	defer info.Unlock()
+// hasPodReference checks if a pod reference exists in the claim info.
+func (info *ClaimInfo) hasPodReference(podUID types.UID) bool {
+	return info.PodUIDs.Has(string(podUID))
+}
 
+// deletePodReference deletes a pod reference from the claim info.
+func (info *ClaimInfo) deletePodReference(podUID types.UID) {
 	info.PodUIDs.Delete(string(podUID))
 }
 
-func (info *ClaimInfo) addCDIDevices(pluginName string, cdiDevices []string) error {
-	info.Lock()
-	defer info.Unlock()
-
-	// NOTE: Passing CDI device names as annotations is a temporary solution
-	// It will be removed after all runtimes are updated
-	// to get CDI device names from the ContainerConfig.CDIDevices field
-	annotations, err := cdi.GenerateAnnotations(info.ClaimUID, info.DriverName, cdiDevices)
-	if err != nil {
-		return fmt.Errorf("failed to generate container annotations, err: %+v", err)
-	}
-
-	if info.CDIDevices == nil {
-		info.CDIDevices = make(map[string][]string)
-	}
-
-	info.CDIDevices[pluginName] = cdiDevices
-	info.annotations = append(info.annotations, annotations...)
-
-	return nil
+// setPrepared marks the claim info as prepared.
+func (info *ClaimInfo) setPrepared() {
+	info.prepared = true
 }
 
-// claimInfoCache is a cache of processed resource claims keyed by namespace + claim name.
-type claimInfoCache struct {
-	sync.RWMutex
-	state     state.CheckpointState
-	claimInfo map[string]*ClaimInfo
+// isPrepared checks if claim info is prepared or not.
+func (info *ClaimInfo) isPrepared() bool {
+	return info.prepared
 }
 
-func newClaimInfo(driverName, className string, claimUID types.UID, claimName, namespace string, podUIDs sets.Set[string], resourceHandles []resourcev1alpha2.ResourceHandle) *ClaimInfo {
-	claimInfoState := state.ClaimInfoState{
-		DriverName:      driverName,
-		ClassName:       className,
-		ClaimUID:        claimUID,
-		ClaimName:       claimName,
-		Namespace:       namespace,
-		PodUIDs:         podUIDs,
-		ResourceHandles: resourceHandles,
-	}
-	claimInfo := ClaimInfo{
-		ClaimInfoState: claimInfoState,
-	}
-	return &claimInfo
+// setUnpreparing marks the claim info as being torn down, so
+// prepareResources refuses to attach new pods to it.
+func (info *ClaimInfo) setUnpreparing() {
+	info.unpreparing = true
 }
 
-// newClaimInfoCache is a function that returns an instance of the claimInfoCache.
+// isUnpreparing reports whether unprepareResources is in the process
+// of calling NodeUnprepareResources on this claim.
+func (info *ClaimInfo) isUnpreparing() bool {
+	return info.unpreparing
+}
+
+// cdiDevicesAsList returns a list of CDIDevices from the provided claim info.
+// When the request name is non-empty, only devices relevant for that request
+// are returned.
+func (info *ClaimInfo) cdiDevicesAsList(requestName string) []kubecontainer.CDIDevice {
+	var cdiDevices []kubecontainer.CDIDevice
+	for _, driverData := range info.DriverState {
+		for _, device := range driverData.Devices {
+			if requestName == "" || len(device.RequestNames) == 0 || slices.Contains(device.RequestNames, requestName) {
+				for _, cdiDeviceID := range device.CDIDeviceIDs {
+					cdiDevices = append(cdiDevices, kubecontainer.CDIDevice{Name: cdiDeviceID})
+				}
+			}
+		}
+	}
+	return cdiDevices
+}
+
+// newClaimInfoCache creates a new claim info cache object, pre-populated from a checkpoint (if present).
 func newClaimInfoCache(stateDir, checkpointName string) (*claimInfoCache, error) {
-	stateImpl, err := state.NewCheckpointState(stateDir, checkpointName)
+	checkpointer, err := state.NewCheckpointer(stateDir, checkpointName)
 	if err != nil {
-		return nil, fmt.Errorf("could not initialize checkpoint manager, please drain node and remove dra state file, err: %+v", err)
+		return nil, fmt.Errorf("could not initialize checkpoint manager, please drain node and remove DRA state file, err: %w", err)
 	}
 
-	curState, err := stateImpl.GetOrCreate()
+	checkpoint, err := checkpointer.GetOrCreate()
 	if err != nil {
-		return nil, fmt.Errorf("error calling GetOrCreate() on checkpoint state: %v", err)
+		return nil, fmt.Errorf("GetOrCreate() on checkpoint state: %w", err)
 	}
 
 	cache := &claimInfoCache{
-		state:     stateImpl,
-		claimInfo: make(map[string]*ClaimInfo),
+		checkpointer: checkpointer,
+		claimInfo:    make(map[string]*ClaimInfo),
 	}
 
-	for _, entry := range curState {
-		info := newClaimInfo(
-			entry.DriverName,
-			entry.ClassName,
-			entry.ClaimUID,
-			entry.ClaimName,
-			entry.Namespace,
-			entry.PodUIDs,
-			entry.ResourceHandles,
-		)
-		for pluginName, cdiDevices := range entry.CDIDevices {
-			err := info.addCDIDevices(pluginName, cdiDevices)
-			if err != nil {
-				return nil, fmt.Errorf("failed to add CDIDevices to claimInfo %+v: %+v", info, err)
-			}
-		}
-		cache.add(info)
+	entries, err := checkpoint.GetClaimInfoStateList()
+	if err != nil {
+		return nil, fmt.Errorf("GetEntries() on checkpoint: %w", err)
+
+	}
+	for _, entry := range entries {
+		info := newClaimInfoFromState(&entry)
+		cache.claimInfo[info.Namespace+"/"+info.ClaimName] = info
 	}
 
 	return cache, nil
 }
 
-func (cache *claimInfoCache) add(res *ClaimInfo) {
+// withLock runs a function while holding the claimInfoCache lock.
+// It logs changes.
+func (cache *claimInfoCache) withLock(logger klog.Logger, f func() error) error {
+	logger = logger.WithName("dra-claiminfo")
 	cache.Lock()
 	defer cache.Unlock()
 
-	cache.claimInfo[res.ClaimName+res.Namespace] = res
+	if loggerV := logger.V(5); loggerV.Enabled() {
+		claimsInUseBefore := cache.claimsInUse()
+		defer func() {
+			claimsInUseAfter := cache.claimsInUse()
+			delta := claimsInUseDelta(claimsInUseBefore, claimsInUseAfter)
+
+			changed := false
+			for _, inUse := range delta {
+				if inUse.Delta != 0 {
+					changed = true
+					break
+				}
+			}
+
+			if changed {
+				logger.V(5).Info("ResourceClaim usage changed", "claimsInUse", delta)
+			}
+		}()
+	}
+
+	return f()
 }
 
-func (cache *claimInfoCache) get(claimName, namespace string) *ClaimInfo {
+// withRLock runs a function while holding the claimInfoCache rlock.
+func (cache *claimInfoCache) withRLock(f func() error) error {
 	cache.RLock()
 	defer cache.RUnlock()
-
-	return cache.claimInfo[claimName+namespace]
+	return f()
 }
 
-func (cache *claimInfoCache) delete(claimName, namespace string) {
-	cache.Lock()
-	defer cache.Unlock()
+// add adds a new claim info object into the claim info cache.
+func (cache *claimInfoCache) add(info *ClaimInfo) {
+	cache.claimInfo[info.Namespace+"/"+info.ClaimName] = info
+}
 
-	delete(cache.claimInfo, claimName+namespace)
+// contains checks to see if a specific claim info object is already in the cache.
+func (cache *claimInfoCache) contains(claimName, namespace string) bool {
+	_, exists := cache.claimInfo[namespace+"/"+claimName]
+	return exists
+}
+
+// get gets a specific claim info object from the cache.
+func (cache *claimInfoCache) get(claimName, namespace string) (*ClaimInfo, bool) {
+	info, exists := cache.claimInfo[namespace+"/"+claimName]
+	return info, exists
+}
+
+// delete deletes a specific claim info object from the cache.
+func (cache *claimInfoCache) delete(claimName, namespace string) {
+	delete(cache.claimInfo, namespace+"/"+claimName)
 }
 
 // hasPodReference checks if there is at least one claim
 // that is referenced by the pod with the given UID
 // This function is used indirectly by the status manager
 // to check if pod can enter termination status
-func (cache *claimInfoCache) hasPodReference(UID types.UID) bool {
-	cache.RLock()
-	defer cache.RUnlock()
-
+func (cache *claimInfoCache) hasPodReference(uid types.UID) bool {
 	for _, claimInfo := range cache.claimInfo {
-		if claimInfo.PodUIDs.Has(string(UID)) {
+		if claimInfo.hasPodReference(uid) {
 			return true
 		}
 	}
-
 	return false
 }
 
-func (cache *claimInfoCache) syncToCheckpoint() error {
-	cache.RLock()
-	defer cache.RUnlock()
+// claimNamesForPod returns the names of all claims referenced by the pod with
+// the given UID. The claim info cache is the authoritative record of what was
+// prepared for the pod (it is checkpointed and survives kubelet restarts), so
+// this does not depend on pod.Status.ResourceClaimStatuses being present.
+//
+// Must be called while the rlock is held.
+func (cache *claimInfoCache) claimNamesForPod(uid types.UID) []string {
+	var claimNames []string
+	for _, claimInfo := range cache.claimInfo {
+		if claimInfo.hasPodReference(uid) {
+			claimNames = append(claimNames, claimInfo.ClaimName)
+		}
+	}
+	return claimNames
+}
 
+// syncToCheckpoint syncs the full claim info cache state to a checkpoint.
+func (cache *claimInfoCache) syncToCheckpoint() error {
 	claimInfoStateList := make(state.ClaimInfoStateList, 0, len(cache.claimInfo))
 	for _, infoClaim := range cache.claimInfo {
 		claimInfoStateList = append(claimInfoStateList, infoClaim.ClaimInfoState)
 	}
+	checkpoint, err := state.NewCheckpoint(claimInfoStateList)
+	if err != nil {
+		return err
+	}
+	return cache.checkpointer.Store(checkpoint)
+}
 
-	return cache.state.Store(claimInfoStateList)
+// claimsInUse computes the the current counter vector for DRAResourceClaimsInUse.
+// It returns a map of driver name to number of claims which have been prepared using
+// the driver. The [kubeletmetrics.DRAResourceClaimsInUseAnyDriver] key stands for
+// all prepared claims.
+//
+// Must be called while the rlock is held.
+func (cache *claimInfoCache) claimsInUse() map[string]int {
+	counts := make(map[string]int)
+	total := 0
+	for _, claimInfo := range cache.claimInfo {
+		if !claimInfo.isPrepared() {
+			continue
+		}
+		total++
+
+		for driverName := range claimInfo.DriverState {
+			counts[driverName]++
+		}
+	}
+	counts[kubeletmetrics.DRAResourceClaimsInUseAnyDriver] = total
+	return counts
+}
+
+// claimsInUseDelta compares two maps returned by claimsInUse.
+// The type can be used as value in structured logging.
+func claimsInUseDelta(before, after map[string]int) ClaimsInUseDelta {
+	var delta ClaimsInUseDelta
+	for driverName, count := range before {
+		if _, stillSet := after[driverName]; !stillSet {
+			delta = append(delta, ClaimsInUse{DriverName: driverName, Count: 0, Delta: -count})
+		}
+	}
+	for driverName, count := range after {
+		delta = append(delta, ClaimsInUse{DriverName: driverName, Count: count, Delta: count - before[driverName]})
+	}
+	return delta
+}
+
+// ClaimsInUseDelta provides String (for text logging) and MarshalLog (for structured logging).
+type ClaimsInUseDelta []ClaimsInUse
+
+var _ fmt.Stringer = ClaimsInUseDelta{}
+var _ logr.Marshaler = ClaimsInUseDelta{}
+
+func (d ClaimsInUseDelta) String() string {
+	d = d.sort()
+	var buffer strings.Builder
+	for i, inUse := range d {
+		if i > 0 {
+			buffer.WriteByte('\n')
+		}
+		buffer.WriteString(fmt.Sprintf("%s: %d (%+d)", inUse.DriverName, inUse.Count, inUse.Delta))
+	}
+	return buffer.String()
+}
+
+func (d ClaimsInUseDelta) MarshalLog() any {
+	d = d.sort()
+	return []ClaimsInUse(d)
+}
+
+// sort returns a sorted copy of the slice.
+func (d ClaimsInUseDelta) sort() ClaimsInUseDelta {
+	d = slices.Clone(d)
+	slices.SortFunc(d, func(a, b ClaimsInUse) int {
+		return strings.Compare(a.DriverName, b.DriverName)
+	})
+	return d
+}
+
+type ClaimsInUse struct {
+	DriverName string
+	Count      int
+	Delta      int
+}
+
+// claimInfoCollector provides metrics for a claimInfoCache.
+type claimInfoCollector struct {
+	metrics.BaseStableCollector
+	cache *claimInfoCache
+}
+
+var _ metrics.StableCollector = &claimInfoCollector{}
+
+// DescribeWithStability implements the metrics.StableCollector interface.
+func (collector *claimInfoCollector) DescribeWithStability(ch chan<- *metrics.Desc) {
+	ch <- kubeletmetrics.DRAResourceClaimsInUseDesc
+}
+
+// CollectWithStability implements the metrics.StableCollector interface.
+func (collector *claimInfoCollector) CollectWithStability(ch chan<- metrics.Metric) {
+	var claimsInUse map[string]int
+	_ = collector.cache.withRLock(func() error {
+		claimsInUse = collector.cache.claimsInUse()
+		return nil
+	})
+
+	// Only currently known drivers are listed. If a driver had active
+	// claims in the past, no longer does and then gets uninstalled, it no
+	// longer shows up. This avoids the memory leak problem in a normal
+	// GaugeVec which could grow over time unless obsolete drivers are
+	// actively deleted.
+	//
+	// The empty driver name provides the overall count of all active
+	// ResourceClaims regardless of the driver.
+	for driverName, count := range claimsInUse {
+		ch <- metrics.NewLazyConstMetric(kubeletmetrics.DRAResourceClaimsInUseDesc, metrics.GaugeValue, float64(count), driverName)
+	}
 }

@@ -17,24 +17,30 @@ limitations under the License.
 package validation
 
 import (
+	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/robfig/cron/v3"
-
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apimachineryapivalidation "k8s.io/apimachinery/pkg/api/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	unversionedvalidation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	apimachineryvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/component-helpers/scheduling/schedulingv1/workloadbuilder"
+	jobutil "k8s.io/kubernetes/pkg/api/job"
 	"k8s.io/kubernetes/pkg/apis/batch"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	apivalidation "k8s.io/kubernetes/pkg/apis/core/validation"
-	"k8s.io/utils/pointer"
+	apischeduling "k8s.io/kubernetes/pkg/apis/scheduling"
+	"k8s.io/kubernetes/pkg/util/parsers"
+	"k8s.io/utils/ptr"
 )
 
 // maxParallelismForIndexJob is the maximum parallelism that an Indexed Job
@@ -60,27 +66,35 @@ const (
 
 	// maximum number of patterns for a OnPodConditions requirement in pod failure policy
 	maxPodFailurePolicyOnPodConditionsPatterns = 20
+
+	// maximum length of the value of the managedBy field
+	maxManagedByLength = 63
+
+	// maximum length of succeededIndexes in JobSuccessPolicy.
+	maxJobSuccessPolicySucceededIndexesLimit = 64 * 1024
+	// maximum number of rules in successPolicy.
+	maxSuccessPolicyRule = 20
 )
 
 var (
 	supportedPodFailurePolicyActions = sets.New(
-		string(batch.PodFailurePolicyActionCount),
-		string(batch.PodFailurePolicyActionFailIndex),
-		string(batch.PodFailurePolicyActionFailJob),
-		string(batch.PodFailurePolicyActionIgnore))
+		batch.PodFailurePolicyActionCount,
+		batch.PodFailurePolicyActionFailIndex,
+		batch.PodFailurePolicyActionFailJob,
+		batch.PodFailurePolicyActionIgnore)
 
 	supportedPodFailurePolicyOnExitCodesOperator = sets.New(
-		string(batch.PodFailurePolicyOnExitCodesOpIn),
-		string(batch.PodFailurePolicyOnExitCodesOpNotIn))
+		batch.PodFailurePolicyOnExitCodesOpIn,
+		batch.PodFailurePolicyOnExitCodesOpNotIn)
 
 	supportedPodFailurePolicyOnPodConditionsStatus = sets.New(
-		string(api.ConditionFalse),
-		string(api.ConditionTrue),
-		string(api.ConditionUnknown))
+		api.ConditionFalse,
+		api.ConditionTrue,
+		api.ConditionUnknown)
 
 	supportedPodReplacementPolicy = sets.New(
-		string(batch.Failed),
-		string(batch.TerminatingOrFailed))
+		batch.Failed,
+		batch.TerminatingOrFailed)
 )
 
 // validateGeneratedSelector validates that the generated selector on a controller object match the controller object
@@ -137,12 +151,19 @@ func validateGeneratedSelector(obj *batch.Job, validateBatchLabels bool) field.E
 	return allErrs
 }
 
-// ValidateJob validates a Job and returns an ErrorList with any errors.
-func ValidateJob(job *batch.Job, opts JobValidationOptions) field.ErrorList {
+// ValidateJobCreate validates a Job and returns an ErrorList with any errors.
+func ValidateJobCreate(job *batch.Job, opts JobValidationOptions) field.ErrorList {
 	// Jobs and rcs have the same name validation
-	allErrs := apivalidation.ValidateObjectMeta(&job.ObjectMeta, true, apivalidation.ValidateReplicationControllerName, field.NewPath("metadata"))
+	allErrs := apivalidation.ValidateObjectMeta(&job.ObjectMeta, true, apimachineryapivalidation.NameIsDNSSubdomain, field.NewPath("metadata"))
 	allErrs = append(allErrs, validateGeneratedSelector(job, opts.RequirePrefixedLabels)...)
-	allErrs = append(allErrs, ValidateJobSpec(&job.Spec, field.NewPath("spec"), opts.PodValidationOptions)...)
+	allErrs = append(allErrs, ValidateJobSpec(&job.Spec, nil, field.NewPath("spec"), opts.PodValidationOptions)...)
+	allErrs = append(allErrs, validateSchedulingAndDelegationAnnotations(&job.ObjectMeta, nil, &job.Spec, nil, field.NewPath("spec", "scheduling"))...)
+	allErrs = append(allErrs, validateDelegationAnnotations(&job.ObjectMeta, nil, field.NewPath("metadata", "annotations"))...)
+	allErrs = append(allErrs, validateNameAllowsCompletions(job, opts)...)
+	return allErrs
+}
+func validateNameAllowsCompletions(job *batch.Job, opts JobValidationOptions) field.ErrorList {
+	var allErrs field.ErrorList
 	if job.Spec.CompletionMode != nil && *job.Spec.CompletionMode == batch.IndexedCompletion && job.Spec.Completions != nil && *job.Spec.Completions > 0 {
 		// For indexed job, the job controller appends a suffix (`-$INDEX`)
 		// to the pod hostname when indexed job create pods.
@@ -157,8 +178,9 @@ func ValidateJob(job *batch.Job, opts JobValidationOptions) field.ErrorList {
 }
 
 // ValidateJobSpec validates a JobSpec and returns an ErrorList with any errors.
-func ValidateJobSpec(spec *batch.JobSpec, fldPath *field.Path, opts apivalidation.PodValidationOptions) field.ErrorList {
-	allErrs := validateJobSpec(spec, fldPath, opts)
+// oldSpec is nil on create, non-nil on update.
+func ValidateJobSpec(spec, oldSpec *batch.JobSpec, fldPath *field.Path, opts apivalidation.PodValidationOptions) field.ErrorList {
+	allErrs := validateJobSpec(spec, oldSpec, fldPath, opts)
 	if spec.Selector == nil {
 		allErrs = append(allErrs, field.Required(fldPath.Child("selector"), ""))
 	} else {
@@ -178,36 +200,43 @@ func ValidateJobSpec(spec *batch.JobSpec, fldPath *field.Path, opts apivalidatio
 	return allErrs
 }
 
-func validateJobSpec(spec *batch.JobSpec, fldPath *field.Path, opts apivalidation.PodValidationOptions) field.ErrorList {
+// oldSpec is nil on create, non-nil on update.
+func validateJobSpec(spec, oldSpec *batch.JobSpec, fldPath *field.Path, opts apivalidation.PodValidationOptions) field.ErrorList {
 	allErrs := field.ErrorList{}
 
 	if spec.Parallelism != nil {
-		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.Parallelism), fldPath.Child("parallelism"))...)
+		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.Parallelism), fldPath.Child("parallelism")).MarkCoveredByDeclarative()...)
 	}
 	if spec.Completions != nil {
-		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.Completions), fldPath.Child("completions"))...)
+		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.Completions), fldPath.Child("completions")).MarkCoveredByDeclarative()...)
 	}
 	if spec.ActiveDeadlineSeconds != nil {
-		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.ActiveDeadlineSeconds), fldPath.Child("activeDeadlineSeconds"))...)
+		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.ActiveDeadlineSeconds), fldPath.Child("activeDeadlineSeconds")).MarkCoveredByDeclarative()...)
 	}
 	if spec.BackoffLimit != nil {
-		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.BackoffLimit), fldPath.Child("backoffLimit"))...)
+		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.BackoffLimit), fldPath.Child("backoffLimit")).MarkCoveredByDeclarative()...)
 	}
 	if spec.TTLSecondsAfterFinished != nil {
-		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.TTLSecondsAfterFinished), fldPath.Child("ttlSecondsAfterFinished"))...)
+		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.TTLSecondsAfterFinished), fldPath.Child("ttlSecondsAfterFinished")).MarkCoveredByDeclarative()...)
 	}
 	if spec.BackoffLimitPerIndex != nil {
-		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.BackoffLimitPerIndex), fldPath.Child("backoffLimitPerIndex"))...)
+		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.BackoffLimitPerIndex), fldPath.Child("backoffLimitPerIndex")).MarkCoveredByDeclarative()...)
 	}
 	if spec.MaxFailedIndexes != nil {
-		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.MaxFailedIndexes), fldPath.Child("maxFailedIndexes"))...)
+		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.MaxFailedIndexes), fldPath.Child("maxFailedIndexes")).MarkCoveredByDeclarative()...)
 		if spec.BackoffLimitPerIndex == nil {
-			allErrs = append(allErrs, field.Required(fldPath.Child("backoffLimitPerIndex"), fmt.Sprintf("when maxFailedIndexes is specified")))
+			allErrs = append(allErrs, field.Required(fldPath.Child("backoffLimitPerIndex"), "when maxFailedIndexes is specified").WithOrigin("dependentRequired").MarkCoveredByDeclarative())
+		}
+	}
+	if spec.ManagedBy != nil {
+		allErrs = append(allErrs, apimachineryvalidation.IsDomainPrefixedPath(fldPath.Child("managedBy"), *spec.ManagedBy)...)
+		if len(*spec.ManagedBy) > maxManagedByLength {
+			allErrs = append(allErrs, field.TooLong(fldPath.Child("managedBy"), "" /*unused*/, maxManagedByLength))
 		}
 	}
 	if spec.CompletionMode != nil {
 		if *spec.CompletionMode != batch.NonIndexedCompletion && *spec.CompletionMode != batch.IndexedCompletion {
-			allErrs = append(allErrs, field.NotSupported(fldPath.Child("completionMode"), spec.CompletionMode, []string{string(batch.NonIndexedCompletion), string(batch.IndexedCompletion)}))
+			allErrs = append(allErrs, field.NotSupported(fldPath.Child("completionMode"), spec.CompletionMode, []batch.CompletionMode{batch.NonIndexedCompletion, batch.IndexedCompletion}))
 		}
 		if *spec.CompletionMode == batch.IndexedCompletion {
 			if spec.Completions == nil {
@@ -247,8 +276,31 @@ func validateJobSpec(spec *batch.JobSpec, fldPath *field.Path, opts apivalidatio
 	if spec.PodFailurePolicy != nil {
 		allErrs = append(allErrs, validatePodFailurePolicy(spec, fldPath.Child("podFailurePolicy"))...)
 	}
+	if spec.SuccessPolicy != nil {
+		if ptr.Deref(spec.CompletionMode, batch.NonIndexedCompletion) != batch.IndexedCompletion {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("successPolicy"), *spec.SuccessPolicy, "requires indexed completion mode"))
+		} else {
+			allErrs = append(allErrs, validateSuccessPolicy(spec, fldPath.Child("successPolicy"))...)
+		}
+	}
 
 	allErrs = append(allErrs, validatePodReplacementPolicy(spec, fldPath.Child("podReplacementPolicy"))...)
+
+	// The scheduling gang minCount must not exceed parallelism. This runs on both
+	// create and update, and for Jobs embedded in a CronJob jobTemplate. It is a
+	// no-op when spec.scheduling is unset.
+	allErrs = append(allErrs, validateGangMinCount(spec, fldPath.Child("scheduling"))...)
+
+	// Controllers treat a user-supplied schedulingGroup as authoritative, so
+	// spec.scheduling would have no effect. Reject the combination unless the
+	// old object already had both (v1.37 alpha carve-out).
+	allErrs = append(allErrs, validateSchedulingAndSchedulingGroup(spec, oldSpec, fldPath.Child("scheduling"))...)
+
+	// Controller-policy checks that declarative validation cannot express:
+	// the resolved scheduling policy and disruption mode must be in the Job's
+	// allow-lists, and the Basic policy cannot be combined with All disruption.
+	// Structural building-block constraints are enforced by DV.
+	allErrs = append(allErrs, validateJobScheduling(spec, oldSpec, fldPath.Child("scheduling"))...)
 
 	allErrs = append(allErrs, apivalidation.ValidatePodTemplateSpec(&spec.Template, fldPath.Child("template"), opts)...)
 
@@ -260,7 +312,7 @@ func validateJobSpec(spec *batch.JobSpec, fldPath *field.Path, opts apivalidatio
 			fmt.Sprintf("valid values: %q, %q", api.RestartPolicyOnFailure, api.RestartPolicyNever)))
 	} else if spec.Template.Spec.RestartPolicy != api.RestartPolicyOnFailure && spec.Template.Spec.RestartPolicy != api.RestartPolicyNever {
 		allErrs = append(allErrs, field.NotSupported(fldPath.Child("template", "spec", "restartPolicy"),
-			spec.Template.Spec.RestartPolicy, []string{string(api.RestartPolicyOnFailure), string(api.RestartPolicyNever)}))
+			spec.Template.Spec.RestartPolicy, []api.RestartPolicy{api.RestartPolicyOnFailure, api.RestartPolicyNever}))
 	} else if spec.PodFailurePolicy != nil && spec.Template.Spec.RestartPolicy != api.RestartPolicyNever {
 		allErrs = append(allErrs, field.Invalid(fldPath.Child("template", "spec", "restartPolicy"),
 			spec.Template.Spec.RestartPolicy, fmt.Sprintf("only %q is supported when podFailurePolicy is specified", api.RestartPolicyNever)))
@@ -274,15 +326,24 @@ func validatePodFailurePolicy(spec *batch.JobSpec, fldPath *field.Path) field.Er
 	if len(spec.PodFailurePolicy.Rules) > maxPodFailurePolicyRules {
 		allErrs = append(allErrs, field.TooMany(rulesPath, len(spec.PodFailurePolicy.Rules), maxPodFailurePolicyRules))
 	}
-	containerNames := sets.NewString()
+	containerNames := sets.Set[string]{}
 	for _, containerSpec := range spec.Template.Spec.Containers {
 		containerNames.Insert(containerSpec.Name)
 	}
 	for _, containerSpec := range spec.Template.Spec.InitContainers {
 		containerNames.Insert(containerSpec.Name)
 	}
+
+	ruleNames := sets.Set[string]{}
 	for i, rule := range spec.PodFailurePolicy.Rules {
-		allErrs = append(allErrs, validatePodFailurePolicyRule(spec, &rule, rulesPath.Index(i), containerNames)...)
+		rulePath := rulesPath.Index(i)
+		allErrs = append(allErrs, validatePodFailurePolicyRule(spec, &rule, rulePath, containerNames)...)
+		if rule.Name != nil {
+			if ruleNames.Has(*rule.Name) {
+				allErrs = append(allErrs, field.Duplicate(rulePath.Child("name"), *rule.Name))
+			}
+			ruleNames.Insert(*rule.Name)
+		}
 	}
 	return allErrs
 }
@@ -293,17 +354,17 @@ func validatePodReplacementPolicy(spec *batch.JobSpec, fldPath *field.Path) fiel
 		// If PodFailurePolicy is specified then we only allow Failed.
 		if spec.PodFailurePolicy != nil {
 			if *spec.PodReplacementPolicy != batch.Failed {
-				allErrs = append(allErrs, field.NotSupported(fldPath, *spec.PodReplacementPolicy, []string{string(batch.Failed)}))
+				allErrs = append(allErrs, field.NotSupported(fldPath, *spec.PodReplacementPolicy, []batch.PodReplacementPolicy{batch.Failed}))
 			}
 			// If PodFailurePolicy not specified we allow values in supportedPodReplacementPolicy.
-		} else if !supportedPodReplacementPolicy.Has(string(*spec.PodReplacementPolicy)) {
+		} else if !supportedPodReplacementPolicy.Has(*spec.PodReplacementPolicy) {
 			allErrs = append(allErrs, field.NotSupported(fldPath, *spec.PodReplacementPolicy, sets.List(supportedPodReplacementPolicy)))
 		}
 	}
 	return allErrs
 }
 
-func validatePodFailurePolicyRule(spec *batch.JobSpec, rule *batch.PodFailurePolicyRule, rulePath *field.Path, containerNames sets.String) field.ErrorList {
+func validatePodFailurePolicyRule(spec *batch.JobSpec, rule *batch.PodFailurePolicyRule, rulePath *field.Path, containerNames sets.Set[string]) field.ErrorList {
 	var allErrs field.ErrorList
 	actionPath := rulePath.Child("action")
 	if rule.Action == "" {
@@ -312,7 +373,7 @@ func validatePodFailurePolicyRule(spec *batch.JobSpec, rule *batch.PodFailurePol
 		if spec.BackoffLimitPerIndex == nil {
 			allErrs = append(allErrs, field.Invalid(actionPath, rule.Action, "requires the backoffLimitPerIndex to be set"))
 		}
-	} else if !supportedPodFailurePolicyActions.Has(string(rule.Action)) {
+	} else if !supportedPodFailurePolicyActions.Has(rule.Action) {
 		allErrs = append(allErrs, field.NotSupported(actionPath, rule.Action, sets.List(supportedPodFailurePolicyActions)))
 	}
 	if rule.OnExitCodes != nil {
@@ -341,19 +402,19 @@ func validatePodFailurePolicyRuleOnPodConditions(onPodConditions []batch.PodFail
 		allErrs = append(allErrs, apivalidation.ValidateQualifiedName(string(pattern.Type), patternPath.Child("type"))...)
 		if pattern.Status == "" {
 			allErrs = append(allErrs, field.Required(statusPath, fmt.Sprintf("valid values: %q", sets.List(supportedPodFailurePolicyOnPodConditionsStatus))))
-		} else if !supportedPodFailurePolicyOnPodConditionsStatus.Has(string(pattern.Status)) {
+		} else if !supportedPodFailurePolicyOnPodConditionsStatus.Has(pattern.Status) {
 			allErrs = append(allErrs, field.NotSupported(statusPath, pattern.Status, sets.List(supportedPodFailurePolicyOnPodConditionsStatus)))
 		}
 	}
 	return allErrs
 }
 
-func validatePodFailurePolicyRuleOnExitCodes(onExitCode *batch.PodFailurePolicyOnExitCodesRequirement, onExitCodesPath *field.Path, containerNames sets.String) field.ErrorList {
+func validatePodFailurePolicyRuleOnExitCodes(onExitCode *batch.PodFailurePolicyOnExitCodesRequirement, onExitCodesPath *field.Path, containerNames sets.Set[string]) field.ErrorList {
 	var allErrs field.ErrorList
 	operatorPath := onExitCodesPath.Child("operator")
 	if onExitCode.Operator == "" {
 		allErrs = append(allErrs, field.Required(operatorPath, fmt.Sprintf("valid values: %q", sets.List(supportedPodFailurePolicyOnExitCodesOperator))))
-	} else if !supportedPodFailurePolicyOnExitCodesOperator.Has(string(onExitCode.Operator)) {
+	} else if !supportedPodFailurePolicyOnExitCodesOperator.Has(onExitCode.Operator) {
 		allErrs = append(allErrs, field.NotSupported(operatorPath, onExitCode.Operator, sets.List(supportedPodFailurePolicyOnExitCodesOperator)))
 	}
 	if onExitCode.ContainerName != nil && !containerNames.Has(*onExitCode.ContainerName) {
@@ -388,9 +449,54 @@ func validatePodFailurePolicyRuleOnExitCodes(onExitCode *batch.PodFailurePolicyO
 	return allErrs
 }
 
+func validateSuccessPolicy(spec *batch.JobSpec, fldPath *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+	rulesPath := fldPath.Child("rules")
+	if len(spec.SuccessPolicy.Rules) == 0 {
+		allErrs = append(allErrs, field.Required(rulesPath, "at least one rules must be specified when the successPolicy is specified"))
+	}
+	if len(spec.SuccessPolicy.Rules) > maxSuccessPolicyRule {
+		allErrs = append(allErrs, field.TooMany(rulesPath, len(spec.SuccessPolicy.Rules), maxSuccessPolicyRule))
+	}
+	for i, rule := range spec.SuccessPolicy.Rules {
+		allErrs = append(allErrs, validateSuccessPolicyRule(spec, &rule, rulesPath.Index(i))...)
+	}
+	return allErrs
+}
+
+func validateSuccessPolicyRule(spec *batch.JobSpec, rule *batch.SuccessPolicyRule, rulePath *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+	if rule.SucceededCount == nil && rule.SucceededIndexes == nil {
+		allErrs = append(allErrs, field.Required(rulePath, "at least one of succeededCount or succeededIndexes must be specified"))
+	}
+	var totalIndexes int32
+	if rule.SucceededIndexes != nil {
+		succeededIndexes := rulePath.Child("succeededIndexes")
+		if len(*rule.SucceededIndexes) > maxJobSuccessPolicySucceededIndexesLimit {
+			allErrs = append(allErrs, field.TooLong(succeededIndexes, "" /*unused*/, maxJobSuccessPolicySucceededIndexesLimit))
+		}
+		var err error
+		if totalIndexes, err = validateIndexesFormat(*rule.SucceededIndexes, *spec.Completions); err != nil {
+			allErrs = append(allErrs, field.Invalid(succeededIndexes, *rule.SucceededIndexes, fmt.Sprintf("error parsing succeededIndexes: %s", err.Error())))
+		}
+	}
+	if rule.SucceededCount != nil {
+		succeededCountPath := rulePath.Child("succeededCount")
+		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*rule.SucceededCount), succeededCountPath)...)
+		if *rule.SucceededCount > *spec.Completions {
+			allErrs = append(allErrs, field.Invalid(succeededCountPath, *rule.SucceededCount, fmt.Sprintf("must be less than or equal to %d (the number of specified completions)", *spec.Completions)))
+		}
+		if rule.SucceededIndexes != nil && *rule.SucceededCount > totalIndexes {
+			allErrs = append(allErrs, field.Invalid(succeededCountPath, *rule.SucceededCount, fmt.Sprintf("must be less than or equal to %d (the number of indexes in the specified succeededIndexes field)", totalIndexes)))
+		}
+	}
+	return allErrs
+}
+
 // validateJobStatus validates a JobStatus and returns an ErrorList with any errors.
-func validateJobStatus(status *batch.JobStatus, fldPath *field.Path) field.ErrorList {
+func validateJobStatus(job *batch.Job, fldPath *field.Path, opts JobStatusValidationOptions) field.ErrorList {
 	allErrs := field.ErrorList{}
+	status := job.Status
 	allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(status.Active), fldPath.Child("active"))...)
 	allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(status.Succeeded), fldPath.Child("succeeded"))...)
 	allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(status.Failed), fldPath.Child("failed"))...)
@@ -402,27 +508,131 @@ func validateJobStatus(status *batch.JobStatus, fldPath *field.Path) field.Error
 	}
 	if status.UncountedTerminatedPods != nil {
 		path := fldPath.Child("uncountedTerminatedPods")
-		seen := sets.NewString()
+		seen := sets.New[types.UID]()
 		for i, k := range status.UncountedTerminatedPods.Succeeded {
 			p := path.Child("succeeded").Index(i)
 			if k == "" {
 				allErrs = append(allErrs, field.Invalid(p, k, "must not be empty"))
-			} else if seen.Has(string(k)) {
+			} else if seen.Has(k) {
 				allErrs = append(allErrs, field.Duplicate(p, k))
 			} else {
-				seen.Insert(string(k))
+				seen.Insert(k)
 			}
 		}
 		for i, k := range status.UncountedTerminatedPods.Failed {
 			p := path.Child("failed").Index(i)
 			if k == "" {
 				allErrs = append(allErrs, field.Invalid(p, k, "must not be empty"))
-			} else if seen.Has(string(k)) {
+			} else if seen.Has(k) {
 				allErrs = append(allErrs, field.Duplicate(p, k))
 			} else {
-				seen.Insert(string(k))
+				seen.Insert(k)
 			}
 		}
+	}
+	if opts.RejectCompleteJobWithFailedCondition {
+		if IsJobComplete(job) && IsJobFailed(job) {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("conditions"), field.OmitValueType{}, "cannot set Complete=True and Failed=true conditions"))
+		}
+	}
+	if opts.RejectCompleteJobWithFailureTargetCondition {
+		if IsJobComplete(job) && IsConditionTrue(status.Conditions, batch.JobFailureTarget) {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("conditions"), field.OmitValueType{}, "cannot set Complete=True and FailureTarget=true conditions"))
+		}
+	}
+	if opts.RejectNotCompleteJobWithCompletionTime {
+		if status.CompletionTime != nil && !IsJobComplete(job) {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("completionTime"), status.CompletionTime, "cannot set completionTime when there is no Complete=True condition"))
+		}
+	}
+	if opts.RejectCompleteJobWithoutCompletionTime {
+		if status.CompletionTime == nil && IsJobComplete(job) {
+			allErrs = append(allErrs, field.Required(fldPath.Child("completionTime"), "completionTime is required for Complete jobs"))
+		}
+	}
+	if opts.RejectCompletionTimeBeforeStartTime {
+		if status.StartTime != nil && status.CompletionTime != nil && status.CompletionTime.Before(status.StartTime) {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("completionTime"), status.CompletionTime, "must be equal to or after `startTime`"))
+		}
+	}
+	if opts.RejectFailedJobWithoutFailureTarget {
+		if IsJobFailed(job) && !isJobFailureTarget(job) {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("conditions"), field.OmitValueType{}, "cannot set Failed=True condition without the FailureTarget=true condition"))
+		}
+	}
+	if opts.RejectCompleteJobWithoutSuccessCriteriaMet {
+		if IsJobComplete(job) && !isJobSuccessCriteriaMet(job) {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("conditions"), field.OmitValueType{}, "cannot set Complete=True condition without the SuccessCriteriaMet=true condition"))
+		}
+	}
+	isJobFinished := IsJobFinished(job)
+	if opts.RejectFinishedJobWithActivePods {
+		if status.Active > 0 && isJobFinished {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("active"), status.Active, "active>0 is invalid for finished job"))
+		}
+	}
+	if opts.RejectFinishedJobWithoutStartTime {
+		if status.StartTime == nil && isJobFinished {
+			allErrs = append(allErrs, field.Required(fldPath.Child("startTime"), "startTime is required for finished job"))
+		}
+	}
+	if opts.RejectFinishedJobWithUncountedTerminatedPods {
+		if isJobFinished && status.UncountedTerminatedPods != nil && len(status.UncountedTerminatedPods.Failed)+len(status.UncountedTerminatedPods.Succeeded) > 0 {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("uncountedTerminatedPods"), status.UncountedTerminatedPods, "must be empty for finished job"))
+		}
+	}
+	if opts.RejectInvalidCompletedIndexes {
+		if job.Spec.Completions != nil {
+			if _, err := validateIndexesFormat(status.CompletedIndexes, int32(*job.Spec.Completions)); err != nil {
+				allErrs = append(allErrs, field.Invalid(fldPath.Child("completedIndexes"), status.CompletedIndexes, fmt.Sprintf("error parsing completedIndexes: %s", err.Error())))
+			}
+		}
+	}
+	if opts.RejectInvalidFailedIndexes {
+		if job.Spec.Completions != nil && job.Spec.BackoffLimitPerIndex != nil && status.FailedIndexes != nil {
+			if _, err := validateIndexesFormat(*status.FailedIndexes, int32(*job.Spec.Completions)); err != nil {
+				allErrs = append(allErrs, field.Invalid(fldPath.Child("failedIndexes"), status.FailedIndexes, fmt.Sprintf("error parsing failedIndexes: %s", err.Error())))
+			}
+		}
+	}
+	isIndexed := ptr.Deref(job.Spec.CompletionMode, batch.NonIndexedCompletion) == batch.IndexedCompletion
+	if opts.RejectCompletedIndexesForNonIndexedJob {
+		if len(status.CompletedIndexes) != 0 && !isIndexed {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("completedIndexes"), status.CompletedIndexes, "cannot set non-empty completedIndexes when non-indexed completion mode"))
+		}
+	}
+	if opts.RejectFailedIndexesForNoBackoffLimitPerIndex {
+		// Note that this check also verifies that FailedIndexes are not used for
+		// regular (non-indexed) jobs, because regular jobs have backoffLimitPerIndex = nil.
+		if job.Spec.BackoffLimitPerIndex == nil && status.FailedIndexes != nil {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("failedIndexes"), *status.FailedIndexes, "cannot set non-null failedIndexes when backoffLimitPerIndex is null"))
+		}
+	}
+	if opts.RejectFailedIndexesOverlappingCompleted {
+		if job.Spec.Completions != nil && status.FailedIndexes != nil {
+			if err := validateFailedIndexesNotOverlapCompleted(status.CompletedIndexes, *status.FailedIndexes, int32(*job.Spec.Completions)); err != nil {
+				allErrs = append(allErrs, field.Invalid(fldPath.Child("failedIndexes"), *status.FailedIndexes, err.Error()))
+			}
+		}
+	}
+	if opts.RejectFinishedJobWithTerminatingPods {
+		if status.Terminating != nil && *status.Terminating > 0 && isJobFinished {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("terminating"), status.Terminating, "terminating>0 is invalid for finished job"))
+		}
+	}
+	if opts.RejectMoreReadyThanActivePods {
+		if status.Ready != nil && *status.Ready > status.Active {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("ready"), *status.Ready, "cannot set more ready pods than active"))
+		}
+	}
+	if isJobSuccessCriteriaMet(job) && IsJobFailed(job) {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("conditions"), field.OmitValueType{}, "cannot set SuccessCriteriaMet=True and Failed=true conditions"))
+	}
+	if isJobSuccessCriteriaMet(job) && isJobFailureTarget(job) {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("conditions"), field.OmitValueType{}, "cannot set SuccessCriteriaMet=True and FailureTarget=true conditions"))
+	}
+	if job.Spec.SuccessPolicy != nil && !isJobSuccessCriteriaMet(job) && IsJobComplete(job) {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("conditions"), field.OmitValueType{}, "cannot set Complete=True for Job with SuccessPolicy unless SuccessCriteriaMet=True"))
 	}
 	return allErrs
 }
@@ -431,27 +641,225 @@ func validateJobStatus(status *batch.JobStatus, fldPath *field.Path) field.Error
 func ValidateJobUpdate(job, oldJob *batch.Job, opts JobValidationOptions) field.ErrorList {
 	allErrs := apivalidation.ValidateObjectMetaUpdate(&job.ObjectMeta, &oldJob.ObjectMeta, field.NewPath("metadata"))
 	allErrs = append(allErrs, ValidateJobSpecUpdate(job.Spec, oldJob.Spec, field.NewPath("spec"), opts)...)
+	allErrs = append(allErrs, validateSchedulingAndDelegationAnnotations(&job.ObjectMeta, &oldJob.ObjectMeta, &job.Spec, &oldJob.Spec, field.NewPath("spec", "scheduling"))...)
+	allErrs = append(allErrs, validateDelegationAnnotationsUpdate(&job.ObjectMeta, &oldJob.ObjectMeta, field.NewPath("metadata", "annotations"))...)
+	allErrs = append(allErrs, validateNameAllowsCompletions(job, opts)...)
 	return allErrs
 }
 
 // ValidateJobUpdateStatus validates an update to the status of a Job and returns an ErrorList with any errors.
-func ValidateJobUpdateStatus(job, oldJob *batch.Job) field.ErrorList {
+func ValidateJobUpdateStatus(job, oldJob *batch.Job, opts JobStatusValidationOptions) field.ErrorList {
 	allErrs := apivalidation.ValidateObjectMetaUpdate(&job.ObjectMeta, &oldJob.ObjectMeta, field.NewPath("metadata"))
-	allErrs = append(allErrs, ValidateJobStatusUpdate(job.Status, oldJob.Status)...)
+	allErrs = append(allErrs, validateDelegationAnnotationsUpdate(&job.ObjectMeta, &oldJob.ObjectMeta, field.NewPath("metadata", "annotations"))...)
+	allErrs = append(allErrs, ValidateJobStatusUpdate(job, oldJob, opts)...)
 	return allErrs
 }
 
 // ValidateJobSpecUpdate validates an update to a JobSpec and returns an ErrorList with any errors.
 func ValidateJobSpecUpdate(spec, oldSpec batch.JobSpec, fldPath *field.Path, opts JobValidationOptions) field.ErrorList {
 	allErrs := field.ErrorList{}
-	allErrs = append(allErrs, ValidateJobSpec(&spec, fldPath, opts.PodValidationOptions)...)
+	allErrs = append(allErrs, ValidateJobSpec(&spec, &oldSpec, fldPath, opts.PodValidationOptions)...)
 	allErrs = append(allErrs, validateCompletions(spec, oldSpec, fldPath.Child("completions"), opts)...)
 	allErrs = append(allErrs, apivalidation.ValidateImmutableField(spec.Selector, oldSpec.Selector, fldPath.Child("selector"))...)
 	allErrs = append(allErrs, validatePodTemplateUpdate(spec, oldSpec, fldPath, opts)...)
 	allErrs = append(allErrs, apivalidation.ValidateImmutableField(spec.CompletionMode, oldSpec.CompletionMode, fldPath.Child("completionMode"))...)
 	allErrs = append(allErrs, apivalidation.ValidateImmutableField(spec.PodFailurePolicy, oldSpec.PodFailurePolicy, fldPath.Child("podFailurePolicy"))...)
 	allErrs = append(allErrs, apivalidation.ValidateImmutableField(spec.BackoffLimitPerIndex, oldSpec.BackoffLimitPerIndex, fldPath.Child("backoffLimitPerIndex"))...)
+	allErrs = append(allErrs, apivalidation.ValidateImmutableField(spec.ManagedBy, oldSpec.ManagedBy, fldPath.Child("managedBy"))...)
+	allErrs = append(allErrs, apivalidation.ValidateImmutableField(spec.SuccessPolicy, oldSpec.SuccessPolicy, fldPath.Child("successPolicy"))...)
+	allErrs = append(allErrs, validateJobSchedulingUpdate(spec, oldSpec, fldPath.Child("scheduling"))...)
 	return allErrs
+}
+
+// gangMinCountExceedsParallelism reports whether spec sets an explicit gang
+// minCount greater than parallelism.
+func gangMinCountExceedsParallelism(spec *batch.JobSpec) bool {
+	if spec == nil || spec.Scheduling == nil ||
+		spec.Scheduling.SchedulingPolicy == nil ||
+		spec.Scheduling.SchedulingPolicy.Gang == nil {
+		return false
+	}
+	minCount := spec.Scheduling.SchedulingPolicy.Gang.MinCount
+	if minCount == nil {
+		return false
+	}
+	parallelism := int32(1)
+	if spec.Parallelism != nil {
+		parallelism = *spec.Parallelism
+	}
+	return *minCount > parallelism
+}
+
+// validateGangMinCount rejects a gang minCount that exceeds the Job's parallelism.
+func validateGangMinCount(spec *batch.JobSpec, fldPath *field.Path) field.ErrorList {
+	if !gangMinCountExceedsParallelism(spec) {
+		return nil
+	}
+	parallelism := int32(1)
+	if spec.Parallelism != nil {
+		parallelism = *spec.Parallelism
+	}
+	return field.ErrorList{field.Invalid(
+		fldPath.Child("schedulingPolicy", "gang", "minCount"),
+		*spec.Scheduling.SchedulingPolicy.Gang.MinCount,
+		fmt.Sprintf("must not be greater than parallelism (%d)", parallelism))}
+}
+
+// validateSchedulingAndSchedulingGroup rejects spec.scheduling when the pod
+// template also carries schedulingGroup. On update, the combination is allowed
+// only if oldSpec already had both fields set.
+func validateSchedulingAndSchedulingGroup(spec, oldSpec *batch.JobSpec, fldPath *field.Path) field.ErrorList {
+	if spec == nil || spec.Scheduling == nil || spec.Template.Spec.SchedulingGroup == nil {
+		return nil
+	}
+	if oldSpec != nil && oldSpec.Scheduling != nil && oldSpec.Template.Spec.SchedulingGroup != nil {
+		return nil
+	}
+	return field.ErrorList{field.Invalid(fldPath, field.OmitValueType{},
+		"must not be set together with template.spec.schedulingGroup")}
+}
+
+// delegationAnnotations select a template in an external Workload.
+var delegationAnnotations = []string{apischeduling.WorkloadNameAnnotation, apischeduling.GroupTemplateNameAnnotation}
+
+// immutableJobAnnotations cannot change after Job creation.
+var immutableJobAnnotations = []string{
+	apischeduling.WorkloadNameAnnotation,
+	apischeduling.GroupTemplateNameAnnotation,
+	apischeduling.ParentCompositePodGroupAnnotation,
+}
+
+// validateSchedulingAndDelegationAnnotations rejects spec.scheduling when the
+// object also carries a delegation annotation. On update, an annotation is
+// allowed only if oldSpec already had spec.scheduling and oldMeta already had
+// that same annotation.
+func validateSchedulingAndDelegationAnnotations(meta, oldMeta *metav1.ObjectMeta, spec,
+	oldSpec *batch.JobSpec, fldPath *field.Path) field.ErrorList {
+	if spec == nil || spec.Scheduling == nil {
+		return nil
+	}
+	oldHadScheduling := oldSpec != nil && oldSpec.Scheduling != nil && oldMeta != nil
+	for _, key := range delegationAnnotations {
+		if _, ok := meta.Annotations[key]; !ok {
+			continue
+		}
+		if oldHadScheduling {
+			if _, ok := oldMeta.Annotations[key]; ok {
+				continue
+			}
+		}
+		return field.ErrorList{field.Invalid(fldPath, field.OmitValueType{},
+			fmt.Sprintf("must not be set together with the %s annotation", key))}
+	}
+	return nil
+}
+
+// validateDelegationAnnotations requires both delegation annotations to be
+// set to non-empty values once either is present. fldPath points at
+// metadata.annotations. On update, a pair that is unchanged from oldMeta is
+// allowed so existing objects stay updatable.
+func validateDelegationAnnotations(meta, oldMeta *metav1.ObjectMeta, fldPath *field.Path) field.ErrorList {
+	_, hasWorkload := meta.Annotations[apischeduling.WorkloadNameAnnotation]
+	_, hasTemplate := meta.Annotations[apischeduling.GroupTemplateNameAnnotation]
+	if !hasWorkload && !hasTemplate {
+		return nil
+	}
+	if oldMeta != nil && delegationAnnotationsUnchanged(meta, oldMeta) {
+		return nil
+	}
+	var allErrs field.ErrorList
+	for _, key := range delegationAnnotations {
+		if meta.Annotations[key] == "" {
+			allErrs = append(allErrs, field.Required(fldPath.Key(key),
+				fmt.Sprintf("must be set to a non-empty value when %s or %s is set",
+					apischeduling.WorkloadNameAnnotation, apischeduling.GroupTemplateNameAnnotation)))
+		}
+	}
+	return allErrs
+}
+
+func delegationAnnotationsUnchanged(meta, oldMeta *metav1.ObjectMeta) bool {
+	for _, key := range delegationAnnotations {
+		if annotationChanged(meta, oldMeta, key) {
+			return false
+		}
+	}
+	return true
+}
+
+func validateDelegationAnnotationsUpdate(meta, oldMeta *metav1.ObjectMeta, fldPath *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+	for _, key := range immutableJobAnnotations {
+		if annotationChanged(meta, oldMeta, key) {
+			allErrs = append(allErrs, field.Invalid(fldPath.Key(key), meta.Annotations[key], apimachineryapivalidation.FieldImmutableErrorMsg))
+		}
+	}
+	return allErrs
+}
+
+func annotationChanged(meta, oldMeta *metav1.ObjectMeta, key string) bool {
+	value, ok := meta.Annotations[key]
+	oldValue, oldOk := oldMeta.Annotations[key]
+	return ok != oldOk || value != oldValue
+}
+
+// validateJobSchedulingUpdate enforces the spec.scheduling immutability
+// constraint that declarative validation cannot express: the basic/gang policy
+// variant is frozen after creation. Only schedulingPolicy.gang.minCount may change.
+// Adding or removing the scheduling or schedulingPolicy fields themselves is handled by
+// declarative validation, so this only guards an in-place variant switch.
+func validateJobSchedulingUpdate(spec, oldSpec batch.JobSpec, fldPath *field.Path) field.ErrorList {
+	if spec.Scheduling == nil || oldSpec.Scheduling == nil {
+		return nil
+	}
+	newPolicy, oldPolicy := spec.Scheduling.SchedulingPolicy, oldSpec.Scheduling.SchedulingPolicy
+	if newPolicy == nil || oldPolicy == nil {
+		return nil
+	}
+	if (oldPolicy.Basic != nil) != (newPolicy.Basic != nil) {
+		return field.ErrorList{field.Invalid(
+			fldPath.Child("schedulingPolicy"), nil,
+			"the basic/gang policy variant is immutable after creation; only schedulingPolicy.gang.minCount may be updated")}
+	}
+	return nil
+}
+
+// validateJobScheduling runs the controller-policy checks that declarative
+// validation cannot express via the shared workloadbuilder library.
+// Structural building-block constraints come from DV, so they are not
+// repeated here. It is a no-op when spec.scheduling is unset.
+// oldSpec is nil on create, non-nil on update.
+func validateJobScheduling(spec, oldSpec *batch.JobSpec, fldPath *field.Path) field.ErrorList {
+	if spec.Scheduling == nil {
+		return nil
+	}
+	// an unchanged spec skips these checks so that tightening them
+	// later never invalidates already-persisted objects.
+	if apiequality.Semantic.DeepEqual(spec, oldSpec) {
+		return nil
+	}
+	// Build the same logical workload tree the Job controller compiles, so
+	// validation and the controller never drift.
+	input := jobutil.WorkloadInputForJobInternal(spec.Scheduling)
+	item := jobutil.WorkloadItemForJob("job", spec.Template.Spec.PriorityClassName, spec.Parallelism, input, fldPath)
+
+	var oldItem *workloadbuilder.WorkloadItem
+	if oldSpec != nil {
+		oldInput := jobutil.WorkloadInputForJobInternal(oldSpec.Scheduling)
+		// The old item's Path is unused: Validate reports errors at the new item's
+		// Path, so it is left nil here.
+		oldItem = jobutil.WorkloadItemForJob("job", oldSpec.Template.Spec.PriorityClassName, oldSpec.Parallelism, oldInput, nil) // +k8s:verify-mutation:reason=clone
+	}
+
+	return workloadbuilder.NewBuilder(item, workloadbuilder.BuildOptions{
+		AllowedPolicies:        []workloadbuilder.SchedulingPolicyOption{workloadbuilder.BasicPolicy, workloadbuilder.GangPolicy},
+		AllowedDisruptionModes: []workloadbuilder.DisruptionModeOption{workloadbuilder.SingleMode, workloadbuilder.AllMode},
+		// The apiserver already runs declarative validation on the versioned
+		// building blocks, so Validate here only runs the controller-policy
+		// checks against the resolved config; it neither compiles the Workload
+		// nor needs an owner.
+		DisableDeclarativeValidation: true,
+	}).Validate(context.Background(), workloadbuilder.ValidationInput{OldRoot: oldItem})
 }
 
 func validatePodTemplateUpdate(spec, oldSpec batch.JobSpec, fldPath *field.Path, opts JobValidationOptions) field.ErrorList {
@@ -480,21 +888,103 @@ func validatePodTemplateUpdate(spec, oldSpec batch.JobSpec, fldPath *field.Path,
 		oldTemplate.Labels = template.Labels                             // +k8s:verify-mutation:reason=clone
 		oldTemplate.Spec.SchedulingGates = template.Spec.SchedulingGates // +k8s:verify-mutation:reason=clone
 	}
-	allErrs = append(allErrs, apivalidation.ValidateImmutableField(template, oldTemplate, fldPath.Child("template"))...)
+	suspended := oldSpec.Suspend != nil && *oldSpec.Suspend
+	if !suspended {
+		// if the job isn't suspended, then we cannot allow any mutation of the template
+		allErrs = append(allErrs, apivalidation.ValidateImmutableField(template, oldTemplate, fldPath.Child("template"))...)
+	} else {
+		if !opts.AllowMutablePodResources {
+			allErrs = append(allErrs, apivalidation.ValidateImmutableField(template, oldTemplate, fldPath.Child("template"))...)
+		} else {
+			// Only allow container resource updates when AllowMutablePodResources is true
+			allErrs = append(allErrs, validatePodResourceUpdatesOnly(template.Spec, oldTemplate.Spec, fldPath.Child("template.spec"))...)
+		}
+	}
+	return allErrs
+}
+
+// validatePodResourceUpdatesOnly will validate that only container resources are updated.
+func validatePodResourceUpdatesOnly(newPod api.PodSpec, oldPod api.PodSpec, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+
+	// Create a deep copy of the old pod spec to modify
+	oldPodCopy := oldPod.DeepCopy()
+	// Update container resources in the copy to match the new pod spec
+	if len(newPod.Containers) == len(oldPodCopy.Containers) {
+		for i := range newPod.Containers {
+			if oldPodCopy.Containers[i].Name == newPod.Containers[i].Name {
+				oldPodCopy.Containers[i].Resources = newPod.Containers[i].Resources // +k8s:verify-mutation:reason=clone
+			}
+		}
+	}
+
+	// Update init container resources in the copy to match the new pod spec
+	if len(newPod.InitContainers) == len(oldPodCopy.InitContainers) {
+		for i := range newPod.InitContainers {
+			if oldPodCopy.InitContainers[i].Name == newPod.InitContainers[i].Name {
+				oldPodCopy.InitContainers[i].Resources = newPod.InitContainers[i].Resources // +k8s:verify-mutation:reason=clone
+			}
+		}
+	}
+
+	// Validate that the modified copy is identical to the new pod spec
+	// This ensures only container resources were changed
+	allErrs = append(allErrs, apivalidation.ValidateImmutableField(newPod, *oldPodCopy, fldPath)...)
+
 	return allErrs
 }
 
 // ValidateJobStatusUpdate validates an update to a JobStatus and returns an ErrorList with any errors.
-func ValidateJobStatusUpdate(status, oldStatus batch.JobStatus) field.ErrorList {
+func ValidateJobStatusUpdate(job, oldJob *batch.Job, opts JobStatusValidationOptions) field.ErrorList {
 	allErrs := field.ErrorList{}
-	allErrs = append(allErrs, validateJobStatus(&status, field.NewPath("status"))...)
+	statusFld := field.NewPath("status")
+	allErrs = append(allErrs, validateJobStatus(job, statusFld, opts)...)
+
+	if opts.RejectDisablingTerminalCondition {
+		for _, cType := range []batch.JobConditionType{batch.JobFailed, batch.JobComplete, batch.JobFailureTarget} {
+			if IsConditionTrue(oldJob.Status.Conditions, cType) && !IsConditionTrue(job.Status.Conditions, cType) {
+				allErrs = append(allErrs, field.Invalid(statusFld.Child("conditions"), field.OmitValueType{}, fmt.Sprintf("cannot disable the terminal %s=True condition", string(cType))))
+			}
+		}
+	}
+	if opts.RejectDecreasingFailedCounter {
+		if job.Status.Failed < oldJob.Status.Failed {
+			allErrs = append(allErrs, field.Invalid(statusFld.Child("failed"), job.Status.Failed, "cannot decrease the failed counter"))
+		}
+	}
+	if opts.RejectDecreasingSucceededCounter {
+		if job.Status.Succeeded < oldJob.Status.Succeeded {
+			allErrs = append(allErrs, field.Invalid(statusFld.Child("succeeded"), job.Status.Succeeded, "cannot decrease the succeeded counter"))
+		}
+	}
+	if opts.RejectMutatingCompletionTime {
+		// Note that we check the condition only when `job.Status.CompletionTime != nil`, this is because
+		// we don't want to block transitions to completionTime = nil when the job is not finished yet.
+		// Setting completionTime = nil for finished jobs is prevented in RejectCompleteJobWithoutCompletionTime.
+		if job.Status.CompletionTime != nil && oldJob.Status.CompletionTime != nil && !ptr.Equal(job.Status.CompletionTime, oldJob.Status.CompletionTime) {
+			allErrs = append(allErrs, field.Invalid(statusFld.Child("completionTime"), job.Status.CompletionTime, "field is immutable"))
+		}
+	}
+	if opts.RejectStartTimeUpdateForUnsuspendedJob {
+		// Note that we check `oldJob.Status.StartTime != nil` to allow transitioning from
+		// startTime = nil to startTime != nil for unsuspended jobs, which is a desired transition.
+		if oldJob.Status.StartTime != nil && !ptr.Equal(oldJob.Status.StartTime, job.Status.StartTime) && !ptr.Deref(job.Spec.Suspend, false) {
+			allErrs = append(allErrs, field.Invalid(statusFld.Child("startTime"), job.Status.StartTime, "field is immutable for unsuspended job once set"))
+		}
+	}
+	if isJobSuccessCriteriaMet(oldJob) && !isJobSuccessCriteriaMet(job) {
+		allErrs = append(allErrs, field.Invalid(statusFld.Child("conditions"), field.OmitValueType{}, "cannot disable the SuccessCriteriaMet=True condition"))
+	}
+	if IsJobComplete(oldJob) && !isJobSuccessCriteriaMet(oldJob) && isJobSuccessCriteriaMet(job) {
+		allErrs = append(allErrs, field.Invalid(statusFld.Child("conditions"), field.OmitValueType{}, "cannot set SuccessCriteriaMet=True for Job already has Complete=true conditions"))
+	}
 	return allErrs
 }
 
 // ValidateCronJobCreate validates a CronJob on creation and returns an ErrorList with any errors.
 func ValidateCronJobCreate(cronJob *batch.CronJob, opts apivalidation.PodValidationOptions) field.ErrorList {
 	// CronJobs and rcs have the same name validation
-	allErrs := apivalidation.ValidateObjectMeta(&cronJob.ObjectMeta, true, apivalidation.ValidateReplicationControllerName, field.NewPath("metadata"))
+	allErrs := apivalidation.ValidateObjectMeta(&cronJob.ObjectMeta, true, apimachineryapivalidation.NameIsDNSSubdomain, field.NewPath("metadata"))
 	allErrs = append(allErrs, validateCronJobSpec(&cronJob.Spec, nil, field.NewPath("spec"), opts)...)
 	if len(cronJob.ObjectMeta.Name) > apimachineryvalidation.DNS1035LabelMaxLength-11 {
 		// The cronjob controller appends a 11-character suffix to the cronjob (`-$TIMESTAMP`) when
@@ -520,22 +1010,28 @@ func ValidateCronJobUpdate(job, oldJob *batch.CronJob, opts apivalidation.PodVal
 func validateCronJobSpec(spec, oldSpec *batch.CronJobSpec, fldPath *field.Path, opts apivalidation.PodValidationOptions) field.ErrorList {
 	allErrs := field.ErrorList{}
 
-	if len(spec.Schedule) == 0 {
-		allErrs = append(allErrs, field.Required(fldPath.Child("schedule"), ""))
-	} else {
-		allErrs = append(allErrs, validateScheduleFormat(spec.Schedule, spec.TimeZone, fldPath.Child("schedule"))...)
+	if len(spec.Schedule) != 0 {
+		allowTZInSchedule := false
+		if oldSpec != nil {
+			allowTZInSchedule = strings.Contains(oldSpec.Schedule, "TZ")
+		}
+		allErrs = append(allErrs, validateScheduleFormat(spec.Schedule, allowTZInSchedule, spec.TimeZone, fldPath.Child("schedule"))...)
 	}
 
 	if spec.StartingDeadlineSeconds != nil {
 		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.StartingDeadlineSeconds), fldPath.Child("startingDeadlineSeconds"))...)
 	}
 
-	if oldSpec == nil || !pointer.StringEqual(oldSpec.TimeZone, spec.TimeZone) {
+	if oldSpec == nil || !ptr.Equal(oldSpec.TimeZone, spec.TimeZone) {
 		allErrs = append(allErrs, validateTimeZone(spec.TimeZone, fldPath.Child("timeZone"))...)
 	}
 
+	var oldTemplateSpec *batch.JobTemplateSpec
+	if oldSpec != nil {
+		oldTemplateSpec = &oldSpec.JobTemplate // +k8s:verify-mutation:reason=clone
+	}
 	allErrs = append(allErrs, validateConcurrencyPolicy(&spec.ConcurrencyPolicy, fldPath.Child("concurrencyPolicy"))...)
-	allErrs = append(allErrs, ValidateJobTemplateSpec(&spec.JobTemplate, fldPath.Child("jobTemplate"), opts)...)
+	allErrs = append(allErrs, ValidateJobTemplateSpec(&spec.JobTemplate, oldTemplateSpec, fldPath.Child("jobTemplate"), opts)...)
 
 	if spec.SuccessfulJobsHistoryLimit != nil {
 		// zero is a valid SuccessfulJobsHistoryLimit
@@ -557,20 +1053,24 @@ func validateConcurrencyPolicy(concurrencyPolicy *batch.ConcurrencyPolicy, fldPa
 	case "":
 		allErrs = append(allErrs, field.Required(fldPath, ""))
 	default:
-		validValues := []string{string(batch.AllowConcurrent), string(batch.ForbidConcurrent), string(batch.ReplaceConcurrent)}
+		validValues := []batch.ConcurrencyPolicy{batch.AllowConcurrent, batch.ForbidConcurrent, batch.ReplaceConcurrent}
 		allErrs = append(allErrs, field.NotSupported(fldPath, *concurrencyPolicy, validValues))
 	}
 
 	return allErrs
 }
 
-func validateScheduleFormat(schedule string, timeZone *string, fldPath *field.Path) field.ErrorList {
+func validateScheduleFormat(schedule string, allowTZInSchedule bool, timeZone *string, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
-	if _, err := cron.ParseStandard(schedule); err != nil {
+
+	if _, err := parsers.ParseCronScheduleWithPanicRecovery(schedule); err != nil {
 		allErrs = append(allErrs, field.Invalid(fldPath, schedule, err.Error()))
 	}
-	if strings.Contains(schedule, "TZ") && timeZone != nil {
+	switch {
+	case allowTZInSchedule && strings.Contains(schedule, "TZ") && timeZone != nil:
 		allErrs = append(allErrs, field.Invalid(fldPath, schedule, "cannot use both timeZone field and TZ or CRON_TZ in schedule"))
+	case !allowTZInSchedule && strings.Contains(schedule, "TZ"):
+		allErrs = append(allErrs, field.Invalid(fldPath, schedule, "cannot use TZ or CRON_TZ in schedule, use timeZone field instead"))
 	}
 
 	return allErrs
@@ -616,8 +1116,18 @@ func validateTimeZone(timeZone *string, fldPath *field.Path) field.ErrorList {
 }
 
 // ValidateJobTemplateSpec validates a JobTemplateSpec and returns an ErrorList with any errors.
-func ValidateJobTemplateSpec(spec *batch.JobTemplateSpec, fldPath *field.Path, opts apivalidation.PodValidationOptions) field.ErrorList {
-	allErrs := validateJobSpec(&spec.Spec, fldPath.Child("spec"), opts)
+// oldSpec is nil on create, non-nil on update.
+func ValidateJobTemplateSpec(spec, oldSpec *batch.JobTemplateSpec, fldPath *field.Path, opts apivalidation.PodValidationOptions) field.ErrorList {
+	var oldJobSpec *batch.JobSpec
+	var oldMeta *metav1.ObjectMeta
+	if oldSpec != nil {
+		oldJobSpec = &oldSpec.Spec    // +k8s:verify-mutation:reason=clone
+		oldMeta = &oldSpec.ObjectMeta // +k8s:verify-mutation:reason=clone
+	}
+	allErrs := validateJobSpec(&spec.Spec, oldJobSpec, fldPath.Child("spec"), opts)
+	// Reject delegation annotations on jobTemplate when jobTemplate.spec.scheduling is set.
+	allErrs = append(allErrs, validateSchedulingAndDelegationAnnotations(&spec.ObjectMeta, oldMeta, &spec.Spec, oldJobSpec, fldPath.Child("spec", "scheduling"))...)
+	allErrs = append(allErrs, validateDelegationAnnotations(&spec.ObjectMeta, oldMeta, fldPath.Child("metadata", "annotations"))...)
 
 	// jobtemplate will always have the selector automatically generated
 	if spec.Spec.Selector != nil {
@@ -630,13 +1140,7 @@ func ValidateJobTemplateSpec(spec *batch.JobTemplateSpec, fldPath *field.Path, o
 }
 
 func validateCompletions(spec, oldSpec batch.JobSpec, fldPath *field.Path, opts JobValidationOptions) field.ErrorList {
-	if !opts.AllowElasticIndexedJobs {
-		return apivalidation.ValidateImmutableField(spec.Completions, oldSpec.Completions, fldPath)
-	}
-
-	// Completions is immutable for non-indexed jobs.
-	// For Indexed Jobs, if ElasticIndexedJob feature gate is not enabled,
-	// fall back to validating that spec.Completions is always immutable.
+	// Completions is immutable for non-indexed jobs, but mutable for Indexed Jobs.
 	isIndexedJob := spec.CompletionMode != nil && *spec.CompletionMode == batch.IndexedCompletion
 	if !isIndexedJob {
 		return apivalidation.ValidateImmutableField(spec.Completions, oldSpec.Completions, fldPath)
@@ -658,12 +1162,174 @@ func validateCompletions(spec, oldSpec batch.JobSpec, fldPath *field.Path, opts 
 	return allErrs
 }
 
+func IsJobFinished(job *batch.Job) bool {
+	for _, c := range job.Status.Conditions {
+		if (c.Type == batch.JobComplete || c.Type == batch.JobFailed) && c.Status == api.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func IsJobComplete(job *batch.Job) bool {
+	return IsConditionTrue(job.Status.Conditions, batch.JobComplete)
+}
+
+func IsJobFailed(job *batch.Job) bool {
+	return IsConditionTrue(job.Status.Conditions, batch.JobFailed)
+}
+
+func isJobSuccessCriteriaMet(job *batch.Job) bool {
+	return IsConditionTrue(job.Status.Conditions, batch.JobSuccessCriteriaMet)
+}
+
+func isJobFailureTarget(job *batch.Job) bool {
+	return IsConditionTrue(job.Status.Conditions, batch.JobFailureTarget)
+}
+
+func IsConditionTrue(list []batch.JobCondition, cType batch.JobConditionType) bool {
+	for _, c := range list {
+		if c.Type == cType && c.Status == api.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func IsConditionFalse(list []batch.JobCondition, cType batch.JobConditionType) bool {
+	for _, c := range list {
+		if c.Type == cType && c.Status == api.ConditionFalse {
+			return true
+		}
+	}
+	return false
+}
+
+func validateFailedIndexesNotOverlapCompleted(completedIndexesStr string, failedIndexesStr string, completions int32) error {
+	if len(completedIndexesStr) == 0 || len(failedIndexesStr) == 0 {
+		return nil
+	}
+	completedIndexesIntervals := strings.Split(completedIndexesStr, ",")
+	failedIndexesIntervals := strings.Split(failedIndexesStr, ",")
+	var completedPos, failedPos int
+	cX, cY, cErr := parseIndexInterval(completedIndexesIntervals[completedPos], completions)
+	fX, fY, fErr := parseIndexInterval(failedIndexesIntervals[failedPos], completions)
+	for completedPos < len(completedIndexesIntervals) && failedPos < len(failedIndexesIntervals) {
+		if cErr != nil {
+			// Failure to parse "completed" interval. We go to the next interval,
+			// the error will be reported to the user when validating the format.
+			completedPos++
+			if completedPos < len(completedIndexesIntervals) {
+				cX, cY, cErr = parseIndexInterval(completedIndexesIntervals[completedPos], completions)
+			}
+		} else if fErr != nil {
+			// Failure to parse "failed" interval. We go to the next interval,
+			// the error will be reported to the user when validating the format.
+			failedPos++
+			if failedPos < len(failedIndexesIntervals) {
+				fX, fY, fErr = parseIndexInterval(failedIndexesIntervals[failedPos], completions)
+			}
+		} else {
+			// We have one failed and one completed interval parsed.
+			if cX <= fY && fX <= cY {
+				return fmt.Errorf("failedIndexes and completedIndexes overlap at index: %d", max(cX, fX))
+			}
+			// No overlap, let's move to the next one.
+			if cX <= fX {
+				completedPos++
+				if completedPos < len(completedIndexesIntervals) {
+					cX, cY, cErr = parseIndexInterval(completedIndexesIntervals[completedPos], completions)
+				}
+			} else {
+				failedPos++
+				if failedPos < len(failedIndexesIntervals) {
+					fX, fY, fErr = parseIndexInterval(failedIndexesIntervals[failedPos], completions)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateIndexesFormat(indexesStr string, completions int32) (int32, error) {
+	if len(indexesStr) == 0 {
+		return 0, nil
+	}
+	var lastIndex *int32
+	var total int32
+	for _, intervalStr := range strings.Split(indexesStr, ",") {
+		x, y, err := parseIndexInterval(intervalStr, completions)
+		if err != nil {
+			return 0, err
+		}
+		if lastIndex != nil && *lastIndex >= x {
+			return 0, fmt.Errorf("non-increasing order, previous: %d, current: %d", *lastIndex, x)
+		}
+		total += y - x + 1
+		lastIndex = &y
+	}
+	return total, nil
+}
+
+func parseIndexInterval(intervalStr string, completions int32) (int32, int32, error) {
+	limitsStr := strings.Split(intervalStr, "-")
+	if len(limitsStr) > 2 {
+		return 0, 0, fmt.Errorf("the fragment %q violates the requirement that an index interval can have at most two parts separated by '-'", intervalStr)
+	}
+	x, err := strconv.Atoi(limitsStr[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("cannot convert string to integer for index: %q", limitsStr[0])
+	}
+	if x >= int(completions) {
+		return 0, 0, fmt.Errorf("too large index: %q", limitsStr[0])
+	}
+	if len(limitsStr) > 1 {
+		y, err := strconv.Atoi(limitsStr[1])
+		if err != nil {
+			return 0, 0, fmt.Errorf("cannot convert string to integer for index: %q", limitsStr[1])
+		}
+		if y >= int(completions) {
+			return 0, 0, fmt.Errorf("too large index: %q", limitsStr[1])
+		}
+		if x >= y {
+			return 0, 0, fmt.Errorf("non-increasing order, previous: %d, current: %d", x, y)
+		}
+		return int32(x), int32(y), nil
+	}
+	return int32(x), int32(x), nil
+}
+
 type JobValidationOptions struct {
 	apivalidation.PodValidationOptions
 	// Allow mutable node affinity, selector and tolerations of the template
 	AllowMutableSchedulingDirectives bool
-	// Allow elastic indexed jobs
-	AllowElasticIndexedJobs bool
 	// Require Job to have the label on batch.kubernetes.io/job-name and batch.kubernetes.io/controller-uid
 	RequirePrefixedLabels bool
+	// Allow mutable pod resources
+	AllowMutablePodResources bool
+}
+
+type JobStatusValidationOptions struct {
+	RejectDecreasingSucceededCounter             bool
+	RejectDecreasingFailedCounter                bool
+	RejectDisablingTerminalCondition             bool
+	RejectInvalidCompletedIndexes                bool
+	RejectInvalidFailedIndexes                   bool
+	RejectFailedIndexesOverlappingCompleted      bool
+	RejectCompletedIndexesForNonIndexedJob       bool
+	RejectFailedIndexesForNoBackoffLimitPerIndex bool
+	RejectFailedJobWithoutFailureTarget          bool
+	RejectCompleteJobWithoutSuccessCriteriaMet   bool
+	RejectFinishedJobWithActivePods              bool
+	RejectFinishedJobWithoutStartTime            bool
+	RejectFinishedJobWithUncountedTerminatedPods bool
+	RejectStartTimeUpdateForUnsuspendedJob       bool
+	RejectCompletionTimeBeforeStartTime          bool
+	RejectMutatingCompletionTime                 bool
+	RejectCompleteJobWithoutCompletionTime       bool
+	RejectNotCompleteJobWithCompletionTime       bool
+	RejectCompleteJobWithFailedCondition         bool
+	RejectCompleteJobWithFailureTargetCondition  bool
+	RejectMoreReadyThanActivePods                bool
+	RejectFinishedJobWithTerminatingPods         bool
 }

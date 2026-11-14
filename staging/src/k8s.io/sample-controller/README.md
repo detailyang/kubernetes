@@ -1,3 +1,8 @@
+> ⚠️ **This is an automatically published [staged repository](https://git.k8s.io/kubernetes/staging#external-repository-staging-area) for Kubernetes**.   
+> Contributions, including issues and pull requests, should be made to the main Kubernetes repository: [https://github.com/kubernetes/kubernetes](https://github.com/kubernetes/kubernetes).  
+> This repository is read-only for importing, and not used for direct contributions.  
+> See [CONTRIBUTING.md](./CONTRIBUTING.md) for more details.
+
 # sample-controller
 
 This repository implements a simple controller for watching Foo resources as
@@ -33,28 +38,11 @@ explained [here](docs/controller-client-go.md).
 
 ## Fetch sample-controller and its dependencies
 
-Like the rest of Kubernetes, sample-controller has used
-[godep](https://github.com/tools/godep) and `$GOPATH` for years and is
-now adopting go 1.11 modules.  There are thus two alternative ways to
-go about fetching this demo and its dependencies.
-
-### Fetch with godep
-
-When NOT using go 1.11 modules, you can use the following commands.
+Issue the following commands --- starting in whatever working directory you
+like.
 
 ```sh
-go get -d k8s.io/sample-controller
-cd $GOPATH/src/k8s.io/sample-controller
-godep restore
-```
-
-### When using go 1.11 modules
-
-When using go 1.11 modules (`GO111MODULE=on`), issue the following
-commands --- starting in whatever working directory you like.
-
-```sh
-git clone https://github.com/kubernetes/sample-controller.git
+git clone https://github.com/kubernetes/sample-controller
 cd sample-controller
 ```
 
@@ -177,3 +165,6 @@ https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/sample-c
 Code changes are made in that location, merged into k8s.io/kubernetes and
 later synced here.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for more information. Please note that [kubernetes/sample-controller](https://github.com/kubernetes/sample-controller/) is a readonly mirror repository, all development is done at [kubernetes/kubernetes](https://github.com/kubernetes/kubernetes).

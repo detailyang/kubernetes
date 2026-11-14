@@ -51,7 +51,7 @@ type ContainerManager interface {
 	// If command exits with a non-zero exit code, an error is returned.
 	ExecSync(ctx context.Context, containerID string, cmd []string, timeout time.Duration) (stdout []byte, stderr []byte, err error)
 	// Exec prepares a streaming endpoint to execute a command in the container, and returns the address.
-	Exec(context.Context, *runtimeapi.ExecRequest) (*runtimeapi.ExecResponse, error)
+	Exec(ctx context.Context, request *runtimeapi.ExecRequest) (*runtimeapi.ExecResponse, error)
 	// Attach prepares a streaming endpoint to attach to a running container, and returns the address.
 	Attach(ctx context.Context, req *runtimeapi.AttachRequest) (*runtimeapi.AttachResponse, error)
 	// ReopenContainerLog asks runtime to reopen the stdout/stderr log file
@@ -61,7 +61,7 @@ type ContainerManager interface {
 	// CheckpointContainer checkpoints a container
 	CheckpointContainer(ctx context.Context, options *runtimeapi.CheckpointContainerRequest) error
 	// GetContainerEvents gets container events from the CRI runtime
-	GetContainerEvents(containerEventsCh chan *runtimeapi.ContainerEventResponse) error
+	GetContainerEvents(ctx context.Context, containerEventsCh chan *runtimeapi.ContainerEventResponse, connectionEstablishedCallback func(runtimeapi.RuntimeService_GetContainerEventsClient)) error
 }
 
 // PodSandboxManager contains methods for operating on PodSandboxes. The methods
@@ -72,7 +72,7 @@ type PodSandboxManager interface {
 	RunPodSandbox(ctx context.Context, config *runtimeapi.PodSandboxConfig, runtimeHandler string) (string, error)
 	// StopPodSandbox stops the sandbox. If there are any running containers in the
 	// sandbox, they should be force terminated.
-	StopPodSandbox(pctx context.Context, odSandboxID string) error
+	StopPodSandbox(ctx context.Context, podSandboxID string) error
 	// RemovePodSandbox removes the sandbox. If there are running containers in the
 	// sandbox, they should be forcibly removed.
 	RemovePodSandbox(ctx context.Context, podSandboxID string) error
@@ -81,7 +81,17 @@ type PodSandboxManager interface {
 	// ListPodSandbox returns a list of Sandbox.
 	ListPodSandbox(ctx context.Context, filter *runtimeapi.PodSandboxFilter) ([]*runtimeapi.PodSandbox, error)
 	// PortForward prepares a streaming endpoint to forward ports from a PodSandbox, and returns the address.
-	PortForward(context.Context, *runtimeapi.PortForwardRequest) (*runtimeapi.PortForwardResponse, error)
+	PortForward(ctx context.Context, request *runtimeapi.PortForwardRequest) (*runtimeapi.PortForwardResponse, error)
+	// UpdatePodSandboxResources synchronously updates the PodSandboxConfig with
+	// the pod-level resource configuration. This method is called _after_ the
+	// Kubelet reconfigures the pod-level cgroups.
+	// This request is treated as best effort, and failure will not block the
+	// Kubelet with proceeding with a resize.
+	UpdatePodSandboxResources(ctx context.Context, request *runtimeapi.UpdatePodSandboxResourcesRequest) (*runtimeapi.UpdatePodSandboxResourcesResponse, error)
+	// CheckpointPod checkpoints a pod sandbox
+	CheckpointPod(ctx context.Context, options *runtimeapi.CheckpointPodRequest) error
+	// RestorePod restores a pod sandbox from a checkpoint
+	RestorePod(ctx context.Context, options *runtimeapi.RestorePodRequest) (*runtimeapi.RestorePodResponse, error)
 }
 
 // ContainerStatsManager contains methods for retrieving the container
@@ -117,6 +127,8 @@ type RuntimeService interface {
 	Status(ctx context.Context, verbose bool) (*runtimeapi.StatusResponse, error)
 	// RuntimeConfig returns the configuration information of the runtime.
 	RuntimeConfig(ctx context.Context) (*runtimeapi.RuntimeConfigResponse, error)
+	// Close will shutdown the internal gRPC client connection.
+	Close(ctx context.Context) error
 }
 
 // ImageManagerService interface should be implemented by a container image
@@ -129,8 +141,16 @@ type ImageManagerService interface {
 	ImageStatus(ctx context.Context, image *runtimeapi.ImageSpec, verbose bool) (*runtimeapi.ImageStatusResponse, error)
 	// PullImage pulls an image with the authentication config.
 	PullImage(ctx context.Context, image *runtimeapi.ImageSpec, auth *runtimeapi.AuthConfig, podSandboxConfig *runtimeapi.PodSandboxConfig) (string, error)
+	// PullSecurityProfile pulls a security profile with the authentication config.
+	PullSecurityProfile(ctx context.Context, image *runtimeapi.ImageSpec, auth *runtimeapi.AuthConfig, podSandboxConfig *runtimeapi.PodSandboxConfig, kind runtimeapi.SecurityProfileKind) (*runtimeapi.PullSecurityProfileResponse, error)
+	// ListSecurityProfiles lists the pulled security profiles.
+	ListSecurityProfiles(ctx context.Context) ([]*runtimeapi.SecurityProfileInfo, error)
+	// RemoveSecurityProfile removes a pulled security profile by its digest.
+	RemoveSecurityProfile(ctx context.Context, digest string) error
 	// RemoveImage removes the image.
 	RemoveImage(ctx context.Context, image *runtimeapi.ImageSpec) error
-	// ImageFsInfo returns information of the filesystem that is used to store images.
-	ImageFsInfo(ctx context.Context) ([]*runtimeapi.FilesystemUsage, error)
+	// ImageFsInfo returns information of the filesystem(s) used to store the read-only layers and the writeable layer.
+	ImageFsInfo(ctx context.Context) (*runtimeapi.ImageFsInfoResponse, error)
+	// Close will shutdown the internal gRPC client connection.
+	Close(ctx context.Context) error
 }

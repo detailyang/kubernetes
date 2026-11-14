@@ -18,6 +18,7 @@ package storage
 
 import (
 	"context"
+	goerrors "errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -30,17 +31,18 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/util/dryrun"
-	"k8s.io/apiserver/pkg/util/feature"
 	policyclient "k8s.io/client-go/kubernetes/typed/policy/v1"
 	"k8s.io/client-go/util/retry"
 	pdbhelper "k8s.io/component-helpers/apps/poddisruptionbudget"
 	podutil "k8s.io/kubernetes/pkg/api/pod"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/policy"
-	"k8s.io/kubernetes/pkg/features"
+
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -135,6 +137,13 @@ func (r *EvictionREST) Create(ctx context.Context, name string, obj runtime.Obje
 		return nil, errors.NewBadRequest("name in URL does not match name in Eviction object")
 	}
 
+	if eviction.DeleteOptions != nil && ptr.Deref(eviction.DeleteOptions.IgnoreStoreReadErrorWithClusterBreakingPotential, false) {
+		errs := field.ErrorList{
+			field.Invalid(field.NewPath("deleteOptions").Child("ignoreStoreReadErrorWithClusterBreakingPotential"), true, "can not be set for pod eviction, try after removing the option"),
+		}
+		return nil, errors.NewInvalid(v1Eviction.GroupKind(), name, errs)
+	}
+
 	originalDeleteOptions, err := propagateDryRun(eviction, options)
 	if err != nil {
 		return nil, err
@@ -147,6 +156,7 @@ func (r *EvictionREST) Create(ctx context.Context, name string, obj runtime.Obje
 	}
 
 	var pod *api.Pod
+	var deletedPodRV string
 	deletedPod := false
 	// by default, retry conflict errors
 	shouldRetry := errors.IsConflict
@@ -180,7 +190,7 @@ func (r *EvictionREST) Create(ctx context.Context, name string, obj runtime.Obje
 			deleteOptions = deleteOptions.DeepCopy()
 			setPreconditionsResourceVersion(deleteOptions, &pod.ResourceVersion)
 		}
-		err = addConditionAndDeletePod(r, ctx, eviction.Name, rest.ValidateAllObjectFunc, deleteOptions)
+		deletedPodRV, err = addConditionAndDeletePod(r, ctx, eviction.Name, rest.ValidateAllObjectFunc, deleteOptions)
 		if err != nil {
 			return err
 		}
@@ -195,7 +205,12 @@ func (r *EvictionREST) Create(ctx context.Context, name string, obj runtime.Obje
 
 	case deletedPod:
 		// this happens when we successfully deleted the pod.  In this case, we're done executing because we've evicted/deleted the pod
-		return &metav1.Status{Status: metav1.StatusSuccess}, nil
+		return &metav1.Status{
+			Status: metav1.StatusSuccess,
+			ListMeta: metav1.ListMeta{
+				ResourceVersion: deletedPodRV,
+			},
+		}, nil
 
 	default:
 		// this happens when we didn't have an error and we didn't delete the pod. The only branch that happens on is when
@@ -230,12 +245,10 @@ func (r *EvictionREST) Create(ctx context.Context, name string, obj runtime.Obje
 		// IsPodReady is the current implementation of IsHealthy
 		// If the pod is healthy, it should be guarded by the PDB.
 		if !podutil.IsPodReady(pod) {
-			if feature.DefaultFeatureGate.Enabled(features.PDBUnhealthyPodEvictionPolicy) {
-				if pdb.Spec.UnhealthyPodEvictionPolicy != nil && *pdb.Spec.UnhealthyPodEvictionPolicy == policyv1.AlwaysAllow {
-					// Delete the unhealthy pod, it doesn't count towards currentHealthy and desiredHealthy and we should not decrement disruptionsAllowed.
-					updateDeletionOptions = true
-					return nil
-				}
+			if pdb.Spec.UnhealthyPodEvictionPolicy != nil && *pdb.Spec.UnhealthyPodEvictionPolicy == policyv1.AlwaysAllow {
+				// Delete the unhealthy pod, it doesn't count towards currentHealthy and desiredHealthy and we should not decrement disruptionsAllowed.
+				updateDeletionOptions = true
+				return nil
 			}
 			// default nil and IfHealthyBudget policy
 			if pdb.Status.CurrentHealthy >= pdb.Status.DesiredHealthy && pdb.Status.DesiredHealthy > 0 {
@@ -267,7 +280,7 @@ func (r *EvictionREST) Create(ctx context.Context, name string, obj runtime.Obje
 		})
 		return err
 	}()
-	if err == wait.ErrWaitTimeout {
+	if wait.Interrupted(err) {
 		err = errors.NewTimeoutError(fmt.Sprintf("couldn't update PodDisruptionBudget %q due to conflicts", pdbName), 10)
 	}
 	if err != nil {
@@ -292,7 +305,7 @@ func (r *EvictionREST) Create(ctx context.Context, name string, obj runtime.Obje
 	}
 
 	// Try the delete
-	err = addConditionAndDeletePod(r, ctx, eviction.Name, rest.ValidateAllObjectFunc, deleteOptions)
+	deletedPodRV, err = addConditionAndDeletePod(r, ctx, eviction.Name, rest.ValidateAllObjectFunc, deleteOptions)
 	if err != nil {
 		if errors.IsConflict(err) && updateDeletionOptions &&
 			(originalDeleteOptions.Preconditions == nil || originalDeleteOptions.Preconditions.ResourceVersion == nil) {
@@ -305,11 +318,16 @@ func (r *EvictionREST) Create(ctx context.Context, name string, obj runtime.Obje
 	}
 
 	// Success!
-	return &metav1.Status{Status: metav1.StatusSuccess}, nil
+	return &metav1.Status{
+		Status: metav1.StatusSuccess,
+		ListMeta: metav1.ListMeta{
+			ResourceVersion: deletedPodRV,
+		},
+	}, nil
 }
 
-func addConditionAndDeletePod(r *EvictionREST, ctx context.Context, name string, validation rest.ValidateObjectFunc, options *metav1.DeleteOptions) error {
-	if !dryrun.IsDryRun(options.DryRun) && feature.DefaultFeatureGate.Enabled(features.PodDisruptionConditions) {
+func addConditionAndDeletePod(r *EvictionREST, ctx context.Context, name string, validation rest.ValidateObjectFunc, options *metav1.DeleteOptions) (string, error) {
+	if !dryrun.IsDryRun(options.DryRun) {
 		getLatestPod := func(_ context.Context, _, oldObj runtime.Object) (runtime.Object, error) {
 			// Throwaway the newObj. We care only about the latest pod obtained from etcd (oldObj).
 			// So we can add DisruptionTarget condition in conditionAppender without conflicts.
@@ -348,21 +366,27 @@ func addConditionAndDeletePod(r *EvictionREST, ctx context.Context, name string,
 
 		updatedPodObject, _, err := r.store.Update(ctx, name, podUpdatedObjectInfo, rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
 		if err != nil {
-			return err
+			return "", err
 		}
 
 		if !resourceVersionIsUnset(options) {
 			newResourceVersion, err := meta.NewAccessor().ResourceVersion(updatedPodObject)
 			if err != nil {
-				return err
+				return "", err
 			}
 			// bump the resource version, since we are the one who modified it via the update
 			options = options.DeepCopy()
 			options.Preconditions.ResourceVersion = &newResourceVersion
 		}
 	}
-	_, _, err := r.store.Delete(ctx, name, rest.ValidateAllObjectFunc, options)
-	return err
+	deletedObj, _, err := r.store.Delete(ctx, name, rest.ValidateAllObjectFunc, options)
+	if err != nil {
+		return "", err
+	}
+	// Attempt to extract the resource version from the deleted object.
+	// Return no error even if we cannot, since the delete succeeded.
+	rv, _ := meta.NewAccessor().ResourceVersion(deletedObj)
+	return rv, nil
 }
 
 func getPod(r *EvictionREST, ctx context.Context, name string) (*api.Pod, error) {
@@ -421,14 +445,43 @@ func (r *EvictionREST) checkAndDecrement(namespace string, podName string, pdb p
 		return createTooManyRequestsError(pdb.Name)
 	}
 	if pdb.Status.DisruptionsAllowed < 0 {
-		return errors.NewForbidden(policy.Resource("poddisruptionbudget"), pdb.Name, fmt.Errorf("pdb disruptions allowed is negative"))
+		err := errors.NewForbidden(policy.Resource("poddisruptionbudget"), pdb.Name, goerrors.New("pdb disruptions allowed is negative"))
+		err.ErrStatus.Details.Causes = append(err.ErrStatus.Details.Causes, metav1.StatusCause{
+			Type:    policyv1.DisruptionBudgetCause,
+			Message: fmt.Sprintf("The disruption budget %s does not allow evicting pods currently: pdb disruptions allowed is negative", pdb.Name),
+		})
+		return err
 	}
 	if len(pdb.Status.DisruptedPods) > MaxDisruptedPodSize {
-		return errors.NewForbidden(policy.Resource("poddisruptionbudget"), pdb.Name, fmt.Errorf("DisruptedPods map too big - too many evictions not confirmed by PDB controller"))
+		err := errors.NewForbidden(policy.Resource("poddisruptionbudget"), pdb.Name, goerrors.New("DisruptedPods map too big - too many evictions not confirmed by PDB controller"))
+		err.ErrStatus.Details.Causes = append(err.ErrStatus.Details.Causes, metav1.StatusCause{
+			Type:    policyv1.DisruptionBudgetCause,
+			Message: fmt.Sprintf("The disruption budget %s does not allow evicting pods currently: too many pending evictions not confirmed by PDB controller", pdb.Name),
+		})
+		return err
 	}
 	if pdb.Status.DisruptionsAllowed == 0 {
 		err := errors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget.", 0)
-		err.ErrStatus.Details.Causes = append(err.ErrStatus.Details.Causes, metav1.StatusCause{Type: policyv1.DisruptionBudgetCause, Message: fmt.Sprintf("The disruption budget %s needs %d healthy pods and has %d currently", pdb.Name, pdb.Status.DesiredHealthy, pdb.Status.CurrentHealthy)})
+		condition := meta.FindStatusCondition(pdb.Status.Conditions, policyv1.DisruptionAllowedCondition)
+		var msg string
+		switch {
+		// check whether sync is failed first because DesiredHealthy and CurrentHealthy are not trustworthy when the sync is failed
+		case condition != nil && condition.Status == metav1.ConditionFalse && len(condition.Message) > 0 && condition.Reason == policyv1.SyncFailedReason:
+			msg = fmt.Sprintf("The disruption budget %s does not allow evicting pods currently because it failed sync: %s", pdb.Name, condition.Message)
+		case pdb.Status.CurrentHealthy <= pdb.Status.DesiredHealthy:
+			msg = fmt.Sprintf("The disruption budget %s needs %d healthy pods and has %d currently", pdb.Name, pdb.Status.DesiredHealthy, pdb.Status.CurrentHealthy)
+		case condition != nil && condition.Status == metav1.ConditionFalse && len(condition.Message) > 0:
+			msg = fmt.Sprintf("The disruption budget %s does not allow evicting pods currently (%s): %s", pdb.Name, condition.Reason, condition.Message)
+		default:
+			msg = fmt.Sprintf("The disruption budget %s does not allow evicting pods currently", pdb.Name)
+		}
+		err.ErrStatus.Details.Causes = append(
+			err.ErrStatus.Details.Causes,
+			metav1.StatusCause{
+				Type:    policyv1.DisruptionBudgetCause,
+				Message: msg,
+			},
+		)
 		return err
 	}
 

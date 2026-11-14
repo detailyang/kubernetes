@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 /*
 Copyright 2018 The Kubernetes Authors.
@@ -20,12 +19,11 @@ limitations under the License.
 package kubelet
 
 import (
+	"context"
 	"time"
 
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
-	utiliptables "k8s.io/kubernetes/pkg/util/iptables"
-	utilexec "k8s.io/utils/exec"
+	utiliptables "sigs.k8s.io/iptables-wrappers/pkg/iptables"
 )
 
 const (
@@ -37,36 +35,46 @@ const (
 	KubeFirewallChain utiliptables.Chain = "KUBE-FIREWALL"
 )
 
-func (kl *Kubelet) initNetworkUtil() {
-	exec := utilexec.New()
-	iptClients := []utiliptables.Interface{
-		utiliptables.New(exec, utiliptables.ProtocolIPv4),
-		utiliptables.New(exec, utiliptables.ProtocolIPv6),
+func (kl *Kubelet) initNetworkUtil(ctx context.Context) {
+	logger := klog.FromContext(ctx)
+
+	iptClients := utiliptables.NewBestEffort(ctx, utiliptables.UseInstalledMode)
+	if len(iptClients) == 0 {
+		// We don't log this as an error because kubelet itself doesn't need any
+		// of this (it sets up these rules for the benefit of *other* components),
+		// and because we *expect* this to fail on hosts where only nftables is
+		// supported (in which case there can't be any other components using
+		// iptables that would need these rules anyway).
+		logger.Info("No iptables support on this system; not creating the KUBE-IPTABLES-HINT chain")
+		return
 	}
 
-	for i := range iptClients {
-		iptClient := iptClients[i]
-		if kl.syncIPTablesRules(iptClient) {
-			klog.InfoS("Initialized iptables rules.", "protocol", iptClient.Protocol())
+	for family := range iptClients {
+		iptClient := iptClients[family]
+		if kl.syncIPTablesRules(ctx, iptClient) {
+			logger.Info("Initialized iptables rules.", "protocol", iptClient.Protocol())
 			go iptClient.Monitor(
+				ctx,
 				utiliptables.Chain("KUBE-KUBELET-CANARY"),
 				[]utiliptables.Table{utiliptables.TableMangle, utiliptables.TableNAT, utiliptables.TableFilter},
-				func() { kl.syncIPTablesRules(iptClient) },
-				1*time.Minute, wait.NeverStop,
+				func() { kl.syncIPTablesRules(ctx, iptClient) },
+				1*time.Minute,
 			)
 		} else {
-			klog.InfoS("Failed to initialize iptables rules; some functionality may be missing.", "protocol", iptClient.Protocol())
+			logger.Info("Failed to initialize iptables rules; some functionality may be missing.", "protocol", iptClient.Protocol())
 		}
 	}
 }
 
 // syncIPTablesRules ensures the KUBE-IPTABLES-HINT chain exists, and the martian packet
 // protection rule is installed.
-func (kl *Kubelet) syncIPTablesRules(iptClient utiliptables.Interface) bool {
+func (kl *Kubelet) syncIPTablesRules(ctx context.Context, iptClient utiliptables.Interface) bool {
+	logger := klog.FromContext(ctx)
+
 	// Create hint chain so other components can see whether we are using iptables-legacy
 	// or iptables-nft.
-	if _, err := iptClient.EnsureChain(utiliptables.TableMangle, KubeIPTablesHintChain); err != nil {
-		klog.ErrorS(err, "Failed to ensure that iptables hint chain exists")
+	if _, err := iptClient.EnsureChain(ctx, utiliptables.TableMangle, KubeIPTablesHintChain); err != nil {
+		logger.Error(err, "Failed to ensure that iptables hint chain exists")
 		return false
 	}
 
@@ -79,17 +87,17 @@ func (kl *Kubelet) syncIPTablesRules(iptClient utiliptables.Interface) bool {
 		// a way that will interoperate correctly with skewed versions of the rule
 		// created by kube-proxy.
 
-		if _, err := iptClient.EnsureChain(utiliptables.TableFilter, KubeFirewallChain); err != nil {
-			klog.ErrorS(err, "Failed to ensure that filter table KUBE-FIREWALL chain exists")
+		if _, err := iptClient.EnsureChain(ctx, utiliptables.TableFilter, KubeFirewallChain); err != nil {
+			logger.Error(err, "Failed to ensure that filter table KUBE-FIREWALL chain exists")
 			return false
 		}
 
-		if _, err := iptClient.EnsureRule(utiliptables.Prepend, utiliptables.TableFilter, utiliptables.ChainOutput, "-j", string(KubeFirewallChain)); err != nil {
-			klog.ErrorS(err, "Failed to ensure that OUTPUT chain jumps to KUBE-FIREWALL")
+		if _, err := iptClient.EnsureRule(ctx, utiliptables.Prepend, utiliptables.TableFilter, utiliptables.ChainOutput, "-j", string(KubeFirewallChain)); err != nil {
+			logger.Error(err, "Failed to ensure that OUTPUT chain jumps to KUBE-FIREWALL")
 			return false
 		}
-		if _, err := iptClient.EnsureRule(utiliptables.Prepend, utiliptables.TableFilter, utiliptables.ChainInput, "-j", string(KubeFirewallChain)); err != nil {
-			klog.ErrorS(err, "Failed to ensure that INPUT chain jumps to KUBE-FIREWALL")
+		if _, err := iptClient.EnsureRule(ctx, utiliptables.Prepend, utiliptables.TableFilter, utiliptables.ChainInput, "-j", string(KubeFirewallChain)); err != nil {
+			logger.Error(err, "Failed to ensure that INPUT chain jumps to KUBE-FIREWALL")
 			return false
 		}
 
@@ -99,14 +107,14 @@ func (kl *Kubelet) syncIPTablesRules(iptClient utiliptables.Interface) bool {
 		// kube-proxy, but it mistakenly ended up in kubelet instead, and we are
 		// keeping it in kubelet for now in case other third-party components
 		// depend on it.
-		if _, err := iptClient.EnsureRule(utiliptables.Append, utiliptables.TableFilter, KubeFirewallChain,
+		if _, err := iptClient.EnsureRule(ctx, utiliptables.Append, utiliptables.TableFilter, KubeFirewallChain,
 			"-m", "comment", "--comment", "block incoming localnet connections",
 			"--dst", "127.0.0.0/8",
 			"!", "--src", "127.0.0.0/8",
 			"-m", "conntrack",
 			"!", "--ctstate", "RELATED,ESTABLISHED,DNAT",
 			"-j", "DROP"); err != nil {
-			klog.ErrorS(err, "Failed to ensure rule to drop invalid localhost packets in filter table KUBE-FIREWALL chain")
+			logger.Error(err, "Failed to ensure rule to drop invalid localhost packets in filter table KUBE-FIREWALL chain")
 			return false
 		}
 	}

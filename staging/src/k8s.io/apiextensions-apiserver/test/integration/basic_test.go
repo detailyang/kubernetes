@@ -25,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/test/integration/fixtures"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -243,6 +243,10 @@ func testSimpleCRUD(t *testing.T, ns string, noxuDefinition *apiextensionsv1.Cus
 							t.Fatal(err)
 						}
 
+						if watchEvent.Type == watch.Bookmark {
+							continue
+						}
+
 						if watchEvent.Type != watch.Modified {
 							t.Errorf("expected modified event, got %v", watchEvent.Type)
 							break
@@ -283,6 +287,10 @@ func testSimpleCRUD(t *testing.T, ns string, noxuDefinition *apiextensionsv1.Cus
 				eventMetadata, err := meta.Accessor(watchEvent.Object)
 				if err != nil {
 					t.Fatal(err)
+				}
+
+				if watchEvent.Type == watch.Bookmark {
+					continue
 				}
 
 				if watchEvent.Type != watch.Deleted {

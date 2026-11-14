@@ -25,7 +25,6 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controller"
 	deploymentutil "k8s.io/kubernetes/pkg/controller/deployment/util"
-	"k8s.io/utils/integer"
 )
 
 // rolloutRolling implements the logic for rolling a new replica set.
@@ -36,34 +35,28 @@ func (dc *DeploymentController) rolloutRolling(ctx context.Context, d *apps.Depl
 	}
 	allRSs := append(oldRSs, newRS)
 
+	err = dc.reconcileRollingReplicaSets(ctx, d, allRSs, oldRSs, newRS)
+	return dc.syncRolloutStatusAfter(ctx, err, allRSs, newRS, d)
+}
+
+func (dc *DeploymentController) reconcileRollingReplicaSets(ctx context.Context, d *apps.Deployment, allRSs, oldRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet) error {
 	// Scale up, if we can.
 	scaledUp, err := dc.reconcileNewReplicaSet(ctx, allRSs, newRS, d)
-	if err != nil {
+	if err != nil || scaledUp {
 		return err
-	}
-	if scaledUp {
-		// Update DeploymentStatus
-		return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
 	}
 
 	// Scale down, if we can.
 	scaledDown, err := dc.reconcileOldReplicaSets(ctx, allRSs, controller.FilterActiveReplicaSets(oldRSs), newRS, d)
-	if err != nil {
+	if err != nil || scaledDown {
 		return err
-	}
-	if scaledDown {
-		// Update DeploymentStatus
-		return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
 	}
 
 	if deploymentutil.DeploymentComplete(d, &d.Status) {
-		if err := dc.cleanupDeployment(ctx, oldRSs, d); err != nil {
-			return err
-		}
+		return dc.cleanupDeployment(ctx, oldRSs, d)
 	}
 
-	// Sync deployment status
-	return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
+	return nil
 }
 
 func (dc *DeploymentController) reconcileNewReplicaSet(ctx context.Context, allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, deployment *apps.Deployment) (bool, error) {
@@ -73,14 +66,14 @@ func (dc *DeploymentController) reconcileNewReplicaSet(ctx context.Context, allR
 	}
 	if *(newRS.Spec.Replicas) > *(deployment.Spec.Replicas) {
 		// Scale down.
-		scaled, _, err := dc.scaleReplicaSetAndRecordEvent(ctx, newRS, *(deployment.Spec.Replicas), deployment)
+		scaled, _, err := dc.scaleReplicaSet(ctx, newRS, *(deployment.Spec.Replicas), deployment, false)
 		return scaled, err
 	}
 	newReplicasCount, err := deploymentutil.NewRSNewReplicas(deployment, allRSs, newRS)
 	if err != nil {
 		return false, err
 	}
-	scaled, _, err := dc.scaleReplicaSetAndRecordEvent(ctx, newRS, newReplicasCount, deployment)
+	scaled, _, err := dc.scaleReplicaSet(ctx, newRS, newReplicasCount, deployment, false)
 	return scaled, err
 }
 
@@ -136,7 +129,7 @@ func (dc *DeploymentController) reconcileOldReplicaSets(ctx context.Context, all
 	// and cause timeout. See https://github.com/kubernetes/kubernetes/issues/16737
 	oldRSs, cleanupCount, err := dc.cleanupUnhealthyReplicas(ctx, oldRSs, deployment, maxScaledDown)
 	if err != nil {
-		return false, nil
+		return false, err
 	}
 	logger.V(4).Info("Cleaned up unhealthy replicas from old RSes", "count", cleanupCount)
 
@@ -144,7 +137,7 @@ func (dc *DeploymentController) reconcileOldReplicaSets(ctx context.Context, all
 	allRSs = append(oldRSs, newRS)
 	scaledDownCount, err := dc.scaleDownOldReplicaSetsForRollingUpdate(ctx, allRSs, oldRSs, deployment)
 	if err != nil {
-		return false, nil
+		return false, err
 	}
 	logger.V(4).Info("Scaled down old RSes", "deployment", klog.KObj(deployment), "count", scaledDownCount)
 
@@ -174,12 +167,12 @@ func (dc *DeploymentController) cleanupUnhealthyReplicas(ctx context.Context, ol
 			continue
 		}
 
-		scaledDownCount := int32(integer.IntMin(int(maxCleanupCount-totalScaledDown), int(*(targetRS.Spec.Replicas)-targetRS.Status.AvailableReplicas)))
+		scaledDownCount := min(maxCleanupCount-totalScaledDown, *(targetRS.Spec.Replicas)-targetRS.Status.AvailableReplicas)
 		newReplicasCount := *(targetRS.Spec.Replicas) - scaledDownCount
 		if newReplicasCount > *(targetRS.Spec.Replicas) {
 			return nil, 0, fmt.Errorf("when cleaning up unhealthy replicas, got invalid request to scale down %s/%s %d -> %d", targetRS.Namespace, targetRS.Name, *(targetRS.Spec.Replicas), newReplicasCount)
 		}
-		_, updatedOldRS, err := dc.scaleReplicaSetAndRecordEvent(ctx, targetRS, newReplicasCount, deployment)
+		_, updatedOldRS, err := dc.scaleReplicaSet(ctx, targetRS, newReplicasCount, deployment, false)
 		if err != nil {
 			return nil, totalScaledDown, err
 		}
@@ -219,12 +212,12 @@ func (dc *DeploymentController) scaleDownOldReplicaSetsForRollingUpdate(ctx cont
 			continue
 		}
 		// Scale down.
-		scaleDownCount := int32(integer.IntMin(int(*(targetRS.Spec.Replicas)), int(totalScaleDownCount-totalScaledDown)))
+		scaleDownCount := min(*(targetRS.Spec.Replicas), totalScaleDownCount-totalScaledDown)
 		newReplicasCount := *(targetRS.Spec.Replicas) - scaleDownCount
 		if newReplicasCount > *(targetRS.Spec.Replicas) {
 			return 0, fmt.Errorf("when scaling down old RS, got invalid request to scale down %s/%s %d -> %d", targetRS.Namespace, targetRS.Name, *(targetRS.Spec.Replicas), newReplicasCount)
 		}
-		_, _, err := dc.scaleReplicaSetAndRecordEvent(ctx, targetRS, newReplicasCount, deployment)
+		_, _, err := dc.scaleReplicaSet(ctx, targetRS, newReplicasCount, deployment, false)
 		if err != nil {
 			return totalScaledDown, err
 		}

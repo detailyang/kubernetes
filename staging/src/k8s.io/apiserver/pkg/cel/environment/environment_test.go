@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/google/cel-go/cel"
+	"cel.dev/cel-go/cel"
 
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
@@ -42,6 +42,28 @@ func TestBaseEnvironment(t *testing.T) {
 				Type: apiservercel.StringType,
 			},
 		})
+
+	// The escaping happens while construct declType hence we use escaped format here directly.
+	gadgetsType := apiservercel.NewObjectType("Gadget",
+		map[string]*apiservercel.DeclField{
+			"__namespace__": {
+				Name: "__namespace__",
+				Type: apiservercel.StringType,
+			},
+		})
+
+	// Gated functions like 'includes' become available at 1.37. When the default compatibility version rolls over to 1.37 or later, 'includes' will be valid. We dynamically select valid/invalid expressions depending on the current DefaultCompatibilityVersion to prevent test failures during Kubernetes version bump.
+	var defaultCompatibilityInvalid []string
+	var defaultCompatibilityValid []string
+	if DefaultCompatibilityVersion().AtLeast(version.MajorMinor(1, 37)) {
+		defaultCompatibilityValid = []string{
+			"[1, 2].includes(2) == true",
+		}
+	} else {
+		defaultCompatibilityInvalid = []string{
+			"[1, 2].includes(2)",
+		}
+	}
 
 	cases := []struct {
 		name                    string
@@ -249,6 +271,78 @@ func TestBaseEnvironment(t *testing.T) {
 						library.Test(library.TestVersion(1)),
 					},
 				},
+			},
+		},
+		{
+			name: "recognizeKeywordAsFieldName disabled",
+			typeVersionCombinations: []envTypeAndVersion{
+				{version.MajorMinor(1, 30), NewExpressions},
+				// always enabled for StoredExpressions
+			},
+			invalidExpressions: []string{"gadget.namespace == 'buzz'"},
+			activation:         map[string]any{"gadget": map[string]any{"namespace": "buzz"}},
+			opts: []VersionedOptions{
+				{
+					IntroducedVersion: version.MajorMinor(1, 28),
+					DeclTypes:         []*apiservercel.DeclType{gadgetsType},
+					EnvOptions: []cel.EnvOption{
+						cel.Variable("gadget", cel.ObjectType("Gadget")),
+					},
+				},
+			},
+		},
+		{
+			name: "recognizeKeywordAsFieldName enabled",
+			typeVersionCombinations: []envTypeAndVersion{
+				{version.MajorMinor(1, 31), NewExpressions},
+				{version.MajorMinor(1, 30), StoredExpressions},
+			},
+			validExpressions: []string{"gadget.namespace == 'buzz'"},
+			activation:       map[string]any{"gadget": map[string]any{"namespace": "buzz"}},
+			opts: []VersionedOptions{
+				{
+					IntroducedVersion: version.MajorMinor(1, 28),
+					DeclTypes:         []*apiservercel.DeclType{gadgetsType},
+					EnvOptions: []cel.EnvOption{
+						cel.Variable("gadget", cel.ObjectType("Gadget")),
+					},
+				},
+			},
+		},
+		{
+			name: "includes function version gating (default compatibility version)",
+			typeVersionCombinations: []envTypeAndVersion{
+				{version: DefaultCompatibilityVersion(), envType: NewExpressions},
+			},
+			invalidExpressions: defaultCompatibilityInvalid,
+			validExpressions:   defaultCompatibilityValid,
+		},
+		{
+			name: "includes function version gating (emulated version 1.36)",
+			typeVersionCombinations: []envTypeAndVersion{
+				{version: version.MajorMinor(1, 36), envType: NewExpressions},
+			},
+			invalidExpressions: []string{
+				"[1, 2].includes(2)",
+			},
+		},
+		{
+			name: "includes function available (emulated version 1.37)",
+			typeVersionCombinations: []envTypeAndVersion{
+				{version: version.MajorMinor(1, 37), envType: NewExpressions},
+			},
+			validExpressions: []string{
+				"[1, 2].includes(2) == true",
+			},
+		},
+		{
+			name: "includes function available (stored expressions for default/1.36)",
+			typeVersionCombinations: []envTypeAndVersion{
+				{version: DefaultCompatibilityVersion(), envType: StoredExpressions},
+				{version: version.MajorMinor(1, 36), envType: StoredExpressions},
+			},
+			validExpressions: []string{
+				"[1, 2].includes(2) == true",
 			},
 		},
 	}

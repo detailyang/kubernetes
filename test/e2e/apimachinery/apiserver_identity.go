@@ -26,15 +26,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 	"golang.org/x/crypto/cryptobyte"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
-	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	e2essh "k8s.io/kubernetes/test/e2e/framework/ssh"
 	admissionapi "k8s.io/pod-security-admission/api"
 )
@@ -79,13 +79,11 @@ func restartAPIServer(ctx context.Context, node *v1.Node) error {
 }
 
 // This test requires that --feature-gates=APIServerIdentity=true be set on the apiserver
-var _ = SIGDescribe("kube-apiserver identity [Feature:APIServerIdentity]", func() {
+var _ = SIGDescribe("kube-apiserver identity", feature.APIServerIdentity, func() {
 	f := framework.NewDefaultFramework("kube-apiserver-identity")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
-	ginkgo.It("kube-apiserver identity should persist after restart [Disruptive]", func(ctx context.Context) {
-		e2eskipper.SkipUnlessProviderIs("gce")
-
+	f.It("kube-apiserver identity should persist after restart", f.WithDisruptive(), f.WithProvider("gce"), func(ctx context.Context) {
 		client := f.ClientSet
 
 		var controlPlaneNodes []v1.Node
@@ -120,7 +118,7 @@ var _ = SIGDescribe("kube-apiserver identity [Feature:APIServerIdentity]", func(
 			LabelSelector: "apiserver.kubernetes.io/identity=kube-apiserver",
 		})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(len(leases.Items), len(controlPlaneNodes), "unexpected number of leases")
+		gomega.Expect(leases.Items).To(gomega.HaveLen(len(controlPlaneNodes)), "unexpected number of leases")
 
 		for _, node := range controlPlaneNodes {
 			hostname, err := getControlPlaneHostname(ctx, &node)
@@ -176,6 +174,6 @@ var _ = SIGDescribe("kube-apiserver identity [Feature:APIServerIdentity]", func(
 			LabelSelector: "apiserver.kubernetes.io/identity=kube-apiserver",
 		})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(len(leases.Items), len(controlPlaneNodes), "unexpected number of leases")
+		gomega.Expect(leases.Items).To(gomega.HaveLen(len(controlPlaneNodes)), "unexpected number of leases")
 	})
 })

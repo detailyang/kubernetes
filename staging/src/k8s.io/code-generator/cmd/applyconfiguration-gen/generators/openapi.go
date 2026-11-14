@@ -23,18 +23,18 @@ import (
 	"strings"
 
 	openapiv2 "github.com/google/gnostic-models/openapiv2"
-	"k8s.io/gengo/types"
+
+	clientgentypes "k8s.io/code-generator/cmd/client-gen/types"
+	"k8s.io/code-generator/pkg/apidefinitions"
+	"k8s.io/gengo/v2/types"
+	"k8s.io/kube-openapi/pkg/util"
 	utilproto "k8s.io/kube-openapi/pkg/util/proto"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 )
 
 type typeModels struct {
 	models           utilproto.Models
-	gvkToOpenAPIType map[gvk]string
-}
-
-type gvk struct {
-	group, version, kind string
+	gvkToOpenAPIType map[clientgentypes.GroupVersionKind]string
 }
 
 func newTypeModels(openAPISchemaFilePath string, pkgTypes map[string]*types.Package) (*typeModels, error) {
@@ -56,21 +56,32 @@ func newTypeModels(openAPISchemaFilePath string, pkgTypes map[string]*types.Pack
 
 	// Build a mapping from openAPI type name to GVK.
 	// Find the root types needed by by client-go for apply.
-	gvkToOpenAPIType := map[gvk]string{}
+	gvkToOpenAPIType := map[clientgentypes.GroupVersionKind]string{}
 	rootDefs := map[string]spec.Schema{}
 	for _, p := range pkgTypes {
-		gv := groupVersion(p)
+		gv, err := groupVersion(p)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse comments of package %s: %w", p.Name, err)
+		}
+		// openapi-gen names types after the package's +k8s:openapi-model-package if set.
+		modelPackage, hasModelPackage, err := apidefinitions.OpenAPIModelPackageForPackage(p.Comments)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse comments of package %s: %w", p.Name, err)
+		}
 		for _, t := range p.Types {
 			tags := genclientTags(t)
 			hasApply := tags.HasVerb("apply") || tags.HasVerb("applyStatus")
 			if tags.GenerateClient && hasApply {
-				openAPIType := friendlyName(typeName(t))
-				gvk := gvk{
-					group:   gv.Group.String(),
-					version: gv.Version.String(),
-					kind:    t.Name.Name,
+				openAPIType := util.ToRESTFriendlyName(typeName(t))
+				if hasModelPackage {
+					openAPIType = modelPackage + "." + t.Name.Name
 				}
-				rootDefs[openAPIType] = openAPISchema.Definitions[openAPIType]
+				def, ok := openAPISchema.Definitions[openAPIType]
+				if !ok {
+					return nil, fmt.Errorf("OpenAPI schema has no definition %q for type %s", openAPIType, t.Name)
+				}
+				gvk := gv.WithKind(clientgentypes.Kind(t.Name.Name))
+				rootDefs[openAPIType] = def
 				gvkToOpenAPIType[gvk] = openAPIType
 			}
 		}
@@ -94,7 +105,7 @@ func newTypeModels(openAPISchemaFilePath string, pkgTypes map[string]*types.Pack
 
 var emptyModels = &typeModels{
 	models:           &utilproto.Definitions{},
-	gvkToOpenAPIType: map[gvk]string{},
+	gvkToOpenAPIType: map[clientgentypes.GroupVersionKind]string{},
 }
 
 func toValidatedModels(openAPISchema *spec.Swagger) (utilproto.Models, error) {

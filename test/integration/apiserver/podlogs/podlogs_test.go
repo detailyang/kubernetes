@@ -49,9 +49,9 @@ import (
 	"k8s.io/client-go/transport"
 	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/client-go/util/keyutil"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	"k8s.io/kubernetes/test/integration/framework"
-	"k8s.io/kubernetes/test/utils/ktesting"
 )
 
 func TestInsecurePodLogs(t *testing.T) {
@@ -78,11 +78,8 @@ Bgqc+dJN9xS9Ah5gLiGQJ6C4niUA11piCpvMsy+j/LQ1Erx47KMar5fuMXYk7iPq
 -----END CERTIFICATE-----
 `))
 
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	clientSet, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
+	tCtx := ktesting.Init(t)
+	clientSet, _, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
 		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
 			opts.GenericServerRunOptions.MaxRequestBodyBytes = 1024 * 1024
 			// I have no idea what this cert is, but it doesn't matter, we just want something that always fails validation
@@ -97,7 +94,7 @@ Bgqc+dJN9xS9Ah5gLiGQJ6C4niUA11piCpvMsy+j/LQ1Erx47KMar5fuMXYk7iPq
 	}))
 	defer fakeKubeletServer.Close()
 
-	pod := prepareFakeNodeAndPod(ctx, t, clientSet, fakeKubeletServer)
+	pod := prepareFakeNodeAndPod(tCtx, t, clientSet, fakeKubeletServer)
 
 	insecureResult := clientSet.CoreV1().Pods("ns").GetLogs(pod.Name, &corev1.PodLogOptions{InsecureSkipTLSVerifyBackend: true}).Do(context.TODO())
 	if err := insecureResult.Error(); err != nil {
@@ -109,7 +106,7 @@ Bgqc+dJN9xS9Ah5gLiGQJ6C4niUA11piCpvMsy+j/LQ1Erx47KMar5fuMXYk7iPq
 		t.Fatal(insecureStatusCode)
 	}
 
-	secureResult := clientSet.CoreV1().Pods("ns").GetLogs(pod.Name, &corev1.PodLogOptions{}).Do(ctx)
+	secureResult := clientSet.CoreV1().Pods("ns").GetLogs(pod.Name, &corev1.PodLogOptions{}).Do(tCtx)
 	if err := secureResult.Error(); err == nil || !strings.Contains(err.Error(), "x509: certificate signed by unknown authority") {
 		t.Fatal(err)
 	}
@@ -205,12 +202,9 @@ func TestPodLogsKubeletClientCertReload(t *testing.T) {
 	t.Cleanup(cancel)
 
 	origCertCallbackRefreshDuration := transport.CertCallbackRefreshDuration
-	origDialerStopCh := transport.DialerStopCh
 	transport.CertCallbackRefreshDuration = time.Second // make client cert reloading fast
-	transport.DialerStopCh = ctx.Done()
 	t.Cleanup(func() {
 		transport.CertCallbackRefreshDuration = origCertCallbackRefreshDuration
-		transport.DialerStopCh = origDialerStopCh
 	})
 
 	// create a CA to sign the API server's kubelet client cert
@@ -283,7 +277,7 @@ func TestPodLogsKubeletClientCertReload(t *testing.T) {
 	}
 
 	// wait until the kubelet observes the new CA
-	if err := wait.PollImmediateUntilWithContext(ctx, time.Second, func(ctx context.Context) (bool, error) {
+	if err := wait.PollUntilContextCancel(ctx, time.Second, true, func(ctx context.Context) (bool, error) {
 		_, errLog := clientSet.CoreV1().Pods("ns").GetLogs(pod.Name, &corev1.PodLogOptions{}).DoRaw(ctx)
 		if errors.IsUnauthorized(errLog) {
 			return true, nil
@@ -302,7 +296,7 @@ func TestPodLogsKubeletClientCertReload(t *testing.T) {
 	}
 
 	// confirm that the API server observes the new client cert and closes existing connections to use it
-	if err := wait.PollImmediateUntilWithContext(ctx, time.Second, func(ctx context.Context) (bool, error) {
+	if err := wait.PollUntilContextCancel(ctx, time.Second, true, func(ctx context.Context) (bool, error) {
 		fixedPodLogs, errLog := clientSet.CoreV1().Pods("ns").GetLogs(pod.Name, &corev1.PodLogOptions{}).DoRaw(ctx)
 		if errors.IsUnauthorized(errLog) {
 			t.Log("api server has not observed new client cert")
@@ -359,7 +353,7 @@ func generateClientCert(t *testing.T) testCerts {
 		NotBefore:    caCert.NotBefore,
 		SerialNumber: serial,
 		NotAfter:     time.Now().Add(time.Hour).UTC(),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
 	clientCertDERBytes, err := x509.CreateCertificate(rand.Reader, &certTmpl, caCert, clientCertKey.Public(), caPrivateKey)

@@ -20,20 +20,19 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	corev1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/types"
 	endpointsliceutil "k8s.io/endpointslice/util"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 func TestNumEndpointsAndSlices(t *testing.T) {
 	c := NewCache(int32(100))
 
-	p80 := int32(80)
-	p443 := int32(443)
-
-	pmKey80443 := endpointsliceutil.NewPortMapKey([]discovery.EndpointPort{{Port: &p80}, {Port: &p443}})
-	pmKey80 := endpointsliceutil.NewPortMapKey([]discovery.EndpointPort{{Port: &p80}})
+	pmKey80443 := endpointsliceutil.NewPortMapKey([]discovery.EndpointPort{{Port: ptr.To[int32](80)}, {Port: ptr.To[int32](443)}})
+	pmKey80 := endpointsliceutil.NewPortMapKey([]discovery.EndpointPort{{Port: ptr.To[int32](80)}})
 
 	spCacheEfficient := NewServicePortCache()
 	spCacheEfficient.Set(pmKey80, EfficiencyInfo{Endpoints: 45, Slices: 1})
@@ -62,11 +61,8 @@ func TestNumEndpointsAndSlices(t *testing.T) {
 func TestPlaceHolderSlice(t *testing.T) {
 	c := NewCache(int32(100))
 
-	p80 := int32(80)
-	p443 := int32(443)
-
-	pmKey80443 := endpointsliceutil.NewPortMapKey([]discovery.EndpointPort{{Port: &p80}, {Port: &p443}})
-	pmKey80 := endpointsliceutil.NewPortMapKey([]discovery.EndpointPort{{Port: &p80}})
+	pmKey80443 := endpointsliceutil.NewPortMapKey([]discovery.EndpointPort{{Port: ptr.To[int32](80)}, {Port: ptr.To[int32](443)}})
+	pmKey80 := endpointsliceutil.NewPortMapKey([]discovery.EndpointPort{{Port: ptr.To[int32](80)}})
 
 	sp := NewServicePortCache()
 	sp.Set(pmKey80, EfficiencyInfo{Endpoints: 0, Slices: 1})
@@ -89,11 +85,98 @@ func expectNumEndpointsAndSlices(t *testing.T, c *Cache, desired int, actual int
 	}
 }
 
+// Tests the mutations to servicesByTrafficDistribution field within Cache
+// object.
+func TestCache_ServicesByTrafficDistribution(t *testing.T) {
+	cache := NewCache(0)
+
+	service1 := types.NamespacedName{Namespace: "ns1", Name: "service1"}
+	service2 := types.NamespacedName{Namespace: "ns1", Name: "service2"}
+	service3 := types.NamespacedName{Namespace: "ns2", Name: "service3"}
+	service4 := types.NamespacedName{Namespace: "ns3", Name: "service4"}
+
+	// Define helper function for assertion
+	mustHaveServicesByTrafficDistribution := func(wantServicesByTrafficDistribution map[string]map[types.NamespacedName]bool, desc string) {
+		t.Helper()
+		gotServicesByTrafficDistribution := cache.servicesByTrafficDistribution
+		if diff := cmp.Diff(wantServicesByTrafficDistribution, gotServicesByTrafficDistribution); diff != "" {
+			t.Fatalf("UpdateTrafficDistributionForService(%v) resulted in unexpected diff for cache.servicesByTrafficDistribution; (-want, +got)\n%v", desc, diff)
+		}
+	}
+
+	// Mutate and make assertions
+
+	desc := "service1 starts using trafficDistribution=PreferClose"
+	cache.UpdateTrafficDistributionForService(service1, ptr.To(corev1.ServiceTrafficDistributionPreferClose))
+	mustHaveServicesByTrafficDistribution(map[string]map[types.NamespacedName]bool{
+		corev1.ServiceTrafficDistributionPreferClose: {service1: true},
+	}, desc)
+
+	desc = "service1 starts using trafficDistribution=PreferClose, retries of similar mutation should be idempotent"
+	cache.UpdateTrafficDistributionForService(service1, ptr.To(corev1.ServiceTrafficDistributionPreferClose))
+	mustHaveServicesByTrafficDistribution(map[string]map[types.NamespacedName]bool{ // No delta
+		corev1.ServiceTrafficDistributionPreferClose: {service1: true},
+	}, desc)
+
+	desc = "service2 starts using trafficDistribution=PreferClose"
+	cache.UpdateTrafficDistributionForService(service2, ptr.To(corev1.ServiceTrafficDistributionPreferClose))
+	mustHaveServicesByTrafficDistribution(map[string]map[types.NamespacedName]bool{
+		corev1.ServiceTrafficDistributionPreferClose: {service1: true, service2: true}, // Delta
+	}, desc)
+
+	desc = "service3 starts using trafficDistribution=FutureValue"
+	cache.UpdateTrafficDistributionForService(service3, ptr.To("FutureValue"))
+	mustHaveServicesByTrafficDistribution(map[string]map[types.NamespacedName]bool{
+		corev1.ServiceTrafficDistributionPreferClose: {service1: true, service2: true},
+		"FutureValue": {service3: true}, // Delta
+	}, desc)
+
+	desc = "service4 starts using trafficDistribution=nil"
+	cache.UpdateTrafficDistributionForService(service4, nil)
+	mustHaveServicesByTrafficDistribution(map[string]map[types.NamespacedName]bool{ // No delta
+		corev1.ServiceTrafficDistributionPreferClose: {service1: true, service2: true},
+		"FutureValue": {service3: true},
+	}, desc)
+
+	desc = "service2 transitions trafficDistribution: PreferClose -> AnotherFutureValue"
+	cache.UpdateTrafficDistributionForService(service2, ptr.To("AnotherFutureValue"))
+	mustHaveServicesByTrafficDistribution(map[string]map[types.NamespacedName]bool{
+		corev1.ServiceTrafficDistributionPreferClose: {service1: true}, // Delta
+		"FutureValue":        {service3: true},
+		"AnotherFutureValue": {service2: true}, // Delta
+	}, desc)
+
+	desc = "service3 gets deleted"
+	cache.DeleteService(service3)
+	mustHaveServicesByTrafficDistribution(map[string]map[types.NamespacedName]bool{
+		corev1.ServiceTrafficDistributionPreferClose: {service1: true},
+		"FutureValue":        {}, // Delta
+		"AnotherFutureValue": {service2: true},
+	}, desc)
+
+	desc = "service1 transitions trafficDistribution: PreferClose -> nil"
+	cache.UpdateTrafficDistributionForService(service1, nil)
+	mustHaveServicesByTrafficDistribution(map[string]map[types.NamespacedName]bool{
+		corev1.ServiceTrafficDistributionPreferClose: {}, // Delta
+		"FutureValue":        {},
+		"AnotherFutureValue": {service2: true},
+	}, desc)
+
+	desc = "service2 transitions trafficDistribution: AnotherFutureValue -> nil"
+	cache.UpdateTrafficDistributionForService(service2, nil)
+	mustHaveServicesByTrafficDistribution(map[string]map[types.NamespacedName]bool{
+		corev1.ServiceTrafficDistributionPreferClose: {},
+		"FutureValue":        {},
+		"AnotherFutureValue": {}, // Delta
+	}, desc)
+
+}
+
 func benchmarkUpdateServicePortCache(b *testing.B, num int) {
 	c := NewCache(int32(100))
 	ns := "benchmark"
-	httpKey := endpointsliceutil.NewPortMapKey([]discovery.EndpointPort{{Port: pointer.Int32(80)}})
-	httpsKey := endpointsliceutil.NewPortMapKey([]discovery.EndpointPort{{Port: pointer.Int32(443)}})
+	httpKey := endpointsliceutil.NewPortMapKey([]discovery.EndpointPort{{Port: ptr.To[int32](80)}})
+	httpsKey := endpointsliceutil.NewPortMapKey([]discovery.EndpointPort{{Port: ptr.To[int32](443)}})
 	spCache := &ServicePortCache{items: map[endpointsliceutil.PortMapKey]EfficiencyInfo{
 		httpKey: {
 			Endpoints: 182,

@@ -16,7 +16,7 @@
 
 # A set of helpers for starting/running etcd for tests
 
-ETCD_VERSION=${ETCD_VERSION:-3.5.9}
+ETCD_VERSION=${ETCD_VERSION:-3.7.1}
 ETCD_HOST=${ETCD_HOST:-127.0.0.1}
 ETCD_PORT=${ETCD_PORT:-2379}
 # This is intentionally not called ETCD_LOG_LEVEL:
@@ -84,8 +84,13 @@ kube::etcd::start() {
   else
     ETCD_LOGFILE=${ETCD_LOGFILE:-"/dev/null"}
   fi
-  kube::log::info "etcd --advertise-client-urls ${KUBE_INTEGRATION_ETCD_URL} --data-dir ${ETCD_DIR} --listen-client-urls http://${ETCD_HOST}:${ETCD_PORT} --log-level=${ETCD_LOGLEVEL} 2> \"${ETCD_LOGFILE}\" >/dev/null"
-  etcd --advertise-client-urls "${KUBE_INTEGRATION_ETCD_URL}" --data-dir "${ETCD_DIR}" --listen-client-urls "${KUBE_INTEGRATION_ETCD_URL}" --log-level="${ETCD_LOGLEVEL}" 2> "${ETCD_LOGFILE}" >/dev/null &
+  if [[ -n "${ETCD_DRY_RUN:-}" ]]; then
+      echo "RUN etcd: $(command -v etcd) --advertise-client-urls ${KUBE_INTEGRATION_ETCD_URL} --data-dir ${ETCD_DIR} --listen-client-urls ${KUBE_INTEGRATION_ETCD_URL} --listen-peer-urls http://localhost:0 --log-level=${ETCD_LOGLEVEL}"
+      return
+  fi
+
+  kube::log::info "etcd --advertise-client-urls ${KUBE_INTEGRATION_ETCD_URL} --data-dir ${ETCD_DIR} --listen-client-urls http://${ETCD_HOST}:${ETCD_PORT} --listen-peer-urls http://localhost:0 --log-level=${ETCD_LOGLEVEL} 2> \"${ETCD_LOGFILE}\" >/dev/null"
+  etcd --advertise-client-urls "${KUBE_INTEGRATION_ETCD_URL}" --data-dir "${ETCD_DIR}" --listen-client-urls "${KUBE_INTEGRATION_ETCD_URL}" --listen-peer-urls "http://localhost:0" --log-level="${ETCD_LOGLEVEL}" 2> "${ETCD_LOGFILE}" >/dev/null &
   ETCD_PID=$!
 
   echo "Waiting for etcd to come up."
@@ -144,6 +149,12 @@ kube::etcd::cleanup() {
 }
 
 kube::etcd::install() {
+  # Make sure that we will abort if the inner shell fails.
+  set -o errexit
+  set -o pipefail
+  set -o nounset
+
+  # We change directories below, so this subshell is needed.
   (
     local os
     local arch
@@ -153,9 +164,8 @@ kube::etcd::install() {
 
     cd "${KUBE_ROOT}/third_party" || return 1
     if [[ $(readlink etcd) == etcd-v${ETCD_VERSION}-${os}-* ]]; then
-      kube::log::info "etcd v${ETCD_VERSION} already installed. To use:"
-      kube::log::info "export PATH=\"$(pwd)/etcd:\${PATH}\""
-      return  #already installed
+      V=4 kube::log::info "etcd v${ETCD_VERSION} is already installed"
+      return 0 # already installed
     fi
 
     if [[ ${os} == "darwin" ]]; then
@@ -166,7 +176,7 @@ kube::etcd::install() {
       ln -fns "etcd-v${ETCD_VERSION}-${os}-${arch}" etcd
       rm "${download_file}"
     elif [[ ${os} == "linux" ]]; then
-      url="https://github.com/coreos/etcd/releases/download/v${ETCD_VERSION}/etcd-v${ETCD_VERSION}-${os}-${arch}.tar.gz"
+      url="https://github.com/etcd-io/etcd/releases/download/v${ETCD_VERSION}/etcd-v${ETCD_VERSION}-${os}-${arch}.tar.gz"
       download_file="etcd-v${ETCD_VERSION}-${os}-${arch}.tar.gz"
       kube::util::download_file "${url}" "${download_file}"
       tar xzf "${download_file}"
@@ -174,8 +184,14 @@ kube::etcd::install() {
       rm "${download_file}"
     else
       kube::log::info "${os} is NOT supported."
+      return 1
     fi
-    kube::log::info "etcd v${ETCD_VERSION} installed. To use:"
-    kube::log::info "export PATH=\"$(pwd)/etcd:\${PATH}\""
+    V=4 kube::log::info "installed etcd v${ETCD_VERSION}"
+    return 0 # newly installed
   )
+  # Through the magic of errexit, we will not get here if the above shell
+  # fails!
+  PATH="${KUBE_ROOT}/third_party/etcd:${PATH}" # export into current process
+  export PATH
+  V=3 kube::log::info "added etcd to PATH: ${KUBE_ROOT}/third_party/etcd"
 }

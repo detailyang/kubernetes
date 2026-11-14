@@ -20,13 +20,13 @@ import (
 	"os"
 
 	"k8s.io/apiextensions-apiserver/pkg/cmd/server"
-	genericapiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/server/signals"
 	"k8s.io/component-base/cli"
 )
 
 func main() {
-	stopCh := genericapiserver.SetupSignalHandler()
-	cmd := server.NewServerCommand(os.Stdout, os.Stderr, stopCh)
+	ctx := signals.SetupSignalContext()
+	cmd := server.NewServerCommand(ctx, os.Stdout, os.Stderr)
 	code := cli.Run(cmd)
 	os.Exit(code)
 }

@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -38,9 +39,13 @@ import (
 	auditinternal "k8s.io/apiserver/pkg/apis/audit"
 	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/apiserver/pkg/endpoints/openapi"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
+	clientscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/ktesting"
+	kubeopenapi "k8s.io/kube-openapi/pkg/common"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/net/http2"
@@ -200,10 +205,15 @@ func TestGracefulTerminationWithKeepListeningDuringGracefulTerminationDisabled(t
 	}, nil)
 
 	// start the API server
-	stopCh, runCompletedCh := make(chan struct{}), make(chan struct{})
+	_, ctx := ktesting.NewTestContext(t)
+	stopCtx, stop := context.WithCancelCause(ctx)
+	defer stop(errors.New("test has completed"))
+	runCompletedCh := make(chan struct{})
 	go func() {
 		defer close(runCompletedCh)
-		s.PrepareRun().Run(stopCh)
+		if err := s.PrepareRun().RunWithContext(stopCtx); err != nil {
+			t.Errorf("unexpected error from RunWithContext: %v", err)
+		}
 	}()
 	waitForAPIServerStarted(t, doer)
 
@@ -222,7 +232,7 @@ func TestGracefulTerminationWithKeepListeningDuringGracefulTerminationDisabled(t
 	}
 
 	// signal termination event: initiate a shutdown
-	close(stopCh)
+	stop(errors.New("shutting down"))
 	waitForeverUntilSignaled(t, signals.ShutdownInitiated)
 
 	// /readyz must return an error, but we need to give it some time
@@ -423,10 +433,15 @@ func TestGracefulTerminationWithKeepListeningDuringGracefulTerminationEnabled(t 
 	}, nil)
 
 	// start the API server
-	stopCh, runCompletedCh := make(chan struct{}), make(chan struct{})
+	_, ctx := ktesting.NewTestContext(t)
+	stopCtx, stop := context.WithCancelCause(ctx)
+	defer stop(errors.New("test has completed"))
+	runCompletedCh := make(chan struct{})
 	go func() {
 		defer close(runCompletedCh)
-		s.PrepareRun().Run(stopCh)
+		if err := s.PrepareRun().RunWithContext(stopCtx); err != nil {
+			t.Errorf("unexpected error from RunWithContext: %v", err)
+		}
 	}()
 	waitForAPIServerStarted(t, doer)
 
@@ -445,7 +460,7 @@ func TestGracefulTerminationWithKeepListeningDuringGracefulTerminationEnabled(t 
 	}
 
 	// signal termination event: initiate a shutdown
-	close(stopCh)
+	stop(errors.New("shutting down"))
 	waitForeverUntilSignaled(t, signals.ShutdownInitiated)
 
 	// /readyz must return an error, but we need to give it some time
@@ -549,6 +564,92 @@ func TestGracefulTerminationWithKeepListeningDuringGracefulTerminationEnabled(t 
 	}
 }
 
+// This test checks that the watch wait group has entered waiting mode
+// before active watch handlers observe the draining signal.
+func TestGracefulTerminationWatchShutdownOrdering(t *testing.T) {
+	s := newGenericAPIServer(t, &fakeAudit{}, true)
+	client := newClient(false)
+	doer := setupDoer(t, s.SecureServingInfo)
+
+	// the more watches, the more likely one of them wins the race
+	const n = 200
+	startedWG := sync.WaitGroup{}
+	startedWG.Add(n)
+	var lock sync.Mutex
+	var shutdownBeforeWait int
+	s.Handler.NonGoRestfulMux.Handle("/apis/watches.group/v1/namespaces/foo/bar", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		signals := apirequest.ServerShutdownSignalFrom(req.Context())
+		startedWG.Done()
+		if signals == nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		<-signals.DrainingWatches()
+
+		// After observing draining, a positive Add should be rejected.
+		// Success means the watch wait group has not yet entered waiting mode.
+		if err := s.WatchRequestWaitGroup.Add(1); err == nil {
+			if err := s.WatchRequestWaitGroup.Add(-1); err != nil {
+				t.Errorf("unexpected error undoing watch wait group Add: %v", err)
+			}
+			lock.Lock()
+			shutdownBeforeWait++
+			lock.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	signals := &s.lifecycleSignals
+	signals.WatchRequestsDraining = wrapLifecycleSignal(t, signals.WatchRequestsDraining, func(_ lifecycleSignal) {
+		// NOTE: this is invoked with WatchRequestWaitGroup locked
+		select {
+		case <-signals.ShuttingDown():
+		default:
+			t.Errorf("Expected ShuttingDown() to be signaled before %s", signals.WatchRequestsDraining.Name())
+		}
+	}, nil)
+
+	_, ctx := ktesting.NewTestContext(t)
+	stopCtx, stop := context.WithCancelCause(ctx)
+	defer stop(errors.New("test has completed"))
+	runCompletedCh := make(chan struct{})
+	go func() {
+		defer close(runCompletedCh)
+		if err := s.PrepareRun().RunWithContext(stopCtx); err != nil {
+			t.Errorf("unexpected error from RunWithContext: %v", err)
+		}
+	}()
+	waitForAPIServerStarted(t, doer)
+
+	resultCh := make(chan result, n)
+	for range n {
+		go func() {
+			resultCh <- doer.Do(client, func(httptrace.GotConnInfo) {}, "/apis/watches.group/v1/namespaces/foo/bar?watch=true", 0)
+		}()
+	}
+	startedCh := make(chan struct{})
+	go func() {
+		defer close(startedCh)
+		startedWG.Wait()
+	}()
+	waitForeverUntil(t, startedCh, "in-flight watch requests did not reach the server")
+
+	stop(errors.New("shutting down"))
+	for range n {
+		resultGot := <-resultCh
+		if err := assertResponseStatusCode(resultGot, http.StatusOK); err != nil {
+			t.Errorf("%s", err.Error())
+		}
+	}
+	waitForeverUntil(t, runCompletedCh, "the apiserver Run method did not return")
+
+	lock.Lock()
+	defer lock.Unlock()
+	if shutdownBeforeWait != 0 {
+		t.Errorf("%d of %d watch handlers observed draining before the watch wait group entered waiting mode", shutdownBeforeWait, n)
+	}
+}
+
 func TestMuxAndDiscoveryComplete(t *testing.T) {
 	// setup
 	testSignal1 := make(chan struct{})
@@ -568,10 +669,15 @@ func TestMuxAndDiscoveryComplete(t *testing.T) {
 	}
 
 	// start the API server
-	stopCh, runCompletedCh := make(chan struct{}), make(chan struct{})
+	_, ctx := ktesting.NewTestContext(t)
+	stopCtx, stop := context.WithCancelCause(ctx)
+	defer stop(errors.New("test has completed"))
+	runCompletedCh := make(chan struct{})
 	go func() {
 		defer close(runCompletedCh)
-		s.PrepareRun().Run(stopCh)
+		if err := s.PrepareRun().RunWithContext(stopCtx); err != nil {
+			t.Errorf("unexpected error from RunWithContext: %v", err)
+		}
 	}()
 	waitForAPIServerStarted(t, doer)
 
@@ -612,6 +718,9 @@ func TestPreShutdownHooks(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			stopCtx, stop := context.WithCancelCause(ctx)
+			defer stop(errors.New("test has completed"))
 			s := test.server()
 			doer := setupDoer(t, s.SecureServingInfo)
 
@@ -643,14 +752,16 @@ func TestPreShutdownHooks(t *testing.T) {
 			}
 
 			// start the API server
-			stopCh, runCompletedCh := make(chan struct{}), make(chan struct{})
+			runCompletedCh := make(chan struct{})
 			go func() {
 				defer close(runCompletedCh)
-				s.PrepareRun().Run(stopCh)
+				if err := s.PrepareRun().RunWithContext(stopCtx); err != nil {
+					t.Errorf("unexpected error from RunWithContext: %v", err)
+				}
 			}()
 			waitForAPIServerStarted(t, doer)
 
-			close(stopCh)
+			stop(errors.New("shutting down"))
 
 			waitForeverUntil(t, runCompletedCh, "the apiserver Run method did not return")
 
@@ -729,7 +840,7 @@ func setupInFlightWatchRequestHandler(s *GenericAPIServer) *inFlightRequest {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		<-signals.ShuttingDown()
+		<-signals.DrainingWatches()
 		w.WriteHeader(http.StatusOK)
 	})
 	s.Handler.NonGoRestfulMux.Handle("/apis/watches.group/v1/namespaces/foo/bar", handler)
@@ -1002,6 +1113,12 @@ func newClient(useNewConnection bool) *http.Client {
 	}
 }
 
+func getOpenAPIDefinitionsForTest(_ kubeopenapi.ReferenceCallback) map[string]kubeopenapi.OpenAPIDefinition {
+	return map[string]kubeopenapi.OpenAPIDefinition{
+		"io.k8s.apimachinery.pkg.apis.meta.v1.APIGroupList": {},
+	}
+}
+
 func newGenericAPIServer(t *testing.T, fAudit *fakeAudit, keepListening bool) *GenericAPIServer {
 	config, _ := setUp(t)
 	config.ShutdownDelayDuration = 100 * time.Millisecond
@@ -1010,6 +1127,9 @@ func newGenericAPIServer(t *testing.T, fAudit *fakeAudit, keepListening bool) *G
 	config.ShutdownWatchTerminationGracePeriod = 2 * time.Second
 	config.AuditPolicyRuleEvaluator = fAudit
 	config.AuditBackend = fAudit
+	namer := openapi.NewDefinitionNamer(clientscheme.Scheme)
+	config.OpenAPIConfig = DefaultOpenAPIConfig(getOpenAPIDefinitionsForTest, namer)
+	config.OpenAPIV3Config = DefaultOpenAPIV3Config(getOpenAPIDefinitionsForTest, namer)
 
 	s, err := config.Complete(nil).New("test", NewEmptyDelegate())
 	if err != nil {

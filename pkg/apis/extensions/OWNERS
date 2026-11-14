@@ -2,22 +2,21 @@
 
 reviewers:
   - thockin
-  - smarterclayton
   - wojtek-t
   - deads2k
   - derekwaynecarr
   - caesarxuchao
-  - mikedanese
   - liggitt
   - sttts
   - saad-ali
   - janetkuo
   - justinsb
-  - ncdc
   - tallclair
   - mwielgus
   - soltysh
   - dims
   - jpbetz
+emeritus_reviewers:
+  - ncdc
 labels:
   - sig/apps

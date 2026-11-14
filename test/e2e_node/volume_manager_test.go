@@ -18,6 +18,8 @@ package e2enode
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -27,8 +29,6 @@ import (
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	admissionapi "k8s.io/pod-security-admission/api"
 
-	"fmt"
-
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -37,7 +37,7 @@ var _ = SIGDescribe("Kubelet Volume Manager", func() {
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	ginkgo.Describe("Volume Manager", func() {
 		ginkgo.Context("On termination of pod with memory backed volume", func() {
-			ginkgo.It("should remove the volume from the node [NodeConformance]", func(ctx context.Context) {
+			f.It("should remove the volume from the node", f.WithNodeConformance(), func(ctx context.Context) {
 				var (
 					memoryBackedPod *v1.Pod
 					volumeName      string
@@ -80,7 +80,7 @@ var _ = SIGDescribe("Kubelet Volume Manager", func() {
 				ginkgo.By("Verifying the memory backed volume was removed from node", func() {
 					volumePath := fmt.Sprintf("/tmp/%s/volumes/kubernetes.io~empty-dir/%s", string(memoryBackedPod.UID), volumeName)
 					var err error
-					for i := 0; i < 10; i++ {
+					for range 10 {
 						// need to create a new verification pod on each pass since updates
 						//to the HostPath volume aren't propogated to the pod
 						pod := e2epod.NewPodClient(f).Create(ctx, &v1.Pod{
@@ -107,9 +107,7 @@ var _ = SIGDescribe("Kubelet Volume Manager", func() {
 									{
 										Name: "kubelet-pods",
 										VolumeSource: v1.VolumeSource{
-											// TODO: remove hardcoded kubelet volume directory path
-											// framework.TestContext.KubeVolumeDir is currently not populated for node e2e
-											HostPath: &v1.HostPathVolumeSource{Path: "/var/lib/kubelet/pods"},
+											HostPath: &v1.HostPathVolumeSource{Path: filepath.Join(framework.TestContext.KubeletRootDir, "pods")},
 										},
 									},
 								},

@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -52,7 +53,7 @@ import (
 	hashutil "k8s.io/kubernetes/pkg/util/hash"
 	taintutils "k8s.io/kubernetes/pkg/util/taints"
 	"k8s.io/utils/clock"
-	"k8s.io/utils/integer"
+	"k8s.io/utils/ptr"
 
 	"k8s.io/klog/v2"
 )
@@ -84,6 +85,13 @@ const (
 	// The number of batches is given by:
 	//      1+floor(log_2(ceil(N/SlowStartInitialBatchSize)))
 	SlowStartInitialBatchSize = 1
+
+	// PodNodeNameKeyIndex is the name of the index used by PodInformer to index pods by their node name.
+	PodNodeNameKeyIndex = "spec.nodeName"
+
+	// PodControllerIndex is the name for the Pod store's index function,
+	// which indexes by the key returned from PodControllerIndexKey.
+	PodControllerIndex = "podController"
 )
 
 var UpdateTaintBackoff = wait.Backoff{
@@ -160,6 +168,7 @@ type ControllerExpectationsInterface interface {
 // ControllerExpectations is a cache mapping controllers to what they expect to see before being woken up for a sync.
 type ControllerExpectations struct {
 	cache.Store
+	clock clock.Clock
 }
 
 // GetExpectations returns the ControlleeExpectations of the given controller.
@@ -189,7 +198,7 @@ func (r *ControllerExpectations) SatisfiedExpectations(logger klog.Logger, contr
 		if exp.Fulfilled() {
 			logger.V(4).Info("Controller expectations fulfilled", "expectations", exp)
 			return true
-		} else if exp.isExpired() {
+		} else if exp.isExpired(r.clock) {
 			logger.V(4).Info("Controller expectations expired", "expectations", exp)
 			return true
 		} else {
@@ -211,16 +220,13 @@ func (r *ControllerExpectations) SatisfiedExpectations(logger klog.Logger, contr
 	return true
 }
 
-// TODO: Extend ExpirationCache to support explicit expiration.
-// TODO: Make this possible to disable in tests.
-// TODO: Support injection of clock.
-func (exp *ControlleeExpectations) isExpired() bool {
-	return clock.RealClock{}.Since(exp.timestamp) > ExpectationsTimeout
+func (e *ControlleeExpectations) isExpired(clk clock.Clock) bool {
+	return clk.Since(e.timestamp) > ExpectationsTimeout
 }
 
 // SetExpectations registers new expectations for the given controller. Forgets existing expectations.
 func (r *ControllerExpectations) SetExpectations(logger klog.Logger, controllerKey string, add, del int) error {
-	exp := &ControlleeExpectations{add: int64(add), del: int64(del), key: controllerKey, timestamp: clock.RealClock{}.Now()}
+	exp := &ControlleeExpectations{add: int64(add), del: int64(del), key: controllerKey, timestamp: r.clock.Now()}
 	logger.V(4).Info("Setting expectations", "expectations", exp)
 	return r.Add(exp)
 }
@@ -302,9 +308,21 @@ func (e *ControlleeExpectations) MarshalLog() interface{} {
 	}
 }
 
+// ExpectationsClock is the clock NewControllerExpectations uses. It is not safe
+// to change while controllers are being constructed.
+var ExpectationsClock clock.Clock = clock.RealClock{}
+
 // NewControllerExpectations returns a store for ControllerExpectations.
 func NewControllerExpectations() *ControllerExpectations {
-	return &ControllerExpectations{cache.NewStore(ExpKeyFunc)}
+	return NewControllerExpectationsWithClock(ExpectationsClock)
+}
+
+// NewControllerExpectationsWithClock returns a store for ControllerExpectations using the specified clock.
+func NewControllerExpectationsWithClock(clk clock.Clock) *ControllerExpectations {
+	return &ControllerExpectations{
+		Store: cache.NewStore(ExpKeyFunc),
+		clock: clk,
+	}
 }
 
 // UIDSetKeyFunc to parse out the key from a UIDSet.
@@ -474,6 +492,7 @@ type PodControlInterface interface {
 type RealPodControl struct {
 	KubeClient clientset.Interface
 	Recorder   record.EventRecorder
+	OnWrite    func(*v1.Pod, *metav1.OwnerReference)
 }
 
 var _ PodControlInterface = &RealPodControl{}
@@ -543,11 +562,15 @@ func (r RealPodControl) CreatePodsWithGenerateName(ctx context.Context, namespac
 	if len(generateName) > 0 {
 		pod.ObjectMeta.GenerateName = generateName
 	}
-	return r.createPods(ctx, namespace, pod, controllerObject)
+	return r.createPods(ctx, namespace, pod, controllerObject, controllerRef)
 }
 
 func (r RealPodControl) PatchPod(ctx context.Context, namespace, name string, data []byte) error {
-	_, err := r.KubeClient.CoreV1().Pods(namespace).Patch(ctx, name, types.StrategicMergePatchType, data, metav1.PatchOptions{})
+	pod, err := r.KubeClient.CoreV1().Pods(namespace).Patch(ctx, name, types.StrategicMergePatchType, data, metav1.PatchOptions{})
+	if err == nil && r.OnWrite != nil {
+		ownerRef := metav1.GetControllerOfNoCopy(pod)
+		r.OnWrite(pod, ownerRef)
+	}
 	return err
 }
 
@@ -576,7 +599,7 @@ func GetPodFromTemplate(template *v1.PodTemplateSpec, parentObject runtime.Objec
 	return pod, nil
 }
 
-func (r RealPodControl) createPods(ctx context.Context, namespace string, pod *v1.Pod, object runtime.Object) error {
+func (r RealPodControl) createPods(ctx context.Context, namespace string, pod *v1.Pod, object runtime.Object, controllerRef *metav1.OwnerReference) error {
 	if len(labels.Set(pod.Labels)) == 0 {
 		return fmt.Errorf("unable to create pods, no labels")
 	}
@@ -589,6 +612,9 @@ func (r RealPodControl) createPods(ctx context.Context, namespace string, pod *v
 		return err
 	}
 	logger := klog.FromContext(ctx)
+	if r.OnWrite != nil {
+		r.OnWrite(newPod, controllerRef)
+	}
 	accessor, err := meta.Accessor(object)
 	if err != nil {
 		logger.Error(err, "parentObject does not have ObjectMeta")
@@ -627,6 +653,7 @@ type FakePodControl struct {
 	DeletePodName   []string
 	Patches         [][]byte
 	Err             error
+	DeleteErr       error
 	CreateLimit     int
 	CreateCallCount int
 }
@@ -654,6 +681,9 @@ func (f *FakePodControl) CreatePodsWithGenerateName(ctx context.Context, namespa
 	if f.CreateLimit != 0 && f.CreateCallCount > f.CreateLimit {
 		return fmt.Errorf("not creating pod, limit %d already reached (create call %d)", f.CreateLimit, f.CreateCallCount)
 	}
+	// spec usually points into an informer-cached object; copy before writing
+	// so the fake doesn't mutate the cache (RealPodControl copies too).
+	spec = spec.DeepCopy()
 	spec.GenerateName = generateNamePrefix
 	f.Templates = append(f.Templates, *spec)
 	f.ControllerRefs = append(f.ControllerRefs, *controllerRef)
@@ -667,6 +697,9 @@ func (f *FakePodControl) DeletePod(ctx context.Context, namespace string, podID 
 	f.Lock()
 	defer f.Unlock()
 	f.DeletePodName = append(f.DeletePodName, podID)
+	if f.DeleteErr != nil {
+		return f.DeleteErr
+	}
 	if f.Err != nil {
 		return f.Err
 	}
@@ -714,8 +747,8 @@ func (s ByLogging) Less(i, j int) bool {
 		}
 	}
 	// 5. Pods with containers with higher restart counts < lower restart counts
-	if maxContainerRestarts(s[i]) != maxContainerRestarts(s[j]) {
-		return maxContainerRestarts(s[i]) > maxContainerRestarts(s[j])
+	if res := compareMaxContainerRestarts(s[i], s[j]); res != nil {
+		return *res
 	}
 	// 6. older pods < newer pods < empty timestamp pods
 	if !s[i].CreationTimestamp.Equal(&s[j].CreationTimestamp) {
@@ -757,8 +790,8 @@ func (s ActivePods) Less(i, j int) bool {
 		}
 	}
 	// 5. Pods with containers with higher restart counts < lower restart counts
-	if maxContainerRestarts(s[i]) != maxContainerRestarts(s[j]) {
-		return maxContainerRestarts(s[i]) > maxContainerRestarts(s[j])
+	if res := compareMaxContainerRestarts(s[i], s[j]); res != nil {
+		return *res
 	}
 	// 6. Empty creation time pods < newer pods < older pods
 	if !s[i].CreationTimestamp.Equal(&s[j].CreationTimestamp) {
@@ -864,38 +897,30 @@ func (s ActivePodsWithRanks) Less(i, j int) bool {
 		readyTime1 := podReadyTime(s.Pods[i])
 		readyTime2 := podReadyTime(s.Pods[j])
 		if !readyTime1.Equal(readyTime2) {
-			if !utilfeature.DefaultFeatureGate.Enabled(features.LogarithmicScaleDown) {
+			if s.Now.IsZero() || readyTime1.IsZero() || readyTime2.IsZero() {
 				return afterOrZero(readyTime1, readyTime2)
-			} else {
-				if s.Now.IsZero() || readyTime1.IsZero() || readyTime2.IsZero() {
-					return afterOrZero(readyTime1, readyTime2)
-				}
-				rankDiff := logarithmicRankDiff(*readyTime1, *readyTime2, s.Now)
-				if rankDiff == 0 {
-					return s.Pods[i].UID < s.Pods[j].UID
-				}
-				return rankDiff < 0
 			}
-		}
-	}
-	// 7. Pods with containers with higher restart counts < lower restart counts
-	if maxContainerRestarts(s.Pods[i]) != maxContainerRestarts(s.Pods[j]) {
-		return maxContainerRestarts(s.Pods[i]) > maxContainerRestarts(s.Pods[j])
-	}
-	// 8. Empty creation time pods < newer pods < older pods
-	if !s.Pods[i].CreationTimestamp.Equal(&s.Pods[j].CreationTimestamp) {
-		if !utilfeature.DefaultFeatureGate.Enabled(features.LogarithmicScaleDown) {
-			return afterOrZero(&s.Pods[i].CreationTimestamp, &s.Pods[j].CreationTimestamp)
-		} else {
-			if s.Now.IsZero() || s.Pods[i].CreationTimestamp.IsZero() || s.Pods[j].CreationTimestamp.IsZero() {
-				return afterOrZero(&s.Pods[i].CreationTimestamp, &s.Pods[j].CreationTimestamp)
-			}
-			rankDiff := logarithmicRankDiff(s.Pods[i].CreationTimestamp, s.Pods[j].CreationTimestamp, s.Now)
+			rankDiff := logarithmicRankDiff(*readyTime1, *readyTime2, s.Now)
 			if rankDiff == 0 {
 				return s.Pods[i].UID < s.Pods[j].UID
 			}
 			return rankDiff < 0
 		}
+	}
+	// 7. Pods with containers with higher restart counts < lower restart counts
+	if res := compareMaxContainerRestarts(s.Pods[i], s.Pods[j]); res != nil {
+		return *res
+	}
+	// 8. Empty creation time pods < newer pods < older pods
+	if !s.Pods[i].CreationTimestamp.Equal(&s.Pods[j].CreationTimestamp) {
+		if s.Now.IsZero() || s.Pods[i].CreationTimestamp.IsZero() || s.Pods[j].CreationTimestamp.IsZero() {
+			return afterOrZero(&s.Pods[i].CreationTimestamp, &s.Pods[j].CreationTimestamp)
+		}
+		rankDiff := logarithmicRankDiff(s.Pods[i].CreationTimestamp, s.Pods[j].CreationTimestamp, s.Now)
+		if rankDiff == 0 {
+			return s.Pods[i].UID < s.Pods[j].UID
+		}
+		return rankDiff < 0
 	}
 	return false
 }
@@ -937,12 +962,56 @@ func podReadyTime(pod *v1.Pod) *metav1.Time {
 	return &metav1.Time{}
 }
 
-func maxContainerRestarts(pod *v1.Pod) int {
-	maxRestarts := 0
+func maxContainerRestarts(pod *v1.Pod) (regularRestarts, sidecarRestarts int) {
 	for _, c := range pod.Status.ContainerStatuses {
-		maxRestarts = integer.IntMax(maxRestarts, int(c.RestartCount))
+		regularRestarts = max(regularRestarts, int(c.RestartCount))
 	}
-	return maxRestarts
+	names := sets.New[string]()
+	for _, c := range pod.Spec.InitContainers {
+		if c.RestartPolicy != nil && *c.RestartPolicy == v1.ContainerRestartPolicyAlways {
+			names.Insert(c.Name)
+		}
+	}
+	for _, c := range pod.Status.InitContainerStatuses {
+		if names.Has(c.Name) {
+			sidecarRestarts = max(sidecarRestarts, int(c.RestartCount))
+		}
+	}
+	return
+}
+
+// We use *bool here to determine equality:
+// true: pi has a higher container restart count.
+// false: pj has a higher container restart count.
+// nil: Both have the same container restart count.
+func compareMaxContainerRestarts(pi *v1.Pod, pj *v1.Pod) *bool {
+	regularRestartsI, sidecarRestartsI := maxContainerRestarts(pi)
+	regularRestartsJ, sidecarRestartsJ := maxContainerRestarts(pj)
+	if regularRestartsI != regularRestartsJ {
+		res := regularRestartsI > regularRestartsJ
+		return &res
+	}
+	// If pods have the same restart count, an attempt is made to compare the restart counts of sidecar containers.
+	if sidecarRestartsI != sidecarRestartsJ {
+		res := sidecarRestartsI > sidecarRestartsJ
+		return &res
+	}
+	return nil
+}
+
+// FilterClaimedPods returns pods that are controlled by the controller and match the selector.
+func FilterClaimedPods(controller metav1.Object, selector labels.Selector, pods []*v1.Pod) []*v1.Pod {
+	var result []*v1.Pod
+	for _, pod := range pods {
+		if !metav1.IsControlledBy(pod, controller) {
+			// It's an orphan or owned by someone else.
+			continue
+		}
+		if selector.Matches(labels.Set(pod.Labels)) {
+			result = append(result, pod)
+		}
+	}
+	return result
 }
 
 // FilterActivePods returns pods that have not terminated.
@@ -951,8 +1020,6 @@ func FilterActivePods(logger klog.Logger, pods []*v1.Pod) []*v1.Pod {
 	for _, p := range pods {
 		if IsPodActive(p) {
 			result = append(result, p)
-		} else {
-			logger.V(4).Info("Ignoring inactive pod", "pod", klog.KObj(p), "phase", p.Status.Phase, "deletionTime", p.DeletionTimestamp)
 		}
 	}
 	return result
@@ -976,6 +1043,60 @@ func CountTerminatingPods(pods []*v1.Pod) int32 {
 		}
 	}
 	return int32(numberOfTerminatingPods)
+}
+
+// nextPodAvailabilityCheck implements similar logic to podutil.IsPodAvailable
+func nextPodAvailabilityCheck(pod *v1.Pod, minReadySeconds int32, now time.Time) *time.Duration {
+	if !podutil.IsPodReady(pod) || minReadySeconds <= 0 {
+		return nil
+	}
+
+	c := podutil.GetPodReadyCondition(pod.Status)
+	if c.LastTransitionTime.IsZero() {
+		return nil
+	}
+	minReadySecondsDuration := time.Duration(minReadySeconds) * time.Second
+	nextCheck := c.LastTransitionTime.Add(minReadySecondsDuration).Sub(now)
+	if nextCheck > 0 {
+		return ptr.To(nextCheck)
+	}
+	return nil
+}
+
+// findMinNextPodAvailabilitySimpleCheck finds a duration when the next availability check should occur. It also returns the
+// first pod affected by the future availability recalculation (there might be more pods if they became ready at the same time;
+// this helps to implement FindMinNextPodAvailabilityCheck).
+func findMinNextPodAvailabilitySimpleCheck(pods []*v1.Pod, minReadySeconds int32, now time.Time) (*time.Duration, *v1.Pod) {
+	var minAvailabilityCheck *time.Duration
+	var checkPod *v1.Pod
+	for _, p := range pods {
+		nextCheck := nextPodAvailabilityCheck(p, minReadySeconds, now)
+		if nextCheck != nil && (minAvailabilityCheck == nil || *nextCheck < *minAvailabilityCheck) {
+			minAvailabilityCheck = nextCheck
+			checkPod = p
+		}
+	}
+	return minAvailabilityCheck, checkPod
+}
+
+// FindMinNextPodAvailabilityCheck finds a duration when the next availability check should occur.
+// We should check for the availability at the same time as the status evaluation/update occurs (e.g. .status.availableReplicas) by
+// passing lastOwnerStatusEvaluation. This ensures that we will not skip any pods that might become available
+// (findMinNextPodAvailabilitySimpleCheck would return nil in the future time), since the owner status evaluation.
+// clock is then used to calculate the precise time for the next availability check.
+func FindMinNextPodAvailabilityCheck(pods []*v1.Pod, minReadySeconds int32, lastOwnerStatusEvaluation time.Time, clock clock.PassiveClock) *time.Duration {
+	nextCheckAccordingToOwnerStatusEvaluation, checkPod := findMinNextPodAvailabilitySimpleCheck(pods, minReadySeconds, lastOwnerStatusEvaluation)
+	if nextCheckAccordingToOwnerStatusEvaluation == nil || checkPod == nil {
+		return nil
+	}
+	// There must be a nextCheck. We try to calculate a more precise value for the next availability check.
+	// Check the earliest pod to avoid being preempted by a later pod.
+	if updatedNextCheck := nextPodAvailabilityCheck(checkPod, minReadySeconds, clock.Now()); updatedNextCheck != nil {
+		// There is a delay since the last Now() call (lastOwnerStatusEvaluation). Use the updatedNextCheck.
+		return updatedNextCheck
+	}
+	// Fall back to 0 (immediate check) in case the last nextPodAvailabilityCheck call (with a refreshed Now) returns nil, as we might be past the check.
+	return ptr.To(time.Duration(0))
 }
 
 func IsPodActive(p *v1.Pod) bool {
@@ -1008,6 +1129,96 @@ func FilterReplicaSets(RSes []*apps.ReplicaSet, filterFn filterRS) []*apps.Repli
 		}
 	}
 	return filtered
+}
+
+// AddPodNodeNameIndexer adds an indexer for Pod's nodeName to the given PodInformer.
+// This indexer is used to efficiently look up pods by their node name.
+func AddPodNodeNameIndexer(podInformer cache.SharedIndexInformer) error {
+	if _, exists := podInformer.GetIndexer().GetIndexers()[PodNodeNameKeyIndex]; exists {
+		// indexer already exists, do nothing
+		return nil
+	}
+
+	return podInformer.AddIndexers(cache.Indexers{
+		PodNodeNameKeyIndex: func(obj interface{}) ([]string, error) {
+			pod, ok := obj.(*v1.Pod)
+			if !ok {
+				return []string{}, nil
+			}
+			if len(pod.Spec.NodeName) == 0 {
+				return []string{}, nil
+			}
+			return []string{pod.Spec.NodeName}, nil
+		},
+	})
+}
+
+// PodControllerIndexKey returns the index key to locate pods with the specified controller ownerReference.
+// If ownerReference is nil, the returned key locates pods in the namespace without a controller ownerReference.
+func PodControllerIndexKey(namespace string, ownerReference *metav1.OwnerReference) string {
+	if ownerReference == nil {
+		return namespace
+	}
+	return namespace + "/" + ownerReference.Kind + "/" + ownerReference.Name + "/" + string(ownerReference.UID)
+}
+
+// AddPodControllerIndexer adds an indexer for Pod's controllerRef.UID to the given PodInformer.
+// This indexer is used to efficiently look up pods by their ControllerRef.UID
+func AddPodControllerIndexer(podInformer cache.SharedIndexInformer) error {
+	if _, exists := podInformer.GetIndexer().GetIndexers()[PodControllerIndex]; exists {
+		// indexer already exists, do nothing
+		return nil
+	}
+	return podInformer.AddIndexers(cache.Indexers{
+		PodControllerIndex: func(obj interface{}) ([]string, error) {
+			pod, ok := obj.(*v1.Pod)
+			if !ok {
+				return nil, nil
+			}
+			// Get the ControllerRef of the Pod to check if it's managed by a controller.
+			// Index with a non-nil controller (indicating an owned pod) or a nil controller (indicating an orphan pod).
+			return []string{PodControllerIndexKey(pod.Namespace, metav1.GetControllerOf(pod))}, nil
+		},
+	})
+}
+
+// FilterPodsByOwner gets the Pods managed by an owner or orphan Pods in the owner's namespace
+func FilterPodsByOwner(podIndexer cache.Indexer, owner *metav1.ObjectMeta, ownerKind string, includeOrphanedPods bool) ([]*v1.Pod, error) {
+	result := []*v1.Pod{}
+
+	if len(owner.Namespace) == 0 {
+		return nil, fmt.Errorf("no owner namespace provided")
+	}
+	if len(owner.Name) == 0 {
+		return nil, fmt.Errorf("no owner name provided")
+	}
+	if len(owner.UID) == 0 {
+		return nil, fmt.Errorf("no owner uid provided")
+	}
+	if len(ownerKind) == 0 {
+		return nil, fmt.Errorf("no owner kind provided")
+	}
+	// Always include the owner key, which identifies Pods that are controlled by the owner
+	keys := []string{PodControllerIndexKey(owner.Namespace, &metav1.OwnerReference{Name: owner.Name, Kind: ownerKind, UID: owner.UID})}
+	if includeOrphanedPods {
+		// Optionally include the unowned key, which identifies orphaned Pods in the owner's namespace and might be adopted by the owner later
+		keys = append(keys, PodControllerIndexKey(owner.Namespace, nil))
+	}
+	for _, key := range keys {
+		pods, err := podIndexer.ByIndex(PodControllerIndex, key)
+		if err != nil {
+			return nil, err
+		}
+		for _, obj := range pods {
+			pod, ok := obj.(*v1.Pod)
+			if !ok {
+				utilruntime.HandleError(fmt.Errorf("unexpected object type in pod indexer: %v", obj))
+				continue
+			}
+			result = append(result, pod)
+		}
+	}
+	return result, nil
 }
 
 // PodKey returns a key unique to the given pod within a cluster.

@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 /*
 Copyright 2016 The Kubernetes Authors.
@@ -31,14 +30,15 @@ import (
 	"github.com/lithammer/dedent"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
+	filesutil "k8s.io/kubernetes/cmd/kubeadm/app/util/files/testing"
 	pkiutiltesting "k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil/testing"
 	staticpodutil "k8s.io/kubernetes/cmd/kubeadm/app/util/staticpod"
-	testutil "k8s.io/kubernetes/cmd/kubeadm/test"
 )
 
 const (
@@ -52,31 +52,73 @@ func TestGetStaticPodSpecs(t *testing.T) {
 	// Creates a Cluster Configuration
 	cfg := &kubeadmapi.ClusterConfiguration{
 		KubernetesVersion: "v1.9.0",
-		Scheduler: kubeadmapi.ControlPlaneComponent{ExtraEnvs: []v1.EnvVar{
-			{Name: "Foo", Value: "Bar"},
+		Scheduler: kubeadmapi.ControlPlaneComponent{ExtraEnvs: []kubeadmapi.EnvVar{
+			{
+				EnvVar: v1.EnvVar{Name: "Foo", Value: "Bar"},
+			},
 		}},
 	}
 
 	// Executes GetStaticPodSpecs
-	specs := GetStaticPodSpecs(cfg, &kubeadmapi.APIEndpoint{}, []v1.EnvVar{})
+	specs := GetStaticPodSpecs(cfg, &kubeadmapi.APIEndpoint{
+		BindPort: kubeadmconstants.KubeAPIServerPort,
+	}, []kubeadmapi.EnvVar{})
 
 	var tests = []struct {
-		name          string
-		staticPodName string
-		env           []v1.EnvVar
+		name                 string
+		staticPodName        string
+		expectLivenessProbe  bool
+		expectReadinessProbe bool
+		expectStartupProbe   bool
+		probePort            string
+		env                  []v1.EnvVar
+		containerPorts       []v1.ContainerPort
 	}{
 		{
-			name:          "KubeAPIServer",
-			staticPodName: kubeadmconstants.KubeAPIServer,
+			name:                 "KubeAPIServer",
+			staticPodName:        kubeadmconstants.KubeAPIServer,
+			expectLivenessProbe:  true,
+			expectReadinessProbe: true,
+			expectStartupProbe:   true,
+			probePort:            kubeadmconstants.ProbePort,
+			containerPorts: []v1.ContainerPort{
+				{
+					Name:          kubeadmconstants.ProbePort,
+					ContainerPort: kubeadmconstants.KubeAPIServerPort,
+					Protocol:      v1.ProtocolTCP,
+				},
+			},
 		},
 		{
-			name:          "KubeControllerManager",
-			staticPodName: kubeadmconstants.KubeControllerManager,
+			name:                 "KubeControllerManager",
+			staticPodName:        kubeadmconstants.KubeControllerManager,
+			expectLivenessProbe:  true,
+			expectReadinessProbe: false,
+			expectStartupProbe:   true,
+			probePort:            kubeadmconstants.ProbePort,
+			containerPorts: []v1.ContainerPort{
+				{
+					Name:          kubeadmconstants.ProbePort,
+					ContainerPort: kubeadmconstants.KubeControllerManagerPort,
+					Protocol:      v1.ProtocolTCP,
+				},
+			},
 		},
 		{
-			name:          "KubeScheduler",
-			staticPodName: kubeadmconstants.KubeScheduler,
-			env:           []v1.EnvVar{{Name: "Foo", Value: "Bar"}},
+			name:                 "KubeScheduler",
+			staticPodName:        kubeadmconstants.KubeScheduler,
+			expectLivenessProbe:  true,
+			expectReadinessProbe: true,
+			expectStartupProbe:   true,
+			probePort:            kubeadmconstants.ProbePort,
+			env:                  []v1.EnvVar{{Name: "Foo", Value: "Bar"}},
+			containerPorts: []v1.ContainerPort{
+				{
+					Name:          kubeadmconstants.ProbePort,
+					ContainerPort: kubeadmconstants.KubeSchedulerPort,
+					Protocol:      v1.ProtocolTCP,
+				},
+			},
 		},
 	}
 
@@ -93,6 +135,35 @@ func TestGetStaticPodSpecs(t *testing.T) {
 						t.Errorf("expected env: %v, got: %v", tc.env, spec.Spec.Containers[0].Env)
 					}
 				}
+
+				if tc.expectLivenessProbe != (spec.Spec.Containers[0].LivenessProbe != nil) {
+					t.Errorf("expected livenessProbe: %v, got: %v", tc.expectLivenessProbe, (spec.Spec.Containers[0].LivenessProbe != nil))
+				}
+				if tc.expectReadinessProbe != (spec.Spec.Containers[0].ReadinessProbe != nil) {
+					t.Errorf("expected readinessProbe: %v, got: %v", tc.expectReadinessProbe, (spec.Spec.Containers[0].ReadinessProbe != nil))
+				}
+				if tc.expectStartupProbe != (spec.Spec.Containers[0].StartupProbe != nil) {
+					t.Errorf("expected startupProbe: %v, got: %v", tc.expectStartupProbe, (spec.Spec.Containers[0].StartupProbe != nil))
+				}
+
+				if len(tc.probePort) > 0 {
+					if spec.Spec.Containers[0].LivenessProbe != nil && !reflect.DeepEqual(intstr.FromString(tc.probePort), spec.Spec.Containers[0].LivenessProbe.HTTPGet.Port) {
+						t.Errorf("expected livenessProbe port: %v, got: %v", intstr.FromString(tc.probePort), spec.Spec.Containers[0].LivenessProbe.HTTPGet.Port)
+					}
+					if spec.Spec.Containers[0].ReadinessProbe != nil && len(tc.probePort) > 0 && !reflect.DeepEqual(intstr.FromString(tc.probePort), spec.Spec.Containers[0].ReadinessProbe.HTTPGet.Port) {
+						t.Errorf("expected readinessProbe port: %v, got: %v", intstr.FromString(tc.probePort), spec.Spec.Containers[0].ReadinessProbe.HTTPGet.Port)
+					}
+					if spec.Spec.Containers[0].StartupProbe != nil && !reflect.DeepEqual(intstr.FromString(tc.probePort), spec.Spec.Containers[0].StartupProbe.HTTPGet.Port) {
+						t.Errorf("expected startupProbe port: %v, got: %v", intstr.FromString(tc.probePort), spec.Spec.Containers[0].StartupProbe.HTTPGet.Port)
+					}
+				}
+
+				if len(tc.containerPorts) > 0 {
+					if !reflect.DeepEqual(spec.Spec.Containers[0].Ports, tc.containerPorts) {
+						t.Errorf("expected ports: %v, got: %v", tc.containerPorts, spec.Spec.Containers[0].Ports)
+					}
+				}
+
 			} else {
 				t.Errorf("getStaticPodSpecs didn't create spec for %s ", tc.staticPodName)
 			}
@@ -107,7 +178,7 @@ func TestCreateStaticPodFilesAndWrappers(t *testing.T) {
 		components []string
 	}{
 		{
-			name:       "KubeAPIServer KubeAPIServer KubeScheduler",
+			name:       "KubeAPIServer KubeControllerManager KubeScheduler",
 			components: []string{kubeadmconstants.KubeAPIServer, kubeadmconstants.KubeControllerManager, kubeadmconstants.KubeScheduler},
 		},
 		{
@@ -127,8 +198,7 @@ func TestCreateStaticPodFilesAndWrappers(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Create temp folder for the test case
-			tmpdir := testutil.SetupTempDir(t)
-			defer os.RemoveAll(tmpdir)
+			tmpdir := t.TempDir()
 
 			// Creates a Cluster Configuration
 			cfg := &kubeadmapi.ClusterConfiguration{
@@ -144,10 +214,10 @@ func TestCreateStaticPodFilesAndWrappers(t *testing.T) {
 			}
 
 			// Assert expected files are there
-			testutil.AssertFilesCount(t, manifestPath, len(test.components))
+			filesutil.AssertFilesCount(t, manifestPath, len(test.components))
 
 			for _, fileName := range test.components {
-				testutil.AssertFileExists(t, manifestPath, fileName+".yaml")
+				filesutil.AssertFileExists(t, manifestPath, fileName+".yaml")
 			}
 		})
 	}
@@ -155,8 +225,7 @@ func TestCreateStaticPodFilesAndWrappers(t *testing.T) {
 
 func TestCreateStaticPodFilesWithPatches(t *testing.T) {
 	// Create temp folder for the test case
-	tmpdir := testutil.SetupTempDir(t)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	// Creates a Cluster Configuration
 	cfg := &kubeadmapi.ClusterConfiguration{
@@ -512,6 +581,103 @@ func TestGetAPIServerCommand(t *testing.T) {
 				"--etcd-keyfile=" + filepath.Join(testCertsDir, "apiserver-etcd-client.key"),
 			},
 		},
+		{
+			name: "authorization-config extra-args",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				Networking:      kubeadmapi.Networking{ServiceSubnet: "bar", DNSDomain: "cluster.local"},
+				CertificatesDir: testCertsDir,
+				APIServer: kubeadmapi.APIServer{
+					ControlPlaneComponent: kubeadmapi.ControlPlaneComponent{
+						ExtraArgs: []kubeadmapi.Arg{
+							{Name: "authorization-config", Value: "/path/to/authorization/config/file"},
+						},
+					},
+				},
+			},
+			endpoint: &kubeadmapi.APIEndpoint{BindPort: 123, AdvertiseAddress: "1.2.3.4"},
+			expected: []string{
+				"kube-apiserver",
+				"--enable-admission-plugins=NodeRestriction",
+				"--service-cluster-ip-range=bar",
+				"--service-account-key-file=" + filepath.Join(testCertsDir, "sa.pub"),
+				"--service-account-signing-key-file=" + filepath.Join(testCertsDir, "sa.key"),
+				"--service-account-issuer=https://kubernetes.default.svc.cluster.local",
+				"--client-ca-file=" + filepath.Join(testCertsDir, "ca.crt"),
+				"--tls-cert-file=" + filepath.Join(testCertsDir, "apiserver.crt"),
+				"--tls-private-key-file=" + filepath.Join(testCertsDir, "apiserver.key"),
+				"--kubelet-client-certificate=" + filepath.Join(testCertsDir, "apiserver-kubelet-client.crt"),
+				"--kubelet-client-key=" + filepath.Join(testCertsDir, "apiserver-kubelet-client.key"),
+				"--enable-bootstrap-token-auth=true",
+				"--secure-port=123",
+				"--allow-privileged=true",
+				"--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname",
+				"--proxy-client-cert-file=" + filepath.FromSlash("/var/lib/certs/front-proxy-client.crt"),
+				"--proxy-client-key-file=" + filepath.FromSlash("/var/lib/certs/front-proxy-client.key"),
+				"--requestheader-username-headers=X-Remote-User",
+				"--requestheader-group-headers=X-Remote-Group",
+				"--requestheader-extra-headers-prefix=X-Remote-Extra-",
+				"--requestheader-client-ca-file=" + filepath.Join(testCertsDir, "front-proxy-ca.crt"),
+				"--requestheader-allowed-names=front-proxy-client",
+				"--authorization-config=/path/to/authorization/config/file",
+				"--advertise-address=1.2.3.4",
+				fmt.Sprintf("--etcd-servers=https://127.0.0.1:%d", kubeadmconstants.EtcdListenClientPort),
+				"--etcd-cafile=" + filepath.Join(testCertsDir, "etcd/ca.crt"),
+				"--etcd-certfile=" + filepath.Join(testCertsDir, "apiserver-etcd-client.crt"),
+				"--etcd-keyfile=" + filepath.Join(testCertsDir, "apiserver-etcd-client.key"),
+			},
+		},
+		{
+			// Note that we do not block it at this level but api server would fail to start.
+			name: "authorization-config and authorization-mode extra-args",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				Networking:      kubeadmapi.Networking{ServiceSubnet: "bar", DNSDomain: "cluster.local"},
+				CertificatesDir: testCertsDir,
+				APIServer: kubeadmapi.APIServer{
+					ControlPlaneComponent: kubeadmapi.ControlPlaneComponent{
+						ExtraArgs: []kubeadmapi.Arg{
+							{Name: "authorization-config", Value: "/path/to/authorization/config/file"},
+							{Name: "authorization-mode", Value: strings.Join([]string{
+								kubeadmconstants.ModeNode,
+								kubeadmconstants.ModeRBAC,
+								kubeadmconstants.ModeWebhook,
+							}, ",")},
+						},
+					},
+				},
+			},
+			endpoint: &kubeadmapi.APIEndpoint{BindPort: 123, AdvertiseAddress: "1.2.3.4"},
+			expected: []string{
+				"kube-apiserver",
+				"--enable-admission-plugins=NodeRestriction",
+				"--service-cluster-ip-range=bar",
+				"--service-account-key-file=" + filepath.Join(testCertsDir, "sa.pub"),
+				"--service-account-signing-key-file=" + filepath.Join(testCertsDir, "sa.key"),
+				"--service-account-issuer=https://kubernetes.default.svc.cluster.local",
+				"--client-ca-file=" + filepath.Join(testCertsDir, "ca.crt"),
+				"--tls-cert-file=" + filepath.Join(testCertsDir, "apiserver.crt"),
+				"--tls-private-key-file=" + filepath.Join(testCertsDir, "apiserver.key"),
+				"--kubelet-client-certificate=" + filepath.Join(testCertsDir, "apiserver-kubelet-client.crt"),
+				"--kubelet-client-key=" + filepath.Join(testCertsDir, "apiserver-kubelet-client.key"),
+				"--enable-bootstrap-token-auth=true",
+				"--secure-port=123",
+				"--allow-privileged=true",
+				"--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname",
+				"--proxy-client-cert-file=" + filepath.FromSlash("/var/lib/certs/front-proxy-client.crt"),
+				"--proxy-client-key-file=" + filepath.FromSlash("/var/lib/certs/front-proxy-client.key"),
+				"--requestheader-username-headers=X-Remote-User",
+				"--requestheader-group-headers=X-Remote-Group",
+				"--requestheader-extra-headers-prefix=X-Remote-Extra-",
+				"--requestheader-client-ca-file=" + filepath.Join(testCertsDir, "front-proxy-ca.crt"),
+				"--requestheader-allowed-names=front-proxy-client",
+				"--authorization-config=/path/to/authorization/config/file",
+				"--authorization-mode=Node,RBAC,Webhook",
+				"--advertise-address=1.2.3.4",
+				fmt.Sprintf("--etcd-servers=https://127.0.0.1:%d", kubeadmconstants.EtcdListenClientPort),
+				"--etcd-cafile=" + filepath.Join(testCertsDir, "etcd/ca.crt"),
+				"--etcd-certfile=" + filepath.Join(testCertsDir, "apiserver-etcd-client.crt"),
+				"--etcd-keyfile=" + filepath.Join(testCertsDir, "apiserver-etcd-client.key"),
+			},
+		},
 	}
 
 	for _, rt := range tests {
@@ -521,6 +687,55 @@ func TestGetAPIServerCommand(t *testing.T) {
 			sort.Strings(rt.expected)
 			if !reflect.DeepEqual(actual, rt.expected) {
 				errorDiffArguments(t, rt.name, actual, rt.expected)
+			}
+		})
+	}
+}
+
+func TestGetAPIServerCommandEtcdServers(t *testing.T) {
+	base := fmt.Sprintf("https://127.0.0.1:%d", kubeadmconstants.EtcdListenClientPort)
+	tests := []struct {
+		name string
+		arg  kubeadmapi.Arg
+		want string
+	}{
+		{
+			name: "replace overrides etcd-servers with the value",
+			arg:  kubeadmapi.Arg{Name: "advertise-client-urls", Value: "https://10.0.0.5:2379"},
+			want: "--etcd-servers=https://10.0.0.5:2379",
+		},
+		{
+			name: "append joins the value onto the default",
+			arg:  kubeadmapi.Arg{Name: "advertise-client-urls", Value: ",https://10.0.0.5:2379", MergeMethod: kubeadmapi.ArgMergeMethodAppend},
+			want: "--etcd-servers=" + base + ",https://10.0.0.5:2379",
+		},
+		{
+			name: "prepend joins the value before the default",
+			arg:  kubeadmapi.Arg{Name: "advertise-client-urls", Value: "https://10.0.0.5:2379,", MergeMethod: kubeadmapi.ArgMergeMethodPrepend},
+			want: "--etcd-servers=https://10.0.0.5:2379," + base,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &kubeadmapi.ClusterConfiguration{
+				Networking:      kubeadmapi.Networking{ServiceSubnet: "bar", DNSDomain: "cluster.local"},
+				CertificatesDir: testCertsDir,
+				Etcd: kubeadmapi.Etcd{
+					Local: &kubeadmapi.LocalEtcd{ExtraArgs: []kubeadmapi.Arg{tt.arg}},
+				},
+			}
+			endpoint := &kubeadmapi.APIEndpoint{BindPort: 123, AdvertiseAddress: "1.2.3.4"}
+
+			var got string
+			for _, c := range getAPIServerCommand(cfg, endpoint) {
+				if strings.HasPrefix(c, "--etcd-servers=") {
+					got = c
+					break
+				}
+			}
+			if got != tt.want {
+				t.Errorf("expected %q, got %q", tt.want, got)
 			}
 		})
 	}
@@ -537,7 +752,7 @@ func errorDiffArguments(t *testing.T, name string, actual, expected []string) {
 }
 
 // removeCommon removes common items from left list
-// makes compairing two cmdline (with lots of arguments) easier
+// makes comparing two cmdline (with lots of arguments) easier
 func removeCommon(left, right []string) []string {
 	origSet := sets.New(left...)
 	origSet.Delete(right...)
@@ -905,8 +1120,7 @@ func TestGetControllerManagerCommandExternalCA(t *testing.T) {
 			pkiutiltesting.Reset()
 
 			// Create temp folder for the test case
-			tmpdir := testutil.SetupTempDir(t)
-			defer os.RemoveAll(tmpdir)
+			tmpdir := t.TempDir()
 			test.cfg.CertificatesDir = tmpdir
 
 			if err := certs.CreatePKIAssets(test.cfg); err != nil {
@@ -968,9 +1182,10 @@ func TestGetSchedulerCommand(t *testing.T) {
 
 func TestGetAuthzModes(t *testing.T) {
 	var tests = []struct {
-		name     string
-		authMode []string
-		expected string
+		name        string
+		authMode    []string
+		mergeMethod kubeadmapi.ArgMergeMethod
+		expected    string
 	}{
 		{
 			name:     "default if empty",
@@ -1002,11 +1217,36 @@ func TestGetAuthzModes(t *testing.T) {
 			authMode: []string{kubeadmconstants.ModeNode, kubeadmconstants.ModeWebhook, kubeadmconstants.ModeRBAC, kubeadmconstants.ModeABAC},
 			expected: "Node,Webhook,RBAC,ABAC",
 		},
+		{
+			name:        "append returns the default and lets ArgumentsToCommand merge the value",
+			authMode:    []string{kubeadmconstants.ModeWebhook},
+			mergeMethod: kubeadmapi.ArgMergeMethodAppend,
+			expected:    "Node,RBAC",
+		},
+		{
+			name:        "prepend returns the default and lets ArgumentsToCommand merge the value",
+			authMode:    []string{kubeadmconstants.ModeWebhook},
+			mergeMethod: kubeadmapi.ArgMergeMethodPrepend,
+			expected:    "Node,RBAC",
+		},
+		{
+			name:        "append still returns the default even with an unknown mode",
+			authMode:    []string{"FooAuthzMode"},
+			mergeMethod: kubeadmapi.ArgMergeMethodAppend,
+			expected:    "Node,RBAC",
+		},
+		{
+			name:        "append with a leading separator is handled",
+			authMode:    []string{"", kubeadmconstants.ModeWebhook}, // ",Webhook"
+			mergeMethod: kubeadmapi.ArgMergeMethodAppend,
+			expected:    "Node,RBAC",
+		},
 	}
 
 	for _, rt := range tests {
 		t.Run(rt.name, func(t *testing.T) {
-			actual := getAuthzModes(strings.Join(rt.authMode, ","))
+			arg := &kubeadmapi.Arg{Value: strings.Join(rt.authMode, ","), MergeMethod: rt.mergeMethod}
+			actual := getAuthzModes(arg)
 			if actual != rt.expected {
 				t.Errorf("failed getAuthzModes:\nexpected:\n%v\nsaw:\n%v", rt.expected, actual)
 			}

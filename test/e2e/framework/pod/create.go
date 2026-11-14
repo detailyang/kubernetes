@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/kubernetes/test/e2e/framework"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 	admissionapi "k8s.io/pod-security-admission/api"
 )
@@ -50,6 +51,7 @@ type Config struct {
 	NodeSelection          NodeSelection
 	ImageID                imageutils.ImageID
 	PodFSGroupChangePolicy *v1.PodFSGroupChangePolicy
+	PodSELinuxChangePolicy *v1.PodSELinuxChangePolicy
 }
 
 // CreateUnschedulablePod with given claims based on node selector
@@ -131,7 +133,7 @@ func CreateSecPodWithNodeSelection(ctx context.Context, client clientset.Interfa
 // name.  A slice of BASH commands can be supplied as args to be run by the pod
 func MakePod(ns string, nodeSelector map[string]string, pvclaims []*v1.PersistentVolumeClaim, securityLevel admissionapi.Level, command string) *v1.Pod {
 	if len(command) == 0 {
-		command = "trap exit TERM; while true; do sleep 1; done"
+		command = InfiniteSleepCommand
 	}
 	podSpec := &v1.Pod{
 		TypeMeta: metav1.TypeMeta{
@@ -172,11 +174,11 @@ func MakeSecPod(podConfig *Config) (*v1.Pod, error) {
 		return nil, fmt.Errorf("Cannot create pod with empty namespace")
 	}
 	if len(podConfig.Command) == 0 {
-		podConfig.Command = "trap exit TERM; while true; do sleep 1; done"
+		podConfig.Command = InfiniteSleepCommand
 	}
 
 	podName := "pod-" + string(uuid.NewUUID())
-	if podConfig.FsGroup == nil && !NodeOSDistroIs("windows") {
+	if podConfig.FsGroup == nil && !framework.NodeOSDistroIs("windows") {
 		podConfig.FsGroup = func(i int64) *int64 {
 			return &i
 		}(1000)
@@ -222,6 +224,9 @@ func MakePodSpec(podConfig *Config) *v1.PodSpec {
 
 	if podConfig.PodFSGroupChangePolicy != nil {
 		podSpec.SecurityContext.FSGroupChangePolicy = podConfig.PodFSGroupChangePolicy
+	}
+	if podConfig.PodSELinuxChangePolicy != nil {
+		podSpec.SecurityContext.SELinuxChangePolicy = podConfig.PodSELinuxChangePolicy
 	}
 
 	setVolumes(podSpec, podConfig.PVCs, podConfig.InlineVolumeSources, podConfig.PVCsReadOnly)

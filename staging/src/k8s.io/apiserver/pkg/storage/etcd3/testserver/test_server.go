@@ -17,20 +17,45 @@ limitations under the License.
 package testserver
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/kubernetes"
 	"go.etcd.io/etcd/server/v3/embed"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest"
-	"google.golang.org/grpc"
+
+	storagetesting "k8s.io/apiserver/pkg/storage/testing"
 )
+
+// T is the subset of testing.T or ktesting.TContext needed by this package.
+type T interface {
+	Cleanup(func())
+	Error(args ...any)
+	Errorf(format string, args ...any)
+	Fail()
+	FailNow()
+	Failed() bool
+	Fatal(args ...any)
+	Helper()
+	Logf(format string, args ...any)
+	Name() string
+	TempDir() string
+}
+
+// This tells the vet printf checker that methods in the interface must be checked.
+//
+//nolint:forbidigo
+var _ T = &testing.T{}
 
 // getAvailablePort returns a TCP port that is available for binding.
 func getAvailablePorts(count int) ([]int, error) {
@@ -47,14 +72,14 @@ func getAvailablePorts(count int) ([]int, error) {
 	return ports, nil
 }
 
-// NewTestConfig returns a configuration for an embedded etcd server.
+// newTestConfig returns a configuration for an embedded etcd server.
 // The configuration is based on embed.NewConfig(), with the following adjustments:
 //   - sets UnsafeNoFsync = true to improve test performance (only reasonable in a test-only
 //     single-member server we never intend to restart or keep data from)
 //   - uses free ports for client and peer listeners
 //   - cleans up the data directory on test termination
 //   - silences server logs other than errors
-func NewTestConfig(t testing.TB) *embed.Config {
+func newTestConfig(t T) *embed.Config {
 	cfg := embed.NewConfig()
 
 	cfg.UnsafeNoFsync = true
@@ -78,17 +103,37 @@ func NewTestConfig(t testing.TB) *embed.Config {
 	return cfg
 }
 
-// RunEtcd starts an embedded etcd server with the provided config
-// (or NewTestConfig(t) if nil), and returns a client connected to the server.
+var autoPortLock sync.Mutex
+
+// RunEtcd starts an embedded etcd server with a test configuration run through
+// any provided configuration tweak functions, and returns a client connected to the server.
 // The server is terminated when the test ends.
-func RunEtcd(t testing.TB, cfg *embed.Config) *clientv3.Client {
+func RunEtcd(t T, tweakConfig ...func(cfg *embed.Config)) *kubernetes.Client {
 	t.Helper()
 
-	if cfg == nil {
-		cfg = NewTestConfig(t)
-	}
+	// lock until we successfully start the server on the ports we chose
+	autoPortLock.Lock()
+	defer autoPortLock.Unlock()
+	var (
+		cfg *embed.Config
+		e   *embed.Etcd
+		err error
+	)
+	// reattempt up to three times if the port was taken
+	maxAttempts := 3
+	for attempt := range maxAttempts {
+		cfg = newTestConfig(t)
+		for _, f := range tweakConfig {
+			f(cfg)
+		}
 
-	e, err := embed.StartEtcd(cfg)
+		e, err = embed.StartEtcd(cfg)
+		if errors.Is(err, syscall.EADDRINUSE) && attempt < maxAttempts {
+			t.Logf("error starting embedded etcd, retrying: %v", err)
+			continue
+		}
+		break
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,15 +157,20 @@ func RunEtcd(t testing.TB, cfg *embed.Config) *clientv3.Client {
 		t.Fatal(err)
 	}
 
-	client, err := clientv3.New(clientv3.Config{
+	client, err := kubernetes.New(clientv3.Config{
 		TLS:         tlsConfig,
 		Endpoints:   e.Server.Cluster().ClientURLs(),
 		DialTimeout: 10 * time.Second,
-		DialOptions: []grpc.DialOption{grpc.WithBlock()},
 		Logger:      zaptest.NewLogger(t, zaptest.Level(zapcore.ErrorLevel)).Named("etcd-client"),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+	kubernetesRecorder := storagetesting.NewKubernetesRecorder(client.Kubernetes)
+	client.KV = storagetesting.NewKVRecorder(client.KV, kubernetesRecorder)
+	client.Kubernetes = kubernetesRecorder
 	return client
 }

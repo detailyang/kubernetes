@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 	"time"
 
@@ -40,7 +41,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/controller-manager/pkg/informerfactory"
-
+	"k8s.io/kubernetes/pkg/controller/apis/config/scheme"
 	"k8s.io/kubernetes/pkg/controller/garbagecollector/metaonly"
 )
 
@@ -85,7 +86,8 @@ type GraphBuilder struct {
 	// dependencyGraphBuilder
 	monitors    monitors
 	monitorLock sync.RWMutex
-	// informersStarted is closed after after all of the controllers have been initialized and are running.
+	monitorWG   sync.WaitGroup
+	// informersStarted is closed after all of the controllers have been initialized and are running.
 	// After that it is safe to start them here, before that it is not.
 	informersStarted <-chan struct{}
 
@@ -93,22 +95,24 @@ type GraphBuilder struct {
 	// This channel is also protected by monitorLock.
 	stopCh <-chan struct{}
 
-	// running tracks whether Run() has been called.
-	// it is protected by monitorLock.
+	// running is set to true when the Run() function has been called.
+	// It will revert to false when the Run() function receives a cancellation.
+	// It is protected by monitorLock.
 	running bool
 
-	eventRecorder record.EventRecorder
+	eventRecorder    record.EventRecorder
+	eventBroadcaster record.EventBroadcaster
 
 	metadataClient metadata.Interface
 	// monitors are the producer of the graphChanges queue, graphBuilder alters
 	// the in-memory graph according to the changes.
-	graphChanges workqueue.RateLimitingInterface
+	graphChanges workqueue.TypedRateLimitingInterface[*event]
 	// uidToNode doesn't require a lock to protect, because only the
 	// single-threaded GraphBuilder.processGraphChanges() reads/writes it.
 	uidToNode *concurrentUIDToNode
 	// GraphBuilder is the producer of attemptToDelete and attemptToOrphan, GC is the consumer.
-	attemptToDelete workqueue.RateLimitingInterface
-	attemptToOrphan workqueue.RateLimitingInterface
+	attemptToDelete workqueue.TypedRateLimitingInterface[*node]
+	attemptToOrphan workqueue.TypedRateLimitingInterface[*node]
 	// GraphBuilder and GC share the absentOwnerCache. Objects that are known to
 	// be non-existent are added to the cached.
 	absentOwnerCache *ReferenceCache
@@ -129,10 +133,61 @@ type monitor struct {
 // Run is intended to be called in a goroutine. Multiple calls of this is an
 // error.
 func (m *monitor) Run() {
-	m.controller.Run(m.stopCh)
+	m.controller.RunWithContext(wait.ContextForChannel(m.stopCh))
 }
 
 type monitors map[schema.GroupVersionResource]*monitor
+
+func NewDependencyGraphBuilder(
+	ctx context.Context,
+	metadataClient metadata.Interface,
+	mapper meta.ResettableRESTMapper,
+	ignoredResources map[schema.GroupResource]struct{},
+	sharedInformers informerfactory.InformerFactory,
+	informersStarted <-chan struct{},
+) *GraphBuilder {
+	eventBroadcaster := record.NewBroadcaster(record.WithContext(ctx))
+
+	attemptToDelete := workqueue.NewTypedRateLimitingQueueWithConfig(
+		workqueue.DefaultTypedControllerRateLimiter[*node](),
+		workqueue.TypedRateLimitingQueueConfig[*node]{
+			Logger: new(klog.FromContext(ctx)),
+			Name:   "garbage_collector_attempt_to_delete",
+		},
+	)
+	attemptToOrphan := workqueue.NewTypedRateLimitingQueueWithConfig(
+		workqueue.DefaultTypedControllerRateLimiter[*node](),
+		workqueue.TypedRateLimitingQueueConfig[*node]{
+			Logger: new(klog.FromContext(ctx)),
+			Name:   "garbage_collector_attempt_to_orphan",
+		},
+	)
+	absentOwnerCache := NewReferenceCache(500)
+	graphBuilder := &GraphBuilder{
+		eventRecorder:    eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "garbage-collector-controller"}),
+		eventBroadcaster: eventBroadcaster,
+		metadataClient:   metadataClient,
+		informersStarted: informersStarted,
+		restMapper:       mapper,
+		graphChanges: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[*event](),
+			workqueue.TypedRateLimitingQueueConfig[*event]{
+				Logger: new(klog.FromContext(ctx)),
+				Name:   "garbage_collector_graph_changes",
+			},
+		),
+		uidToNode: &concurrentUIDToNode{
+			uidToNode: make(map[types.UID]*node),
+		},
+		attemptToDelete:  attemptToDelete,
+		attemptToOrphan:  attemptToOrphan,
+		absentOwnerCache: absentOwnerCache,
+		sharedInformers:  sharedInformers,
+		ignoredResources: ignoredResources,
+	}
+
+	return graphBuilder
+}
 
 func (gb *GraphBuilder) controllerFor(logger klog.Logger, resource schema.GroupVersionResource, kind schema.GroupVersionKind) (cache.Controller, cache.Store, error) {
 	handlers := cache.ResourceEventHandlerFuncs{
@@ -172,12 +227,17 @@ func (gb *GraphBuilder) controllerFor(logger klog.Logger, resource schema.GroupV
 
 	shared, err := gb.sharedInformers.ForResource(resource)
 	if err != nil {
-		logger.V(4).Error(err, "unable to use a shared informer", "resource", resource, "kind", kind)
+		logger.V(4).Info("unable to use a shared informer", "resource", resource, "kind", kind, "err", err)
 		return nil, nil, err
 	}
 	logger.V(4).Info("using a shared informer", "resource", resource, "kind", kind)
-	// need to clone because it's from a shared cache
-	shared.Informer().AddEventHandlerWithResyncPeriod(handlers, ResourceResyncTime)
+	resyncPeriod := time.Duration(0)
+	if _, err := shared.Informer().AddEventHandlerWithOptions(handlers, cache.HandlerOptions{
+		Logger:       &logger,
+		ResyncPeriod: &resyncPeriod,
+	}); err != nil {
+		return nil, nil, err
+	}
 	return shared.Informer().GetController(), shared.Informer().GetStore(), nil
 }
 
@@ -258,11 +318,42 @@ func (gb *GraphBuilder) startMonitors(logger klog.Logger) {
 		if monitor.stopCh == nil {
 			monitor.stopCh = make(chan struct{})
 			gb.sharedInformers.Start(gb.stopCh)
-			go monitor.Run()
+			gb.monitorWG.Go(monitor.Run)
 			started++
 		}
 	}
 	logger.V(4).Info("started new monitors", "new", started, "current", len(monitors))
+}
+
+// stopMonitors terminates all running monitors.
+// stopMonitors should be called after startMonitors to do cleanup.
+//
+// This function panics unless the running flag is set to false.
+func (gb *GraphBuilder) stopMonitors(logger klog.Logger) {
+	var total, stopped int
+
+	func() {
+		gb.monitorLock.Lock()
+		defer gb.monitorLock.Unlock()
+
+		if gb.running {
+			panic("must not call stopMonitors while still marked as running")
+		}
+
+		total = len(gb.monitors)
+		for _, monitor := range gb.monitors {
+			if monitor.stopCh != nil {
+				stopped++
+				close(monitor.stopCh)
+			}
+		}
+
+		// reset monitors so that the graph builder can be safely re-run/synced.
+		gb.monitors = nil
+	}()
+
+	gb.monitorWG.Wait()
+	logger.Info("stopped monitors", "stopped", stopped, "total", total)
 }
 
 // IsResourceSynced returns true if a monitor exists for the given resource and has synced
@@ -298,6 +389,8 @@ func (gb *GraphBuilder) IsSynced(logger klog.Logger) bool {
 // Run sets the stop channel and starts monitor execution until stopCh is
 // closed. Any running monitors will be stopped before Run returns.
 func (gb *GraphBuilder) Run(ctx context.Context) {
+	defer utilruntime.HandleCrashWithContext(ctx)
+
 	logger := klog.FromContext(ctx)
 	logger.Info("Running", "component", "GraphBuilder")
 	defer logger.Info("Stopping", "component", "GraphBuilder")
@@ -308,26 +401,19 @@ func (gb *GraphBuilder) Run(ctx context.Context) {
 	gb.running = true
 	gb.monitorLock.Unlock()
 
-	// Start monitors and begin change processing until the stop channel is
-	// closed.
+	// Start monitors and begin change processing until the stop channel is closed.
 	gb.startMonitors(logger)
 	wait.Until(func() { gb.runProcessGraphChanges(logger) }, 1*time.Second, ctx.Done())
 
-	// Stop any running monitors.
+	// Mark as not running so that no new monitors can be started.
+	// Not doing this here could cause goroutine leaks and deadlocks since it would make it possible for startMonitors
+	// to proceed and start new monitors after stopMonitors has been called.
 	gb.monitorLock.Lock()
-	defer gb.monitorLock.Unlock()
-	monitors := gb.monitors
-	stopped := 0
-	for _, monitor := range monitors {
-		if monitor.stopCh != nil {
-			stopped++
-			close(monitor.stopCh)
-		}
-	}
+	gb.running = false
+	gb.monitorLock.Unlock()
 
-	// reset monitors so that the graph builder can be safely re-run/synced.
-	gb.monitors = nil
-	logger.Info("stopped monitors", "stopped", stopped, "total", len(monitors))
+	// Stop the currently running monitors.
+	gb.stopMonitors(logger)
 }
 
 var ignoredResources = map[schema.GroupResource]struct{}{
@@ -544,12 +630,7 @@ func hasOrphanFinalizer(accessor metav1.Object) bool {
 
 func hasFinalizer(accessor metav1.Object, matchingFinalizer string) bool {
 	finalizers := accessor.GetFinalizers()
-	for _, finalizer := range finalizers {
-		if finalizer == matchingFinalizer {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(finalizers, matchingFinalizer)
 }
 
 // this function takes newAccessor directly because the caller already
@@ -632,12 +713,8 @@ func (gb *GraphBuilder) processGraphChanges(logger klog.Logger) bool {
 		return false
 	}
 	defer gb.graphChanges.Done(item)
-	event, ok := item.(*event)
-	if !ok {
-		utilruntime.HandleError(fmt.Errorf("expect a *event, got %v", item))
-		return true
-	}
-	obj := event.obj
+	event := item
+	obj := item.obj
 	accessor, err := meta.Accessor(obj)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("cannot access obj: %v", err))
@@ -711,7 +788,7 @@ func (gb *GraphBuilder) processGraphChanges(logger klog.Logger) bool {
 			// waiting for the deletion of their dependents.
 			gb.addUnblockedOwnersToDeleteQueue(logger, removed, changed)
 			// update the node itself
-			existingNode.owners = accessor.GetOwnerReferences()
+			existingNode.setOwners(accessor.GetOwnerReferences())
 			// Add the node to its new owners' dependent lists.
 			gb.addDependentToOwners(logger, existingNode, added)
 			// remove the node from the dependent list of node that are no longer in
@@ -934,4 +1011,49 @@ func getAlternateOwnerIdentity(deps []*node, verifiedAbsentIdentity objectRefere
 	}
 	// otherwise return the first alternate identity
 	return first
+}
+
+func (gb *GraphBuilder) GetGraphResources() (
+	attemptToDelete workqueue.TypedRateLimitingInterface[*node],
+	attemptToOrphan workqueue.TypedRateLimitingInterface[*node],
+	absentOwnerCache *ReferenceCache,
+) {
+	return gb.attemptToDelete, gb.attemptToOrphan, gb.absentOwnerCache
+}
+
+type Monitor struct {
+	Store      cache.Store
+	Controller cache.Controller
+}
+
+// GetMonitor returns a monitor for the given resource. It will return the
+// monitor and whether or not the monitor has been synced yet.
+func (gb *GraphBuilder) GetMonitor(ctx context.Context, resource schema.GroupVersionResource) (*Monitor, bool, error) {
+	gb.monitorLock.RLock()
+	defer gb.monitorLock.RUnlock()
+
+	monitor, ok := gb.monitors[resource]
+	if !ok {
+		return nil, false, fmt.Errorf("no monitor found for resource %s", resource.String())
+	}
+
+	resourceMonitor := &Monitor{
+		Store:      monitor.store,
+		Controller: monitor.controller,
+	}
+
+	if !cache.WaitForNamedCacheSyncWithContext(
+		ctx,
+		func() bool {
+			return monitor.controller.HasSynced()
+		},
+	) {
+		return nil, false, nil
+	}
+
+	return resourceMonitor, true, nil
+}
+
+func (gb *GraphBuilder) Name() string {
+	return "dependencygraphbuilder"
 }

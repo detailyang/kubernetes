@@ -46,6 +46,10 @@ func (f *fakeHttpProber) Probe(*http.Request, time.Duration) (probe.Result, stri
 	return f.result, f.body, f.err
 }
 
+func (f *fakeHttpProber) ProbeH2C(*http.Request, time.Duration) (probe.Result, string, error) {
+	return f.result, f.body, f.err
+}
+
 type testResponse struct {
 	result probe.Result
 	data   string
@@ -177,7 +181,7 @@ func TestGet_BadName(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Expected error, but did not get one")
 	}
-	if !strings.Contains(err.Error(), "Component not found: invalidname") {
+	if !strings.Contains(err.Error(), `componentstatus "invalidname" not found`) {
 		t.Fatalf("Got unexpected error: %v", err)
 	}
 }

@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/component-helpers/storage/ephemeral"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eoutput "k8s.io/kubernetes/test/e2e/framework/pod/output"
@@ -66,7 +67,7 @@ func InitCustomSnapshottableTestSuite(patterns []storageframework.TestPattern) s
 			SupportedSizeRange: e2evolume.SizeRange{
 				Min: "1Mi",
 			},
-			FeatureTag: "[Feature:VolumeSnapshotDataSource]",
+			TestTags: []interface{}{feature.VolumeSnapshotDataSource},
 		},
 	}
 }
@@ -89,25 +90,26 @@ func (s *snapshottableTestSuite) GetTestSuiteInfo() storageframework.TestSuiteIn
 	return s.tsInfo
 }
 
-func (s *snapshottableTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
+func (s *snapshottableTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) string {
 	// Check preconditions.
 	dInfo := driver.GetDriverInfo()
 	ok := false
 	_, ok = driver.(storageframework.SnapshottableTestDriver)
 	if !dInfo.Capabilities[storageframework.CapSnapshotDataSource] || !ok {
-		e2eskipper.Skipf("Driver %q does not support snapshots - skipping", dInfo.Name)
+		return fmt.Sprintf("Driver %q does not support snapshots", dInfo.Name)
 	}
 	_, ok = driver.(storageframework.DynamicPVTestDriver)
 	if !ok {
-		e2eskipper.Skipf("Driver %q does not support dynamic provisioning - skipping", driver.GetDriverInfo().Name)
+		return fmt.Sprintf("Driver %q does not support dynamic provisioning", driver.GetDriverInfo().Name)
 	}
+	return ""
 }
 
 func (s *snapshottableTestSuite) DefineTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
 
 	// Beware that it also registers an AfterEach which renders f unusable. Any code using
 	// f must run inside an It or Context callback.
-	f := framework.NewDefaultFramework("snapshotting")
+	f := framework.NewFrameworkWithCustomTimeouts("snapshotting", storageframework.GetDriverTimeouts(driver))
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
 	ginkgo.Describe("volume snapshot controller", func() {
@@ -314,7 +316,7 @@ func (s *snapshottableTestSuite) DefineTests(driver storageframework.TestDriver,
 					framework.ExpectNoError(err)
 					volumesInUse := node.Status.VolumesInUse
 					framework.Logf("current volumes in use: %+v", volumesInUse)
-					for i := 0; i < len(volumesInUse); i++ {
+					for i := range volumesInUse {
 						if strings.HasSuffix(string(volumesInUse[i]), volumeName) {
 							return false
 						}
@@ -403,18 +405,18 @@ func deleteVolumeSnapshot(ctx context.Context, f *framework.Framework, dc dynami
 	vs := sr.Vs
 
 	// Wait for the Snapshot to be actually deleted from API server
-	err := storageutils.WaitForNamespacedGVRDeletion(ctx, dc, storageutils.SnapshotGVR, vs.GetNamespace(), vs.GetNamespace(), framework.Poll, f.Timeouts.SnapshotDelete)
+	err := storageutils.WaitForNamespacedGVRDeletion(ctx, dc, storageutils.SnapshotGVR, vs.GetNamespace(), vs.GetName(), framework.Poll, f.Timeouts.SnapshotDelete)
 	framework.ExpectNoError(err)
 
 	switch pattern.SnapshotDeletionPolicy {
 	case storageframework.DeleteSnapshot:
 		ginkgo.By("checking the SnapshotContent has been deleted")
-		err = storageutils.WaitForGVRDeletion(ctx, dc, storageutils.SnapshotContentGVR, vscontent.GetName(), framework.Poll, f.Timeouts.SnapshotDelete)
+		err = storageutils.EnsureGVRDeletion(ctx, dc, storageutils.SnapshotContentGVR, vscontent.GetName(), framework.Poll, f.Timeouts.SnapshotDelete, "")
 		framework.ExpectNoError(err)
 	case storageframework.RetainSnapshot:
 		ginkgo.By("checking the SnapshotContent has not been deleted")
-		err = storageutils.WaitForGVRDeletion(ctx, dc, storageutils.SnapshotContentGVR, vscontent.GetName(), 1*time.Second /* poll */, 30*time.Second /* timeout */)
-		framework.ExpectError(err)
+		err = storageutils.EnsureNoGVRDeletion(ctx, dc, storageutils.SnapshotContentGVR, vscontent.GetName(), 1*time.Second /* poll */, 30*time.Second /* timeout */, "")
+		framework.ExpectNoError(err)
 	}
 }
 
@@ -440,9 +442,9 @@ func checkSnapshot(ctx context.Context, dc dynamic.Interface, sr *storageframewo
 	ginkgo.By("checking the SnapshotContent")
 	// PreprovisionedCreatedSnapshot do not need to set volume snapshot class name
 	if pattern.SnapshotType != storageframework.PreprovisionedCreatedSnapshot {
-		framework.ExpectEqual(snapshotContentSpec["volumeSnapshotClassName"], vsc.GetName())
+		gomega.Expect(snapshotContentSpec["volumeSnapshotClassName"]).To(gomega.Equal(vsc.GetName()))
 	}
-	framework.ExpectEqual(volumeSnapshotRef["name"], vs.GetName())
-	framework.ExpectEqual(volumeSnapshotRef["namespace"], vs.GetNamespace())
+	gomega.Expect(volumeSnapshotRef).To(gomega.HaveKeyWithValue("name", vs.GetName()))
+	gomega.Expect(volumeSnapshotRef).To(gomega.HaveKeyWithValue("namespace", vs.GetNamespace()))
 	return vscontent
 }

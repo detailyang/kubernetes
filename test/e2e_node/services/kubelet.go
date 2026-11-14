@@ -17,6 +17,7 @@ limitations under the License.
 package services
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -74,13 +75,13 @@ func init() {
 
 // RunKubelet starts kubelet and waits for termination signal. Once receives the
 // termination signal, it will stop the kubelet gracefully.
-func RunKubelet(featureGates map[string]bool) {
+func RunKubelet(ctx context.Context, featureGates map[string]bool) {
 	var err error
 	// Enable monitorParent to make sure kubelet will receive termination signal
 	// when test process exits.
 	e := NewE2EServices(true /* monitorParent */)
 	defer e.Stop()
-	e.kubelet, err = e.startKubelet(featureGates)
+	e.kubelet, err = e.startKubelet(ctx, featureGates)
 	if err != nil {
 		klog.Fatalf("Failed to start kubelet: %v", err)
 	}
@@ -96,7 +97,7 @@ const (
 // Health check url of kubelet
 var kubeletHealthCheckURL = fmt.Sprintf("http://127.0.0.1:%d/healthz", ports.KubeletHealthzPort)
 
-func baseKubeConfiguration(cfgPath string) (*kubeletconfig.KubeletConfiguration, error) {
+func baseKubeConfiguration(ctx context.Context, cfgPath string) (*kubeletconfig.KubeletConfiguration, error) {
 	cfgPath, err := filepath.Abs(cfgPath)
 	if err != nil {
 		return nil, err
@@ -147,12 +148,12 @@ func baseKubeConfiguration(cfgPath string) (*kubeletconfig.KubeletConfiguration,
 		return nil, err
 	}
 
-	return loader.Load()
+	return loader.Load(ctx)
 }
 
 // startKubelet starts the Kubelet in a separate process or returns an error
 // if the Kubelet fails to start.
-func (e *E2EServices) startKubelet(featureGates map[string]bool) (*server, error) {
+func (e *E2EServices) startKubelet(ctx context.Context, featureGates map[string]bool) (*server, error) {
 	klog.Info("Starting kubelet")
 
 	framework.Logf("Standalone mode: %v", framework.TestContext.StandaloneMode)
@@ -174,6 +175,12 @@ func (e *E2EServices) startKubelet(featureGates map[string]bool) (*server, error
 		return nil, err
 	}
 
+	// KubeletDropInConfiguration directory path
+	framework.TestContext.KubeletConfigDropinDir, err = KubeletConfigDirCWDDir()
+	if err != nil {
+		return nil, err
+	}
+
 	// Create pod directory
 	podPath, err := createPodDirectory()
 	if err != nil {
@@ -189,7 +196,7 @@ func (e *E2EServices) startKubelet(featureGates map[string]bool) (*server, error
 	if lookup != nil {
 		kubeletConfigFile = lookup.Value.String()
 	}
-	kc, err := baseKubeConfiguration(kubeletConfigFile)
+	kc, err := baseKubeConfiguration(ctx, kubeletConfigFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load base kubelet configuration: %w", err)
 	}
@@ -282,6 +289,9 @@ func (e *E2EServices) startKubelet(featureGates map[string]bool) (*server, error
 		kc.FeatureGates = featureGates
 	}
 
+	// Add the KubeletDropinConfigDirectory flag if set.
+	cmdArgs = append(cmdArgs, "--config-dir", framework.TestContext.KubeletConfigDropinDir)
+
 	// Keep hostname override for convenience.
 	if framework.TestContext.NodeName != "" { // If node name is specified, set hostname override.
 		cmdArgs = append(cmdArgs, "--hostname-override", framework.TestContext.NodeName)
@@ -295,7 +305,7 @@ func (e *E2EServices) startKubelet(featureGates map[string]bool) (*server, error
 		cmdArgs = append(cmdArgs, "--image-service-endpoint", framework.TestContext.ImageServiceEndpoint)
 	}
 
-	if err := writeKubeletConfigFile(kc, kubeletConfigPath); err != nil {
+	if err := WriteKubeletConfigFile(kc, kubeletConfigPath); err != nil {
 		return nil, err
 	}
 	// add the flag to load config from a file
@@ -324,8 +334,8 @@ func (e *E2EServices) startKubelet(featureGates map[string]bool) (*server, error
 	return server, server.start()
 }
 
-// writeKubeletConfigFile writes the kubelet config file based on the args and returns the filename
-func writeKubeletConfigFile(internal *kubeletconfig.KubeletConfiguration, path string) error {
+// WriteKubeletConfigFile writes the kubelet config file based on the args and returns the filename
+func WriteKubeletConfigFile(internal *kubeletconfig.KubeletConfiguration, path string) error {
 	data, err := kubeletconfigcodec.EncodeKubeletConfig(internal, kubeletconfigv1beta1.SchemeGroupVersion)
 	if err != nil {
 		return err
@@ -406,6 +416,18 @@ func kubeletConfigCWDPath() (string, error) {
 	}
 	// DO NOT name this file "kubelet" - you will overwrite the kubelet binary and be very confused :)
 	return filepath.Join(cwd, "kubelet-config"), nil
+}
+
+func KubeletConfigDirCWDDir() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("failed to get current working directory: %w", err)
+	}
+	dir := filepath.Join(cwd, "kubelet.conf.d")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", err
+	}
+	return dir, nil
 }
 
 // like createKubeconfig, but creates kubeconfig at current-working-directory/kubeconfig

@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 /*
 Copyright 2022 The Kubernetes Authors.
@@ -41,7 +40,7 @@ const SeccompProcStatusField = "Seccomp:"
 const ProcSelfStatusPath = "/proc/self/status"
 
 // Serial because the test updates kubelet configuration.
-var _ = SIGDescribe("SeccompDefault [Serial] [Feature:SeccompDefault] [LinuxOnly]", func() {
+var _ = SIGDescribe("SeccompDefault", framework.WithSerial(), framework.WithNodeConformance(), "[LinuxOnly]", func() {
 	f := framework.NewDefaultFramework("seccompdefault-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 

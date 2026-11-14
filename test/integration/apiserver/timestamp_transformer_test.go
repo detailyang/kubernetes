@@ -59,11 +59,11 @@ func doBench(b *testing.B, useUnstructured bool, shortCircuit bool) {
 
 	fuzzer.MaxDepth(1000).NilChance(0.2).NumElements(2, 15)
 	pod := &v1.Pod{}
-	fuzzer.Fuzz(pod)
+	fuzzer.Fill(pod)
 
 	fuzzer.NilChance(0.2).NumElements(10, 100).MaxDepth(10)
 	deployment := &v1.Endpoints{}
-	fuzzer.Fuzz(deployment)
+	fuzzer.Fill(deployment)
 
 	bts, err := json.Marshal(deployment)
 	require.NoError(b, err)
@@ -92,9 +92,9 @@ func doBench(b *testing.B, useUnstructured bool, shortCircuit bool) {
 			APIVersion: "apps/v1",
 			Time:       &now,
 			FieldsType: "FieldsV1",
-			FieldsV1: &metav1.FieldsV1{
-				Raw: []byte(`{"f:metadata":{"f:labels":{"f:sidecar_version":{}}},"f:spec":{"f:template":{"f:spec":{"f:containers":{"k:{\"name\":\"sidecar\"}":{".":{},"f:image":{},"f:name":{}}}}}}}`),
-			},
+			FieldsV1: metav1.NewFieldsV1(
+				`{"f:metadata":{"f:labels":{"f:sidecar_version":{}}},"f:spec":{"f:template":{"f:spec":{"f:containers":{"k:{\"name\":\"sidecar\"}":{".":{},"f:image":{},"f:name":{}}}}}}}`,
+			),
 		}
 
 		largeMeta, err := meta.Accessor(actualLarge)

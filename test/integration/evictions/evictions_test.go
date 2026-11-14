@@ -40,7 +40,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apiserver/pkg/util/feature"
 	cacheddiscovery "k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
@@ -50,14 +49,12 @@ import (
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/scale"
 	"k8s.io/client-go/tools/cache"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2"
+	"k8s.io/ktesting"
 	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/controller/disruption"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/test/integration/framework"
-	"k8s.io/kubernetes/test/utils/ktesting"
 )
 
 const (
@@ -69,18 +66,15 @@ const (
 func TestConcurrentEvictionRequests(t *testing.T) {
 	podNameFormat := "test-pod-%d"
 
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-
-	closeFn, rm, informers, _, clientSet := rmSetup(ctx, t)
-	defer closeFn()
+	tCtx := ktesting.Init(t)
+	closeFn, rm, informers, _, clientSet := rmSetup(tCtx, t)
+	tCtx.Cleanup(closeFn)
 
 	ns := framework.CreateNamespaceOrDie(clientSet, "concurrent-eviction-requests", t)
 	defer framework.DeleteNamespaceOrDie(clientSet, ns, t)
-	defer cancel()
 
-	informers.Start(ctx.Done())
-	go rm.Run(ctx)
+	informers.Start(tCtx.Done())
+	go rm.Run(tCtx, 1)
 
 	var gracePeriodSeconds int64 = 30
 	deleteOption := metav1.DeleteOptions{
@@ -88,7 +82,7 @@ func TestConcurrentEvictionRequests(t *testing.T) {
 	}
 
 	// Generate numOfEvictions pods to evict
-	for i := 0; i < numOfEvictions; i++ {
+	for i := range numOfEvictions {
 		podName := fmt.Sprintf(podNameFormat, i)
 		pod := newPod(podName)
 
@@ -111,11 +105,11 @@ func TestConcurrentEvictionRequests(t *testing.T) {
 
 	waitPDBStable(t, clientSet, ns.Name, pdb.Name, numOfEvictions)
 
-	var numberPodsEvicted uint32
+	var numberPodsEvicted atomic.Uint32
 	errCh := make(chan error, 3*numOfEvictions)
 	var wg sync.WaitGroup
 	// spawn numOfEvictions goroutines to concurrently evict the pods
-	for i := 0; i < numOfEvictions; i++ {
+	for i := range numOfEvictions {
 		wg.Add(1)
 		go func(id int, errCh chan error) {
 			defer wg.Done()
@@ -144,7 +138,7 @@ func TestConcurrentEvictionRequests(t *testing.T) {
 			_, err = clientSet.CoreV1().Pods(ns.Name).Get(context.TODO(), podName, metav1.GetOptions{})
 			switch {
 			case apierrors.IsNotFound(err):
-				atomic.AddUint32(&numberPodsEvicted, 1)
+				numberPodsEvicted.Add(1)
 				// pod was evicted and deleted so return from goroutine immediately
 				return
 			case err == nil:
@@ -177,25 +171,22 @@ func TestConcurrentEvictionRequests(t *testing.T) {
 		t.Fatal(utilerrors.NewAggregate(errList))
 	}
 
-	if atomic.LoadUint32(&numberPodsEvicted) != numOfEvictions {
-		t.Fatalf("fewer number of successful evictions than expected : %d", numberPodsEvicted)
+	if numberPodsEvicted.Load() != numOfEvictions {
+		t.Fatalf("fewer number of successful evictions than expected : %d", numberPodsEvicted.Load())
 	}
 }
 
 // TestTerminalPodEviction ensures that PDB is not checked for terminal pods.
 func TestTerminalPodEviction(t *testing.T) {
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-
-	closeFn, rm, informers, _, clientSet := rmSetup(ctx, t)
-	defer closeFn()
+	tCtx := ktesting.Init(t)
+	closeFn, rm, informers, _, clientSet := rmSetup(tCtx, t)
+	tCtx.Cleanup(closeFn)
 
 	ns := framework.CreateNamespaceOrDie(clientSet, "terminalpod-eviction", t)
 	defer framework.DeleteNamespaceOrDie(clientSet, ns, t)
-	defer cancel()
 
-	informers.Start(ctx.Done())
-	go rm.Run(ctx)
+	informers.Start(tCtx.Done())
+	go rm.Run(tCtx, 1)
 
 	var gracePeriodSeconds int64 = 30
 	deleteOption := metav1.DeleteOptions{
@@ -260,15 +251,12 @@ func TestTerminalPodEviction(t *testing.T) {
 
 // TestEvictionVersions ensures the eviction endpoint accepts and returns the correct API versions
 func TestEvictionVersions(t *testing.T) {
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
+	tCtx := ktesting.Init(t)
+	closeFn, rm, informers, config, clientSet := rmSetup(tCtx, t)
+	tCtx.Cleanup(closeFn)
 
-	closeFn, rm, informers, config, clientSet := rmSetup(ctx, t)
-	defer closeFn()
-	defer cancel()
-
-	informers.Start(ctx.Done())
-	go rm.Run(ctx)
+	informers.Start(tCtx.Done())
+	go rm.Run(tCtx, 1)
 
 	ns := "default"
 	subresource := "eviction"
@@ -352,63 +340,45 @@ func TestEvictionVersions(t *testing.T) {
 // TestEvictionWithFinalizers tests eviction with the use of finalizers
 func TestEvictionWithFinalizers(t *testing.T) {
 	cases := map[string]struct {
-		enablePodDisruptionConditions bool
-		phase                         v1.PodPhase
-		dryRun                        bool
-		wantDisruptionTargetCond      bool
+		phase                    v1.PodPhase
+		dryRun                   bool
+		wantDisruptionTargetCond bool
 	}{
-		"terminal pod with PodDisruptionConditions enabled": {
-			enablePodDisruptionConditions: true,
-			phase:                         v1.PodSucceeded,
-			wantDisruptionTargetCond:      true,
+		"terminal pod": {
+			phase:                    v1.PodSucceeded,
+			wantDisruptionTargetCond: true,
 		},
-		"terminal pod with PodDisruptionConditions disabled": {
-			enablePodDisruptionConditions: false,
-			phase:                         v1.PodSucceeded,
-			wantDisruptionTargetCond:      false,
+		"running pod": {
+			phase:                    v1.PodRunning,
+			wantDisruptionTargetCond: true,
 		},
-		"running pod with PodDisruptionConditions enabled": {
-			enablePodDisruptionConditions: true,
-			phase:                         v1.PodRunning,
-			wantDisruptionTargetCond:      true,
-		},
-		"running pod with PodDisruptionConditions disabled": {
-			enablePodDisruptionConditions: false,
-			phase:                         v1.PodRunning,
-			wantDisruptionTargetCond:      false,
-		},
-		"running pod with PodDisruptionConditions enabled should not update conditions in dry-run mode": {
-			enablePodDisruptionConditions: true,
-			phase:                         v1.PodRunning,
-			dryRun:                        true,
-			wantDisruptionTargetCond:      false,
+		"running pod should not update conditions in dry-run mode": {
+			phase:                    v1.PodRunning,
+			dryRun:                   true,
+			wantDisruptionTargetCond: false,
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, ctx := ktesting.NewTestContext(t)
-			ctx, cancel := context.WithCancel(ctx)
-
-			closeFn, rm, informers, _, clientSet := rmSetup(ctx, t)
-			defer closeFn()
+			tCtx := ktesting.Init(t)
+			closeFn, rm, informers, _, clientSet := rmSetup(tCtx, t)
+			tCtx.Cleanup(closeFn)
 
 			ns := framework.CreateNamespaceOrDie(clientSet, "eviction-with-finalizers", t)
 			defer framework.DeleteNamespaceOrDie(clientSet, ns, t)
-			defer featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.PodDisruptionConditions, tc.enablePodDisruptionConditions)()
-			defer cancel()
 
-			informers.Start(ctx.Done())
-			go rm.Run(ctx)
+			informers.Start(tCtx.Done())
+			go rm.Run(tCtx, 1)
 
 			pod := newPod("pod")
 			pod.ObjectMeta.Finalizers = []string{"test.k8s.io/finalizer"}
-			if _, err := clientSet.CoreV1().Pods(ns.Name).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+			if _, err := clientSet.CoreV1().Pods(ns.Name).Create(tCtx, pod, metav1.CreateOptions{}); err != nil {
 				t.Errorf("Failed to create pod: %v", err)
 			}
 
 			pod.Status.Phase = tc.phase
 			addPodConditionReady(pod)
-			if _, err := clientSet.CoreV1().Pods(ns.Name).UpdateStatus(ctx, pod, metav1.UpdateOptions{}); err != nil {
+			if _, err := clientSet.CoreV1().Pods(ns.Name).UpdateStatus(tCtx, pod, metav1.UpdateOptions{}); err != nil {
 				t.Fatal(err)
 			}
 
@@ -420,19 +390,19 @@ func TestEvictionWithFinalizers(t *testing.T) {
 
 			eviction := newV1Eviction(ns.Name, pod.Name, deleteOption)
 
-			err := clientSet.PolicyV1().Evictions(ns.Name).Evict(ctx, eviction)
+			err := clientSet.PolicyV1().Evictions(ns.Name).Evict(tCtx, eviction)
 			if err != nil {
 				t.Fatalf("Eviction of pod failed %v", err)
 			}
 
-			updatedPod, e := clientSet.CoreV1().Pods(ns.Name).Get(ctx, pod.Name, metav1.GetOptions{})
+			updatedPod, e := clientSet.CoreV1().Pods(ns.Name).Get(tCtx, pod.Name, metav1.GetOptions{})
 			if e != nil {
 				t.Fatalf("Failed to get the pod %q with error: %q", klog.KObj(pod), e)
 			}
 			_, cond := podutil.GetPodCondition(&updatedPod.Status, v1.PodConditionType(v1.DisruptionTarget))
-			if tc.wantDisruptionTargetCond == true && cond == nil {
+			if tc.wantDisruptionTargetCond && cond == nil {
 				t.Errorf("Pod %q does not have the expected condition: %q", klog.KObj(updatedPod), v1.DisruptionTarget)
-			} else if tc.wantDisruptionTargetCond == false && cond != nil {
+			} else if !tc.wantDisruptionTargetCond && cond != nil {
 				t.Errorf("Pod %q has an unexpected condition: %q", klog.KObj(updatedPod), v1.DisruptionTarget)
 			}
 		})
@@ -442,51 +412,37 @@ func TestEvictionWithFinalizers(t *testing.T) {
 // TestEvictionWithUnhealthyPodEvictionPolicy tests eviction with a PDB that has a UnhealthyPodEvictionPolicy
 func TestEvictionWithUnhealthyPodEvictionPolicy(t *testing.T) {
 	cases := map[string]struct {
-		enableUnhealthyPodEvictionPolicy bool
-		unhealthyPodEvictionPolicy       *policyv1.UnhealthyPodEvictionPolicyType
-		isPodReady                       bool
+		unhealthyPodEvictionPolicy *policyv1.UnhealthyPodEvictionPolicyType
+		isPodReady                 bool
 	}{
-		"UnhealthyPodEvictionPolicy disabled and policy not set": {
-			enableUnhealthyPodEvictionPolicy: false,
-			unhealthyPodEvictionPolicy:       nil,
-			isPodReady:                       true,
-		},
 		"UnhealthyPodEvictionPolicy enabled but policy not set": {
-			enableUnhealthyPodEvictionPolicy: true,
-			unhealthyPodEvictionPolicy:       nil,
-			isPodReady:                       true,
+			unhealthyPodEvictionPolicy: nil,
+			isPodReady:                 true,
 		},
 		"UnhealthyPodEvictionPolicy enabled but policy set to IfHealthyBudget with ready pod": {
-			enableUnhealthyPodEvictionPolicy: true,
-			unhealthyPodEvictionPolicy:       unhealthyPolicyPtr(policyv1.IfHealthyBudget),
-			isPodReady:                       true,
+			unhealthyPodEvictionPolicy: unhealthyPolicyPtr(policyv1.IfHealthyBudget),
+			isPodReady:                 true,
 		},
 		"UnhealthyPodEvictionPolicy enabled but policy set to AlwaysAllow with ready pod": {
-			enableUnhealthyPodEvictionPolicy: true,
-			unhealthyPodEvictionPolicy:       unhealthyPolicyPtr(policyv1.AlwaysAllow),
-			isPodReady:                       true,
+			unhealthyPodEvictionPolicy: unhealthyPolicyPtr(policyv1.AlwaysAllow),
+			isPodReady:                 true,
 		},
 		"UnhealthyPodEvictionPolicy enabled but policy set to AlwaysAllow with unready pod": {
-			enableUnhealthyPodEvictionPolicy: true,
-			unhealthyPodEvictionPolicy:       unhealthyPolicyPtr(policyv1.AlwaysAllow),
-			isPodReady:                       false,
+			unhealthyPodEvictionPolicy: unhealthyPolicyPtr(policyv1.AlwaysAllow),
+			isPodReady:                 false,
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, ctx := ktesting.NewTestContext(t)
-			ctx, cancel := context.WithCancel(ctx)
-
-			defer featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.PDBUnhealthyPodEvictionPolicy, tc.enableUnhealthyPodEvictionPolicy)()
-			closeFn, rm, informers, _, clientSet := rmSetup(ctx, t)
-			defer closeFn()
+			tCtx := ktesting.Init(t)
+			closeFn, rm, informers, _, clientSet := rmSetup(tCtx, t)
+			tCtx.Cleanup(closeFn)
 
 			ns := framework.CreateNamespaceOrDie(clientSet, "eviction-with-pdb-pod-healthy-policy", t)
 			defer framework.DeleteNamespaceOrDie(clientSet, ns, t)
-			defer cancel()
 
-			informers.Start(ctx.Done())
-			go rm.Run(ctx)
+			informers.Start(tCtx.Done())
+			go rm.Run(tCtx, 1)
 
 			pod := newPod("pod")
 			if _, err := clientSet.CoreV1().Pods(ns.Name).Create(context.TODO(), pod, metav1.CreateOptions{}); err != nil {
@@ -498,7 +454,7 @@ func TestEvictionWithUnhealthyPodEvictionPolicy(t *testing.T) {
 				addPodConditionReady(pod)
 			}
 
-			if _, err := clientSet.CoreV1().Pods(ns.Name).UpdateStatus(ctx, pod, metav1.UpdateOptions{}); err != nil {
+			if _, err := clientSet.CoreV1().Pods(ns.Name).UpdateStatus(tCtx, pod, metav1.UpdateOptions{}); err != nil {
 				t.Fatal(err)
 			}
 
@@ -524,7 +480,7 @@ func TestEvictionWithUnhealthyPodEvictionPolicy(t *testing.T) {
 
 			deleteOption := metav1.DeleteOptions{}
 			eviction := newV1Eviction(ns.Name, pod.Name, deleteOption)
-			err := policyV1NoRetriesClient.Evictions(ns.Name).Evict(ctx, eviction)
+			err := policyV1NoRetriesClient.Evictions(ns.Name).Evict(tCtx, eviction)
 			if err != nil {
 				t.Fatalf("Eviction of pod failed %v", err)
 			}
@@ -570,18 +526,15 @@ func TestEvictionWithPrecondition(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, ctx := ktesting.NewTestContext(t)
-			ctx, cancel := context.WithCancel(ctx)
-
-			closeFn, rm, informers, _, clientSet := rmSetup(ctx, t)
-			defer closeFn()
+			tCtx := ktesting.Init(t)
+			closeFn, rm, informers, _, clientSet := rmSetup(tCtx, t)
+			tCtx.Cleanup(closeFn)
 
 			ns := framework.CreateNamespaceOrDie(clientSet, "eviction-with-preconditions", t)
 			defer framework.DeleteNamespaceOrDie(clientSet, ns, t)
 
-			defer cancel()
-			informers.Start(ctx.Done())
-			go rm.Run(ctx)
+			informers.Start(tCtx.Done())
+			go rm.Run(tCtx, 1)
 
 			pod := newPod("pod")
 			pod, err := clientSet.CoreV1().Pods(ns.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
@@ -593,7 +546,7 @@ func TestEvictionWithPrecondition(t *testing.T) {
 			addPodConditionReady(pod)
 
 			// generate a new resource version
-			updatedPod, err := clientSet.CoreV1().Pods(ns.Name).UpdateStatus(ctx, pod, metav1.UpdateOptions{})
+			updatedPod, err := clientSet.CoreV1().Pods(ns.Name).UpdateStatus(tCtx, pod, metav1.UpdateOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -629,7 +582,7 @@ func TestEvictionWithPrecondition(t *testing.T) {
 			policyV1NoRetriesClient := policyv1client.New(policyV1NoRetriesRESTClient)
 
 			eviction := newV1Eviction(ns.Name, updatedPod.Name, deleteOption)
-			err = policyV1NoRetriesClient.Evictions(ns.Name).Evict(ctx, eviction)
+			err = policyV1NoRetriesClient.Evictions(ns.Name).Evict(tCtx, eviction)
 			if err != nil && !tc.shouldErr {
 				t.Fatalf("Eviction of pod failed %q", err)
 			}
@@ -700,7 +653,7 @@ func newV1Eviction(ns, evictionName string, deleteOption metav1.DeleteOptions) *
 
 func rmSetup(ctx context.Context, t *testing.T) (kubeapiservertesting.TearDownFunc, *disruption.DisruptionController, informers.SharedInformerFactory, *restclient.Config, clientset.Interface) {
 	// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins=ServiceAccount"}, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 
 	config := restclient.CopyConfig(server.ClientConfig)
 	clientSet, err := clientset.NewForConfig(config)

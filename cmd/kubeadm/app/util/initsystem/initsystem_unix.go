@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -22,9 +21,10 @@ package initsystem
 import (
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 
-	"github.com/pkg/errors"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
 // OpenRCInitSystem defines openrc
@@ -61,8 +61,28 @@ func (openrc OpenRCInitSystem) ServiceExists(service string) bool {
 // ServiceIsEnabled ensures the service is enabled to start on each boot.
 func (openrc OpenRCInitSystem) ServiceIsEnabled(service string) bool {
 	args := []string{"show", "default"}
-	outBytes, _ := exec.Command("rc-update", args...).Output()
-	return strings.Contains(string(outBytes), service)
+	outBytes, err := exec.Command("rc-update", args...).Output()
+	if err != nil {
+		return false
+	}
+	return openrcServiceIsEnabled(string(outBytes), service)
+}
+
+// openrcServiceIsEnabled reports whether the listing printed by "rc-update show default"
+// has the service in the default runlevel.
+func openrcServiceIsEnabled(listing, service string) bool {
+	// rc-update prints one "<service> | <runlevels>" line per listed service, and with
+	// verbose output on it lists services in no runlevel. Hence, we compare both columns.
+	for line := range strings.SplitSeq(listing, "\n") {
+		name, runlevels, found := strings.CutLast(line, "|")
+		if !found || strings.TrimSpace(name) != service {
+			continue
+		}
+		if slices.Contains(strings.Fields(runlevels), "default") {
+			return true
+		}
+	}
+	return false
 }
 
 // ServiceIsActive ensures the service is running, or attempting to run. (crash looping in the case of kubelet)
@@ -125,7 +145,7 @@ func (sysd SystemdInitSystem) ServiceExists(service string) bool {
 	args := []string{"status", service}
 	outBytes, _ := exec.Command("systemctl", args...).Output()
 	output := string(outBytes)
-	return !strings.Contains(output, "Loaded: not-found")
+	return !strings.Contains(output, "Loaded: not-found") && !strings.Contains(output, "could not be found")
 }
 
 // ServiceIsEnabled ensures the service is enabled to start on each boot.
@@ -160,6 +180,13 @@ func GetInitSystem() (InitSystem, error) {
 	}
 	_, err = exec.LookPath("openrc")
 	if err == nil {
+		binaries := []string{"rc-service", "rc-update"}
+		for _, binary := range binaries {
+			_, err = exec.LookPath(binary)
+			if err != nil {
+				return nil, errors.Wrapf(err, "openrc detected, but missing required binary: %s", binary)
+			}
+		}
 		return &OpenRCInitSystem{}, nil
 	}
 

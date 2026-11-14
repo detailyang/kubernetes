@@ -19,6 +19,7 @@ package statefulset
 import (
 	"context"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -32,9 +33,13 @@ import (
 // WaitForRunning waits for numPodsRunning in ss to be Running and for the first
 // numPodsReady ordinals to be Ready.
 func WaitForRunning(ctx context.Context, c clientset.Interface, numPodsRunning, numPodsReady int32, ss *appsv1.StatefulSet) {
-	pollErr := wait.PollImmediateWithContext(ctx, StatefulSetPoll, StatefulSetTimeout,
+	pollErr := wait.PollUntilContextTimeout(ctx, StatefulSetPoll, StatefulSetTimeout, true,
 		func(ctx context.Context) (bool, error) {
-			podList := GetPodList(ctx, c, ss)
+			podList, err := GetPodList(ctx, c, ss)
+			if err != nil {
+				return false, err
+			}
+
 			SortStatefulPods(podList)
 			if int32(len(podList.Items)) < numPodsRunning {
 				framework.Logf("Found %d stateful pods, waiting for %d", len(podList.Items), numPodsRunning)
@@ -59,15 +64,19 @@ func WaitForRunning(ctx context.Context, c clientset.Interface, numPodsRunning, 
 	}
 }
 
-// WaitForState periodically polls for the ss and its pods until the until function returns either true or an error
-func WaitForState(ctx context.Context, c clientset.Interface, ss *appsv1.StatefulSet, until func(*appsv1.StatefulSet, *v1.PodList) (bool, error)) {
-	pollErr := wait.PollImmediateWithContext(ctx, StatefulSetPoll, StatefulSetTimeout,
+// WaitForState periodically polls for the ss and its pods until the until function returns either true or an error.
+func WaitForState(ctx context.Context, c clientset.Interface, ss *appsv1.StatefulSet, pollInterval time.Duration, until func(*appsv1.StatefulSet, *v1.PodList) (bool, error)) {
+	pollErr := wait.PollUntilContextTimeout(ctx, pollInterval, StatefulSetTimeout, true,
 		func(ctx context.Context) (bool, error) {
 			ssGet, err := c.AppsV1().StatefulSets(ss.Namespace).Get(ctx, ss.Name, metav1.GetOptions{})
 			if err != nil {
 				return false, err
 			}
-			podList := GetPodList(ctx, c, ssGet)
+			podList, err := GetPodList(ctx, c, ssGet)
+			if err != nil {
+				return false, err
+			}
+
 			return until(ssGet, podList)
 		})
 	if pollErr != nil {
@@ -83,7 +92,7 @@ func WaitForRunningAndReady(ctx context.Context, c clientset.Interface, numState
 // WaitForPodReady waits for the Pod named podName in set to exist and have a Ready condition.
 func WaitForPodReady(ctx context.Context, c clientset.Interface, set *appsv1.StatefulSet, podName string) (*appsv1.StatefulSet, *v1.PodList) {
 	var pods *v1.PodList
-	WaitForState(ctx, c, set, func(set2 *appsv1.StatefulSet, pods2 *v1.PodList) (bool, error) {
+	WaitForState(ctx, c, set, StatefulSetPoll, func(set2 *appsv1.StatefulSet, pods2 *v1.PodList) (bool, error) {
 		set = set2
 		pods = pods2
 		for i := range pods.Items {
@@ -101,7 +110,7 @@ func WaitForStatusReadyReplicas(ctx context.Context, c clientset.Interface, ss *
 	framework.Logf("Waiting for statefulset status.readyReplicas updated to %d", expectedReplicas)
 
 	ns, name := ss.Namespace, ss.Name
-	pollErr := wait.PollImmediateWithContext(ctx, StatefulSetPoll, StatefulSetTimeout,
+	pollErr := wait.PollUntilContextTimeout(ctx, StatefulSetPoll, StatefulSetTimeout, true,
 		func(ctx context.Context) (bool, error) {
 			ssGet, err := c.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
@@ -126,7 +135,7 @@ func WaitForStatusAvailableReplicas(ctx context.Context, c clientset.Interface, 
 	framework.Logf("Waiting for statefulset status.AvailableReplicas updated to %d", expectedReplicas)
 
 	ns, name := ss.Namespace, ss.Name
-	pollErr := wait.PollImmediateWithContext(ctx, StatefulSetPoll, StatefulSetTimeout,
+	pollErr := wait.PollUntilContextTimeout(ctx, StatefulSetPoll, StatefulSetTimeout, true,
 		func(ctx context.Context) (bool, error) {
 			ssGet, err := c.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
@@ -151,7 +160,7 @@ func WaitForStatusReplicas(ctx context.Context, c clientset.Interface, ss *appsv
 	framework.Logf("Waiting for statefulset status.replicas updated to %d", expectedReplicas)
 
 	ns, name := ss.Namespace, ss.Name
-	pollErr := wait.PollImmediateWithContext(ctx, StatefulSetPoll, StatefulSetTimeout,
+	pollErr := wait.PollUntilContextTimeout(ctx, StatefulSetPoll, StatefulSetTimeout, true,
 		func(ctx context.Context) (bool, error) {
 			ssGet, err := c.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
@@ -179,5 +188,44 @@ func Saturate(ctx context.Context, c clientset.Interface, ss *appsv1.StatefulSet
 		WaitForRunning(ctx, c, i+1, i, ss)
 		framework.Logf("Resuming stateful pod at index %v", i)
 		ResumeNextPod(ctx, c, ss)
+	}
+}
+
+// WaitForFailedWithImagePullErr waits for numPodsFailed in ss to be Failed with ImagePullBackError or ImagePullErr
+func WaitForFailedWithImagePullErr(ctx context.Context, c clientset.Interface, numPodsFailed int32, ss *appsv1.StatefulSet) {
+	pollErr := wait.PollUntilContextTimeout(ctx, StatefulSetPoll, StatefulSetTimeout, true,
+		func(ctx context.Context) (bool, error) {
+			podList, err := GetPodList(ctx, c, ss)
+			if err != nil {
+				return false, err
+			}
+
+			SortStatefulPods(podList)
+			if int32(len(podList.Items)) < numPodsFailed {
+				framework.Logf("Found %d stateful pods, waiting for %d", len(podList.Items), numPodsFailed)
+				return false, nil
+			}
+			if int32(len(podList.Items)) > numPodsFailed {
+				framework.Logf("Found %d scheduled pods, waiting for %d", len(podList.Items), numPodsFailed)
+			}
+			for _, p := range podList.Items {
+				isFailingWithImagePullErr := false
+				shouldBeFailing := getStatefulPodOrdinal(&p) < int(numPodsFailed)
+				for _, containerStatus := range p.Status.ContainerStatuses {
+					w := containerStatus.State.Waiting
+					if w != nil && (w.Reason == "ImagePullBackOff" || w.Reason == "ErrImagePull") {
+						isFailingWithImagePullErr = true
+					}
+				}
+				desiredFailing := shouldBeFailing == isFailingWithImagePullErr
+				framework.Logf("Waiting for pod %v to be stuck with image pull error - shouldFail=%v, phase=%v, imagePullErr=%v", p.Name, shouldBeFailing, p.Status.Phase, isFailingWithImagePullErr)
+				if p.Status.Phase != v1.PodPending || !desiredFailing {
+					return false, nil
+				}
+			}
+			return true, nil
+		})
+	if pollErr != nil {
+		framework.Failf("Failed waiting for %d pods to be stuck with image pull error: %v", numPodsFailed, pollErr)
 	}
 }

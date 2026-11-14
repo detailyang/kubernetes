@@ -22,10 +22,12 @@ import (
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 )
 
+// Convert_kubeadm_InitConfiguration_To_v1beta4_InitConfiguration is required because the ClusterConfiguration is embedded in the private InitConfiguration struct.
 func Convert_kubeadm_InitConfiguration_To_v1beta4_InitConfiguration(in *kubeadm.InitConfiguration, out *InitConfiguration, s conversion.Scope) error {
 	return autoConvert_kubeadm_InitConfiguration_To_v1beta4_InitConfiguration(in, out, s)
 }
 
+// Convert_v1beta4_InitConfiguration_To_kubeadm_InitConfiguration is required because the ClusterConfiguration is embedded in the private InitConfiguration struct.
 func Convert_v1beta4_InitConfiguration_To_kubeadm_InitConfiguration(in *InitConfiguration, out *kubeadm.InitConfiguration, s conversion.Scope) error {
 	err := autoConvert_v1beta4_InitConfiguration_To_kubeadm_InitConfiguration(in, out, s)
 	if err != nil {
@@ -33,4 +35,18 @@ func Convert_v1beta4_InitConfiguration_To_kubeadm_InitConfiguration(in *InitConf
 	}
 	err = Convert_v1beta4_ClusterConfiguration_To_kubeadm_ClusterConfiguration(&ClusterConfiguration{}, &out.ClusterConfiguration, s)
 	return err
+}
+
+// Convert_v1beta4_Arg_To_kubeadm_Arg is required because MergeMethod is not present in v1beta4.
+func Convert_v1beta4_Arg_To_kubeadm_Arg(in *Arg, out *kubeadm.Arg, s conversion.Scope) error {
+	out.Name = in.Name
+	out.Value = in.Value
+	return nil
+}
+
+// Convert_kubeadm_Arg_To_v1beta4_Arg is required because MergeMethod is not present in v1beta4.
+func Convert_kubeadm_Arg_To_v1beta4_Arg(in *kubeadm.Arg, out *Arg, s conversion.Scope) error {
+	out.Name = in.Name
+	out.Value = in.Value
+	return nil
 }

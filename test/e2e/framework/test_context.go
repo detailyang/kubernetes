@@ -17,18 +17,18 @@ limitations under the License.
 package framework
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/ginkgo/v2/reporters"
@@ -36,6 +36,7 @@ import (
 	"github.com/onsi/gomega"
 	gomegaformat "github.com/onsi/gomega/format"
 
+	"k8s.io/apimachinery/pkg/util/sets"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	cliflag "k8s.io/component-base/cli/flag"
@@ -51,6 +52,20 @@ const (
 
 	// DefaultNumNodes is the number of nodes. If not specified, then number of nodes is auto-detected
 	DefaultNumNodes = -1
+)
+
+var (
+	// Output is used for output when not running tests, for example in -list-tests.
+	// Test output should go to ginkgo.GinkgoWriter.
+	Output io.Writer = os.Stdout
+
+	// Exit is called when the framework detects fatal errors or when
+	// it is done with the execution of e.g. -list-tests.
+	Exit = os.Exit
+
+	// CheckForBugs determines whether the framework bails out when
+	// test initialization found any bugs.
+	CheckForBugs = true
 )
 
 // TestContextType contains test settings and global state. Due to
@@ -82,17 +97,20 @@ const (
 // Test suite authors can use framework/viper to make all command line
 // parameters also configurable via a configuration file.
 type TestContextType struct {
-	KubeConfig         string
-	KubeContext        string
-	KubeAPIContentType string
-	KubeletRootDir     string
-	CertDir            string
-	Host               string
-	BearerToken        string `datapolicy:"token"`
+	KubeConfig             string
+	KubeContext            string
+	KubeAPIContentType     string
+	KubeletRootDir         string
+	KubeletConfigDropinDir string
+	CertDir                string
+	Host                   string
+	BearerToken            string `datapolicy:"token"`
 	// TODO: Deprecating this over time... instead just use gobindata_util.go , see #23987.
 	RepoRoot string
 	// ListImages will list off all images that are used then quit
 	ListImages bool
+
+	listTests, listLabels bool
 
 	// ListConformanceTests will list off all conformance tests that are available then quit
 	ListConformanceTests bool
@@ -167,9 +185,6 @@ type TestContextType struct {
 	// The DNS Domain of the cluster.
 	ClusterDNSDomain string
 
-	// The configuration of NodeKiller.
-	NodeKiller NodeKillerConfig
-
 	// The Default IP Family of the cluster ("ipv4" or "ipv6")
 	IPFamily string
 
@@ -209,30 +224,6 @@ type TestContextType struct {
 	EnabledVolumeDrivers []string
 }
 
-// NodeKillerConfig describes configuration of NodeKiller -- a utility to
-// simulate node failures.
-//
-// TODO: move this and the corresponding command line flags into
-// test/e2e/framework/node.
-type NodeKillerConfig struct {
-	// Enabled determines whether NodeKill should do anything at all.
-	// All other options below are ignored if Enabled = false.
-	Enabled bool
-	// FailureRatio is a percentage of all nodes that could fail simultinously.
-	FailureRatio float64
-	// Interval is time between node failures.
-	Interval time.Duration
-	// JitterFactor is factor used to jitter node failures.
-	// Node will be killed between [Interval, Interval + (1.0 + JitterFactor)].
-	JitterFactor float64
-	// SimulatedDowntime is a duration between node is killed and recreated.
-	SimulatedDowntime time.Duration
-	// NodeKillerStopCtx is a context that is used to notify NodeKiller to stop killing nodes.
-	NodeKillerStopCtx context.Context
-	// NodeKillerStop is the cancel function for NodeKillerStopCtx.
-	NodeKillerStop func()
-}
-
 // NodeTestContextType is part of TestContextType, it is shared by all node e2e test.
 type NodeTestContextType struct {
 	// NodeE2E indicates whether it is running node e2e.
@@ -257,6 +248,8 @@ type NodeTestContextType struct {
 	ExtraEnvs map[string]string
 	// StandaloneMode indicates whether the test is running kubelet in a standalone mode.
 	StandaloneMode bool
+	// CriProxyEnabled indicates whether enable CRI API proxy for failure injection.
+	CriProxyEnabled bool
 }
 
 // CloudConfig holds the cloud configuration for e2e test suites.
@@ -356,6 +349,8 @@ func RegisterCommonFlags(flags *flag.FlagSet) {
 	flags.StringVar(&TestContext.NonblockingTaints, "non-blocking-taints", `node-role.kubernetes.io/control-plane`, "Nodes with taints in this comma-delimited list will not block the test framework from starting tests.")
 
 	flags.BoolVar(&TestContext.ListImages, "list-images", false, "If true, will show list of images used for running tests.")
+	flags.BoolVar(&TestContext.listLabels, "list-labels", false, "If true, will show the list of labels that can be used to select tests via -ginkgo.label-filter.")
+	flags.BoolVar(&TestContext.listTests, "list-tests", false, "If true, will show the full names of all tests (aka specs) that can be used to select test via -ginkgo.focus/skip.")
 	flags.StringVar(&TestContext.KubectlPath, "kubectl-path", "kubectl", "The kubectl binary to use. For development, you might use 'cluster/kubectl.sh' here.")
 
 	flags.StringVar(&TestContext.ProgressReportURL, "progress-report-url", "", "The URL to POST progress updates to as the suite runs to assist in aiding integrations. If empty, no messages sent.")
@@ -377,7 +372,7 @@ func CreateGinkgoConfig() (types.SuiteConfig, types.ReporterConfig) {
 	// Randomize specs as well as suites
 	suiteConfig.RandomizeAllSpecs = true
 	// Disable skipped tests unless they are explicitly requested.
-	if len(suiteConfig.FocusStrings) == 0 && len(suiteConfig.SkipStrings) == 0 {
+	if len(suiteConfig.FocusStrings) == 0 && len(suiteConfig.SkipStrings) == 0 && suiteConfig.LabelFilter == "" {
 		suiteConfig.SkipStrings = []string{`\[Flaky\]|\[Feature:.+\]`}
 	}
 	return suiteConfig, reporterConfig
@@ -419,7 +414,7 @@ func RegisterClusterFlags(flags *flag.FlagSet) {
 	flags.StringVar(&cloudConfig.Cluster, "gke-cluster", "", "GKE name of cluster being used, if applicable")
 	flags.StringVar(&cloudConfig.NodeInstanceGroup, "node-instance-group", "", "Name of the managed instance group for nodes. Valid only for gce, gke or aws. If there is more than one group: comma separated list of groups.")
 	flags.StringVar(&cloudConfig.Network, "network", "e2e", "The cloud provider network for this e2e cluster.")
-	flags.IntVar(&cloudConfig.NumNodes, "num-nodes", DefaultNumNodes, fmt.Sprintf("Number of nodes in the cluster. If the default value of '%q' is used the number of schedulable nodes is auto-detected.", DefaultNumNodes))
+	flags.IntVar(&cloudConfig.NumNodes, "num-nodes", DefaultNumNodes, fmt.Sprintf("Number of nodes in the cluster. If the default value of '%d' is used the number of schedulable nodes is auto-detected.", DefaultNumNodes))
 	flags.StringVar(&cloudConfig.ClusterIPRange, "cluster-ip-range", "10.64.0.0/14", "A CIDR notation IP range from which to assign IPs in the cluster.")
 	flags.StringVar(&cloudConfig.NodeTag, "node-tag", "", "Network tags used on node instances. Valid only for gce, gke")
 	flags.StringVar(&cloudConfig.MasterTag, "master-tag", "", "Network tags used on master instances. Valid only for gce, gke")
@@ -434,19 +429,12 @@ func RegisterClusterFlags(flags *flag.FlagSet) {
 	flags.StringVar(&TestContext.EtcdUpgradeVersion, "etcd-upgrade-version", "", "The etcd binary version to upgrade to (e.g., '3.0.14', '2.3.7') if doing an etcd upgrade test.")
 	flags.StringVar(&TestContext.GCEUpgradeScript, "gce-upgrade-script", "", "Script to use to upgrade a GCE cluster.")
 	flags.BoolVar(&TestContext.CleanStart, "clean-start", false, "If true, purge all namespaces except default and system before running tests. This serves to Cleanup test namespaces from failed/interrupted e2e runs in a long-lived cluster.")
-
-	nodeKiller := &TestContext.NodeKiller
-	flags.BoolVar(&nodeKiller.Enabled, "node-killer", false, "Whether NodeKiller should kill any nodes.")
-	flags.Float64Var(&nodeKiller.FailureRatio, "node-killer-failure-ratio", 0.01, "Percentage of nodes to be killed")
-	flags.DurationVar(&nodeKiller.Interval, "node-killer-interval", 1*time.Minute, "Time between node failures.")
-	flags.Float64Var(&nodeKiller.JitterFactor, "node-killer-jitter-factor", 60, "Factor used to jitter node failures.")
-	flags.DurationVar(&nodeKiller.SimulatedDowntime, "node-killer-simulated-downtime", 10*time.Minute, "A delay between node death and recreation")
 }
 
-// GenerateSecureToken returns a string of length tokenLen, consisting
+// generateSecureToken returns a string of length tokenLen, consisting
 // of random bytes encoded as base64 for use as a Bearer Token during
 // communication with an APIServer
-func GenerateSecureToken(tokenLen int) (string, error) {
+func generateSecureToken(tokenLen int) (string, error) {
 	// Number of bytes to be tokenLen when base64 encoded.
 	tokenSize := math.Ceil(float64(tokenLen) * 6 / 8)
 	rawToken := make([]byte, int(tokenSize))
@@ -470,19 +458,12 @@ func AfterReadingAllFlags(t *TestContextType) {
 	if t.KubeTestRepoList != "" {
 		image.Init(t.KubeTestRepoList)
 	}
-	var fs flag.FlagSet
-	klog.InitFlags(&fs)
-	fs.Set("logtostderr", "false")
-	fs.Set("alsologtostderr", "false")
-	fs.Set("one_output", "true")
-	fs.Set("stderrthreshold", "10" /* higher than any of the severities -> none pass the threshold */)
-	klog.SetOutput(ginkgo.GinkgoWriter)
 
 	if t.ListImages {
 		for _, v := range image.GetImageConfigs() {
 			fmt.Println(v.GetE2EImage())
 		}
-		os.Exit(0)
+		Exit(0)
 	}
 
 	// Reconfigure gomega defaults. The poll interval should be suitable
@@ -493,6 +474,21 @@ func AfterReadingAllFlags(t *TestContextType) {
 	gomega.SetDefaultConsistentlyPollingInterval(t.timeouts.Poll)
 	gomega.SetDefaultEventuallyTimeout(t.timeouts.PodStart)
 	gomega.SetDefaultConsistentlyDuration(t.timeouts.PodStartShort)
+	gomega.EnforceDefaultTimeoutsWhenUsingContexts()
+
+	// ginkgo.PreviewSpecs will expand all nodes and thus may find new bugs.
+	report := ginkgo.PreviewSpecs("Kubernetes e2e test statistics")
+	validateSpecs(report.SpecReports)
+	if err := FormatBugs(); CheckForBugs && err != nil {
+		// Refuse to do anything if the E2E suite is buggy.
+		fmt.Fprint(Output, "ERROR: E2E suite initialization was faulty, these errors must be fixed:")
+		fmt.Fprint(Output, "\n"+err.Error())
+		Exit(1)
+	}
+	if t.listLabels || t.listTests {
+		listTestInformation(report)
+		Exit(0)
+	}
 
 	// Only set a default host if one won't be supplied via kubeconfig
 	if len(t.Host) == 0 && len(t.KubeConfig) == 0 {
@@ -512,10 +508,8 @@ func AfterReadingAllFlags(t *TestContextType) {
 	}
 	if len(t.BearerToken) == 0 {
 		var err error
-		t.BearerToken, err = GenerateSecureToken(16)
-		if err != nil {
-			klog.Fatalf("Failed to generate bearer token: %v", err)
-		}
+		t.BearerToken, err = generateSecureToken(16)
+		ExpectNoError(err, "Failed to generate bearer token")
 	}
 
 	// Allow 1% of nodes to be unready (statistically) - relevant for large clusters.
@@ -553,7 +547,7 @@ func AfterReadingAllFlags(t *TestContextType) {
 		} else {
 			klog.Errorf("Failed to setup provider config for %q: %v", TestContext.Provider, err)
 		}
-		os.Exit(1)
+		Exit(1)
 	}
 
 	if TestContext.ReportDir != "" {
@@ -563,13 +557,13 @@ func AfterReadingAllFlags(t *TestContextType) {
 		// in parallel, so we will get "exists" error in most of them.
 		if err := os.MkdirAll(TestContext.ReportDir, 0777); err != nil && !os.IsExist(err) {
 			klog.Errorf("Create report dir: %v", err)
-			os.Exit(1)
+			Exit(1)
 		}
 		ginkgoDir := path.Join(TestContext.ReportDir, "ginkgo")
 		if TestContext.ReportCompleteGinkgo || TestContext.ReportCompleteJUnit {
 			if err := os.MkdirAll(ginkgoDir, 0777); err != nil && !os.IsExist(err) {
 				klog.Errorf("Create <report-dir>/ginkgo: %v", err)
-				os.Exit(1)
+				Exit(1)
 			}
 		}
 
@@ -599,4 +593,48 @@ func AfterReadingAllFlags(t *TestContextType) {
 			ExpectNoError(junit.WriteJUnitReport(report, junitReport))
 		})
 	}
+}
+
+func listTestInformation(report ginkgo.Report) {
+	indent := strings.Repeat(" ", 4)
+
+	if TestContext.listLabels {
+		labels := sets.New[string]()
+		for _, spec := range report.SpecReports {
+			if spec.LeafNodeType == types.NodeTypeIt {
+				labels.Insert(spec.Labels()...)
+			}
+		}
+		fmt.Fprintf(Output, "The following labels can be used with 'ginkgo run --label-filter':\n%s%s\n\n", indent, strings.Join(sets.List(labels), "\n"+indent))
+	}
+	if TestContext.listTests {
+		leafs := make([][]string, 0, len(report.SpecReports))
+		wd, _ := os.Getwd()
+		for _, spec := range report.SpecReports {
+			if spec.LeafNodeType == types.NodeTypeIt {
+				leafs = append(leafs, []string{fmt.Sprintf("%s:%d: ", relativePath(wd, spec.LeafNodeLocation.FileName), spec.LeafNodeLocation.LineNumber), spec.FullText()})
+			}
+		}
+		// Sort by test name, not the source code location, because the test
+		// name is more stable across code refactoring.
+		sort.Slice(leafs, func(i, j int) bool {
+			return leafs[i][1] < leafs[j][1]
+		})
+		fmt.Fprint(Output, "The following spec names can be used with 'ginkgo run --focus/skip':\n")
+		for _, leaf := range leafs {
+			fmt.Fprintf(Output, "%s%s%s\n", indent, leaf[0], leaf[1])
+		}
+		fmt.Fprint(Output, "\n")
+	}
+}
+
+func relativePath(wd, path string) string {
+	if wd == "" {
+		return path
+	}
+	relpath, err := filepath.Rel(wd, path)
+	if err != nil {
+		return path
+	}
+	return relpath
 }

@@ -23,8 +23,6 @@ import (
 
 	wordwrap "github.com/mitchellh/go-wordwrap"
 	"github.com/moby/term"
-
-	"k8s.io/client-go/tools/remotecommand"
 )
 
 type wordWrapWriter struct {
@@ -70,7 +68,7 @@ func NewWordWrapWriter(w io.Writer, limit uint) io.Writer {
 	}
 }
 
-func getTerminalLimitWidth(terminalSize *remotecommand.TerminalSize) uint {
+func getTerminalLimitWidth(terminalSize *TerminalSize) uint {
 	var limit uint
 	switch {
 	case terminalSize.Width >= 120:
@@ -103,44 +101,4 @@ func (w wordWrapWriter) Write(p []byte) (nn int, err error) {
 	original := string(p)
 	wrapped := wordwrap.WrapString(original, w.limit)
 	return w.writer.Write([]byte(wrapped))
-}
-
-// NewPunchCardWriter is a NewWordWrapWriter that limits the line width to 80 columns.
-func NewPunchCardWriter(w io.Writer) io.Writer {
-	return NewWordWrapWriter(w, 80)
-}
-
-type maxWidthWriter struct {
-	maxWidth     uint
-	currentWidth uint
-	written      uint
-	writer       io.Writer
-}
-
-// NewMaxWidthWriter is a Writer that supports a limit of characters on every
-// line, but doesn't do any word wrapping automatically.
-func NewMaxWidthWriter(w io.Writer, maxWidth uint) io.Writer {
-	return &maxWidthWriter{
-		maxWidth: maxWidth,
-		writer:   w,
-	}
-}
-
-func (m maxWidthWriter) Write(p []byte) (nn int, err error) {
-	for _, b := range p {
-		if m.currentWidth == m.maxWidth {
-			m.writer.Write([]byte{'\n'})
-			m.currentWidth = 0
-		}
-		if b == '\n' {
-			m.currentWidth = 0
-		}
-		_, err := m.writer.Write([]byte{b})
-		if err != nil {
-			return int(m.written), err
-		}
-		m.written++
-		m.currentWidth++
-	}
-	return len(p), nil
 }

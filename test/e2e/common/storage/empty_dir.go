@@ -20,13 +20,16 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"strings"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2epodoutput "k8s.io/kubernetes/test/e2e/framework/pod/output"
@@ -47,7 +50,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 	f := framework.NewDefaultFramework("emptydir")
 	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 
-	ginkgo.Context("when FSGroup is specified [LinuxOnly] [NodeFeature:FSGroup]", func() {
+	f.Context("when FSGroup is specified [LinuxOnly]", f.WithNodeConformance(), func() {
 
 		ginkgo.BeforeEach(func() {
 			// Windows does not support the FSGroup SecurityContext option.
@@ -85,7 +88,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume and 'medium' as 'Memory', the volume MUST have mode set as -rwxrwxrwx and mount type set to tmpfs.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions, or the medium = 'Memory'.
 	*/
-	framework.ConformanceIt("volume on tmpfs should have the correct mode [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("volume on tmpfs should have the correct mode [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTestVolumeMode(ctx, f, 0, v1.StorageMediumMemory)
 	})
 
@@ -95,7 +98,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume and 'medium' as 'Memory', the volume mode set to 0644. The volume MUST have mode -rw-r--r-- and mount type set to tmpfs and the contents MUST be readable.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions, or running as UID / GID, or the medium = 'Memory'.
 	*/
-	framework.ConformanceIt("should support (root,0644,tmpfs) [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support (root,0644,tmpfs) [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTest0644(ctx, f, 0, v1.StorageMediumMemory)
 	})
 
@@ -105,7 +108,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume and 'medium' as 'Memory', the volume mode set to 0666. The volume MUST have mode -rw-rw-rw- and mount type set to tmpfs and the contents MUST be readable.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions, or running as UID / GID, or the medium = 'Memory'.
 	*/
-	framework.ConformanceIt("should support (root,0666,tmpfs) [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support (root,0666,tmpfs) [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTest0666(ctx, f, 0, v1.StorageMediumMemory)
 	})
 
@@ -115,7 +118,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume and 'medium' as 'Memory', the volume mode set to 0777.  The volume MUST have mode set as -rwxrwxrwx and mount type set to tmpfs and the contents MUST be readable.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions, or running as UID / GID, or the medium = 'Memory'.
 	*/
-	framework.ConformanceIt("should support (root,0777,tmpfs) [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support (root,0777,tmpfs) [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTest0777(ctx, f, 0, v1.StorageMediumMemory)
 	})
 
@@ -125,7 +128,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume and 'medium' as 'Memory', the volume mode set to 0644. Volume is mounted into the container where container is run as a non-root user. The volume MUST have mode -rw-r--r-- and mount type set to tmpfs and the contents MUST be readable.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions, or running as UID / GID, or the medium = 'Memory'.
 	*/
-	framework.ConformanceIt("should support (non-root,0644,tmpfs) [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support (non-root,0644,tmpfs) [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTest0644(ctx, f, nonRootUID, v1.StorageMediumMemory)
 	})
 
@@ -135,7 +138,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume and 'medium' as 'Memory', the volume mode set to 0666. Volume is mounted into the container where container is run as a non-root user. The volume MUST have mode -rw-rw-rw- and mount type set to tmpfs and the contents MUST be readable.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions, or running as UID / GID, or the medium = 'Memory'.
 	*/
-	framework.ConformanceIt("should support (non-root,0666,tmpfs) [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support (non-root,0666,tmpfs) [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTest0666(ctx, f, nonRootUID, v1.StorageMediumMemory)
 	})
 
@@ -145,7 +148,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume and 'medium' as 'Memory', the volume mode set to 0777. Volume is mounted into the container where container is run as a non-root user. The volume MUST have mode -rwxrwxrwx and mount type set to tmpfs and the contents MUST be readable.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions, or running as UID / GID, or the medium = 'Memory'.
 	*/
-	framework.ConformanceIt("should support (non-root,0777,tmpfs) [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support (non-root,0777,tmpfs) [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTest0777(ctx, f, nonRootUID, v1.StorageMediumMemory)
 	})
 
@@ -155,7 +158,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume, the volume MUST have mode set as -rwxrwxrwx and mount type set to tmpfs.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions.
 	*/
-	framework.ConformanceIt("volume on default medium should have the correct mode [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("volume on default medium should have the correct mode [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTestVolumeMode(ctx, f, 0, v1.StorageMediumDefault)
 	})
 
@@ -165,7 +168,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume, the volume mode set to 0644. The volume MUST have mode -rw-r--r-- and mount type set to tmpfs and the contents MUST be readable.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions, or running as UID / GID.
 	*/
-	framework.ConformanceIt("should support (root,0644,default) [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support (root,0644,default) [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTest0644(ctx, f, 0, v1.StorageMediumDefault)
 	})
 
@@ -175,7 +178,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume, the volume mode set to 0666. The volume MUST have mode -rw-rw-rw- and mount type set to tmpfs and the contents MUST be readable.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions, or running as UID / GID.
 	*/
-	framework.ConformanceIt("should support (root,0666,default) [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support (root,0666,default) [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTest0666(ctx, f, 0, v1.StorageMediumDefault)
 	})
 
@@ -185,7 +188,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume, the volume mode set to 0777.  The volume MUST have mode set as -rwxrwxrwx and mount type set to tmpfs and the contents MUST be readable.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions, or running as UID / GID.
 	*/
-	framework.ConformanceIt("should support (root,0777,default) [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support (root,0777,default) [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTest0777(ctx, f, 0, v1.StorageMediumDefault)
 	})
 
@@ -195,7 +198,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume, the volume mode set to 0644. Volume is mounted into the container where container is run as a non-root user. The volume MUST have mode -rw-r--r-- and mount type set to tmpfs and the contents MUST be readable.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions, or running as UID / GID.
 	*/
-	framework.ConformanceIt("should support (non-root,0644,default) [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support (non-root,0644,default) [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTest0644(ctx, f, nonRootUID, v1.StorageMediumDefault)
 	})
 
@@ -205,7 +208,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume, the volume mode set to 0666. Volume is mounted into the container where container is run as a non-root user. The volume MUST have mode -rw-rw-rw- and mount type set to tmpfs and the contents MUST be readable.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions, or running as UID / GID.
 	*/
-	framework.ConformanceIt("should support (non-root,0666,default) [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support (non-root,0666,default) [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTest0666(ctx, f, nonRootUID, v1.StorageMediumDefault)
 	})
 
@@ -215,7 +218,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 		Description: A Pod created with an 'emptyDir' Volume, the volume mode set to 0777. Volume is mounted into the container where container is run as a non-root user. The volume MUST have mode -rwxrwxrwx and mount type set to tmpfs and the contents MUST be readable.
 		This test is marked LinuxOnly since Windows does not support setting specific file permissions, or running as UID / GID.
 	*/
-	framework.ConformanceIt("should support (non-root,0777,default) [LinuxOnly] [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support (non-root,0777,default) [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
 		doTest0777(ctx, f, nonRootUID, v1.StorageMediumDefault)
 	})
 
@@ -257,7 +260,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 						Name:    busyBoxMainContainerName,
 						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/sh"},
-						Args:    []string{"-c", "sleep 100000"},
+						Args:    []string{"-c", e2epod.InfiniteSleepCommand},
 						VolumeMounts: []v1.VolumeMount{
 							{
 								Name:      volumeName,
@@ -285,19 +288,47 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 
 		ginkgo.By("Creating Pod")
 		e2epod.NewPodClient(f).Create(ctx, pod)
-		framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name))
+		framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name), "wait for Pod %q in namespace %q to run", pod.Name, f.Namespace.Name)
 
 		ginkgo.By("Reading file content from the nginx-container")
 		result := e2epod.ExecShellInContainer(f, pod.Name, busyBoxMainContainerName, fmt.Sprintf("cat %s", busyBoxMainVolumeFilePath))
-		gomega.Expect(result).To(gomega.Equal(message), "failed to match expected string %s with %s", message, resultString)
+		gomega.Expect(result).To(gomega.Equal(message), "match expected string %s with %s", message, resultString)
+	})
+
+	f.Context("EmptyDirVolumeMode [LinuxOnly]", framework.WithFeatureGate(kubefeatures.EmptyDirVolumeMode), func() {
+		ginkgo.It("should set mode 0750 on emptyDir directory", func(ctx context.Context) {
+			mode := int32(0o750)
+			pod := createEmptyDirModePod(ctx, f, &mode)
+
+			output := e2epod.ExecCommandInContainer(f, pod.Name, "test-container", "/bin/sh", "-c", "stat -c %a /mnt/test-vol")
+			gomega.Expect(strings.TrimSpace(output)).To(gomega.Equal("750"))
+		})
+
+		ginkgo.It("should set mode 01777 with sticky bit on emptyDir directory", func(ctx context.Context) {
+			mode := int32(0o1777)
+			pod := createEmptyDirModePod(ctx, f, &mode)
+
+			output := e2epod.ExecCommandInContainer(f, pod.Name, "test-container", "/bin/sh", "-c", "stat -c %a /mnt/test-vol")
+			gomega.Expect(strings.TrimSpace(output)).To(gomega.Equal("1777"))
+		})
+
+		ginkgo.It("should default to mode 0777 when mode is not set", func(ctx context.Context) {
+			pod := createEmptyDirModePod(ctx, f, nil)
+
+			output := e2epod.ExecCommandInContainer(f, pod.Name, "test-container", "/bin/sh", "-c", "stat -c %a /mnt/test-vol")
+			gomega.Expect(strings.TrimSpace(output)).To(gomega.Equal("777"))
+		})
 	})
 
 	/*
 		Release: v1.20
 		Testname: EmptyDir, Memory backed volume is sized to specified limit
 		Description: A Pod created with an 'emptyDir' Volume backed by memory should be sized to user provided value.
+		This test is marked LinuxOnly since Windows supports emptyDir volumes, but not memory-backed emptyDir volumes.
 	*/
-	ginkgo.It("pod should support memory backed volumes of specified size", func(ctx context.Context) {
+	f.It("pod should support memory backed volumes of specified size [LinuxOnly]", f.WithNodeConformance(), func(ctx context.Context) {
+		e2eskipper.SkipIfNodeOSDistroIs("windows")
+
 		var (
 			volumeName                 = "shared-data"
 			busyBoxMainVolumeMountPath = "/usr/share/volumeshare"
@@ -328,7 +359,7 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 						Name:    busyBoxMainContainerName,
 						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/sh"},
-						Args:    []string{"-c", "sleep 100000"},
+						Args:    []string{"-c", e2epod.InfiniteSleepCommand},
 						VolumeMounts: []v1.VolumeMount{
 							{
 								Name:      volumeName,
@@ -348,15 +379,15 @@ var _ = SIGDescribe("EmptyDir volumes", func() {
 
 		ginkgo.By("Waiting for the pod running")
 		err = e2epod.WaitForPodNameRunningInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name)
-		framework.ExpectNoError(err, "failed to deploy pod %s", pod.Name)
+		framework.ExpectNoError(err, "deploy pod %s", pod.Name)
 
 		ginkgo.By("Getting the pod")
 		pod, err = e2epod.NewPodClient(f).Get(ctx, pod.Name, metav1.GetOptions{})
-		framework.ExpectNoError(err, "failed to get pod %s", pod.Name)
+		framework.ExpectNoError(err, "get pod %s", pod.Name)
 
 		ginkgo.By("Reading empty dir size")
 		result := e2epod.ExecShellInContainer(f, pod.Name, busyBoxMainContainerName, fmt.Sprintf("df | grep %s | awk '{print $2}'", busyBoxMainVolumeMountPath))
-		gomega.Expect(result).To(gomega.Equal(expectedResult), "failed to match expected string %s with %s", expectedResult, result)
+		gomega.Expect(result).To(gomega.Equal(expectedResult), "match expected string %s with %s", expectedResult, result)
 	})
 })
 
@@ -631,6 +662,40 @@ func testPodWithVolume(uid int64, path string, source *v1.EmptyDirVolumeSource) 
 	if uid != 0 {
 		pod.Spec.SecurityContext.RunAsUser = &uid
 	}
+
+	return pod
+}
+
+func createEmptyDirModePod(ctx context.Context, f *framework.Framework, mode *int32) *v1.Pod {
+	podClient := e2epod.NewPodClient(f)
+	pod := podClient.CreateSync(ctx, &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "emptydir-mode-test"},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:    "test-container",
+					Image:   imageutils.GetE2EImage(imageutils.BusyBox),
+					Command: []string{"/bin/sleep", "10000"},
+					VolumeMounts: []v1.VolumeMount{
+						{
+							Name:      "test-vol",
+							MountPath: "/mnt/test-vol",
+						},
+					},
+				},
+			},
+			Volumes: []v1.Volume{
+				{
+					Name: "test-vol",
+					VolumeSource: v1.VolumeSource{
+						EmptyDir: &v1.EmptyDirVolumeSource{
+							Mode: mode,
+						},
+					},
+				},
+			},
+		},
+	})
 
 	return pod
 }

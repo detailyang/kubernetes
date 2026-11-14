@@ -17,7 +17,6 @@ limitations under the License.
 package openapi
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -27,16 +26,15 @@ import (
 	"k8s.io/apiserver/pkg/util/openapi"
 	restclient "k8s.io/client-go/rest"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/ktesting"
 	"k8s.io/kube-openapi/pkg/common"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 	"k8s.io/kubernetes/pkg/controlplane"
 	generated "k8s.io/kubernetes/pkg/generated/openapi"
 	"k8s.io/kubernetes/test/integration/framework"
-	"k8s.io/kubernetes/test/utils/ktesting"
 )
 
 func TestEnablingOpenAPIEnumTypes(t *testing.T) {
-	const typeToAddEnum = "k8s.io/api/core/v1.ContainerPort"
 	const typeToCheckEnum = "io.k8s.api.core.v1.ContainerPort"
 
 	for _, tc := range []struct {
@@ -56,15 +54,12 @@ func TestEnablingOpenAPIEnumTypes(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, ctx := ktesting.NewTestContext(t)
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.OpenAPIEnums, tc.featureEnabled)()
+			tCtx := ktesting.Init(t)
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.OpenAPIEnums, tc.featureEnabled)
 
 			getDefinitionsFn := openapi.GetOpenAPIDefinitionsWithoutDisabledFeatures(func(ref common.ReferenceCallback) map[string]common.OpenAPIDefinition {
 				defs := generated.GetOpenAPIDefinitions(ref)
-				def := defs[typeToAddEnum]
+				def := defs[typeToCheckEnum]
 				// replace protocol to add the would-be enum field.
 				def.Schema.Properties["protocol"] = spec.Schema{
 					SchemaProps: spec.SchemaProps{
@@ -75,14 +70,14 @@ func TestEnablingOpenAPIEnumTypes(t *testing.T) {
 						Enum:        []interface{}{"SCTP", "TCP", "UDP"},
 					},
 				}
-				defs[typeToAddEnum] = def
+				defs[typeToCheckEnum] = def
 				return defs
 			})
 
-			_, kubeConfig, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
+			_, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
 				ModifyServerConfig: func(config *controlplane.Config) {
-					config.GenericConfig.OpenAPIConfig = framework.DefaultOpenAPIConfig()
-					config.GenericConfig.OpenAPIConfig.GetDefinitions = getDefinitionsFn
+					config.ControlPlane.Generic.OpenAPIConfig = framework.DefaultOpenAPIConfig()
+					config.ControlPlane.Generic.OpenAPIConfig.GetDefinitions = getDefinitionsFn
 				},
 			})
 			defer tearDownFn()

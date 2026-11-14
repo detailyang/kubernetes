@@ -32,8 +32,8 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	"k8s.io/apiextensions-api/pkg/client/clientset/clientset"
 	"k8s.io/apiextensions-apiserver/test/integration/fixtures"
 )
 
@@ -252,7 +252,7 @@ func TestTableGet(t *testing.T) {
 				// Validate extra column for v1
 				if i == 1 {
 					if got, expected := tbl.Rows[0].Cells[6], int64(5); got != expected {
-						t.Errorf("expected cell[6] to equal %q, got %q", expected, got)
+						t.Errorf("expected cell[6] to equal %v, got %v", expected, got)
 					}
 				}
 			}
@@ -350,7 +350,7 @@ func TestTableGet(t *testing.T) {
 				// Validate extra column for v1
 				if i == 1 {
 					if got, expected := tbl.Rows[0].Cells[6], int64(5); got != expected {
-						t.Errorf("expected cell[6] to equal %q, got %q", expected, got)
+						t.Errorf("expected cell[6] to equal %v, got %v", expected, got)
 					}
 				}
 			}

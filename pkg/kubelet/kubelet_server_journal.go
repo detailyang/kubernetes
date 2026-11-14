@@ -34,8 +34,6 @@ import (
 	"strings"
 	"time"
 
-	securejoin "github.com/cyphar/filepath-securejoin"
-
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
@@ -53,7 +51,7 @@ var (
 	// The set of known safe characters to pass to journalctl / GetWinEvent flags - only add to this list if the
 	// character cannot be used to create invalid sequences. This is intended as a broad defense against malformed
 	// input that could cause an escape.
-	reServiceNameUnsafeCharacters = regexp.MustCompile(`[^a-zA-Z\-_0-9@]+`)
+	reServiceNameUnsafeCharacters = regexp.MustCompile(`[^a-zA-Z\-_.:0-9@]+`)
 )
 
 // journalServer returns text output from the OS specific service logger to view
@@ -65,6 +63,13 @@ type journalServer struct{}
 // to journalctl on the current system. It supports content-encoding of
 // gzip to reduce total content size.
 func (journalServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet && req.Method != http.MethodPost {
+		// Only GET and POST are supported for journal log queries.
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	var out io.Writer = w
 
 	nlq, errs := newNodeLogQuery(req.URL.Query())
@@ -87,7 +92,7 @@ func (journalServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		defer gz.Close()
 		out = gz
 	}
-	nlq.Copy(out)
+	nlq.Copy(req.Context(), out)
 }
 
 // nodeLogQuery encapsulates the log query request
@@ -138,7 +143,7 @@ func newNodeLogQuery(query url.Values) (*nodeLogQuery, field.ErrorList) {
 	// Prevent specifying  an empty or blank space query.
 	// Example: kubectl get --raw /api/v1/nodes/$node/proxy/logs?query="   "
 	if ok && (len(nlq.Files) == 0 && len(nlq.Services) == 0) {
-		allErrs = append(allErrs, field.Invalid(field.NewPath("query"), queries, "query cannot be empty"))
+		allErrs = append(allErrs, field.Invalid(field.NewPath("query"), queries, "may not be empty"))
 	}
 
 	var sinceTime time.Time
@@ -229,10 +234,14 @@ func (n *nodeLogQuery) validate() field.ErrorList {
 	case len(n.Files) == 1 && n.options != (options{}):
 		allErrs = append(allErrs, field.Invalid(field.NewPath("query"), n.Files, "cannot specify file with options"))
 	case len(n.Files) == 1:
-		if fullLogFilename, err := securejoin.SecureJoin(nodeLogDir, n.Files[0]); err != nil {
+		if root, err := os.OpenRoot(nodeLogDir); err != nil {
 			allErrs = append(allErrs, field.Invalid(field.NewPath("query"), n.Files, err.Error()))
-		} else if _, err := os.Stat(fullLogFilename); err != nil {
-			allErrs = append(allErrs, field.Invalid(field.NewPath("query"), n.Files, err.Error()))
+		} else {
+			// root.Close() never returns errors
+			defer func() { _ = root.Close() }()
+			if _, err := root.Stat(n.Files[0]); err != nil {
+				allErrs = append(allErrs, field.Invalid(field.NewPath("query"), n.Files, err.Error()))
+			}
 		}
 	}
 
@@ -241,7 +250,7 @@ func (n *nodeLogQuery) validate() field.ErrorList {
 	}
 
 	if n.Boot != nil && runtime.GOOS == "windows" {
-		allErrs = append(allErrs, field.Invalid(field.NewPath("boot"), *n.Boot, "boot is not supported on Windows"))
+		allErrs = append(allErrs, field.Invalid(field.NewPath("boot"), *n.Boot, "not supported on Windows"))
 	}
 
 	if n.Boot != nil && *n.Boot > 0 {
@@ -263,11 +272,11 @@ func (n *nodeLogQuery) validate() field.ErrorList {
 
 // Copy streams the contents of the OS specific logging command executed  with the current args to the provided
 // writer. If an error occurs a line is written to the output.
-func (n *nodeLogQuery) Copy(w io.Writer) {
+func (n *nodeLogQuery) Copy(ctx context.Context, w io.Writer) {
 	// set the deadline to the maximum across both runs
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(30*time.Second))
+	ctx, cancel := context.WithDeadline(ctx, time.Now().Add(30*time.Second))
 	defer cancel()
-	boot := int(0)
+	boot := 0
 	if n.Boot != nil {
 		boot = *n.Boot
 	}
@@ -316,7 +325,7 @@ func (n *nodeLogQuery) splitNativeVsFileLoggers(ctx context.Context) ([]string, 
 // copyServiceLogs invokes journalctl or Get-WinEvent with the provided args. Note that
 // services are explicitly passed here to account for the heuristics.
 func (n *nodeLogQuery) copyServiceLogs(ctx context.Context, w io.Writer, services []string, previousBoot int) {
-	cmdStr, args, err := getLoggingCmd(n, services)
+	cmdStr, args, cmdEnv, err := getLoggingCmd(n, services)
 	if err != nil {
 		fmt.Fprintf(w, "\nfailed to get logging cmd: %v\n", err)
 		return
@@ -324,6 +333,7 @@ func (n *nodeLogQuery) copyServiceLogs(ctx context.Context, w io.Writer, service
 	cmd := exec.CommandContext(ctx, cmdStr, args...)
 	cmd.Stdout = w
 	cmd.Stderr = w
+	cmd.Env = append(os.Environ(), cmdEnv...)
 
 	if err := cmd.Run(); err != nil {
 		if _, ok := err.(*exec.ExitError); ok {
@@ -343,7 +353,7 @@ func copyFileLogs(ctx context.Context, w io.Writer, services []string) {
 	}
 
 	for _, service := range services {
-		heuristicsCopyFileLogs(ctx, w, service)
+		heuristicsCopyFileLogs(ctx, w, nodeLogDir, service)
 	}
 }
 
@@ -352,21 +362,16 @@ func copyFileLogs(ctx context.Context, w io.Writer, services []string) {
 // /var/log/service.log or
 // /var/log/service/service.log or
 // in that order stopping on first success.
-func heuristicsCopyFileLogs(ctx context.Context, w io.Writer, service string) {
+func heuristicsCopyFileLogs(ctx context.Context, w io.Writer, logDir, service string) {
 	logFileNames := [3]string{
-		fmt.Sprintf("%s", service),
+		service,
 		fmt.Sprintf("%s.log", service),
 		fmt.Sprintf("%s/%s.log", service, service),
 	}
 
 	var err error
 	for _, logFileName := range logFileNames {
-		var logFile string
-		logFile, err = securejoin.SecureJoin(nodeLogDir, logFileName)
-		if err != nil {
-			break
-		}
-		err = heuristicsCopyFileLog(ctx, w, logFile)
+		err = heuristicsCopyFileLog(ctx, w, logDir, logFileName)
 		if err == nil {
 			break
 		} else if errors.Is(err, os.ErrNotExist) {
@@ -408,8 +413,14 @@ func newReaderCtx(ctx context.Context, r io.Reader) io.Reader {
 }
 
 // heuristicsCopyFileLog returns the contents of the given logFile
-func heuristicsCopyFileLog(ctx context.Context, w io.Writer, logFile string) error {
-	fInfo, err := os.Stat(logFile)
+func heuristicsCopyFileLog(ctx context.Context, w io.Writer, logDir, logFileName string) error {
+	f, err := os.OpenInRoot(logDir, logFileName)
+	if err != nil {
+		return err
+	}
+	// Ignoring errors when closing a file opened read-only doesn't cause data loss
+	defer func() { _ = f.Close() }()
+	fInfo, err := f.Stat()
 	if err != nil {
 		return err
 	}
@@ -418,12 +429,6 @@ func heuristicsCopyFileLog(ctx context.Context, w io.Writer, logFile string) err
 	if fInfo.IsDir() {
 		return os.ErrNotExist
 	}
-
-	f, err := os.Open(logFile)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
 
 	if _, err := io.Copy(w, newReaderCtx(ctx, f)); err != nil {
 		return err
@@ -434,7 +439,7 @@ func heuristicsCopyFileLog(ctx context.Context, w io.Writer, logFile string) err
 func safeServiceName(s string) error {
 	// Max length of a service name is 256 across supported OSes
 	if len(s) > maxServiceLength {
-		return fmt.Errorf("length must be less than 100")
+		return fmt.Errorf("length must be less than %d", maxServiceLength)
 	}
 
 	if reServiceNameUnsafeCharacters.MatchString(s) {

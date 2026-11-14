@@ -19,6 +19,7 @@ package apps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -76,7 +77,7 @@ func mysqlKubectlCreate(ns, file string) {
 
 func (t *MySQLUpgradeTest) getServiceIP(ctx context.Context, f *framework.Framework, ns, svcName string) string {
 	svc, err := f.ClientSet.CoreV1().Services(ns).Get(ctx, svcName, metav1.GetOptions{})
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "get Service %q in namespace %q", svcName, ns)
 	ingress := svc.Status.LoadBalancer.Ingress
 	if len(ingress) == 0 {
 		return ""
@@ -103,7 +104,7 @@ func (t *MySQLUpgradeTest) Setup(ctx context.Context, f *framework.Framework) {
 	mysqlKubectlCreate(ns, "tester.yaml")
 
 	ginkgo.By("Getting the ingress IPs from the test-service")
-	err := wait.PollImmediateWithContext(ctx, statefulsetPoll, statefulsetTimeout, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, statefulsetPoll, statefulsetTimeout, true, func(ctx context.Context) (bool, error) {
 		if t.ip = t.getServiceIP(ctx, f, ns, "test-server"); t.ip == "" {
 			return false, nil
 		}
@@ -113,19 +114,19 @@ func (t *MySQLUpgradeTest) Setup(ctx context.Context, f *framework.Framework) {
 		}
 		return true, nil
 	})
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "count names stored in MySQL")
 	framework.Logf("Service endpoint is up")
 
 	ginkgo.By("Adding 2 names to the database")
 	err = t.addName(strconv.Itoa(t.nextWrite))
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "add name %q to MySQL", strconv.Itoa(t.nextWrite))
 	err = t.addName(strconv.Itoa(t.nextWrite))
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "add name %q to MySQL", strconv.Itoa(t.nextWrite))
 
 	ginkgo.By("Verifying that the 2 names have been inserted")
 	count, err := t.countNames()
-	framework.ExpectNoError(err)
-	framework.ExpectEqual(count, 2)
+	framework.ExpectNoError(err, "count names stored in MySQL")
+	gomega.Expect(count).To(gomega.Equal(2))
 }
 
 // Test continually polls the db using the read and write connections, inserting data, and checking
@@ -176,7 +177,7 @@ func (t *MySQLUpgradeTest) Test(ctx context.Context, f *framework.Framework, don
 // Teardown performs one final check of the data's availability.
 func (t *MySQLUpgradeTest) Teardown(ctx context.Context, f *framework.Framework) {
 	count, err := t.countNames()
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "count names stored in MySQL")
 	gomega.Expect(count).To(gomega.BeNumerically(">=", t.successfulWrites), "count is too small")
 }
 
@@ -194,7 +195,7 @@ func (t *MySQLUpgradeTest) addName(name string) error {
 		if err != nil {
 			return err
 		}
-		return fmt.Errorf(string(b))
+		return errors.New(string(b))
 	}
 	return nil
 }
@@ -212,7 +213,7 @@ func (t *MySQLUpgradeTest) countNames() (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		return 0, fmt.Errorf(string(b))
+		return 0, errors.New(string(b))
 	}
 	var count int
 	if err := json.NewDecoder(r.Body).Decode(&count); err != nil {

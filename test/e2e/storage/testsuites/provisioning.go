@@ -24,6 +24,9 @@ import (
 	"sync"
 	"time"
 
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	crdclientset "k8s.io/apiextensions-api/pkg/client/clientset/clientset"
+
 	e2ekubectl "k8s.io/kubernetes/test/e2e/framework/kubectl"
 
 	"github.com/onsi/ginkgo/v2"
@@ -39,6 +42,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
@@ -48,6 +52,10 @@ import (
 	storageutils "k8s.io/kubernetes/test/e2e/storage/utils"
 	admissionapi "k8s.io/pod-security-admission/api"
 )
+
+// defaultNumParallelClones is the default number of parallel clones of a single
+// source PVC. Drivers can override it via DriverInfo.VolumeCloneStressTestOptions.
+const defaultNumParallelClones = 5
 
 // StorageClassTest represents parameters to be used by provisioning tests.
 // Not all parameters are used by all tests.
@@ -69,6 +77,7 @@ type StorageClassTest struct {
 	AllowVolumeExpansion bool
 	NodeSelection        e2epod.NodeSelection
 	MountOptions         []string
+	ReclaimPolicy        *v1.PersistentVolumeReclaimPolicy
 }
 
 type provisioningTestSuite struct {
@@ -104,15 +113,16 @@ func (p *provisioningTestSuite) GetTestSuiteInfo() storageframework.TestSuiteInf
 	return p.tsInfo
 }
 
-func (p *provisioningTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
+func (p *provisioningTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) string {
 	// Check preconditions.
 	if pattern.VolType != storageframework.DynamicPV {
-		e2eskipper.Skipf("Suite %q does not support %v", p.tsInfo.Name, pattern.VolType)
+		return fmt.Sprintf("Suite %q does not support %v", p.tsInfo.Name, pattern.VolType)
 	}
 	dInfo := driver.GetDriverInfo()
 	if pattern.VolMode == v1.PersistentVolumeBlock && !dInfo.Capabilities[storageframework.CapBlock] {
-		e2eskipper.Skipf("Driver %s doesn't support %v -- skipping", dInfo.Name, pattern.VolMode)
+		return fmt.Sprintf("Driver %s doesn't support %v", dInfo.Name, pattern.VolMode)
 	}
+	return ""
 }
 
 func (p *provisioningTestSuite) DefineTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
@@ -199,7 +209,7 @@ func (p *provisioningTestSuite) DefineTests(driver storageframework.TestDriver, 
 		l.testCase.TestDynamicProvisioning(ctx)
 	})
 
-	ginkgo.It("should provision storage with snapshot data source [Feature:VolumeSnapshotDataSource]", func(ctx context.Context) {
+	f.It("should provision storage with snapshot data source", feature.VolumeSnapshotDataSource, func(ctx context.Context) {
 		if !dInfo.Capabilities[storageframework.CapSnapshotDataSource] {
 			e2eskipper.Skipf("Driver %q does not support populating data from snapshot - skipping", dInfo.Name)
 		}
@@ -235,7 +245,7 @@ func (p *provisioningTestSuite) DefineTests(driver storageframework.TestDriver, 
 		l.testCase.TestDynamicProvisioning(ctx)
 	})
 
-	ginkgo.It("should provision storage with snapshot data source (ROX mode) [Feature:VolumeSnapshotDataSource]", func(ctx context.Context) {
+	f.It("should provision storage with snapshot data source (ROX mode)", feature.VolumeSnapshotDataSource, func(ctx context.Context) {
 		if !dInfo.Capabilities[storageframework.CapSnapshotDataSource] {
 			e2eskipper.Skipf("Driver %q does not support populating data from snapshot - skipping", dInfo.Name)
 		}
@@ -277,9 +287,9 @@ func (p *provisioningTestSuite) DefineTests(driver storageframework.TestDriver, 
 		l.testCase.TestDynamicProvisioning(ctx)
 	})
 
-	ginkgo.It("should provision storage with any volume data source [Serial]", func(ctx context.Context) {
+	f.It("should provision storage with any volume data source", f.WithSerial(), func(ctx context.Context) {
 		if len(dInfo.InTreePluginName) != 0 {
-			e2eskipper.Skipf("AnyVolumeDataSource feature only works with CSI drivers - skipping")
+			e2eskipper.Skipf("It only works with CSI drivers - skipping")
 		}
 		if pattern.VolMode == v1.PersistentVolumeBlock {
 			e2eskipper.Skipf("Test for Block volumes is not implemented - skipping")
@@ -295,12 +305,34 @@ func (p *provisioningTestSuite) DefineTests(driver storageframework.TestDriver, 
 		framework.ExpectNoError(err)
 		ginkgo.DeferCleanup(f.DeleteNamespace, valNamespace.Name)
 
-		ginkgo.By("Deploying validator")
 		valManifests := []string{
-			"test/e2e/testing-manifests/storage-csi/any-volume-datasource/crd/populator.storage.k8s.io_volumepopulators.yaml",
 			"test/e2e/testing-manifests/storage-csi/any-volume-datasource/volume-data-source-validator/rbac-data-source-validator.yaml",
 			"test/e2e/testing-manifests/storage-csi/any-volume-datasource/volume-data-source-validator/setup-data-source-validator.yaml",
 		}
+
+		crdManifestPath := "test/e2e/testing-manifests/storage-csi/any-volume-datasource/crd/populator.storage.k8s.io_volumepopulators.yaml"
+		crdItems, err := storageutils.LoadFromManifests(crdManifestPath)
+		framework.ExpectNoError(err, "Failed to load VolumePopulator CRD manifest")
+		gomega.Expect(crdItems).To(gomega.HaveLen(1), "Expected exactly one CRD in manifest")
+
+		crd, ok := crdItems[0].(*apiextensionsv1.CustomResourceDefinition)
+		gomega.Expect(ok).To(gomega.BeTrueBecause("Resource in loaded manifest file is not a CustomResourceDefinition: %s", crdManifestPath))
+
+		config, err := framework.LoadConfig()
+		framework.ExpectNoError(err)
+		apiExtensionClient, err := crdclientset.NewForConfig(config)
+		framework.ExpectNoError(err)
+
+		ginkgo.By(fmt.Sprintf("Checking if %s CRD exists", crd.Name))
+		_, err = apiExtensionClient.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, crd.Name, metav1.GetOptions{})
+		if err != nil && apierrors.IsNotFound(err) {
+			ginkgo.By("VolumePopulator CRD not found, test will create it and remove when done")
+			valManifests = append(valManifests, crdManifestPath)
+		} else if err != nil {
+			framework.ExpectNoError(err, "Error checking for VolumePopulator CRD existence")
+		}
+
+		ginkgo.By("Deploying validator")
 		err = storageutils.CreateFromManifests(ctx, f, valNamespace,
 			func(item interface{}) error { return nil },
 			valManifests...)
@@ -449,11 +481,7 @@ func (p *provisioningTestSuite) DefineTests(driver storageframework.TestDriver, 
 		l.testCase.TestDynamicProvisioning(ctx)
 	})
 
-	ginkgo.It("should provision correct filesystem size when restoring snapshot to larger size pvc [Feature:VolumeSnapshotDataSource]", func(ctx context.Context) {
-		//TODO: remove skip when issue is resolved - https://github.com/kubernetes/kubernetes/issues/113359
-		if framework.NodeOSDistroIs("windows") {
-			e2eskipper.Skipf("Test is not valid Windows - skipping")
-		}
+	f.It("should provision correct filesystem size when restoring snapshot to larger size pvc", feature.VolumeSnapshotDataSource, func(ctx context.Context) {
 
 		if pattern.VolMode == "Block" {
 			e2eskipper.Skipf("Test is not valid for Block volume mode - skipping")
@@ -612,7 +640,7 @@ func (p *provisioningTestSuite) DefineTests(driver storageframework.TestDriver, 
 		l.testCase.TestDynamicProvisioning(ctx)
 	})
 
-	ginkgo.It("should provision storage with pvc data source in parallel [Slow]", func(ctx context.Context) {
+	f.It("should provision storage with pvc data source in parallel", f.WithSlow(), func(ctx context.Context) {
 		// Test cloning a single volume multiple times.
 		if !dInfo.Capabilities[storageframework.CapPVCDataSource] {
 			e2eskipper.Skipf("Driver %q does not support cloning - skipping", dInfo.Name)
@@ -635,8 +663,16 @@ func (p *provisioningTestSuite) DefineTests(driver storageframework.TestDriver, 
 		dataSourceRef := preparePVCDataSourceForProvisioning(ctx, f, testConfig, l.cs, l.sourcePVC, l.sc, pattern.VolMode, expectedContent)
 		l.pvc.Spec.DataSourceRef = dataSourceRef
 
+		numClones := defaultNumParallelClones
+		if opts := dInfo.VolumeCloneStressTestOptions; opts != nil {
+			if opts.NumClones <= 0 {
+				framework.Failf("NumClones in volume clone stress test options must be a positive integer, received: %d", opts.NumClones)
+			}
+			numClones = opts.NumClones
+		}
+
 		var wg sync.WaitGroup
-		for i := 0; i < 5; i++ {
+		for i := range numClones {
 			wg.Add(1)
 			go func(i int) {
 				defer ginkgo.GinkgoRecover()
@@ -764,7 +800,7 @@ func (t StorageClassTest) TestDynamicProvisioning(ctx context.Context) *v1.Persi
 	}()
 
 	// ensure that the claim refers to the provisioned StorageClass
-	framework.ExpectEqual(*claim.Spec.StorageClassName, class.Name)
+	gomega.Expect(*claim.Spec.StorageClassName).To(gomega.Equal(class.Name))
 
 	// if late binding is configured, create and delete a pod to provision the volume
 	if *class.VolumeBindingMode == storagev1.VolumeBindingWaitForFirstConsumer {
@@ -856,17 +892,17 @@ func (t StorageClassTest) checkProvisioning(ctx context.Context, client clientse
 		}
 	}
 
-	framework.ExpectEqual(pv.Spec.ClaimRef.Name, claim.ObjectMeta.Name)
-	framework.ExpectEqual(pv.Spec.ClaimRef.Namespace, claim.ObjectMeta.Namespace)
+	gomega.Expect(pv.Spec.ClaimRef.Name).To(gomega.Equal(claim.ObjectMeta.Name))
+	gomega.Expect(pv.Spec.ClaimRef.Namespace).To(gomega.Equal(claim.ObjectMeta.Namespace))
 	if class == nil {
-		framework.ExpectEqual(pv.Spec.PersistentVolumeReclaimPolicy, v1.PersistentVolumeReclaimDelete)
+		gomega.Expect(pv.Spec.PersistentVolumeReclaimPolicy).To(gomega.Equal(v1.PersistentVolumeReclaimDelete))
 	} else {
-		framework.ExpectEqual(pv.Spec.PersistentVolumeReclaimPolicy, *class.ReclaimPolicy)
-		framework.ExpectEqual(pv.Spec.MountOptions, class.MountOptions)
+		gomega.Expect(pv.Spec.PersistentVolumeReclaimPolicy).To(gomega.Equal(*class.ReclaimPolicy))
+		gomega.Expect(pv.Spec.MountOptions).To(gomega.Equal(class.MountOptions))
 	}
 	if claim.Spec.VolumeMode != nil {
 		gomega.Expect(pv.Spec.VolumeMode).NotTo(gomega.BeNil())
-		framework.ExpectEqual(*pv.Spec.VolumeMode, *claim.Spec.VolumeMode)
+		gomega.Expect(*pv.Spec.VolumeMode).To(gomega.Equal(*claim.Spec.VolumeMode))
 	}
 	return pv
 }
@@ -938,7 +974,7 @@ func PVWriteReadSingleNodeCheck(ctx context.Context, client clientset.Interface,
 //
 // This is a common test that can be called from a StorageClassTest.PvCheck.
 func PVMultiNodeCheck(ctx context.Context, client clientset.Interface, timeouts *framework.TimeoutContext, claim *v1.PersistentVolumeClaim, node e2epod.NodeSelection) {
-	framework.ExpectEqual(node.Name, "", "this test only works when not locked onto a single node")
+	gomega.Expect(node.Name).To(gomega.BeZero(), "this test only works when not locked onto a single node")
 
 	var pod *v1.Pod
 	defer func() {
@@ -965,7 +1001,7 @@ func PVMultiNodeCheck(ctx context.Context, client clientset.Interface, timeouts 
 	framework.ExpectNoError(e2epod.WaitForPodSuccessInNamespaceTimeout(ctx, client, pod.Name, pod.Namespace, timeouts.PodStartSlow))
 	runningPod, err = client.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 	framework.ExpectNoError(err, "get pod")
-	framework.ExpectNotEqual(runningPod.Spec.NodeName, actualNodeName, "second pod should have run on a different node")
+	gomega.Expect(runningPod.Spec.NodeName).ToNot(gomega.Equal(actualNodeName), "second pod should have run on a different node")
 	StopPod(ctx, client, pod)
 	pod = nil
 }
@@ -973,7 +1009,7 @@ func PVMultiNodeCheck(ctx context.Context, client clientset.Interface, timeouts 
 // TestBindingWaitForFirstConsumerMultiPVC tests the binding with WaitForFirstConsumer mode
 func (t StorageClassTest) TestBindingWaitForFirstConsumerMultiPVC(ctx context.Context, claims []*v1.PersistentVolumeClaim, nodeSelector map[string]string, expectUnschedulable bool) ([]*v1.PersistentVolume, *v1.Node) {
 	var err error
-	framework.ExpectNotEqual(len(claims), 0)
+	gomega.Expect(claims).ToNot(gomega.BeEmpty())
 	namespace := claims[0].Namespace
 
 	ginkgo.By("creating claims")
@@ -1003,7 +1039,7 @@ func (t StorageClassTest) TestBindingWaitForFirstConsumerMultiPVC(ctx context.Co
 	// Wait for ClaimProvisionTimeout (across all PVCs in parallel) and make sure the phase did not become Bound i.e. the Wait errors out
 	ginkgo.By("checking the claims are in pending state")
 	err = e2epv.WaitForPersistentVolumeClaimsPhase(ctx, v1.ClaimBound, t.Client, namespace, claimNames, 2*time.Second /* Poll */, t.Timeouts.ClaimProvisionShort, true)
-	framework.ExpectError(err)
+	gomega.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("not all in phase Bound")))
 	verifyPVCsPending(ctx, t.Client, createdClaims)
 
 	ginkgo.By("creating a pod referring to the claims")
@@ -1043,7 +1079,7 @@ func (t StorageClassTest) TestBindingWaitForFirstConsumerMultiPVC(ctx context.Co
 		framework.ExpectNoError(err)
 		pvs = append(pvs, pv)
 	}
-	framework.ExpectEqual(len(pvs), len(createdClaims))
+	gomega.Expect(pvs).To(gomega.HaveLen(len(createdClaims)))
 	return pvs, node
 }
 
@@ -1185,7 +1221,7 @@ func StopPodAndDependents(ctx context.Context, c clientset.Interface, timeouts *
 			// As with CSI inline volumes, we use the pod delete timeout here because conceptually
 			// the volume deletion needs to be that fast (whatever "that" is).
 			framework.Logf("Wait up to %v for pod PV %s to be fully deleted", timeouts.PodDelete, pv.Name)
-			framework.ExpectNoError(e2epv.WaitForPersistentVolumeDeleted(ctx, c, pv.Name, 5*time.Second, timeouts.PodDelete))
+			framework.ExpectNoError(e2epv.WaitForPersistentVolumeDeleted(ctx, c, pv.Name, 5*time.Second, timeouts.PVDeleteSlow))
 		}
 	}
 }
@@ -1195,7 +1231,7 @@ func verifyPVCsPending(ctx context.Context, client clientset.Interface, pvcs []*
 		// Get new copy of the claim
 		claim, err := client.CoreV1().PersistentVolumeClaims(claim.Namespace).Get(ctx, claim.Name, metav1.GetOptions{})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(claim.Status.Phase, v1.ClaimPending)
+		gomega.Expect(claim.Status.Phase).To(gomega.Equal(v1.ClaimPending))
 	}
 }
 
@@ -1332,8 +1368,19 @@ func findVolumeMountPath(pod *v1.Pod, claim *v1.PersistentVolumeClaim) string {
 	return containerMountPath
 }
 
-// getFilesystemSizeBytes returns a total size of a filesystem on given mountPath inside a pod. You can use findVolumeMountPath for mountPath lookup.
-func getFilesystemSizeBytes(pod *v1.Pod, mountPath string) (int, error) {
+// getFilesystemSizeBytes returns the total capacity of the filesystem mounted inside a pod
+// at the given mountPath. It selects the appropriate platform-specific logic (Windows/Linux).
+// This function relies on the `framework.NodeOSDistroIs` helper to determine the target OS.
+func getFilesystemSizeBytes(pod *v1.Pod, mountPath string) (int64, error) {
+	if framework.NodeOSDistroIs("windows") {
+		return getFilesystemSizeBytesWindows(pod, mountPath)
+	}
+	return getFilesystemSizeBytesLinux(pod, mountPath)
+}
+
+// getFilesystemSizeBytesLinux returns the total size of a filesystem using 'stat' (block size * block count).
+func getFilesystemSizeBytesLinux(pod *v1.Pod, mountPath string) (int64, error) {
+	// Get Block Size: Executes 'stat -f -c %s <mountPath>' inside the pod.
 	cmd := fmt.Sprintf("stat -f -c %%s %v", mountPath)
 	blockSize, err := e2ekubectl.RunKubectl(pod.Namespace, "exec", pod.Name, "--", "/bin/sh", "-c", cmd)
 	if err != nil {
@@ -1356,7 +1403,87 @@ func getFilesystemSizeBytes(pod *v1.Pod, mountPath string) (int, error) {
 		return 0, err
 	}
 
-	return bs * bc, nil
+	return int64(bs * bc), nil
+}
+
+// getFilesystemSizeBytesWindows returns the total size of the filesystem backing
+// the given mountPath inside a Windows pod.
+func getFilesystemSizeBytesWindows(pod *v1.Pod, mountPath string) (int64, error) {
+	// Resolve the underlying volume by executing: (Get-Item -Path "<mountPath>").Target
+	resolveVolumeIDCmd := fmt.Sprintf(`(Get-Item -Path "%s").Target`, mountPath)
+	out, err := e2ekubectl.RunKubectl(
+		pod.Namespace,
+		"exec", pod.Name, "--",
+		"powershell.exe",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command", fmt.Sprintf("& { %s }", resolveVolumeIDCmd),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed resolving underlying volume for mountPath %q: %w", mountPath, err)
+	}
+
+	volumeID := strings.Trim(out, "\x00 \r\n\t")
+
+	if volumeID == "" {
+		return 0, fmt.Errorf("resolved empty volumeID for mountPath %q", mountPath)
+	}
+	// If this is a normal drive letter volume (like "C:" or "D:"),
+	// then Get-Volume -DriveLetter works fine.
+	if len(volumeID) == 2 && volumeID[1] == ':' {
+		driveLetter := volumeID[:1] // "C"
+		psCmd := fmt.Sprintf(`(Get-Volume -DriveLetter %s).Size`, driveLetter)
+
+		return runGetVolumeSize(pod, psCmd, fmt.Sprintf("drive %s", driveLetter))
+	}
+	// Otherwise, this is a real volume GUID:
+	// This path usually requires resolving to the Disk Number first, following CSI Proxy logic.
+	// We simplify the final step by executing a sequence of commands to resolve the Disk Number and get the Size.
+	psDiskNumCmd := fmt.Sprintf(`(Get-Volume -UniqueId "%s" | Get-Partition).DiskNumber`, volumeID)
+
+	diskOut, err := e2ekubectl.RunKubectl(
+		pod.Namespace,
+		"exec", pod.Name, "--",
+		"powershell.exe",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command", fmt.Sprintf("& { %s }", psDiskNumCmd),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get DiskNumber for volumeID %q: %w", volumeID, err)
+	}
+
+	diskNumStr := strings.Trim(diskOut, "\x00 \r\n\t")
+	if diskNumStr == "" {
+		return 0, fmt.Errorf("DiskNumber is empty for volume %q", volumeID)
+	}
+
+	diskSizeCmd := fmt.Sprintf(`(Get-Disk -Number %s).Size`, diskNumStr)
+	return runGetVolumeSize(pod, diskSizeCmd, fmt.Sprintf("disk %s (volumeID=%s)", diskNumStr, volumeID))
+}
+
+// runGetVolumeSize is a shared helper function that executes a PowerShell command
+// expected to return a single integer (the size in bytes) and parses it.
+func runGetVolumeSize(pod *v1.Pod, psCmd, debugTag string) (int64, error) {
+	out, err := e2ekubectl.RunKubectl(
+		pod.Namespace,
+		"exec", pod.Name, "--",
+		"powershell.exe",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command", fmt.Sprintf("& { %s }", psCmd),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed running PowerShell Get-Volume for %s: %w", debugTag, err)
+	}
+	// Clean output of null bytes, carriage returns, and whitespace for safe parsing.
+	cleaned := strings.Trim(out, "\x00 \r\n\t")
+	totalBytes, err := strconv.ParseInt(cleaned, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed parsing PowerShell output %q for %s: %w",
+			cleaned, debugTag, err)
+	}
+	return totalBytes, nil
 }
 
 // MultiplePVMountSingleNodeCheck checks that multiple PV pointing to the same underlying storage can be mounted simultaneously on a single node.

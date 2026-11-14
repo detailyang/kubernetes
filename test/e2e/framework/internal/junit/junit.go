@@ -17,6 +17,9 @@ limitations under the License.
 package junit
 
 import (
+	"slices"
+	"strings"
+
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/ginkgo/v2/reporters"
 	"github.com/onsi/ginkgo/v2/types"
@@ -36,7 +39,26 @@ func WriteJUnitReport(report ginkgo.Report, filename string) error {
 		// both, then tools like kettle and spyglass would concatenate
 		// the two strings and thus show duplicated information.
 		OmitFailureMessageAttr: true,
+
+		// All labels are also part of the spec texts in inline [] tags,
+		// so we don't need to write them separately.
+		OmitSpecLabels: true,
 	}
+
+	// Sort specs by full name. The default is by start (or completion?) time,
+	// which is less useful in spyglass because those times are not shown
+	// and thus tests seem to be listed with no apparent order.
+	slices.SortFunc(report.SpecReports, func(a, b types.SpecReport) int {
+		res := strings.Compare(a.FullText(), b.FullText())
+		if res == 0 {
+			// Use start time as tie-breaker in the unlikely
+			// case that two specs have the same full name.
+			return a.StartTime.Compare(b.StartTime)
+		}
+		return res
+	})
+
+	detectDataRaces(report)
 
 	return reporters.GenerateJUnitReportWithConfig(report, filename, config)
 }

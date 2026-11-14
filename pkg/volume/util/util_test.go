@@ -17,13 +17,13 @@ limitations under the License.
 package util
 
 import (
+	"math"
 	"os"
 	"reflect"
 	"runtime"
-	"strings"
+	"slices"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,9 +32,8 @@ import (
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
 	"k8s.io/kubernetes/pkg/features"
-	"k8s.io/kubernetes/pkg/util/slice"
 	"k8s.io/kubernetes/pkg/volume"
-	utilptr "k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 func TestLoadPodFromFile(t *testing.T) {
@@ -146,6 +145,64 @@ func TestCalculateTimeoutForVolume(t *testing.T) {
 	if timeout != 4500 {
 		t.Errorf("Expected 4500 for timeout but got %v", timeout)
 	}
+
+	// Largest size whose timeout fits the activeDeadlineSeconds ceiling.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("71582788Gi")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != 2147483640 {
+		t.Errorf("Expected 2147483640 for timeout but got %v", timeout)
+	}
+
+	// The size fits int64 but the product does not fit int32.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("71582789Gi")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != math.MaxInt32 {
+		t.Errorf("Expected %v for timeout but got %v", int64(math.MaxInt32), timeout)
+	}
+
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("100E")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != math.MaxInt32 {
+		t.Errorf("Expected %v for timeout but got %v", int64(math.MaxInt32), timeout)
+	}
+
+	// Past int64: Value() saturates, and the timeout is still capped.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("18446744073709551616")
+	timeout = CalculateTimeoutForVolume(50, 30, pv)
+	if timeout != math.MaxInt32 {
+		t.Errorf("Expected %v for timeout but got %v", int64(math.MaxInt32), timeout)
+	}
+
+	// A large increment must not wrap the product. The increment is an int32
+	// flag with no validation bound, and at this size the Gi count is
+	// 8589934591, so anything above 1073741824 overflows the multiplication.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("100E")
+	timeout = CalculateTimeoutForVolume(50, math.MaxInt32, pv)
+	if timeout != math.MaxInt32 {
+		t.Errorf("Expected %v for timeout but got %v", int64(math.MaxInt32), timeout)
+	}
+
+	// The product fits int64 but not int32.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("2Gi")
+	timeout = CalculateTimeoutForVolume(50, math.MaxInt32, pv)
+	if timeout != math.MaxInt32 {
+		t.Errorf("Expected %v for timeout but got %v", int64(math.MaxInt32), timeout)
+	}
+
+	// A negative increment must not wrap the product either: at 100E it wraps
+	// to 2147483648, which the cap would hand back as a 68-year deadline.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("100E")
+	timeout = CalculateTimeoutForVolume(50, math.MinInt32, pv)
+	if timeout != 50 {
+		t.Errorf("Expected 50 for timeout but got %v", timeout)
+	}
+
+	// Below the wrap a negative increment already fell back to the minimum.
+	pv.Spec.Capacity[v1.ResourceStorage] = resource.MustParse("2Gi")
+	timeout = CalculateTimeoutForVolume(50, math.MinInt32, pv)
+	if timeout != 50 {
+		t.Errorf("Expected 50 for timeout but got %v", timeout)
+	}
 }
 
 func TestFsUserFrom(t *testing.T) {
@@ -169,14 +226,14 @@ func TestFsUserFrom(t *testing.T) {
 					InitContainers: []v1.Container{
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
 							},
 						},
 					},
 					Containers: []v1.Container{
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
 							},
 						},
 						{
@@ -195,25 +252,62 @@ func TestFsUserFrom(t *testing.T) {
 					InitContainers: []v1.Container{
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(999),
+								RunAsUser: ptr.To[int64](999),
 							},
 						},
 					},
 					Containers: []v1.Container{
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
 							},
 						},
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+					EphemeralContainers: []v1.EphemeralContainer{
+						{
+							EphemeralContainerCommon: v1.EphemeralContainerCommon{
+								SecurityContext: &v1.SecurityContext{
+									RunAsUser: ptr.To[int64](1001),
+								},
 							},
 						},
 					},
 				},
 			},
 			wantFsUser: nil,
+		},
+		{
+			desc: "init and regular containers have runAsUser specified and the same",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{},
+					InitContainers: []v1.Container{
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+						{
+							SecurityContext: &v1.SecurityContext{
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+				},
+			},
+			wantFsUser: ptr.To[int64](1000),
 		},
 		{
 			desc: "all have runAsUser specified and the same",
@@ -223,25 +317,34 @@ func TestFsUserFrom(t *testing.T) {
 					InitContainers: []v1.Container{
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
 							},
 						},
 					},
 					Containers: []v1.Container{
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
 							},
 						},
 						{
 							SecurityContext: &v1.SecurityContext{
-								RunAsUser: utilptr.Int64Ptr(1000),
+								RunAsUser: ptr.To[int64](1000),
+							},
+						},
+					},
+					EphemeralContainers: []v1.EphemeralContainer{
+						{
+							EphemeralContainerCommon: v1.EphemeralContainerCommon{
+								SecurityContext: &v1.SecurityContext{
+									RunAsUser: ptr.To[int64](1000),
+								},
 							},
 						},
 					},
 				},
 			},
-			wantFsUser: utilptr.Int64Ptr(1000),
+			wantFsUser: ptr.To[int64](1000),
 		},
 	}
 
@@ -258,30 +361,6 @@ func TestFsUserFrom(t *testing.T) {
 				t.Errorf("FsUserFrom(%v) = %d, want %d", test.pod, *fsUser, *test.wantFsUser)
 			}
 		})
-	}
-}
-
-func TestGenerateVolumeName(t *testing.T) {
-
-	// Normal operation, no truncate
-	v1 := GenerateVolumeName("kubernetes", "pv-cinder-abcde", 255)
-	if v1 != "kubernetes-dynamic-pv-cinder-abcde" {
-		t.Errorf("Expected kubernetes-dynamic-pv-cinder-abcde, got %s", v1)
-	}
-
-	// Truncate trailing "6789-dynamic"
-	prefix := strings.Repeat("0123456789", 9) // 90 characters prefix + 8 chars. of "-dynamic"
-	v2 := GenerateVolumeName(prefix, "pv-cinder-abcde", 100)
-	expect := prefix[:84] + "-pv-cinder-abcde"
-	if v2 != expect {
-		t.Errorf("Expected %s, got %s", expect, v2)
-	}
-
-	// Truncate really long cluster name
-	prefix = strings.Repeat("0123456789", 1000) // 10000 characters prefix
-	v3 := GenerateVolumeName(prefix, "pv-cinder-abcde", 100)
-	if v3 != expect {
-		t.Errorf("Expected %s, got %s", expect, v3)
 	}
 }
 
@@ -366,7 +445,9 @@ func TestMountOptionFromSpec(t *testing.T) {
 
 	for name, scenario := range scenarios {
 		mountOptions := MountOptionFromSpec(scenario.volume, scenario.systemOptions...)
-		if !reflect.DeepEqual(slice.SortStrings(mountOptions), slice.SortStrings(scenario.expectedMountList)) {
+		slices.Sort(mountOptions)
+		slices.Sort(scenario.expectedMountList)
+		if !reflect.DeepEqual(mountOptions, scenario.expectedMountList) {
 			t.Errorf("for %s expected mount options : %v got %v", name, scenario.expectedMountList, mountOptions)
 		}
 	}
@@ -616,13 +697,12 @@ func TestMakeAbsolutePath(t *testing.T) {
 }
 
 func TestGetPodVolumeNames(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ReadWriteOncePod, true)()
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SELinuxMountReadWriteOncePod, true)()
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SELinuxMountReadWriteOncePod, true)
 	tests := []struct {
 		name                    string
 		pod                     *v1.Pod
-		expectedMounts          sets.String
-		expectedDevices         sets.String
+		expectedMounts          sets.Set[string]
+		expectedDevices         sets.Set[string]
 		expectedSELinuxContexts map[string][]*v1.SELinuxOptions
 	}{
 		{
@@ -630,8 +710,8 @@ func TestGetPodVolumeNames(t *testing.T) {
 			pod: &v1.Pod{
 				Spec: v1.PodSpec{},
 			},
-			expectedMounts:  sets.NewString(),
-			expectedDevices: sets.NewString(),
+			expectedMounts:  sets.New[string](),
+			expectedDevices: sets.New[string](),
 		},
 		{
 			name: "pod with volumes",
@@ -674,8 +754,8 @@ func TestGetPodVolumeNames(t *testing.T) {
 					},
 				},
 			},
-			expectedMounts:  sets.NewString("vol1", "vol2"),
-			expectedDevices: sets.NewString("vol3", "vol4"),
+			expectedMounts:  sets.New[string]("vol1", "vol2"),
+			expectedDevices: sets.New[string]("vol3", "vol4"),
 		},
 		{
 			name: "pod with init containers",
@@ -718,8 +798,8 @@ func TestGetPodVolumeNames(t *testing.T) {
 					},
 				},
 			},
-			expectedMounts:  sets.NewString("vol1", "vol2"),
-			expectedDevices: sets.NewString("vol3", "vol4"),
+			expectedMounts:  sets.New[string]("vol1", "vol2"),
+			expectedDevices: sets.New[string]("vol3", "vol4"),
 		},
 		{
 			name: "pod with multiple containers",
@@ -777,8 +857,8 @@ func TestGetPodVolumeNames(t *testing.T) {
 					},
 				},
 			},
-			expectedMounts:  sets.NewString("vol1", "vol3"),
-			expectedDevices: sets.NewString("vol2", "vol4"),
+			expectedMounts:  sets.New[string]("vol1", "vol3"),
+			expectedDevices: sets.New[string]("vol2", "vol4"),
 		},
 		{
 			name: "pod with ephemeral containers",
@@ -819,8 +899,8 @@ func TestGetPodVolumeNames(t *testing.T) {
 					},
 				},
 			},
-			expectedMounts:  sets.NewString("vol1", "vol2"),
-			expectedDevices: sets.NewString(),
+			expectedMounts:  sets.New[string]("vol1", "vol2"),
+			expectedDevices: sets.New[string](),
 		},
 		{
 			name: "pod with SELinuxOptions",
@@ -892,7 +972,7 @@ func TestGetPodVolumeNames(t *testing.T) {
 					},
 				},
 			},
-			expectedMounts: sets.NewString("vol1", "vol2", "vol3"),
+			expectedMounts: sets.New[string]("vol1", "vol2", "vol3"),
 			expectedSELinuxContexts: map[string][]*v1.SELinuxOptions{
 				"vol1": {
 					{
@@ -926,12 +1006,12 @@ func TestGetPodVolumeNames(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			mounts, devices, contexts := GetPodVolumeNames(test.pod)
+			mounts, devices, contexts := GetPodVolumeNames(test.pod, true /* collectSELinuxOptions */)
 			if !mounts.Equal(test.expectedMounts) {
-				t.Errorf("Expected mounts: %q, got %q", mounts.List(), test.expectedMounts.List())
+				t.Errorf("Expected mounts: %q, got %q", sets.List[string](mounts), sets.List[string](test.expectedMounts))
 			}
 			if !devices.Equal(test.expectedDevices) {
-				t.Errorf("Expected devices: %q, got %q", devices.List(), test.expectedDevices.List())
+				t.Errorf("Expected devices: %q, got %q", sets.List[string](devices), sets.List[string](test.expectedDevices))
 			}
 			if len(contexts) == 0 {
 				contexts = nil
@@ -943,303 +1023,123 @@ func TestGetPodVolumeNames(t *testing.T) {
 	}
 }
 
-func TestGetPersistentVolumeNodeNames(t *testing.T) {
+func TestVolumeHealthConditionSetsEqual(t *testing.T) {
 	tests := []struct {
-		name              string
-		pv                *v1.PersistentVolume
-		expectedNodeNames []string
+		name string
+		a    []v1.VolumeHealthCondition
+		b    []v1.VolumeHealthCondition
+		want bool
 	}{
 		{
-			name: "nil PV",
-			pv:   nil,
+			name: "nil and empty are equal",
+			a:    nil,
+			b:    []v1.VolumeHealthCondition{},
+			want: true,
 		},
 		{
-			name: "PV missing node affinity",
-			pv: &v1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-			},
+			name: "same condition different message is equal",
+			a: []v1.VolumeHealthCondition{{
+				Status:  v1.VolumeHealthInaccessible,
+				Reason:  "TargetPathNotFound",
+				Message: "old message",
+			}},
+			b: []v1.VolumeHealthCondition{{
+				Status:  v1.VolumeHealthInaccessible,
+				Reason:  "TargetPathNotFound",
+				Message: "new message",
+			}},
+			want: true,
 		},
 		{
-			name: "PV node affinity missing required",
-			pv: &v1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
+			name: "same set different order is equal",
+			a: []v1.VolumeHealthCondition{
+				{
+					Status: v1.VolumeHealthInaccessible,
+					Reason: "TargetPathNotFound",
 				},
-				Spec: v1.PersistentVolumeSpec{
-					NodeAffinity: &v1.VolumeNodeAffinity{},
+				{
+					Status: v1.VolumeHealthDegraded,
+					Reason: "DiskSlow",
 				},
 			},
+			b: []v1.VolumeHealthCondition{
+				{
+					Status: v1.VolumeHealthDegraded,
+					Reason: "DiskSlow",
+				},
+				{
+					Status: v1.VolumeHealthInaccessible,
+					Reason: "TargetPathNotFound",
+				},
+			},
+			want: true,
 		},
 		{
-			name: "PV node affinity required zero selector terms",
-			pv: &v1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
+			name: "duplicates do not change set equality",
+			a: []v1.VolumeHealthCondition{
+				{
+					Status: v1.VolumeHealthDegraded,
+					Reason: "DiskSlow",
 				},
-				Spec: v1.PersistentVolumeSpec{
-					NodeAffinity: &v1.VolumeNodeAffinity{
-						Required: &v1.NodeSelector{
-							NodeSelectorTerms: []v1.NodeSelectorTerm{},
-						},
-					},
+				{
+					Status: v1.VolumeHealthDegraded,
+					Reason: "DiskSlow",
 				},
 			},
-			expectedNodeNames: []string{},
+			b: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDegraded,
+				Reason: "DiskSlow",
+			}},
+			want: true,
 		},
 		{
-			name: "PV node affinity required zero selector terms",
-			pv: &v1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-				Spec: v1.PersistentVolumeSpec{
-					NodeAffinity: &v1.VolumeNodeAffinity{
-						Required: &v1.NodeSelector{
-							NodeSelectorTerms: []v1.NodeSelectorTerm{},
-						},
-					},
-				},
-			},
-			expectedNodeNames: []string{},
+			name: "different status is not equal",
+			a: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDegraded,
+				Reason: "DiskSlow",
+			}},
+			b: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDataLoss,
+				Reason: "DiskSlow",
+			}},
+			want: false,
 		},
 		{
-			name: "PV node affinity required zero match expressions",
-			pv: &v1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-				Spec: v1.PersistentVolumeSpec{
-					NodeAffinity: &v1.VolumeNodeAffinity{
-						Required: &v1.NodeSelector{
-							NodeSelectorTerms: []v1.NodeSelectorTerm{
-								{
-									MatchExpressions: []v1.NodeSelectorRequirement{},
-								},
-							},
-						},
-					},
-				},
-			},
-			expectedNodeNames: []string{},
-		},
-		{
-			name: "PV node affinity required multiple match expressions",
-			pv: &v1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-				Spec: v1.PersistentVolumeSpec{
-					NodeAffinity: &v1.VolumeNodeAffinity{
-						Required: &v1.NodeSelector{
-							NodeSelectorTerms: []v1.NodeSelectorTerm{
-								{
-									MatchExpressions: []v1.NodeSelectorRequirement{
-										{
-											Key:      "foo",
-											Operator: v1.NodeSelectorOpIn,
-										},
-										{
-											Key:      "bar",
-											Operator: v1.NodeSelectorOpIn,
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			expectedNodeNames: []string{},
-		},
-		{
-			name: "PV node affinity required single match expression with no values",
-			pv: &v1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-				Spec: v1.PersistentVolumeSpec{
-					NodeAffinity: &v1.VolumeNodeAffinity{
-						Required: &v1.NodeSelector{
-							NodeSelectorTerms: []v1.NodeSelectorTerm{
-								{
-									MatchExpressions: []v1.NodeSelectorRequirement{
-										{
-											Key:      v1.LabelHostname,
-											Operator: v1.NodeSelectorOpIn,
-											Values:   []string{},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			expectedNodeNames: []string{},
-		},
-		{
-			name: "PV node affinity required single match expression with single node",
-			pv: &v1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-				Spec: v1.PersistentVolumeSpec{
-					NodeAffinity: &v1.VolumeNodeAffinity{
-						Required: &v1.NodeSelector{
-							NodeSelectorTerms: []v1.NodeSelectorTerm{
-								{
-									MatchExpressions: []v1.NodeSelectorRequirement{
-										{
-											Key:      v1.LabelHostname,
-											Operator: v1.NodeSelectorOpIn,
-											Values: []string{
-												"node1",
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			expectedNodeNames: []string{
-				"node1",
-			},
-		},
-		{
-			name: "PV node affinity required single match expression with multiple nodes",
-			pv: &v1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-				Spec: v1.PersistentVolumeSpec{
-					NodeAffinity: &v1.VolumeNodeAffinity{
-						Required: &v1.NodeSelector{
-							NodeSelectorTerms: []v1.NodeSelectorTerm{
-								{
-									MatchExpressions: []v1.NodeSelectorRequirement{
-										{
-											Key:      v1.LabelHostname,
-											Operator: v1.NodeSelectorOpIn,
-											Values: []string{
-												"node1",
-												"node2",
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			expectedNodeNames: []string{
-				"node1",
-				"node2",
-			},
-		},
-		{
-			name: "PV node affinity required multiple match expressions with multiple nodes",
-			pv: &v1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-				Spec: v1.PersistentVolumeSpec{
-					NodeAffinity: &v1.VolumeNodeAffinity{
-						Required: &v1.NodeSelector{
-							NodeSelectorTerms: []v1.NodeSelectorTerm{
-								{
-									MatchExpressions: []v1.NodeSelectorRequirement{
-										{
-											Key:      "bar",
-											Operator: v1.NodeSelectorOpIn,
-											Values: []string{
-												"node1",
-												"node2",
-											},
-										},
-										{
-											Key:      v1.LabelHostname,
-											Operator: v1.NodeSelectorOpIn,
-											Values: []string{
-												"node3",
-												"node4",
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			expectedNodeNames: []string{
-				"node3",
-				"node4",
-			},
-		},
-		{
-			name: "PV node affinity required multiple node selectors multiple match expressions with multiple nodes",
-			pv: &v1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-				Spec: v1.PersistentVolumeSpec{
-					NodeAffinity: &v1.VolumeNodeAffinity{
-						Required: &v1.NodeSelector{
-							NodeSelectorTerms: []v1.NodeSelectorTerm{
-								{
-									MatchExpressions: []v1.NodeSelectorRequirement{
-										{
-											Key:      v1.LabelHostname,
-											Operator: v1.NodeSelectorOpIn,
-											Values: []string{
-												"node1",
-												"node2",
-											},
-										},
-										{
-											Key:      v1.LabelHostname,
-											Operator: v1.NodeSelectorOpIn,
-											Values: []string{
-												"node2",
-												"node3",
-											},
-										},
-									},
-								},
-								{
-									MatchExpressions: []v1.NodeSelectorRequirement{
-										{
-											Key:      v1.LabelHostname,
-											Operator: v1.NodeSelectorOpIn,
-											Values: []string{
-												"node1",
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			expectedNodeNames: []string{
-				"node1",
-				"node2",
-			},
+			name: "different reason is not equal",
+			a: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDegraded,
+				Reason: "DiskSlow",
+			}},
+			b: []v1.VolumeHealthCondition{{
+				Status: v1.VolumeHealthDegraded,
+				Reason: "TargetPathNotFound",
+			}},
+			want: false,
 		},
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			nodeNames := GetLocalPersistentVolumeNodeNames(test.pv)
-			if diff := cmp.Diff(test.expectedNodeNames, nodeNames); diff != "" {
-				t.Errorf("Unexpected nodeNames (-want, +got):\n%s", diff)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := VolumeHealthConditionSetsEqual(tc.a, tc.b); got != tc.want {
+				t.Fatalf("VolumeHealthConditionSetsEqual() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestVolumeHealthConditionSetsEqual_IgnoresMessageChanges(t *testing.T) {
+	a := []v1.VolumeHealthCondition{{
+		Status:  v1.VolumeHealthInaccessible,
+		Reason:  "TargetPathNotFound",
+		Message: "first message",
+	}}
+	b := []v1.VolumeHealthCondition{{
+		Status:  v1.VolumeHealthInaccessible,
+		Reason:  "TargetPathNotFound",
+		Message: "second message",
+	}}
+
+	if !VolumeHealthConditionSetsEqual(a, b) {
+		t.Fatal("expected same status/reason with different message to be equal")
 	}
 }

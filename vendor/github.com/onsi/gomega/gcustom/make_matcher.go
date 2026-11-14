@@ -12,7 +12,7 @@ import (
 	"github.com/onsi/gomega/format"
 )
 
-var interfaceType = reflect.TypeOf((*interface{})(nil)).Elem()
+var interfaceType = reflect.TypeOf((*any)(nil)).Elem()
 var errInterface = reflect.TypeOf((*error)(nil)).Elem()
 
 var defaultTemplate = template.Must(ParseTemplate("{{if .Failure}}Custom matcher failed for:{{else}}Custom matcher succeeded (but was expected to fail) for:{{end}}\n{{.FormattedActual}}"))
@@ -97,7 +97,9 @@ func MakeMatcher(matchFunc any, args ...any) CustomGomegaMatcher {
 		finalMatchFunc = reflect.MakeFunc(reflect.TypeOf(finalMatchFunc),
 			func(args []reflect.Value) []reflect.Value {
 				actual := args[0].Interface()
-				if reflect.TypeOf(actual).AssignableTo(t.In(0)) {
+				if actual == nil && reflect.TypeOf(actual) == reflect.TypeOf(nil) {
+					return matchFuncValue.Call([]reflect.Value{reflect.New(t.In(0)).Elem()})
+				} else if reflect.TypeOf(actual).AssignableTo(t.In(0)) {
 					return matchFuncValue.Call([]reflect.Value{reflect.ValueOf(actual)})
 				} else {
 					return []reflect.Value{
@@ -189,7 +191,7 @@ func (c CustomGomegaMatcher) WithTemplate(templ string, data ...any) CustomGomeg
 /*
 WithPrecompiledTemplate returns a CustomGomegaMatcher configured to use the passed-in template.  The template should be precompiled with gcustom.ParseTemplate().
 
-As with WithTemplate() you can provide a single pice of additional data as an optional argument.  This is accessed in the template via {{.Data}}
+As with WithTemplate() you can provide a single piece of additional data as an optional argument.  This is accessed in the template via {{.Data}}
 */
 func (c CustomGomegaMatcher) WithPrecompiledTemplate(templ *template.Template, data ...any) CustomGomegaMatcher {
 	c.templateMessage = templ

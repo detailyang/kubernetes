@@ -39,18 +39,18 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/component-base/metrics"
+	"k8s.io/component-base/metrics/testutil"
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2ekubelet "k8s.io/kubernetes/test/e2e/framework/kubelet"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 	admissionapi "k8s.io/pod-security-admission/api"
-	utilpointer "k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/expfmt"
 )
 
 var _ = SIGDescribe("Pods Extended", func() {
@@ -138,8 +138,8 @@ var _ = SIGDescribe("Pods Extended", func() {
 			})
 			framework.ExpectNoError(err, "kubelet never observed the termination notice")
 
-			framework.ExpectNotEqual(lastPod.DeletionTimestamp, nil)
-			framework.ExpectNotEqual(lastPod.Spec.TerminationGracePeriodSeconds, 0)
+			gomega.Expect(lastPod.DeletionTimestamp).ToNot(gomega.BeNil())
+			gomega.Expect(lastPod.Spec.TerminationGracePeriodSeconds).ToNot(gomega.BeZero())
 
 			selector = labels.SelectorFromSet(labels.Set(map[string]string{"time": value}))
 			options = metav1.ListOptions{LabelSelector: selector.String()}
@@ -335,7 +335,8 @@ var _ = SIGDescribe("Pods Extended", func() {
 				return podClient.Delete(ctx, pod.Name, metav1.DeleteOptions{})
 			})
 
-			err := e2epod.WaitForPodTerminatedInNamespace(ctx, f.ClientSet, pod.Name, "Evicted", f.Namespace.Name)
+			// Intentionally increase the timeout to ensure the metrics availability required for this test.
+			err := e2epod.WaitForPodTerminatedInNamespaceTimeout(ctx, f.ClientSet, pod.Name, "Evicted", f.Namespace.Name, 10*time.Minute)
 			if err != nil {
 				framework.Failf("error waiting for pod to be evicted: %v", err)
 			}
@@ -367,7 +368,7 @@ var _ = SIGDescribe("Pods Extended", func() {
 							},
 						},
 					},
-					TerminationGracePeriodSeconds: utilpointer.Int64(-1),
+					TerminationGracePeriodSeconds: ptr.To[int64](-1),
 				},
 			}
 
@@ -391,7 +392,7 @@ var _ = SIGDescribe("Pods Extended", func() {
 				pod, err := podClient.Get(ctx, pod.Name, metav1.GetOptions{})
 				framework.ExpectNoError(err, "failed to query for pod")
 				ginkgo.By("updating the pod to have a negative TerminationGracePeriodSeconds")
-				pod.Spec.TerminationGracePeriodSeconds = utilpointer.Int64(-1)
+				pod.Spec.TerminationGracePeriodSeconds = ptr.To[int64](-1)
 				_, err = podClient.PodInterface.Update(ctx, pod, metav1.UpdateOptions{})
 				return err
 			})
@@ -414,7 +415,262 @@ var _ = SIGDescribe("Pods Extended", func() {
 			})
 		})
 	})
+})
 
+var _ = SIGDescribe("Pods Extended (pod generation)", func() {
+	f := framework.NewDefaultFramework("pods")
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
+
+	ginkgo.Describe("Pod Generation", func() {
+		var podClient *e2epod.PodClient
+		ginkgo.BeforeEach(func() {
+			podClient = e2epod.NewPodClient(f)
+		})
+
+		/*
+			Release: v1.35
+			Testname: Pods Generation, updates
+			Description: Create a Pod, and perform a few updates, ensuring that the pod's metadata.generation and status.observedGeneration are updated as expected.
+		*/
+		framework.ConformanceIt("pod generation should start at 1 and increment per update [MinimumKubeletVersion:1.34]", func(ctx context.Context) {
+			ginkgo.By("creating the pod")
+			podName := "pod-generation-" + string(uuid.NewUUID())
+			pod := e2epod.NewAgnhostPod(f.Namespace.Name, podName, nil, nil, nil)
+			pod.Spec.InitContainers = []v1.Container{{
+				Name:  "init-container",
+				Image: imageutils.GetE2EImage(imageutils.BusyBox),
+			}}
+
+			ginkgo.By("submitting the pod to kubernetes")
+			pod = podClient.CreateSync(ctx, pod)
+			gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(1))
+			ginkgo.DeferCleanup(func(ctx context.Context) error {
+				ginkgo.By("deleting the pod")
+				return podClient.Delete(ctx, pod.Name, metav1.DeleteOptions{})
+			})
+
+			ginkgo.By("verifying pod generation bumps as expected")
+			tests := []struct {
+				name                 string
+				updateFn             func(*v1.Pod)
+				expectGenerationBump bool
+			}{
+				{
+					name:                 "empty update",
+					updateFn:             func(pod *v1.Pod) {},
+					expectGenerationBump: false,
+				},
+
+				{
+					name: "updating Tolerations to trigger generation bump",
+					updateFn: func(pod *v1.Pod) {
+						pod.Spec.Tolerations = []v1.Toleration{
+							{
+								Key:      "foo-" + string(uuid.NewUUID()),
+								Operator: v1.TolerationOpEqual,
+								Value:    "bar",
+								Effect:   v1.TaintEffectNoSchedule,
+							},
+						}
+					},
+					expectGenerationBump: true,
+				},
+
+				{
+					name: "updating ActiveDeadlineSeconds to trigger generation bump",
+					updateFn: func(pod *v1.Pod) {
+						int5000 := int64(5000)
+						pod.Spec.ActiveDeadlineSeconds = &int5000
+					},
+					expectGenerationBump: true,
+				},
+
+				{
+					name: "updating container image to trigger generation bump",
+					updateFn: func(pod *v1.Pod) {
+						pod.Spec.Containers[0].Image = imageutils.GetE2EImage(imageutils.Nginx)
+					},
+					expectGenerationBump: true,
+				},
+
+				{
+					name: "updating initContainer image to trigger generation bump",
+					updateFn: func(pod *v1.Pod) {
+						pod.Spec.InitContainers[0].Image = imageutils.GetE2EImage(imageutils.Pause)
+					},
+					expectGenerationBump: true,
+				},
+
+				{
+					name: "updates to pod metadata should not trigger generation bump",
+					updateFn: func(pod *v1.Pod) {
+						if pod.Annotations == nil {
+							pod.Annotations = map[string]string{}
+						}
+						pod.Annotations["key"] = "value"
+					},
+					expectGenerationBump: false,
+				},
+
+				{
+					name: "pod generation updated by client should be ignored",
+					updateFn: func(pod *v1.Pod) {
+						pod.SetGeneration(1)
+					},
+					expectGenerationBump: false,
+				},
+			}
+
+			expectedPodGeneration := int64(1)
+			for _, test := range tests {
+				ginkgo.By(test.name)
+				podClient.Update(ctx, podName, test.updateFn)
+				pod, err := podClient.Get(ctx, podName, metav1.GetOptions{})
+				framework.ExpectNoError(err, "failed to query for pod")
+				if test.expectGenerationBump {
+					expectedPodGeneration++
+				}
+				gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(expectedPodGeneration))
+				framework.ExpectNoError(e2epod.WaitForPodObservedGeneration(ctx, f.ClientSet, f.Namespace.Name, pod.Name, expectedPodGeneration, 20*time.Second))
+			}
+		})
+
+		/*
+			Release: v1.35
+			Testname: Pods Generation, graceful delete
+			Description: Create a Pod, ensure that triggering a graceful delete causes the generation to be updated.
+		*/
+		framework.ConformanceIt("custom-set generation on new pods and graceful delete", func(ctx context.Context) {
+			ginkgo.By("creating the pod")
+			name := "pod-generation-" + string(uuid.NewUUID())
+			value := strconv.Itoa(time.Now().Nanosecond())
+			pod := e2epod.NewAgnhostPod(f.Namespace.Name, name, nil, nil, nil)
+			pod.ObjectMeta.Labels = map[string]string{
+				"time": value,
+			}
+			pod.SetGeneration(100)
+
+			ginkgo.By("submitting the pod to kubernetes")
+			pod = podClient.CreateSync(ctx, pod)
+
+			ginkgo.By("verifying the new pod's generation is 1")
+			gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(1))
+
+			ginkgo.By("issue a graceful delete to trigger generation bump")
+			// We need to wait for the pod to be running, otherwise the deletion
+			// may be carried out immediately rather than gracefully.
+			framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name))
+			pod, err := podClient.Get(ctx, pod.Name, metav1.GetOptions{})
+			framework.ExpectNoError(err, "failed to GET scheduled pod")
+
+			var lastPod v1.Pod
+			var statusCode int
+			// Set gracePeriodSeconds to 60 to give us time to verify the generation bump.
+			err = f.ClientSet.CoreV1().RESTClient().Delete().AbsPath("/api/v1/namespaces", pod.Namespace, "pods", pod.Name).Param("gracePeriodSeconds", "60").Do(ctx).StatusCode(&statusCode).Into(&lastPod)
+			framework.ExpectNoError(err, "failed to use http client to send delete")
+			gomega.Expect(statusCode).To(gomega.Equal(http.StatusOK), "failed to delete gracefully by client request")
+
+			ginkgo.By("verifying the pod generation was bumped")
+			pod, err = podClient.Get(ctx, pod.Name, metav1.GetOptions{})
+			framework.ExpectNoError(err, "failed to query for pod")
+			gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(2))
+		})
+
+		/*
+			Release: v1.35
+			Testname: Pods Generation, 500 updates
+			Description: Create a Pod, issue 499 podSpec updates and verify generation and observedGeneration eventually converge to 500.
+		*/
+		framework.ConformanceIt("issue 500 podspec updates and verify generation and observedGeneration eventually converge [MinimumKubeletVersion:1.34]", func(ctx context.Context) {
+			ginkgo.By("creating the pod")
+			name := "pod-generation-" + string(uuid.NewUUID())
+			value := strconv.Itoa(time.Now().Nanosecond())
+			pod := e2epod.NewAgnhostPod(f.Namespace.Name, name, nil, nil, nil)
+			pod.ObjectMeta.Labels = map[string]string{
+				"time": value,
+			}
+			pod.Spec.ActiveDeadlineSeconds = ptr.To[int64](5000)
+
+			ginkgo.By("submitting the pod to kubernetes")
+			pod = podClient.CreateSync(ctx, pod)
+			ginkgo.DeferCleanup(func(ctx context.Context) error {
+				ginkgo.By("deleting the pod")
+				return podClient.Delete(ctx, pod.Name, metav1.DeleteOptions{})
+			})
+
+			for range 499 {
+				podClient.Update(ctx, pod.Name, func(pod *v1.Pod) {
+					*pod.Spec.ActiveDeadlineSeconds--
+				})
+			}
+
+			// Verify pod observedGeneration converges to the expected generation.
+			expectedPodGeneration := int64(500)
+			framework.ExpectNoError(e2epod.WaitForPodObservedGeneration(ctx, f.ClientSet, f.Namespace.Name, pod.Name, expectedPodGeneration, framework.PodStartTimeout))
+
+			// Verify pod generation converges to the expected generation.
+			pod, err := podClient.Get(ctx, pod.Name, metav1.GetOptions{})
+			framework.ExpectNoError(err, "failed to query for pod")
+			gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(expectedPodGeneration))
+		})
+		ginkgo.It("pod observedGeneration field set in pod conditions", func(ctx context.Context) {
+			ginkgo.By("creating the pod")
+			name := "pod-generation-" + string(uuid.NewUUID())
+			pod := e2epod.NewAgnhostPod(f.Namespace.Name, name, nil, nil, nil)
+
+			// Set the pod image to something that doesn't exist to induce a pull error
+			// to start with.
+			agnImage := pod.Spec.Containers[0].Image
+			pod.Spec.Containers[0].Image = "localhost/some-image-that-doesnt-exist"
+
+			ginkgo.By("submitting the pod to kubernetes")
+			pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+			ginkgo.DeferCleanup(func(ctx context.Context) error {
+				ginkgo.By("deleting the pod")
+				return podClient.Delete(ctx, pod.Name, metav1.DeleteOptions{})
+			})
+
+			expectedPodConditions := []v1.PodConditionType{
+				v1.PodReadyToStartContainers,
+				v1.PodInitialized,
+				v1.PodReady,
+				v1.ContainersReady,
+				v1.PodScheduled,
+			}
+
+			ginkgo.By("verifying the pod conditions have observedGeneration values")
+			expectedObservedGeneration := int64(1)
+			for _, condition := range expectedPodConditions {
+				framework.ExpectNoError(e2epod.WaitForPodConditionObservedGeneration(ctx, f.ClientSet, f.Namespace.Name, pod.Name, condition, expectedObservedGeneration, framework.PodStartTimeout))
+			}
+
+			ginkgo.By("waiting for the container to fail to pull the image")
+			// We need to wait for the container to fail to pull the image to avoid a race condition
+			// where the pod is still being initialized by kubelet while the pod update is received.
+			framework.ExpectNoError(e2epod.WaitForPodCondition(ctx, f.ClientSet, f.Namespace.Name, pod.Name, "image pull failure", framework.PodStartTimeout, func(pod *v1.Pod) (bool, error) {
+				if len(pod.Status.ContainerStatuses) > 0 {
+					status := pod.Status.ContainerStatuses[0]
+					if status.State.Waiting != nil {
+						reason := status.State.Waiting.Reason
+						return reason == "ErrImagePull" || reason == "ImagePullBackOff", nil
+					}
+				}
+				return false, nil
+			}))
+
+			ginkgo.By("updating pod to have a valid image")
+			podClient.Update(ctx, pod.Name, func(pod *v1.Pod) {
+				pod.Spec.Containers[0].Image = agnImage
+			})
+			expectedObservedGeneration++
+
+			ginkgo.By("verifying the pod conditions have updated observedGeneration values")
+			for _, condition := range expectedPodConditions {
+				framework.ExpectNoError(e2epod.WaitForPodConditionObservedGeneration(ctx, f.ClientSet, f.Namespace.Name, pod.Name, condition, expectedObservedGeneration, framework.PodStartTimeout))
+			}
+		})
+	})
 })
 
 func createAndTestPodRepeatedly(ctx context.Context, workers, iterations int, scenario podScenario, podClient v1core.PodInterface) {
@@ -425,8 +681,8 @@ func createAndTestPodRepeatedly(ctx context.Context, workers, iterations int, sc
 		wg sync.WaitGroup
 	)
 
-	r := prometheus.NewRegistry()
-	h := prometheus.NewSummaryVec(prometheus.SummaryOpts{
+	r := metrics.NewKubeRegistry()
+	h := metrics.NewSummaryVec(&metrics.SummaryOpts{ //nolint:staticcheck // SA1019
 		Name: "latency",
 		Objectives: map[float64]float64{
 			0.5:  0.05,
@@ -437,12 +693,12 @@ func createAndTestPodRepeatedly(ctx context.Context, workers, iterations int, sc
 	}, []string{"node"})
 	r.MustRegister(h)
 
-	for i := 0; i < workers; i++ {
+	for i := range workers {
 		wg.Add(1)
 		go func(i int) {
 			defer ginkgo.GinkgoRecover()
 			defer wg.Done()
-			for retries := 0; retries < iterations; retries++ {
+			for retries := range iterations {
 				pod := scenario.Pod(i, retries)
 
 				// create the pod, capture the change events, then delete the pod
@@ -550,7 +806,7 @@ func createAndTestPodRepeatedly(ctx context.Context, workers, iterations int, sc
 	values, _ := r.Gather()
 	var buf bytes.Buffer
 	for _, m := range values {
-		expfmt.MetricFamilyToText(&buf, m)
+		_, _ = testutil.MetricFamilyToText(&buf, m)
 	}
 	framework.Logf("Summary of latencies:\n%s", buf.String())
 }
@@ -610,7 +866,7 @@ func (s podFastDeleteScenario) Pod(worker, attempt int) *v1.Pod {
 				InitContainers: []v1.Container{
 					{
 						Name:  "fail",
-						Image: imageutils.GetE2EImage(imageutils.BusyBox),
+						Image: imageutils.GetE2EImage(imageutils.Agnhost),
 						Command: []string{
 							"/bin/false",
 						},
@@ -625,7 +881,7 @@ func (s podFastDeleteScenario) Pod(worker, attempt int) *v1.Pod {
 				Containers: []v1.Container{
 					{
 						Name:  "blocked",
-						Image: imageutils.GetE2EImage(imageutils.BusyBox),
+						Image: imageutils.GetE2EImage(imageutils.Agnhost),
 						Command: []string{
 							"/bin/true",
 						},
@@ -654,7 +910,7 @@ func (s podFastDeleteScenario) Pod(worker, attempt int) *v1.Pod {
 			Containers: []v1.Container{
 				{
 					Name:  "fail",
-					Image: imageutils.GetE2EImage(imageutils.BusyBox),
+					Image: imageutils.GetE2EImage(imageutils.Agnhost),
 					Command: []string{
 						"/bin/false",
 					},
@@ -726,7 +982,7 @@ func (v *podStartVerifier) Verify(event watch.Event) error {
 	}
 
 	if status := e2epod.FindContainerStatusInPod(pod, "blocked"); status != nil {
-		if (status.Started != nil && *status.Started == true) || status.LastTerminationState.Terminated != nil || status.State.Waiting == nil {
+		if (status.Started != nil && *status.Started) || status.LastTerminationState.Terminated != nil || status.State.Waiting == nil {
 			return fmt.Errorf("pod %s on node %s should not have started the blocked container: %#v", pod.Name, pod.Spec.NodeName, status)
 		}
 	}
@@ -761,6 +1017,11 @@ func (v *podStartVerifier) Verify(event watch.Event) error {
 		switch {
 		case t.ExitCode == 1:
 			// expected
+		case t.ExitCode == 2 && t.Reason == "Error" && t.Message == "":
+			// Some runtimes occasionally surface exit code 2 if stopped before execve makes
+			// it to launching /bin/false in fast-delete scenarios. The test only cares
+			// that the container failed.
+			framework.Logf("pod %s on node %s failed with the symptoms of https://github.com/kubernetes/kubernetes/issues/135713", pod.Name, pod.Spec.NodeName)
 		case t.ExitCode == 137 && (t.Reason == "ContainerStatusUnknown" || t.Reason == "Error"):
 			// expected, pod was force-killed after grace period
 		case t.ExitCode == 128 && (t.Reason == "StartError" || t.Reason == "ContainerCannotRun") && reBug88766.MatchString(t.Message):

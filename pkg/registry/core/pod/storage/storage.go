@@ -19,31 +19,39 @@ package storage
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	apimachineryvalidation "k8s.io/apimachinery/pkg/api/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage"
 	storeerr "k8s.io/apiserver/pkg/storage/errors"
 	"k8s.io/apiserver/pkg/util/dryrun"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	policyclient "k8s.io/client-go/kubernetes/typed/policy/v1"
 	podutil "k8s.io/kubernetes/pkg/api/pod"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
+	kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/client"
 	"k8s.io/kubernetes/pkg/printers"
 	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
 	printerstorage "k8s.io/kubernetes/pkg/printers/storage"
 	registrypod "k8s.io/kubernetes/pkg/registry/core/pod"
 	podrest "k8s.io/kubernetes/pkg/registry/core/pod/rest"
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 // PodStorage includes storage for pods and all sub resources
@@ -54,6 +62,8 @@ type PodStorage struct {
 	Eviction            *EvictionREST
 	Status              *StatusREST
 	EphemeralContainers *EphemeralContainersREST
+	Resize              *ResizeREST
+	Dynamic             *DynamicREST
 	Log                 *podrest.LogREST
 	Proxy               *podrest.ProxyREST
 	Exec                *podrest.ExecREST
@@ -68,7 +78,7 @@ type REST struct {
 }
 
 // NewStorage returns a RESTStorage object that will work against pods.
-func NewStorage(optsGetter generic.RESTOptionsGetter, k client.ConnectionInfoGetter, proxyTransport http.RoundTripper, podDisruptionBudgetClient policyclient.PodDisruptionBudgetsGetter) (PodStorage, error) {
+func NewStorage(optsGetter generic.RESTOptionsGetter, k client.ConnectionInfoGetter, proxyTransport http.RoundTripper, podDisruptionBudgetClient policyclient.PodDisruptionBudgetsGetter, authorizer authorizer.UnconditionalAuthorizer) (PodStorage, error) {
 
 	store := &genericregistry.Store{
 		NewFunc:                   func() runtime.Object { return &api.Pod{} },
@@ -98,22 +108,32 @@ func NewStorage(optsGetter generic.RESTOptionsGetter, k client.ConnectionInfoGet
 	statusStore := *store
 	statusStore.UpdateStrategy = registrypod.StatusStrategy
 	statusStore.ResetFieldsStrategy = registrypod.StatusStrategy
+	evictionStore := *store
+	evictionStore.UpdateStrategy = registrypod.StatusStrategy
+	evictionStore.ResetFieldsStrategy = registrypod.StatusStrategy
+	evictionStore.ReturnDeletedObject = false
 	ephemeralContainersStore := *store
 	ephemeralContainersStore.UpdateStrategy = registrypod.EphemeralContainersStrategy
+	resizeStore := *store
+	resizeStore.UpdateStrategy = registrypod.ResizeStrategy
+	dynamicStore := *store
+	dynamicStore.UpdateStrategy = registrypod.DynamicStrategy
 
 	bindingREST := &BindingREST{store: store}
 	return PodStorage{
 		Pod:                 &REST{store, proxyTransport},
 		Binding:             &BindingREST{store: store},
 		LegacyBinding:       &LegacyBindingREST{bindingREST},
-		Eviction:            newEvictionStorage(&statusStore, podDisruptionBudgetClient),
+		Eviction:            newEvictionStorage(&evictionStore, podDisruptionBudgetClient),
 		Status:              &StatusREST{store: &statusStore},
 		EphemeralContainers: &EphemeralContainersREST{store: &ephemeralContainersStore},
+		Resize:              &ResizeREST{store: &resizeStore},
+		Dynamic:             &DynamicREST{store: &dynamicStore},
 		Log:                 &podrest.LogREST{Store: store, KubeletConn: k},
 		Proxy:               &podrest.ProxyREST{Store: store, ProxyTransport: proxyTransport},
-		Exec:                &podrest.ExecREST{Store: store, KubeletConn: k},
-		Attach:              &podrest.AttachREST{Store: store, KubeletConn: k},
-		PortForward:         &podrest.PortForwardREST{Store: store, KubeletConn: k},
+		Exec:                &podrest.ExecREST{Store: store, KubeletConn: k, Authorizer: authorizer},
+		Attach:              &podrest.AttachREST{Store: store, KubeletConn: k, Authorizer: authorizer},
+		PortForward:         &podrest.PortForwardREST{Store: store, KubeletConn: k, Authorizer: authorizer},
 	}, nil
 }
 
@@ -187,8 +207,16 @@ func (r *BindingREST) Create(ctx context.Context, name string, obj runtime.Objec
 		}
 	}
 
-	err = r.assignPod(ctx, binding.UID, binding.ResourceVersion, binding.Name, binding.Target.Name, binding.Annotations, dryrun.IsDryRun(options.DryRun))
-	out = &metav1.Status{Status: metav1.StatusSuccess}
+	finalPod, err := r.assignPod(ctx, binding.UID, binding.ResourceVersion, binding.Name, binding.Target.Name, binding.Annotations, binding.Labels, dryrun.IsDryRun(options.DryRun))
+	if err != nil {
+		return nil, err
+	}
+	out = &metav1.Status{
+		Status: metav1.StatusSuccess,
+		ListMeta: metav1.ListMeta{
+			ResourceVersion: finalPod.ResourceVersion,
+		},
+	}
 	return
 }
 
@@ -199,10 +227,10 @@ func (r *BindingREST) PreserveRequestObjectMetaSystemFieldsOnSubresourceCreate()
 	return true
 }
 
-// setPodHostAndAnnotations sets the given pod's host to 'machine' if and only if
-// the pod is unassigned and merges the provided annotations with those of the pod.
+// setPodNodeAndMetadata sets the given pod's nodeName to 'machine' if and only if
+// the pod is unassigned, and merges the provided annotations and labels with those of the pod.
 // Returns the current state of the pod, or an error.
-func (r *BindingREST) setPodHostAndAnnotations(ctx context.Context, podUID types.UID, podResourceVersion, podID, machine string, annotations map[string]string, dryRun bool) (finalPod *api.Pod, err error) {
+func (r *BindingREST) setPodNodeAndMetadata(ctx context.Context, podUID types.UID, podResourceVersion, podID, machine string, annotations, labels map[string]string, dryRun bool) (finalPod *api.Pod, err error) {
 	podKey, err := r.store.KeyFunc(ctx, podID)
 	if err != nil {
 		return nil, err
@@ -219,7 +247,8 @@ func (r *BindingREST) setPodHostAndAnnotations(ctx context.Context, podUID types
 		}
 	}
 
-	err = r.store.Storage.GuaranteedUpdate(ctx, podKey, &api.Pod{}, false, preconditions, storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+	finalPod = &api.Pod{}
+	err = r.store.Storage.GuaranteedUpdate(ctx, podKey, finalPod, false, preconditions, storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
 		pod, ok := obj.(*api.Pod)
 		if !ok {
 			return nil, fmt.Errorf("unexpected object: %#v", obj)
@@ -235,25 +264,67 @@ func (r *BindingREST) setPodHostAndAnnotations(ctx context.Context, podUID types
 			return nil, fmt.Errorf("pod %v has non-empty .spec.schedulingGates", pod.Name)
 		}
 		pod.Spec.NodeName = machine
+		// Clear nomination hint to prevent stale information affecting external components.
+		if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.ClearingNominatedNodeNameAfterBinding) {
+			pod.Status.NominatedNodeName = ""
+		}
 		if pod.Annotations == nil {
 			pod.Annotations = make(map[string]string)
 		}
+		var oldAnnotations map[string]string
+		if len(annotations) > 0 {
+			oldAnnotations = maps.Clone(pod.Annotations)
+		}
 		for k, v := range annotations {
 			pod.Annotations[k] = v
+		}
+		// Binding writes bypass the pod strategy (and thus DropDisabledPodFields),
+		// so scrub the merged annotations here the same way.
+		podutil.DropInitContainerAnnotations(pod.Annotations)
+		// Copy all labels from the Binding over to the Pod object, overwriting
+		// any existing labels set on the Pod.
+		if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.PodTopologyLabelsAdmission) {
+			copyLabelsWithOverwriting(pod, labels)
 		}
 		podutil.UpdatePodCondition(&pod.Status, &api.PodCondition{
 			Type:   api.PodScheduled,
 			Status: api.ConditionTrue,
 		})
-		finalPod = pod
+
+		if len(annotations) > 0 {
+			// validate updated annotations
+			fldPath := field.NewPath("metadata", "annotations")
+			allErrs := validation.ValidatePodSpecificAnnotationUpdates(pod, oldAnnotations, fldPath, validation.PodValidationOptions{})
+			if err := apimachineryvalidation.ValidateAnnotationsSize(pod.Annotations); err != nil {
+				allErrs = append(allErrs, field.TooLong(fldPath, "" /*unused*/, apimachineryvalidation.TotalAnnotationSizeLimitB))
+			}
+			if len(allErrs) > 0 {
+				return nil, errors.NewInvalid(schema.GroupKind{Group: "", Kind: "Binding"}, "", allErrs)
+			}
+		}
+
 		return pod, nil
 	}), dryRun, nil)
 	return finalPod, err
 }
 
+func copyLabelsWithOverwriting(pod *api.Pod, labels map[string]string) {
+	if len(labels) == 0 {
+		// nothing to do
+		return
+	}
+	if pod.Labels == nil {
+		pod.Labels = make(map[string]string)
+	}
+	// Iterate over the binding's labels and copy them across to the Pod.
+	for k, v := range labels {
+		pod.Labels[k] = v
+	}
+}
+
 // assignPod assigns the given pod to the given machine.
-func (r *BindingREST) assignPod(ctx context.Context, podUID types.UID, podResourceVersion, podID string, machine string, annotations map[string]string, dryRun bool) (err error) {
-	if _, err = r.setPodHostAndAnnotations(ctx, podUID, podResourceVersion, podID, machine, annotations, dryRun); err != nil {
+func (r *BindingREST) assignPod(ctx context.Context, podUID types.UID, podResourceVersion, podID string, machine string, annotations, labels map[string]string, dryRun bool) (finalPod *api.Pod, err error) {
+	if finalPod, err = r.setPodNodeAndMetadata(ctx, podUID, podResourceVersion, podID, machine, annotations, labels, dryRun); err != nil {
 		err = storeerr.InterpretGetError(err, api.Resource("pods"), podID)
 		err = storeerr.InterpretUpdateError(err, api.Resource("pods"), podID)
 		if _, ok := err.(*errors.StatusError); !ok {
@@ -361,6 +432,70 @@ func (r *EphemeralContainersREST) Destroy() {
 
 // Update alters the EphemeralContainers field in PodSpec
 func (r *EphemeralContainersREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
+	// subresources should never allow create on update.
+	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
+}
+
+// ResizeREST implements the REST endpoint for resizing Pod containers.
+type ResizeREST struct {
+	store *genericregistry.Store
+}
+
+var _ = rest.Patcher(&ResizeREST{})
+
+// Get retrieves the object from the storage. It is required to support Patch.
+func (r *ResizeREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	return r.store.Get(ctx, name, options)
+}
+
+// New creates a new pod resource
+func (r *ResizeREST) New() runtime.Object {
+	return &api.Pod{}
+}
+
+// Destroy cleans up resources on shutdown.
+func (r *ResizeREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
+// Update alters the resource fields in PodSpec
+func (r *ResizeREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
+	// subresources should never allow create on update.
+	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
+}
+
+// DynamicREST implements the REST endpoint for dynamically adding and removing
+// Pod containers, in addition to the changes allowed by pod updates and resizes.
+type DynamicREST struct {
+	store *genericregistry.Store
+}
+
+var _ = rest.Patcher(&DynamicREST{})
+
+// Get retrieves the object from the storage. It is required to support Patch.
+func (r *DynamicREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	return r.store.Get(ctx, name, options)
+}
+
+// New creates a new pod resource
+func (r *DynamicREST) New() runtime.Object {
+	return &api.Pod{}
+}
+
+// Destroy cleans up resources on shutdown.
+func (r *DynamicREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
+// Update alters the PodSpec, including adding and removing containers.
+func (r *DynamicREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	// TODO: Once fail-closed admission (https://github.com/kubernetes/kubernetes/pull/142810) merges,
+	// require that admission plugins and policies intercepting pod updates also cover this subresource.
+
 	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
 	// subresources should never allow create on update.
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)

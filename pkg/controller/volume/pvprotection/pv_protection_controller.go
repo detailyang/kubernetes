@@ -19,6 +19,7 @@ package pvprotection
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -32,7 +33,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/controller/volume/protectionutil"
+	"k8s.io/kubernetes/pkg/controller/util/protectionutil"
 	"k8s.io/kubernetes/pkg/util/slice"
 	volumeutil "k8s.io/kubernetes/pkg/volume/util"
 )
@@ -45,47 +46,63 @@ type Controller struct {
 	pvLister       corelisters.PersistentVolumeLister
 	pvListerSynced cache.InformerSynced
 
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 }
 
 // NewPVProtectionController returns a new *Controller.
-func NewPVProtectionController(logger klog.Logger, pvInformer coreinformers.PersistentVolumeInformer, cl clientset.Interface) *Controller {
+func NewPVProtectionController(ctx context.Context, pvInformer coreinformers.PersistentVolumeInformer, cl clientset.Interface) (*Controller, error) {
+	logger := klog.FromContext(ctx)
 	e := &Controller{
 		client: cl,
-		queue:  workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pvprotection"),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: &logger,
+				Name:   "pvprotection",
+			},
+		),
 	}
 
 	e.pvLister = pvInformer.Lister()
 	e.pvListerSynced = pvInformer.Informer().HasSynced
-	pvInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err := pvInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			e.pvAddedUpdated(logger, obj)
 		},
 		UpdateFunc: func(old, new interface{}) {
 			e.pvAddedUpdated(logger, new)
 		},
-	})
+	}, cache.HandlerOptions{Logger: &logger})
+	if err != nil {
+		return nil, fmt.Errorf("could not add PV event handler: %w", err)
+	}
 
-	return e
+	return e, nil
 }
 
 // Run runs the controller goroutines.
 func (c *Controller) Run(ctx context.Context, workers int) {
-	defer utilruntime.HandleCrash()
-	defer c.queue.ShutDown()
+	defer utilruntime.HandleCrashWithContext(ctx)
 
 	logger := klog.FromContext(ctx)
 	logger.Info("Starting PV protection controller")
-	defer logger.Info("Shutting down PV protection controller")
 
-	if !cache.WaitForNamedCacheSync("PV protection", ctx.Done(), c.pvListerSynced) {
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down PV protection controller")
+		c.queue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, c.pvListerSynced) {
 		return
 	}
 
 	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, c.runWorker, time.Second)
+		})
 	}
-
 	<-ctx.Done()
 }
 
@@ -102,7 +119,7 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	}
 	defer c.queue.Done(pvKey)
 
-	pvName := pvKey.(string)
+	pvName := pvKey
 
 	err := c.processPV(ctx, pvName)
 	if err == nil {

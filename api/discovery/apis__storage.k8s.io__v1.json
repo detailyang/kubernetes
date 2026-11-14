@@ -38,6 +38,17 @@
       ]
     },
     {
+      "kind": "CSINode",
+      "name": "csinodes/status",
+      "namespaced": false,
+      "singularName": "",
+      "verbs": [
+        "get",
+        "patch",
+        "update"
+      ]
+    },
+    {
       "kind": "CSIStorageCapacity",
       "name": "csistoragecapacities",
       "namespaced": true,
@@ -100,6 +111,26 @@
         "get",
         "patch",
         "update"
+      ]
+    },
+    {
+      "kind": "VolumeAttributesClass",
+      "name": "volumeattributesclasses",
+      "namespaced": false,
+      "shortNames": [
+        "vac"
+      ],
+      "singularName": "volumeattributesclass",
+      "storageVersionHash": "tIjydgKBC5w=",
+      "verbs": [
+        "create",
+        "delete",
+        "deletecollection",
+        "get",
+        "list",
+        "patch",
+        "update",
+        "watch"
       ]
     }
   ]

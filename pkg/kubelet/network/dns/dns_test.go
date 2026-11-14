@@ -30,6 +30,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/klog/v2"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
 	netutils "k8s.io/utils/net"
 
@@ -104,10 +106,67 @@ func TestParseResolvConf(t *testing.T) {
 			require.NoError(t, err)
 			assert.EqualValues(t, tc.nameservers, ns, "test case [%d]: name servers", i)
 			assert.EqualValues(t, tc.searches, srch, "test case [%d] searches", i)
-			assert.EqualValues(t, sets.NewString(tc.options...), sets.NewString(opts...), "test case [%d] options", i)
+			assert.EqualValues(t, sets.New[string](tc.options...), sets.New[string](opts...), "test case [%d] options", i)
 		} else {
 			require.Error(t, err, "tc.searches %v", tc.searches)
 		}
+	}
+}
+
+func TestFilterUnusableInheritedNameservers(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	testCases := []struct {
+		desc                string
+		nameservers         []string
+		expectedNameservers []string
+	}{
+		{
+			desc:                "IPv4 nameserver is preserved",
+			nameservers:         []string{"1.1.1.1"},
+			expectedNameservers: []string{"1.1.1.1"},
+		},
+		{
+			desc:                "global IPv6 nameserver is preserved",
+			nameservers:         []string{"2001:4860:4860::8888"},
+			expectedNameservers: []string{"2001:4860:4860::8888"},
+		},
+		{
+			desc:                "scoped link-local IPv6 with numeric zone is removed",
+			nameservers:         []string{"fe80::1%3"},
+			expectedNameservers: []string{},
+		},
+		{
+			desc:                "scoped link-local IPv6 with named zone is removed",
+			nameservers:         []string{"fe80::1%eth0"},
+			expectedNameservers: []string{},
+		},
+		{
+			desc:                "zoned global IPv6 is removed",
+			nameservers:         []string{"2001:db8::1%eth0"},
+			expectedNameservers: []string{},
+		},
+		{
+			desc:                "unscoped link-local IPv6 is outside the filter scope",
+			nameservers:         []string{"fe80::1"},
+			expectedNameservers: []string{"fe80::1"},
+		},
+		{
+			desc:                "mixed nameservers remove only zoned nameservers",
+			nameservers:         []string{"1.1.1.1", "fe80::1%3", "2001:db8::1%eth0", "2001:4860:4860::8888"},
+			expectedNameservers: []string{"1.1.1.1", "2001:4860:4860::8888"},
+		},
+		{
+			desc:                "malformed input is removed",
+			nameservers:         []string{"not-an-ip"},
+			expectedNameservers: []string{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			nameservers := append([]string{}, tc.nameservers...)
+			assert.Equal(t, tc.expectedNameservers, filterUnusableInheritedNameservers(logger, nameservers))
+		})
 	}
 }
 
@@ -224,7 +283,8 @@ func TestFormDNSSearchFitsLimits(t *testing.T) {
 
 	for i, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
-			dnsSearch := configurer.formDNSSearchFitsLimits(tc.hostNames, pod)
+			logger, _ := ktesting.NewTestContext(t)
+			dnsSearch := configurer.formDNSSearchFitsLimits(logger, tc.hostNames, pod)
 			assert.EqualValues(t, tc.resultSearch, dnsSearch, "test [%d]", i)
 			for _, expectedEvent := range tc.events {
 				expected := fmt.Sprintf("%s %s %s", v1.EventTypeWarning, "DNSConfigForming", expectedEvent)
@@ -283,7 +343,8 @@ func TestFormDNSNameserversFitsLimits(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		appliedNameservers := configurer.formDNSNameserversFitsLimits(tc.nameservers, pod)
+		logger, _ := ktesting.NewTestContext(t)
+		appliedNameservers := configurer.formDNSNameserversFitsLimits(logger, tc.nameservers, pod)
 		assert.EqualValues(t, tc.expectedNameserver, appliedNameservers, tc.desc)
 		event := fetchEvent(recorder)
 		if tc.expectedEvent && len(event) == 0 {
@@ -334,7 +395,7 @@ func TestMergeDNSOptions(t *testing.T) {
 	for _, tc := range testCases {
 		options := mergeDNSOptions(tc.existingDNSConfigOptions, tc.dnsConfigOptions)
 		// Options order may be changed after conversion.
-		if !sets.NewString(options...).Equal(sets.NewString(tc.expectedOptions...)) {
+		if !sets.New[string](options...).Equal(sets.New[string](tc.expectedOptions...)) {
 			t.Errorf("%s: mergeDNSOptions(%v, %v)=%v, want %v", tc.desc, tc.existingDNSConfigOptions, tc.dnsConfigOptions, options, tc.expectedOptions)
 		}
 	}
@@ -445,6 +506,7 @@ func TestGetPodDNSType(t *testing.T) {
 }
 
 func TestGetPodDNS(t *testing.T) {
+	ctx := ktesting.Init(t)
 	recorder := record.NewFakeRecorder(20)
 	nodeRef := &v1.ObjectReference{
 		Kind:      "Node",
@@ -471,7 +533,7 @@ func TestGetPodDNS(t *testing.T) {
 	}, 4)
 	for i, pod := range pods {
 		var err error
-		dnsConfig, err := configurer.GetPodDNS(pod)
+		dnsConfig, err := configurer.GetPodDNS(ctx, pod)
 		if err != nil {
 			t.Fatalf("failed to generate container options: %v", err)
 		}
@@ -504,9 +566,10 @@ func TestGetPodDNS(t *testing.T) {
 
 	configurer = NewConfigurer(recorder, nodeRef, nil, testClusterDNS, testClusterDNSDomain, defaultResolvConf)
 	configurer.getHostDNSConfig = fakeGetHostDNSConfigCustom
+
 	for i, pod := range pods {
 		var err error
-		dnsConfig, err := configurer.GetPodDNS(pod)
+		dnsConfig, err := configurer.GetPodDNS(ctx, pod)
 		if err != nil {
 			t.Fatalf("failed to generate container options: %v", err)
 		}
@@ -539,6 +602,147 @@ func TestGetPodDNS(t *testing.T) {
 		t.Errorf("expected prepend of cluster domain, got %+v", options[2].DNSSearch)
 	} else if options[2].DNSSearch[0] != ".svc."+configurer.ClusterDomain {
 		t.Errorf("expected domain %s, got %s", ".svc."+configurer.ClusterDomain, options[0].DNSSearch)
+	}
+}
+
+func TestGetPodDNSFiltersUnusableInheritedNameservers(t *testing.T) {
+	recorder := record.NewFakeRecorder(20)
+	nodeRef := &v1.ObjectReference{
+		Kind:      "Node",
+		Name:      string("testNode"),
+		UID:       types.UID("testNode"),
+		Namespace: "",
+	}
+	testPodNamespace := "testNS"
+	testClusterNameserver := "10.0.0.10"
+	testClusterDNSDomain := "kubernetes.io"
+	testSvcDomain := fmt.Sprintf("svc.%s", testClusterDNSDomain)
+	testNsSvcDomain := fmt.Sprintf("%s.svc.%s", testPodNamespace, testClusterDNSDomain)
+	defaultHostNameservers := []string{"1.1.1.1", "fe80::1%3", "2001:4860:4860::8888"}
+	configurer := NewConfigurer(recorder, nodeRef, nil, []net.IP{netutils.ParseIPSloppy(testClusterNameserver)}, testClusterDNSDomain, defaultResolvConf)
+
+	testCases := []struct {
+		desc              string
+		hostnetwork       bool
+		dnsPolicy         v1.DNSPolicy
+		hostNameservers   []string
+		nodeIPs           []net.IP
+		dnsConfig         *v1.PodDNSConfig
+		expectedDNSConfig *runtimeapi.DNSConfig
+	}{
+		{
+			desc:            "DNSDefault without host network filters inherited zoned nameservers in podDNSHost path",
+			dnsPolicy:       v1.DNSDefault,
+			hostNameservers: defaultHostNameservers,
+			expectedDNSConfig: &runtimeapi.DNSConfig{
+				Servers:  []string{"1.1.1.1", "2001:4860:4860::8888"},
+				Searches: []string{testHostDomain},
+			},
+		},
+		{
+			desc:            "DNSDefault with host network preserves inherited zoned nameservers",
+			hostnetwork:     true,
+			dnsPolicy:       v1.DNSDefault,
+			hostNameservers: defaultHostNameservers,
+			expectedDNSConfig: &runtimeapi.DNSConfig{
+				Servers:  defaultHostNameservers,
+				Searches: []string{testHostDomain},
+			},
+		},
+		{
+			desc:            "DNSClusterFirst is not filtered",
+			dnsPolicy:       v1.DNSClusterFirst,
+			hostNameservers: defaultHostNameservers,
+			expectedDNSConfig: &runtimeapi.DNSConfig{
+				Servers:  []string{testClusterNameserver},
+				Searches: []string{testNsSvcDomain, testSvcDomain, testClusterDNSDomain, testHostDomain},
+				Options:  defaultDNSOptions,
+			},
+		},
+		{
+			desc:            "DNSClusterFirstWithHostNet is not filtered",
+			hostnetwork:     true,
+			dnsPolicy:       v1.DNSClusterFirstWithHostNet,
+			hostNameservers: defaultHostNameservers,
+			expectedDNSConfig: &runtimeapi.DNSConfig{
+				Servers:  []string{testClusterNameserver},
+				Searches: []string{testNsSvcDomain, testSvcDomain, testClusterDNSDomain, testHostDomain},
+				Options:  defaultDNSOptions,
+			},
+		},
+		{
+			desc:            "DNSNone is not filtered",
+			dnsPolicy:       v1.DNSNone,
+			hostNameservers: defaultHostNameservers,
+			expectedDNSConfig: &runtimeapi.DNSConfig{
+				Servers:  nil,
+				Searches: nil,
+				Options:  nil,
+			},
+		},
+		{
+			desc:            "DNSDefault without host network falls back to localhost when all inherited zoned nameservers are filtered",
+			dnsPolicy:       v1.DNSDefault,
+			hostNameservers: []string{"fe80::1%3", "fe80::2%eth0", "2001:db8::1%eth0"},
+			expectedDNSConfig: &runtimeapi.DNSConfig{
+				Servers:  []string{"127.0.0.1"},
+				Searches: []string{testHostDomain},
+			},
+		},
+		{
+			desc:            "DNSDefault without host network falls back to ::1 for IPv6 node when all inherited nameservers are filtered",
+			dnsPolicy:       v1.DNSDefault,
+			hostNameservers: []string{"fe80::1%3"},
+			nodeIPs:         []net.IP{netutils.ParseIPSloppy("2001:db8::1")},
+			expectedDNSConfig: &runtimeapi.DNSConfig{
+				Servers:  []string{"::1"},
+				Searches: []string{testHostDomain},
+			},
+		},
+		{
+			desc:            "explicit zoned nameserver is appended after localhost fallback",
+			dnsPolicy:       v1.DNSDefault,
+			hostNameservers: []string{"fe80::1%3"},
+			dnsConfig: &v1.PodDNSConfig{
+				Nameservers: []string{"fe80::2%eth0"},
+			},
+			expectedDNSConfig: &runtimeapi.DNSConfig{
+				Servers:  []string{"127.0.0.1", "fe80::2%eth0"},
+				Searches: []string{testHostDomain},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			ctx := ktesting.Init(t)
+			configurer.nodeIPs = tc.nodeIPs
+			configurer.getHostDNSConfig = func(klog.Logger, string) (*runtimeapi.DNSConfig, error) {
+				return &runtimeapi.DNSConfig{
+					Servers:  append([]string{}, tc.hostNameservers...),
+					Searches: []string{testHostDomain},
+				}, nil
+			}
+			testPod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test_pod",
+					Namespace: testPodNamespace,
+				},
+				Spec: v1.PodSpec{
+					DNSConfig:   tc.dnsConfig,
+					DNSPolicy:   tc.dnsPolicy,
+					HostNetwork: tc.hostnetwork,
+				},
+			}
+
+			resDNSConfig, err := configurer.GetPodDNS(ctx, testPod)
+			if err != nil {
+				t.Errorf("%s: GetPodDNS(%v), unexpected error: %v", tc.desc, testPod, err)
+			}
+			if !dnsConfigsAreEqual(resDNSConfig, tc.expectedDNSConfig) {
+				t.Errorf("%s: GetPodDNS(%v)=%v, want %v", tc.desc, testPod, resDNSConfig, tc.expectedDNSConfig)
+			}
+		})
 	}
 }
 
@@ -665,11 +869,12 @@ func TestGetPodDNSCustom(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
+			ctx := ktesting.Init(t)
 			testPod.Spec.HostNetwork = tc.hostnetwork
 			testPod.Spec.DNSConfig = tc.dnsConfig
 			testPod.Spec.DNSPolicy = tc.dnsPolicy
 
-			resDNSConfig, err := configurer.GetPodDNS(testPod)
+			resDNSConfig, err := configurer.GetPodDNS(ctx, testPod)
 			if err != nil {
 				t.Errorf("%s: GetPodDNS(%v), unexpected error: %v", tc.desc, testPod, err)
 			}
@@ -697,7 +902,7 @@ func dnsConfigsAreEqual(resConfig, expectedConfig *runtimeapi.DNSConfig) bool {
 		}
 	}
 	// Options order may be changed after conversion.
-	return sets.NewString(resConfig.Options...).Equal(sets.NewString(expectedConfig.Options...))
+	return sets.New[string](resConfig.Options...).Equal(sets.New[string](expectedConfig.Options...))
 }
 
 func newTestPods(count int) []*v1.Pod {

@@ -19,34 +19,94 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 
+	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
+	cgoresource "k8s.io/client-go/kubernetes/typed/resource/v1"
+	draclient "k8s.io/dynamic-resource-allocation/client"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+	"k8s.io/dynamic-resource-allocation/resourceclaim"
+	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
-	drapbv1alpha2 "k8s.io/kubelet/pkg/apis/dra/v1alpha2"
-	drapbv1alpha3 "k8s.io/kubelet/pkg/apis/dra/v1alpha3"
+	cdi "tags.cncf.io/container-device-interface/specs-go"
 )
 
+type Options struct {
+	EnableHealthService bool
+
+	// DisableHealthV1 and DisableHealthV1alpha1 restrict which
+	// DRAResourceHealth gRPC API versions the driver advertises and serves,
+	// to test a kubelet against plugins which only support one version.
+	// The zero values keep both enabled, matching the kubeletplugin helper
+	// defaults.
+	DisableHealthV1       bool
+	DisableHealthV1alpha1 bool
+}
+
+type DeviceHealthUpdate struct {
+	PoolName   string
+	DeviceName string
+	Health     string
+	Message    string
+}
+
+type deviceHealthInfo struct {
+	status  string
+	message string
+}
+
 type ExamplePlugin struct {
-	logger  klog.Logger
-	d       kubeletplugin.DRAPlugin
-	fileOps FileOperations
+	stopCh         <-chan struct{}
+	logger         klog.Logger
+	resourceClient cgoresource.ResourceV1Interface
+	d              *kubeletplugin.Helper
+	fileOps        FileOperations
 
 	cdiDir     string
 	driverName string
 	nodeName   string
 
+	// The mutex is needed because there are other goroutines checking the state.
+	// Serializing in the gRPC server alone is not enough because writing would
+	// race with reading.
 	mutex     sync.Mutex
-	prepared  map[ClaimID]bool
-	gRPCCalls []GRPCCall
+	prepared  map[ClaimID][]kubeletplugin.Device // prepared claims -> result of nodePrepareResource
+	gRPCCalls []*GRPCCall
 
-	block bool
+	healthMutex       sync.Mutex
+	deviceHealth      map[string]deviceHealthInfo
+	HealthControlChan chan DeviceHealthUpdate
+
+	blockPrepareResourcesMutex   sync.Mutex
+	blockUnprepareResourcesMutex sync.Mutex
+
+	prepareResourcesFailure   error
+	failPrepareResourcesMutex sync.Mutex
+
+	unprepareResourcesFailure   error
+	failUnprepareResourcesMutex sync.Mutex
+
+	// cancelMainContext is used to cancel an upper-level context.
+	// It's called from HandleError if set.
+	cancelMainContext context.CancelCauseFunc
 }
+
+var _ kubeletplugin.DRAPlugin = &ExamplePlugin{}
 
 type GRPCCall struct {
 	// FullMethod is the fully qualified, e.g. /package.service/method.
@@ -67,17 +127,26 @@ type GRPCCall struct {
 // sufficient to make the ClaimID unique.
 type ClaimID struct {
 	Name string
-	UID  string
+	UID  types.UID
 }
 
-var _ drapbv1alpha2.NodeServer = &ExamplePlugin{}
+type Device struct {
+	PoolName    string
+	DeviceName  string
+	RequestName string
+	CDIDeviceID string
+}
+
+var _ kubeletplugin.DRAPlugin = &ExamplePlugin{}
 
 // getJSONFilePath returns the absolute path where CDI file is/should be.
-func (ex *ExamplePlugin) getJSONFilePath(claimUID string) string {
-	return filepath.Join(ex.cdiDir, fmt.Sprintf("%s-%s.json", ex.driverName, claimUID))
+func (ex *ExamplePlugin) getJSONFilePath(claimUID types.UID, requestName string) string {
+	baseRequestRef := resourceclaim.BaseRequestRef(requestName)
+	return filepath.Join(ex.cdiDir, fmt.Sprintf("%s-%s-%s.json", ex.driverName, claimUID, baseRequestRef))
 }
 
-// FileOperations defines optional callbacks for handling CDI files.
+// FileOperations defines optional callbacks for handling CDI files
+// and some other configuration.
 type FileOperations struct {
 	// Create must overwrite the file.
 	Create func(name string, content []byte) error
@@ -85,10 +154,19 @@ type FileOperations struct {
 	// Remove must remove the file. It must not return an error when the
 	// file does not exist.
 	Remove func(name string) error
+
+	// HandleError is an optional callback for ResourceSlice publishing problems.
+	HandleError func(ctx context.Context, err error, msg string)
+
+	// DriverResources provides the information that the driver will use to
+	// construct the ResourceSlices that it will publish.
+	DriverResources *resourceslice.DriverResources
 }
 
 // StartPlugin sets up the servers that are necessary for a DRA kubelet plugin.
-func StartPlugin(logger klog.Logger, cdiDir, driverName string, nodeName string, fileOps FileOperations, opts ...kubeletplugin.Option) (*ExamplePlugin, error) {
+func StartPlugin(ctx context.Context, cdiDir, driverName string, kubeClient kubernetes.Interface, nodeName string, fileOps FileOperations, opts ...any) (*ExamplePlugin, error) {
+	logger := klog.FromContext(ctx)
+
 	if fileOps.Create == nil {
 		fileOps.Create = func(name string, content []byte) error {
 			return os.WriteFile(name, content, os.FileMode(0644))
@@ -102,30 +180,80 @@ func StartPlugin(logger klog.Logger, cdiDir, driverName string, nodeName string,
 			return nil
 		}
 	}
-	ex := &ExamplePlugin{
-		logger:     logger,
-		fileOps:    fileOps,
-		cdiDir:     cdiDir,
-		driverName: driverName,
-		nodeName:   nodeName,
-		prepared:   make(map[ClaimID]bool),
+
+	publicOpts := []kubeletplugin.Option{
+		kubeletplugin.DriverName(driverName),
+		kubeletplugin.NodeName(nodeName),
+		kubeletplugin.KubeClient(kubeClient),
 	}
 
-	opts = append(opts,
-		kubeletplugin.Logger(logger),
-		kubeletplugin.DriverName(driverName),
+	testOpts := &options{}
+	pluginOpts := &Options{}
+	for _, opt := range opts {
+		switch typedOpt := opt.(type) {
+		case Options:
+			*pluginOpts = typedOpt
+		case TestOption:
+			if err := typedOpt(testOpts); err != nil {
+				return nil, fmt.Errorf("apply test option: %w", err)
+			}
+		case kubeletplugin.Option:
+			publicOpts = append(publicOpts, typedOpt)
+		default:
+			return nil, fmt.Errorf("unexpected option type %T", opt)
+		}
+	}
+
+	ex := &ExamplePlugin{
+		stopCh:            ctx.Done(),
+		logger:            logger,
+		resourceClient:    draclient.New(kubeClient),
+		fileOps:           fileOps,
+		cdiDir:            cdiDir,
+		driverName:        driverName,
+		nodeName:          nodeName,
+		prepared:          make(map[ClaimID][]kubeletplugin.Device),
+		cancelMainContext: testOpts.cancelMainContext,
+		deviceHealth:      make(map[string]deviceHealthInfo),
+		HealthControlChan: make(chan DeviceHealthUpdate, 10),
+	}
+
+	publicOpts = append(publicOpts,
 		kubeletplugin.GRPCInterceptor(ex.recordGRPCCall),
+		kubeletplugin.GRPCStreamInterceptor(ex.recordGRPCStream),
+		// ExamplePlugin always implements WatchHealthStatus; whether device
+		// health is actually advertised and served, and in which API
+		// versions, is controlled here.
+		kubeletplugin.HealthService(pluginOpts.EnableHealthService),
+		kubeletplugin.HealthV1(!pluginOpts.DisableHealthV1),
+		kubeletplugin.HealthV1alpha1(!pluginOpts.DisableHealthV1alpha1),
 	)
-	d, err := kubeletplugin.Start(ex, opts...)
+	d, err := kubeletplugin.Start(ctx, ex, publicOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("start kubelet plugin: %w", err)
 	}
 	ex.d = d
 
+	if fileOps.DriverResources != nil {
+		if err := ex.d.PublishResources(ctx, *fileOps.DriverResources); err != nil {
+			return nil, fmt.Errorf("start kubelet plugin: publish resources: %w", err)
+		}
+	}
+
 	return ex, nil
 }
 
-// stop ensures that all servers are stopped and resources freed.
+// PublishResources re-publishes the driver's resources, replacing any set that
+// was published before. This resets the resourceslice controller's desired
+// state: if the apiserver previously dropped fields (e.g. because a feature
+// gate was disabled), the controller latches its desired state to what could be
+// stored to avoid a hot update loop. Re-publishing restores the original
+// resources once the apiserver accepts them again.
+func (ex *ExamplePlugin) PublishResources(ctx context.Context, resources resourceslice.DriverResources) error {
+	return ex.d.PublishResources(ctx, resources)
+}
+
+// Stop ensures that all servers are stopped and resources freed.
 func (ex *ExamplePlugin) Stop() {
 	ex.d.Stop()
 }
@@ -138,150 +266,283 @@ func (ex *ExamplePlugin) IsRegistered() bool {
 	return status.PluginRegistered
 }
 
-// Block sets a flag to block Node[Un]PrepareResources
-// to emulate time consuming or stuck calls
-func (ex *ExamplePlugin) Block() {
-	ex.block = true
+func (ex *ExamplePlugin) HandleError(ctx context.Context, err error, msg string) {
+	if ex.fileOps.HandleError != nil {
+		ex.fileOps.HandleError(ctx, err, msg)
+		return
+	}
+	utilruntime.HandleErrorWithContext(ctx, err, msg)
+	if ex.cancelMainContext != nil {
+		ex.cancelMainContext(err)
+	}
 }
 
-// NodePrepareResource ensures that the CDI file for the claim exists. It uses
+// BlockNodePrepareResources locks blockPrepareResourcesMutex and returns unlocking function for it
+func (ex *ExamplePlugin) BlockNodePrepareResources() func() {
+	ex.blockPrepareResourcesMutex.Lock()
+	return func() {
+		ex.blockPrepareResourcesMutex.Unlock()
+	}
+}
+
+// BlockNodeUnprepareResources locks blockUnprepareResourcesMutex and returns unlocking function for it
+func (ex *ExamplePlugin) BlockNodeUnprepareResources() func() {
+	ex.blockUnprepareResourcesMutex.Lock()
+	return func() {
+		ex.blockUnprepareResourcesMutex.Unlock()
+	}
+}
+
+// SetNodePrepareResourcesFailureMode sets the failure mode for NodePrepareResources call
+// and returns a function to unset the failure mode
+func (ex *ExamplePlugin) SetNodePrepareResourcesFailureMode() func() {
+	ex.failPrepareResourcesMutex.Lock()
+	ex.prepareResourcesFailure = errors.New("simulated PrepareResources failure")
+	ex.failPrepareResourcesMutex.Unlock()
+
+	return func() {
+		ex.failPrepareResourcesMutex.Lock()
+		ex.prepareResourcesFailure = nil
+		ex.failPrepareResourcesMutex.Unlock()
+	}
+}
+
+func (ex *ExamplePlugin) getPrepareResourcesFailure() error {
+	ex.failPrepareResourcesMutex.Lock()
+	defer ex.failPrepareResourcesMutex.Unlock()
+	return ex.prepareResourcesFailure
+}
+
+// SetNodeUnprepareResourcesFailureMode sets the failure mode for NodeUnprepareResources call
+// and returns a function to unset the failure mode
+func (ex *ExamplePlugin) SetNodeUnprepareResourcesFailureMode() func() {
+	ex.failUnprepareResourcesMutex.Lock()
+	ex.unprepareResourcesFailure = errors.New("simulated UnprepareResources failure")
+	ex.failUnprepareResourcesMutex.Unlock()
+
+	return func() {
+		ex.failUnprepareResourcesMutex.Lock()
+		ex.unprepareResourcesFailure = nil
+		ex.failUnprepareResourcesMutex.Unlock()
+	}
+}
+
+func (ex *ExamplePlugin) getUnprepareResourcesFailure() error {
+	ex.failUnprepareResourcesMutex.Lock()
+	defer ex.failUnprepareResourcesMutex.Unlock()
+	return ex.unprepareResourcesFailure
+}
+
+// NodePrepareResource ensures that the CDI file(s) (one per request) for the claim exists. It uses
 // a deterministic name to simplify NodeUnprepareResource (no need to remember
 // or discover the name) and idempotency (when called again, the file simply
 // gets written again).
-func (ex *ExamplePlugin) NodePrepareResource(ctx context.Context, req *drapbv1alpha2.NodePrepareResourceRequest) (*drapbv1alpha2.NodePrepareResourceResponse, error) {
+func (ex *ExamplePlugin) nodePrepareResource(ctx context.Context, claim *resourceapi.ResourceClaim) ([]kubeletplugin.Device, error) {
 	logger := klog.FromContext(ctx)
-
-	// Block to emulate plugin stuckness or slowness.
-	// By default the call will not be blocked as ex.block = false.
-	if ex.block {
-		<-ctx.Done()
-		return nil, ctx.Err()
-	}
-
-	// Determine environment variables.
-	var p parameters
-	if err := json.Unmarshal([]byte(req.ResourceHandle), &p); err != nil {
-		return nil, fmt.Errorf("unmarshal resource handle: %w", err)
-	}
-
-	// Sanity check scheduling.
-	if p.NodeName != "" && ex.nodeName != "" && p.NodeName != ex.nodeName {
-		return nil, fmt.Errorf("claim was allocated for %q, cannot be prepared on %q", p.NodeName, ex.nodeName)
-	}
-
-	// CDI wants env variables as set of strings.
-	envs := []string{}
-	for key, val := range p.EnvVars {
-		envs = append(envs, key+"="+val)
-	}
-
-	deviceName := "claim-" + req.ClaimUid
-	vendor := ex.driverName
-	class := "test"
-	spec := &spec{
-		Version: "0.3.0", // This has to be a version accepted by the runtimes.
-		Kind:    vendor + "/" + class,
-		// At least one device is required and its entry must have more
-		// than just the name.
-		Devices: []device{
-			{
-				Name: deviceName,
-				ContainerEdits: containerEdits{
-					Env: envs,
-				},
-			},
-		},
-	}
-	filePath := ex.getJSONFilePath(req.ClaimUid)
-	buffer, err := json.Marshal(spec)
-	if err != nil {
-		return nil, fmt.Errorf("marshal spec: %w", err)
-	}
-	if err := ex.fileOps.Create(filePath, buffer); err != nil {
-		return nil, fmt.Errorf("failed to write CDI file %v", err)
-	}
-
-	dev := vendor + "/" + class + "=" + deviceName
-	resp := &drapbv1alpha2.NodePrepareResourceResponse{CdiDevices: []string{dev}}
 
 	ex.mutex.Lock()
 	defer ex.mutex.Unlock()
-	ex.prepared[ClaimID{Name: req.ClaimName, UID: req.ClaimUid}] = true
+	ex.blockPrepareResourcesMutex.Lock()
+	defer ex.blockPrepareResourcesMutex.Unlock()
 
-	logger.V(3).Info("CDI file created", "path", filePath, "device", dev)
-	return resp, nil
-}
-
-func (ex *ExamplePlugin) NodePrepareResources(ctx context.Context, req *drapbv1alpha3.NodePrepareResourcesRequest) (*drapbv1alpha3.NodePrepareResourcesResponse, error) {
-	resp := &drapbv1alpha3.NodePrepareResourcesResponse{
-		Claims: make(map[string]*drapbv1alpha3.NodePrepareResourceResponse),
+	claimID := ClaimID{Name: claim.Name, UID: claim.UID}
+	if result, ok := ex.prepared[claimID]; ok {
+		// Idempotent call, nothing to do.
+		return result, nil
 	}
-	for _, claimReq := range req.Claims {
-		claimResp, err := ex.NodePrepareResource(ctx, &drapbv1alpha2.NodePrepareResourceRequest{
-			Namespace:      claimReq.Namespace,
-			ClaimName:      claimReq.Name,
-			ClaimUid:       claimReq.Uid,
-			ResourceHandle: claimReq.ResourceHandle,
-		})
-		if err != nil {
-			resp.Claims[claimReq.Uid] = &drapbv1alpha3.NodePrepareResourceResponse{
-				Error: err.Error(),
+
+	var devices []kubeletplugin.Device
+	for _, result := range claim.Status.Allocation.Devices.Results {
+		// Only handle allocations for the current driver.
+		if ex.driverName != result.Driver {
+			continue
+		}
+
+		baseRequestName := resourceclaim.BaseRequestRef(result.Request)
+
+		// The driver joins all env variables in the order in which
+		// they appear in results (last one wins).
+		configs := resourceclaim.ConfigForResult(claim.Status.Allocation.Devices.Config, result)
+		env := make(map[string]string)
+		for i, config := range configs {
+			// Only use configs for the current driver.
+			if config.Opaque.Driver != ex.driverName {
+				continue
 			}
-		} else {
-			resp.Claims[claimReq.Uid] = &drapbv1alpha3.NodePrepareResourceResponse{
-				CDIDevices: claimResp.CdiDevices,
+			if err := extractParameters(config.Opaque.Parameters, &env, config.Source == resourceapi.AllocationConfigSourceClass); err != nil {
+				return nil, fmt.Errorf("parameters in config #%d: %w", i, err)
 			}
 		}
+
+		// It also sets a claim_<claim name>_<request name>=true env variable.
+		// This can be used to identify which devices where mapped into a container.
+		claimReqName := "claim_" + claim.Name + "_" + baseRequestName
+		claimReqName = regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(claimReqName, "_")
+		env[claimReqName] = "true"
+
+		deviceName := "claim-" + string(claim.UID) + "-" + baseRequestName
+		vendor := ex.driverName
+		class := "test"
+		cdiDeviceID := vendor + "/" + class + "=" + deviceName
+
+		// CDI wants env variables as set of strings.
+		envs := []string{}
+		for key, val := range env {
+			envs = append(envs, key+"="+val)
+		}
+		sort.Strings(envs)
+
+		if len(envs) == 0 {
+			// CDI does not support empty ContainerEdits. For example,
+			// kubelet+crio then fail with:
+			//    CDI device injection failed: unresolvable CDI devices ...
+			//
+			// Inject nothing instead, which is supported by DRA.
+			continue
+		}
+
+		spec := &cdi.Spec{
+			Kind: vendor + "/" + class,
+			Devices: []cdi.Device{
+				{
+					Name: deviceName,
+					ContainerEdits: cdi.ContainerEdits{
+						Env: envs,
+					},
+				},
+			},
+		}
+		minVersion, err := cdi.MinimumRequiredVersion(spec)
+		if err != nil {
+			return nil, fmt.Errorf("determine CDI spec version: %w", err)
+		}
+		spec.Version = minVersion
+		filePath := ex.getJSONFilePath(claim.UID, baseRequestName)
+		buffer, err := json.Marshal(spec)
+		if err != nil {
+			return nil, fmt.Errorf("marshal spec: %w", err)
+		}
+		if err := ex.fileOps.Create(filePath, buffer); err != nil {
+			return nil, fmt.Errorf("failed to write CDI file: %w", err)
+		}
+		device := kubeletplugin.Device{
+			PoolName:     result.Pool,
+			DeviceName:   result.Device,
+			ShareID:      result.ShareID,
+			Requests:     []string{result.Request}, // May also return baseRequestName here.
+			CDIDeviceIDs: []string{cdiDeviceID},
+			Metadata: &kubeletplugin.DeviceMetadata{
+				Attributes: map[string]resourceapi.DeviceAttribute{
+					"driverName": {StringValue: &ex.driverName},
+					"pool":       {StringValue: &result.Pool},
+					"device":     {StringValue: &result.Device},
+				},
+			},
+		}
+		devices = append(devices, device)
 	}
-	return resp, nil
+
+	logger.V(3).Info("CDI file(s) created", "devices", devices)
+	ex.prepared[claimID] = devices
+	return devices, nil
+}
+
+func extractParameters(parameters runtime.RawExtension, env *map[string]string, admin bool) error {
+	if len(parameters.Raw) == 0 {
+		return nil
+	}
+	kind := "user"
+	if admin {
+		kind = "admin"
+	}
+	var data map[string]string
+	if err := json.Unmarshal(parameters.Raw, &data); err != nil {
+		return fmt.Errorf("decoding %s parameters: %w", kind, err)
+	}
+	if len(data) > 0 && *env == nil {
+		*env = make(map[string]string)
+	}
+	for key, value := range data {
+		(*env)[kind+"_"+key] = value
+	}
+	return nil
+}
+
+func (ex *ExamplePlugin) PrepareResourceClaims(ctx context.Context, claims []*resourceapi.ResourceClaim) (map[types.UID]kubeletplugin.PrepareResult, error) {
+	if failure := ex.getPrepareResourcesFailure(); failure != nil {
+		return nil, failure
+	}
+
+	result := make(map[types.UID]kubeletplugin.PrepareResult)
+	for _, claim := range claims {
+		devices, err := ex.nodePrepareResource(ctx, claim)
+		var claimResult kubeletplugin.PrepareResult
+		if err != nil {
+			claimResult.Err = err
+		} else {
+			claimResult.Devices = devices
+		}
+		result[claim.UID] = claimResult
+	}
+	return result, nil
 }
 
 // NodeUnprepareResource removes the CDI file created by
 // NodePrepareResource. It's idempotent, therefore it is not an error when that
 // file is already gone.
-func (ex *ExamplePlugin) NodeUnprepareResource(ctx context.Context, req *drapbv1alpha2.NodeUnprepareResourceRequest) (*drapbv1alpha2.NodeUnprepareResourceResponse, error) {
+func (ex *ExamplePlugin) nodeUnprepareResource(ctx context.Context, claimRef kubeletplugin.NamespacedObject) error {
+	ex.blockUnprepareResourcesMutex.Lock()
+	defer ex.blockUnprepareResourcesMutex.Unlock()
+
 	logger := klog.FromContext(ctx)
-
-	// Block to emulate plugin stuckness or slowness.
-	// By default the call will not be blocked as ex.block = false.
-	if ex.block {
-		<-ctx.Done()
-		return nil, ctx.Err()
-	}
-
-	filePath := ex.getJSONFilePath(req.ClaimUid)
-	if err := ex.fileOps.Remove(filePath); err != nil {
-		return nil, fmt.Errorf("error removing CDI file: %w", err)
-	}
-	logger.V(3).Info("CDI file removed", "path", filePath)
 
 	ex.mutex.Lock()
 	defer ex.mutex.Unlock()
-	delete(ex.prepared, ClaimID{Name: req.ClaimName, UID: req.ClaimUid})
-
-	return &drapbv1alpha2.NodeUnprepareResourceResponse{}, nil
-}
-
-func (ex *ExamplePlugin) NodeUnprepareResources(ctx context.Context, req *drapbv1alpha3.NodeUnprepareResourcesRequest) (*drapbv1alpha3.NodeUnprepareResourcesResponse, error) {
-	resp := &drapbv1alpha3.NodeUnprepareResourcesResponse{
-		Claims: make(map[string]*drapbv1alpha3.NodeUnprepareResourceResponse),
+	claimID := ClaimID{Name: claimRef.Name, UID: claimRef.UID}
+	devices, ok := ex.prepared[claimID]
+	if !ok {
+		// Idempotent call, nothing to do.
+		return nil
 	}
-	for _, claimReq := range req.Claims {
-		_, err := ex.NodeUnprepareResource(ctx, &drapbv1alpha2.NodeUnprepareResourceRequest{
-			Namespace:      claimReq.Namespace,
-			ClaimName:      claimReq.Name,
-			ClaimUid:       claimReq.Uid,
-			ResourceHandle: claimReq.ResourceHandle,
-		})
-		if err != nil {
-			resp.Claims[claimReq.Uid] = &drapbv1alpha3.NodeUnprepareResourceResponse{
-				Error: err.Error(),
+
+	for _, device := range devices {
+		// In practice we only prepare one, but let's not assume that here.
+		for _, request := range device.Requests {
+			filePath := ex.getJSONFilePath(claimRef.UID, request)
+			if err := ex.fileOps.Remove(filePath); err != nil {
+				return fmt.Errorf("error removing CDI file: %w", err)
 			}
-		} else {
-			resp.Claims[claimReq.Uid] = &drapbv1alpha3.NodeUnprepareResourceResponse{}
+			logger.V(3).Info("CDI file removed", "path", filePath)
 		}
 	}
-	return resp, nil
+
+	delete(ex.prepared, claimID)
+
+	return nil
+}
+
+func (ex *ExamplePlugin) UnprepareResourceClaims(ctx context.Context, claims []kubeletplugin.NamespacedObject) (map[types.UID]error, error) {
+	result := make(map[types.UID]error)
+
+	if failure := ex.getUnprepareResourcesFailure(); failure != nil {
+		return nil, failure
+	}
+
+	for _, claimRef := range claims {
+		err := ex.nodeUnprepareResource(ctx, claimRef)
+		result[claimRef.UID] = err
+	}
+	return result, nil
+}
+
+// UnprepareClaim manually unprepares a single resource claim on the plugin.
+// This is required in tests where kubelet intentionally bypasses unprepare (e.g. SkipNodeOperationNodeUnprepareResources)
+// so that test cleanup assertions on prepared resources can succeed.
+func (ex *ExamplePlugin) UnprepareClaim(ctx context.Context, claim *resourceapi.ResourceClaim) error {
+	return ex.nodeUnprepareResource(ctx, kubeletplugin.NamespacedObject{
+		NamespacedName: types.NamespacedName{Namespace: claim.Namespace, Name: claim.Name},
+		UID:            claim.UID,
+	})
 }
 
 func (ex *ExamplePlugin) GetPreparedResources() []ClaimID {
@@ -295,23 +556,40 @@ func (ex *ExamplePlugin) GetPreparedResources() []ClaimID {
 }
 
 func (ex *ExamplePlugin) recordGRPCCall(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
-	call := GRPCCall{
+	call := &GRPCCall{
 		FullMethod: info.FullMethod,
 		Request:    req,
 	}
 	ex.mutex.Lock()
 	ex.gRPCCalls = append(ex.gRPCCalls, call)
-	index := len(ex.gRPCCalls) - 1
 	ex.mutex.Unlock()
 
 	// We don't hold the mutex here to allow concurrent calls.
-	call.Response, call.Err = handler(ctx, req)
+	resp, err = handler(ctx, req)
 
 	ex.mutex.Lock()
-	ex.gRPCCalls[index] = call
+	call.Response, call.Err = resp, err
 	ex.mutex.Unlock()
 
-	return call.Response, call.Err
+	return resp, err
+}
+
+func (ex *ExamplePlugin) recordGRPCStream(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	call := &GRPCCall{
+		FullMethod: info.FullMethod,
+	}
+	ex.mutex.Lock()
+	ex.gRPCCalls = append(ex.gRPCCalls, call)
+	ex.mutex.Unlock()
+
+	// We don't hold the mutex here to allow concurrent calls.
+	err := handler(srv, stream)
+
+	ex.mutex.Lock()
+	call.Err = err
+	ex.mutex.Unlock()
+
+	return err
 }
 
 func (ex *ExamplePlugin) GetGRPCCalls() []GRPCCall {
@@ -320,8 +598,159 @@ func (ex *ExamplePlugin) GetGRPCCalls() []GRPCCall {
 
 	// We must return a new slice, otherwise adding new calls would become
 	// visible to the caller. We also need to copy the entries because
-	// they get mutated by recordGRPCCall.
+	// they get mutated by the interceptors.
 	calls := make([]GRPCCall, 0, len(ex.gRPCCalls))
-	calls = append(calls, ex.gRPCCalls...)
+	for _, call := range ex.gRPCCalls {
+		calls = append(calls, *call)
+	}
 	return calls
+}
+
+// ResetGRPCCalls clears the internal tracking of GRPC calls made to the plugin.
+// This is useful in tests to start with a clean slate when verifying plugin
+// registration behavior, particularly when testing registration retry scenarios.
+// A call still in flight is dropped as well; its completion does not bring it back.
+func (ex *ExamplePlugin) ResetGRPCCalls() {
+	ex.mutex.Lock()
+	defer ex.mutex.Unlock()
+	ex.gRPCCalls = nil
+}
+
+// CountCalls counts GRPC calls with the given method suffix.
+func (ex *ExamplePlugin) CountCalls(methodSuffix string) int {
+	count := 0
+	for _, call := range ex.GetGRPCCalls() {
+		if strings.HasSuffix(call.FullMethod, methodSuffix) {
+			count += 1
+		}
+	}
+	return count
+}
+
+func (ex *ExamplePlugin) UpdateStatus(ctx context.Context, resourceClaim *resourceapi.ResourceClaim) (*resourceapi.ResourceClaim, error) {
+	return ex.resourceClient.ResourceClaims(resourceClaim.Namespace).UpdateStatus(ctx, resourceClaim, metav1.UpdateOptions{})
+}
+
+// SetGetInfoError sets an error to be returned by the plugin's GetInfo call.
+// This can be used in tests to simulate a registration failure scenario,
+// allowing verification that the kubelet plugin manager retries registration
+// when GetInfo fails.
+//
+// To restore normal GetInfo behavior, call SetGetInfoError(nil).
+func (ex *ExamplePlugin) SetGetInfoError(err error) {
+	ex.d.SetGetInfoError(err)
+}
+
+// SetNotifyRegistrationStatusError sets an error to be returned by the
+// plugin's NotifyRegistrationStatus call.
+// This can be used in tests to simulate a registration failure scenario,
+// allowing verification that the kubelet plugin manager retries registration
+// when NotifyRegistrationStatus fails.
+//
+// To restore normal NotifyRegistrationStatus behavior, call SetNotifyRegistrationStatusError(nil).
+func (ex *ExamplePlugin) SetNotifyRegistrationStatusError(err error) {
+	ex.d.SetNotifyRegistrationStatusError(err)
+}
+
+// WatchHealthStatus implements [kubeletplugin.DRAPlugin] by streaming device
+// health reports using the version-neutral helper API. The helper translates
+// the reports into whichever DRAResourceHealth gRPC version the kubelet
+// supports.
+func (ex *ExamplePlugin) WatchHealthStatus(ctx context.Context, reports chan<- kubeletplugin.DeviceHealthReport) error {
+	logger := klog.FromContext(ctx)
+	logger.V(3).Info("Starting dynamic WatchHealthStatus stream")
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	// send builds the current report and delivers it, respecting cancellation.
+	// It returns false once the stream is done so the caller can stop.
+	send := func() bool {
+		report := ex.buildHealthReport()
+		logger.V(5).Info("Test driver sending health update", "report", report)
+		select {
+		case <-ctx.Done():
+			return false
+		case reports <- report:
+			return true
+		}
+	}
+
+	// Send an initial update immediately to report on pre-configured devices.
+	if !send() {
+		logger.V(3).Info("WatchHealthStatus stream canceled by kubelet")
+		return nil
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.V(3).Info("WatchHealthStatus stream canceled by kubelet")
+			return nil
+		case update, ok := <-ex.HealthControlChan:
+			if !ok {
+				logger.V(3).Info("HealthControlChan closed, exiting WatchHealthStatus stream.")
+				return nil
+			}
+			logger.V(3).Info("Received health update from control channel", "update", update)
+			ex.healthMutex.Lock()
+			key := update.PoolName + "/" + update.DeviceName
+			ex.deviceHealth[key] = deviceHealthInfo{
+				status:  update.Health,
+				message: update.Message,
+			}
+			ex.healthMutex.Unlock()
+
+			if !send() {
+				return nil
+			}
+		case <-ticker.C:
+			if !send() {
+				return nil
+			}
+		}
+	}
+}
+
+// buildHealthReport dynamically builds the health report from the current state
+// of the deviceHealth map.
+func (ex *ExamplePlugin) buildHealthReport() kubeletplugin.DeviceHealthReport {
+	devices := []kubeletplugin.DeviceHealth{}
+
+	ex.healthMutex.Lock()
+	for key, healthInfo := range ex.deviceHealth {
+		parts := strings.SplitN(key, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		var status kubeletplugin.HealthStatus
+		switch healthInfo.status {
+		case "Healthy":
+			status = kubeletplugin.HealthStatusHealthy
+		case "Unhealthy":
+			status = kubeletplugin.HealthStatusUnhealthy
+		default:
+			status = kubeletplugin.HealthStatusUnknown
+		}
+
+		devices = append(devices, kubeletplugin.DeviceHealth{
+			PoolName:    parts[0],
+			DeviceName:  parts[1],
+			Health:      status,
+			LastUpdated: time.Now(),
+			Message:     healthInfo.message,
+		})
+	}
+	ex.healthMutex.Unlock()
+
+	// Sort to ensure consistent ordering in tests.
+	sort.Slice(devices, func(i, j int) bool {
+		if devices[i].PoolName != devices[j].PoolName {
+			return devices[i].PoolName < devices[j].PoolName
+		}
+		return devices[i].DeviceName < devices[j].DeviceName
+	})
+
+	return kubeletplugin.DeviceHealthReport{Devices: devices}
 }

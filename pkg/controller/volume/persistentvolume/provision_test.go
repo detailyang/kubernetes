@@ -18,12 +18,10 @@ package persistentvolume
 
 import (
 	"errors"
-
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	"k8s.io/klog/v2/ktesting"
-	"k8s.io/kubernetes/pkg/features"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+	"k8s.io/klog/v2/ktesting"
 
 	v1 "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1"
@@ -171,8 +169,6 @@ var provision2Success = provisionCall{
 // 2. Call the syncVolume *once*.
 // 3. Compare resulting volumes with expected volumes.
 func TestProvisionSync(t *testing.T) {
-	// Default enable the HonorPVReclaimPolicy feature gate.
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.HonorPVReclaimPolicy, true)()
 	_, ctx := ktesting.NewTestContext(t)
 	tests := []controllerTest{
 		{
@@ -604,7 +600,7 @@ func TestProvisionMultiSync(t *testing.T) {
 			// Provision a volume with binding
 			name:            "12-1 - successful provision",
 			initialVolumes:  novolumes,
-			expectedVolumes: newVolumeArray("pvc-uid12-1", "1Gi", "uid12-1", "claim12-1", v1.VolumeBound, v1.PersistentVolumeReclaimDelete, classGold, volume.AnnBoundByController, volume.AnnDynamicallyProvisioned),
+			expectedVolumes: volumesWithFinalizers(newVolumeArray("pvc-uid12-1", "1Gi", "uid12-1", "claim12-1", v1.VolumeBound, v1.PersistentVolumeReclaimDelete, classGold, volume.AnnBoundByController, volume.AnnDynamicallyProvisioned), []string{volume.PVDeletionInTreeProtectionFinalizer}),
 			initialClaims:   newClaimArray("claim12-1", "uid12-1", "1Gi", "", v1.ClaimPending, &classGold),
 			expectedClaims:  newClaimArray("claim12-1", "uid12-1", "1Gi", "pvc-uid12-1", v1.ClaimBound, &classGold, volume.AnnBoundByController, volume.AnnBindCompleted, volume.AnnStorageProvisioner, volume.AnnBetaStorageProvisioner),
 			expectedEvents:  noevents,
@@ -632,7 +628,7 @@ func TestProvisionMultiSync(t *testing.T) {
 				// operationTimestamps. Rely on the existences of the start time stamp to create a PV for binding
 				if ctrl.operationTimestamps.Has("default/claim12-2") {
 					volume := newVolume("pvc-uid12-2", "1Gi", "", "", v1.VolumeAvailable, v1.PersistentVolumeReclaimRetain, classExternal)
-					ctrl.volumes.store.Add(volume) // add the volume to controller
+					require.NoError(t, ctrl.volumes.Indexer().Add(volume)) // add the volume to controller
 					reactor.AddVolume(volume)
 				}
 			}),
@@ -671,7 +667,7 @@ func TestProvisionMultiSync(t *testing.T) {
 				// operationTimestamps. Rely on the existences of the start time stamp to create a PV for binding
 				if ctrl.operationTimestamps.Has("default/claim12-4") {
 					volume := newVolume("pvc-uid12-4", "1Gi", "uid12-4", "claim12-4", v1.VolumeBound, v1.PersistentVolumeReclaimRetain, classExternal, volume.AnnBoundByController)
-					ctrl.volumes.store.Add(volume) // add the volume to controller
+					require.NoError(t, ctrl.volumes.Indexer().Add(volume)) // add the volume to controller
 					reactor.AddVolume(volume)
 				}
 			}),

@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	appsinformers "k8s.io/client-go/informers/apps/v1"
 	coordinformers "k8s.io/client-go/informers/coordination/v1"
@@ -40,19 +41,21 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	testcore "k8s.io/client-go/testing"
-	"k8s.io/klog/v2/ktesting"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/ktesting"
 	kubeletapis "k8s.io/kubelet/pkg/apis"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/nodelifecycle/scheduler"
 	"k8s.io/kubernetes/pkg/controller/testutil"
 	controllerutil "k8s.io/kubernetes/pkg/controller/util/node"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/util/node"
 	taintutils "k8s.io/kubernetes/pkg/util/taints"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 const (
-	testNodeMonitorGracePeriod = 40 * time.Second
+	testNodeMonitorGracePeriod = 50 * time.Second
 	testNodeStartupGracePeriod = 60 * time.Second
 	testNodeMonitorPeriod      = 5 * time.Second
 	testRateLimiterQPS         = float32(100000)
@@ -85,6 +88,7 @@ type nodeLifecycleController struct {
 	leaseInformer     coordinformers.LeaseInformer
 	nodeInformer      coreinformers.NodeInformer
 	daemonSetInformer appsinformers.DaemonSetInformer
+	podInformer       coreinformers.PodInformer
 }
 
 func createNodeLease(nodeName string, renewTime metav1.MicroTime) *coordv1.Lease {
@@ -94,7 +98,7 @@ func createNodeLease(nodeName string, renewTime metav1.MicroTime) *coordv1.Lease
 			Namespace: v1.NamespaceNodeLease,
 		},
 		Spec: coordv1.LeaseSpec{
-			HolderIdentity: pointer.String(nodeName),
+			HolderIdentity: ptr.To(nodeName),
 			RenewTime:      &renewTime,
 		},
 	}
@@ -121,6 +125,15 @@ func (nc *nodeLifecycleController) syncNodeStore(fakeNodeHandler *testutil.FakeN
 	return nc.nodeInformer.Informer().GetStore().Replace(newElems, "newRV")
 }
 
+func (nc *nodeLifecycleController) syncPodStore(pod *v1.Pod) error {
+	if pod == nil {
+		return nil
+	}
+	newElems := make([]interface{}, 0, 1)
+	newElems = append(newElems, pod)
+	return nc.podInformer.Informer().GetStore().Replace(newElems, "newRV")
+}
+
 func newNodeLifecycleControllerFromClient(
 	ctx context.Context,
 	kubeClient clientset.Interface,
@@ -138,11 +151,12 @@ func newNodeLifecycleControllerFromClient(
 	leaseInformer := factory.Coordination().V1().Leases()
 	nodeInformer := factory.Core().V1().Nodes()
 	daemonSetInformer := factory.Apps().V1().DaemonSets()
+	podInformer := factory.Core().V1().Pods()
 
 	nc, err := NewNodeLifecycleController(
 		ctx,
 		leaseInformer,
-		factory.Core().V1().Pods(),
+		podInformer,
 		nodeInformer,
 		daemonSetInformer,
 		kubeClient,
@@ -163,7 +177,7 @@ func newNodeLifecycleControllerFromClient(
 	nc.nodeInformerSynced = alwaysReady
 	nc.daemonSetInformerSynced = alwaysReady
 
-	return &nodeLifecycleController{nc, leaseInformer, nodeInformer, daemonSetInformer}, nil
+	return &nodeLifecycleController{nc, leaseInformer, nodeInformer, daemonSetInformer, podInformer}, nil
 }
 
 func TestMonitorNodeHealth(t *testing.T) {
@@ -785,13 +799,13 @@ func TestMonitorNodeHealth(t *testing.T) {
 
 	for testName, tt := range tests {
 		t.Run(testName, func(t *testing.T) {
-			_, ctx := ktesting.NewTestContext(t)
+			tCtx := ktesting.Init(t)
 			fakeNodeHandler := &testutil.FakeNodeHandler{
 				Existing:  tt.nodeList,
 				Clientset: fake.NewSimpleClientset(),
 			}
 			nodeController, _ := newNodeLifecycleControllerFromClient(
-				ctx,
+				tCtx,
 				fakeNodeHandler,
 				testRateLimiterQPS,
 				testRateLimiterQPS,
@@ -812,7 +826,7 @@ func TestMonitorNodeHealth(t *testing.T) {
 				if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 					t.Errorf("unexpected error: %v", err)
 				}
-				if err := nodeController.monitorNodeHealth(ctx); err != nil {
+				if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 					t.Errorf("unexpected error: %v", err)
 				}
 				if diff := cmp.Diff(wanted, nodeController.zoneStates); diff != "" {
@@ -930,10 +944,10 @@ func TestPodStatusChange(t *testing.T) {
 		},
 	}
 
-	_, ctx := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
 	for _, item := range table {
 		nodeController, _ := newNodeLifecycleControllerFromClient(
-			ctx,
+			tCtx,
 			item.fakeNodeHandler,
 			testRateLimiterQPS,
 			testRateLimiterQPS,
@@ -949,7 +963,7 @@ func TestPodStatusChange(t *testing.T) {
 		if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeHealth(ctx); err != nil {
+		if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 		if item.timeToPass > 0 {
@@ -960,19 +974,21 @@ func TestPodStatusChange(t *testing.T) {
 		if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeHealth(ctx); err != nil {
+		if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 		zones := testutil.GetZones(item.fakeNodeHandler)
-		logger, _ := ktesting.NewTestContext(t)
 		for _, zone := range zones {
-			nodeController.zoneNoExecuteTainter[zone].Try(logger, func(value scheduler.TimedValue) (bool, time.Duration) {
+			nodeController.zoneNoExecuteTainter[zone].Try(tCtx.Logger(), func(value scheduler.TimedValue) (bool, time.Duration) {
 				nodeUID, _ := value.UID.(string)
 				pods, err := nodeController.getPodsAssignedToNode(value.Value)
 				if err != nil {
 					t.Errorf("unexpected error: %v", err)
 				}
-				controllerutil.DeletePods(ctx, item.fakeNodeHandler, pods, nodeController.recorder, value.Value, nodeUID, nodeController.daemonSetStore)
+				_, err = controllerutil.DeletePods(tCtx, item.fakeNodeHandler, pods, nodeController.recorder, value.Value, nodeUID, nodeController.daemonSetStore)
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
 				return true, 0
 			})
 		}
@@ -1213,10 +1229,10 @@ func TestMonitorNodeHealthUpdateStatus(t *testing.T) {
 			expectedPodStatusUpdate: false,
 		},
 	}
-	_, ctx := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
 	for i, item := range table {
 		nodeController, _ := newNodeLifecycleControllerFromClient(
-			ctx,
+			tCtx,
 			item.fakeNodeHandler,
 			testRateLimiterQPS,
 			testRateLimiterQPS,
@@ -1232,7 +1248,7 @@ func TestMonitorNodeHealthUpdateStatus(t *testing.T) {
 		if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeHealth(ctx); err != nil {
+		if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 		if item.timeToPass > 0 {
@@ -1241,7 +1257,7 @@ func TestMonitorNodeHealthUpdateStatus(t *testing.T) {
 			if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
-			if err := nodeController.monitorNodeHealth(ctx); err != nil {
+			if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
 		}
@@ -1270,6 +1286,9 @@ func TestMonitorNodeHealthUpdateStatus(t *testing.T) {
 func TestMonitorNodeHealthUpdateNodeAndPodStatusWithLease(t *testing.T) {
 	nodeCreationTime := metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC)
 	fakeNow := metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NodeControllerLeaseCircuitBreaker, true)
+
 	testcases := []struct {
 		description             string
 		fakeNodeHandler         *testutil.FakeNodeHandler
@@ -1277,6 +1296,8 @@ func TestMonitorNodeHealthUpdateNodeAndPodStatusWithLease(t *testing.T) {
 		timeToPass              time.Duration
 		newNodeStatus           v1.NodeStatus
 		newLease                *coordv1.Lease
+		apiServerLease          *coordv1.Lease
+		newAPIServerLease       *coordv1.Lease
 		expectedRequestCount    int
 		expectedNodes           []*v1.Node
 		expectedPodStatusUpdate bool
@@ -1754,13 +1775,187 @@ func TestMonitorNodeHealthUpdateNodeAndPodStatusWithLease(t *testing.T) {
 			},
 			expectedPodStatusUpdate: true,
 		},
+		// Node created long time ago, with status updated by kubelet exceeds grace period.
+		// Node lease is expired in cache, but fresh in API server.
+		// Expect no action from node controller (within monitor grace period) because of double check.
+		{
+			description: "Node created long time ago, with status updated by kubelet exceeds grace period. Node lease is expired in cache, but fresh in API server.",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              "node0",
+							CreationTimestamp: nodeCreationTime,
+						},
+						Status: v1.NodeStatus{
+							Conditions: []v1.NodeCondition{
+								{
+									Type:               v1.NodeReady,
+									Status:             v1.ConditionTrue,
+									LastHeartbeatTime:  fakeNow,
+									LastTransitionTime: fakeNow,
+								},
+							},
+							Capacity: v1.ResourceList{
+								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+								v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+							},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			lease:      createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time)),
+			timeToPass: time.Hour,
+			newNodeStatus: v1.NodeStatus{
+				Conditions: []v1.NodeCondition{
+					{
+						Type:               v1.NodeReady,
+						Status:             v1.ConditionTrue,
+						LastHeartbeatTime:  fakeNow,
+						LastTransitionTime: fakeNow,
+					},
+				},
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+					v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+				},
+			},
+			newLease: func() *coordv1.Lease {
+				l := createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time))
+				l.ResourceVersion = "50"
+				return l
+			}(),
+			apiServerLease: func() *coordv1.Lease {
+				l := createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time))
+				l.ResourceVersion = "50"
+				return l
+			}(),
+			newAPIServerLease: func() *coordv1.Lease {
+				l := createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time.Add(time.Hour)))
+				l.ResourceVersion = "100"
+				return l
+			}(),
+			expectedRequestCount: 2, // List nodes + List nodes + GET lease (GET not counted)
+			expectedNodes: []*v1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "node0",
+						CreationTimestamp: nodeCreationTime,
+					},
+					Status: v1.NodeStatus{
+						Conditions: []v1.NodeCondition{
+							{
+								Type:               v1.NodeReady,
+								Status:             v1.ConditionTrue,
+								LastHeartbeatTime:  fakeNow,
+								LastTransitionTime: fakeNow,
+							},
+						},
+						Capacity: v1.ResourceList{
+							v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+							v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+						},
+					},
+				},
+			},
+			expectedPodStatusUpdate: false,
+		},
+		// Node lease expired in cache but fresh in API server. EnsureReady should skip on second run.
+		{
+			description: "Node lease expired in cache but fresh in API server. EnsureReady should skip on second run.",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              "node0",
+							CreationTimestamp: nodeCreationTime,
+						},
+						Status: v1.NodeStatus{
+							Conditions: []v1.NodeCondition{
+								{
+									Type:               v1.NodeReady,
+									Status:             v1.ConditionTrue,
+									LastHeartbeatTime:  fakeNow,
+									LastTransitionTime: fakeNow,
+								},
+							},
+							Capacity: v1.ResourceList{
+								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+								v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+							},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			lease: func() *coordv1.Lease {
+				l := createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time.Add(-60*time.Second)))
+				l.ResourceVersion = "50"
+				return l
+			}(),
+			timeToPass: 1 * time.Second,
+			newNodeStatus: v1.NodeStatus{
+				Conditions: []v1.NodeCondition{
+					{
+						Type:               v1.NodeReady,
+						Status:             v1.ConditionTrue,
+						LastHeartbeatTime:  fakeNow,
+						LastTransitionTime: fakeNow,
+					},
+				},
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+					v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+				},
+			},
+			newLease: func() *coordv1.Lease {
+				l := createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time.Add(-60*time.Second)))
+				l.ResourceVersion = "50"
+				return l
+			}(),
+			apiServerLease: func() *coordv1.Lease {
+				l := createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time))
+				l.ResourceVersion = "100"
+				return l
+			}(),
+			newAPIServerLease: func() *coordv1.Lease {
+				l := createNodeLease("node0", metav1.NewMicroTime(fakeNow.Time))
+				l.ResourceVersion = "100"
+				return l
+			}(),
+			expectedRequestCount: 2, // List nodes + List nodes (GET lease not counted)
+			expectedNodes: []*v1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "node0",
+						CreationTimestamp: nodeCreationTime,
+					},
+					Status: v1.NodeStatus{
+						Conditions: []v1.NodeCondition{
+							{
+								Type:               v1.NodeReady,
+								Status:             v1.ConditionTrue,
+								LastHeartbeatTime:  fakeNow,
+								LastTransitionTime: fakeNow,
+							},
+						},
+						Capacity: v1.ResourceList{
+							v1.ResourceName(v1.ResourceCPU):    resource.MustParse("10"),
+							v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+						},
+					},
+				},
+			},
+			expectedPodStatusUpdate: false,
+		},
 	}
 
 	for _, item := range testcases {
 		t.Run(item.description, func(t *testing.T) {
-			_, ctx := ktesting.NewTestContext(t)
+			tCtx := ktesting.Init(t)
 			nodeController, _ := newNodeLifecycleControllerFromClient(
-				ctx,
+				tCtx,
 				item.fakeNodeHandler,
 				testRateLimiterQPS,
 				testRateLimiterQPS,
@@ -1779,7 +1974,13 @@ func TestMonitorNodeHealthUpdateNodeAndPodStatusWithLease(t *testing.T) {
 			if err := nodeController.syncLeaseStore(item.lease); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if err := nodeController.monitorNodeHealth(ctx); err != nil {
+			if item.apiServerLease != nil {
+				_, err := item.fakeNodeHandler.CoordinationV1().Leases(v1.NamespaceNodeLease).Create(tCtx, item.apiServerLease, metav1.CreateOptions{})
+				if err != nil {
+					t.Fatalf("unexpected error creating lease in fake client: %v", err)
+				}
+			}
+			if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if item.timeToPass > 0 {
@@ -1791,7 +1992,13 @@ func TestMonitorNodeHealthUpdateNodeAndPodStatusWithLease(t *testing.T) {
 				if err := nodeController.syncLeaseStore(item.newLease); err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
-				if err := nodeController.monitorNodeHealth(ctx); err != nil {
+				if item.newAPIServerLease != nil {
+					_, err := item.fakeNodeHandler.CoordinationV1().Leases(v1.NamespaceNodeLease).Update(tCtx, item.newAPIServerLease, metav1.UpdateOptions{})
+					if err != nil {
+						t.Fatalf("unexpected error updating lease in fake client: %v", err)
+					}
+				}
+				if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
 			}
@@ -1922,10 +2129,10 @@ func TestMonitorNodeHealthMarkPodsNotReady(t *testing.T) {
 		},
 	}
 
-	_, ctx := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
 	for i, item := range table {
 		nodeController, _ := newNodeLifecycleControllerFromClient(
-			ctx,
+			tCtx,
 			item.fakeNodeHandler,
 			testRateLimiterQPS,
 			testRateLimiterQPS,
@@ -1941,7 +2148,7 @@ func TestMonitorNodeHealthMarkPodsNotReady(t *testing.T) {
 		if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeHealth(ctx); err != nil {
+		if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 			t.Errorf("Case[%d] unexpected error: %v", i, err)
 		}
 		if item.timeToPass > 0 {
@@ -1950,7 +2157,7 @@ func TestMonitorNodeHealthMarkPodsNotReady(t *testing.T) {
 			if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
-			if err := nodeController.monitorNodeHealth(ctx); err != nil {
+			if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 				t.Errorf("Case[%d] unexpected error: %v", i, err)
 			}
 		}
@@ -2017,7 +2224,7 @@ func TestMonitorNodeHealthMarkPodsNotReadyWithWorkerSize(t *testing.T) {
 		{workers: 1},
 	}
 
-	_, ctx := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
 	for i, item := range table {
 		fakeNow := metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC)
 
@@ -2027,7 +2234,7 @@ func TestMonitorNodeHealthMarkPodsNotReadyWithWorkerSize(t *testing.T) {
 		}
 
 		nodeController, _ := newNodeLifecycleControllerFromClient(
-			ctx,
+			tCtx,
 			fakeNodeHandler,
 			testRateLimiterQPS,
 			testRateLimiterQPS,
@@ -2045,7 +2252,7 @@ func TestMonitorNodeHealthMarkPodsNotReadyWithWorkerSize(t *testing.T) {
 		if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeHealth(ctx); err != nil {
+		if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 			t.Errorf("Case[%d] unexpected error: %v", i, err)
 		}
 
@@ -2071,7 +2278,7 @@ func TestMonitorNodeHealthMarkPodsNotReadyWithWorkerSize(t *testing.T) {
 		if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if err := nodeController.monitorNodeHealth(ctx); err != nil {
+		if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 			t.Errorf("Case[%d] unexpected error: %v", i, err)
 		}
 
@@ -2085,6 +2292,67 @@ func TestMonitorNodeHealthMarkPodsNotReadyWithWorkerSize(t *testing.T) {
 		if podStatusUpdates != expectedPodStatusUpdates {
 			t.Errorf("Case[%d] expect pod status updated to be %v, but got %v", i, expectedPodStatusUpdates, podStatusUpdates)
 		}
+	}
+}
+
+func TestMonitorNodeHealthRemovesDeletedNodeHealth(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	fakeNow := metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC)
+	fakeNodeHandler := &testutil.FakeNodeHandler{
+		Existing: []*v1.Node{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: fakeNow,
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node1",
+					CreationTimestamp: fakeNow,
+				},
+			},
+		},
+		Clientset: fake.NewSimpleClientset(&v1.PodList{}),
+	}
+	nodeController, _ := newNodeLifecycleControllerFromClient(
+		tCtx,
+		fakeNodeHandler,
+		testRateLimiterQPS,
+		testRateLimiterQPS,
+		testLargeClusterThreshold,
+		testUnhealthyThreshold,
+		testNodeMonitorGracePeriod,
+		testNodeStartupGracePeriod,
+		testNodeMonitorPeriod)
+	nodeController.now = func() metav1.Time { return fakeNow }
+	nodeController.recorder = testutil.NewFakeRecorder()
+	nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(fakeNodeHandler.Clientset)
+
+	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := nodeController.monitorNodeHealth(tCtx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, name := range []string{"node0", "node1"} {
+		if nodeController.nodeHealthMap.getDeepCopy(name) == nil {
+			t.Fatalf("expected node health of %s to be recorded", name)
+		}
+	}
+
+	fakeNodeHandler.Existing = fakeNodeHandler.Existing[:1]
+	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := nodeController.monitorNodeHealth(tCtx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if nodeController.nodeHealthMap.getDeepCopy("node0") == nil {
+		t.Errorf("expected node health of node0 to be kept")
+	}
+	if nodeController.nodeHealthMap.getDeepCopy("node1") != nil {
+		t.Errorf("expected node health of deleted node1 to be removed")
 	}
 }
 
@@ -2228,9 +2496,9 @@ func TestMonitorNodeHealthMarkPodsNotReadyRetry(t *testing.T) {
 
 	for _, item := range table {
 		t.Run(item.desc, func(t *testing.T) {
-			_, ctx := ktesting.NewTestContext(t)
+			tCtx := ktesting.Init(t)
 			nodeController, _ := newNodeLifecycleControllerFromClient(
-				ctx,
+				tCtx,
 				item.fakeNodeHandler,
 				testRateLimiterQPS,
 				testRateLimiterQPS,
@@ -2252,7 +2520,7 @@ func TestMonitorNodeHealthMarkPodsNotReadyRetry(t *testing.T) {
 				if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
 					t.Errorf("unexpected error: %v", err)
 				}
-				if err := nodeController.monitorNodeHealth(ctx); err != nil {
+				if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 					t.Errorf("unexpected error: %v", err)
 				}
 			}
@@ -2352,6 +2620,29 @@ func TestApplyNoExecuteTaints(t *testing.T) {
 					},
 				},
 			},
+			// NotReady Taint with NoExecute effect should not be applied to a node if the NodeCondition Type NodeReady has been set to nil in the interval between the NodeController enqueuing the node and the taint manager picking up.
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node3",
+					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels: map[string]string{
+						v1.LabelTopologyRegion:          "region1",
+						v1.LabelTopologyZone:            "zone1",
+						v1.LabelFailureDomainBetaRegion: "region1",
+						v1.LabelFailureDomainBetaZone:   "zone1",
+					},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionTrue,
+							LastHeartbeatTime:  metav1.Date(2016, 1, 1, 12, 0, 0, 0, time.UTC),
+							LastTransitionTime: metav1.Date(2016, 1, 1, 12, 0, 0, 0, time.UTC),
+						},
+					},
+				},
+			},
 		},
 		Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
 	}
@@ -2365,10 +2656,28 @@ func TestApplyNoExecuteTaints(t *testing.T) {
 			},
 		},
 	}
+	unhealthyNodeNewStatus := v1.NodeStatus{
+		Conditions: []v1.NodeCondition{
+			{
+				Type:               v1.NodeReady,
+				Status:             v1.ConditionFalse,
+				LastHeartbeatTime:  metav1.Date(2017, 1, 1, 12, 10, 0, 0, time.UTC),
+				LastTransitionTime: metav1.Date(2017, 1, 1, 12, 0, 0, 0, time.UTC),
+			},
+		},
+	}
+	overrideNodeNewStatusConditions := []v1.NodeCondition{
+		{
+			Type:               "MemoryPressure",
+			Status:             v1.ConditionUnknown,
+			LastHeartbeatTime:  metav1.Date(2017, 1, 1, 12, 10, 0, 0, time.UTC),
+			LastTransitionTime: metav1.Date(2017, 1, 1, 12, 0, 0, 0, time.UTC),
+		},
+	}
 	originalTaint := UnreachableTaintTemplate
-	_, ctx := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
 	nodeController, _ := newNodeLifecycleControllerFromClient(
-		ctx,
+		tCtx,
 		fakeNodeHandler,
 		testRateLimiterQPS,
 		testRateLimiterQPS,
@@ -2384,11 +2693,11 @@ func TestApplyNoExecuteTaints(t *testing.T) {
 	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if err := nodeController.monitorNodeHealth(ctx); err != nil {
+	if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	nodeController.doNoExecuteTaintingPass(ctx)
-	node0, err := fakeNodeHandler.Get(ctx, "node0", metav1.GetOptions{})
+	nodeController.doNoExecuteTaintingPass(tCtx)
+	node0, err := fakeNodeHandler.Get(tCtx, "node0", metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("Can't get current node0...")
 		return
@@ -2396,7 +2705,7 @@ func TestApplyNoExecuteTaints(t *testing.T) {
 	if !taintutils.TaintExists(node0.Spec.Taints, UnreachableTaintTemplate) {
 		t.Errorf("Can't find taint %v in %v", originalTaint, node0.Spec.Taints)
 	}
-	node2, err := fakeNodeHandler.Get(ctx, "node2", metav1.GetOptions{})
+	node2, err := fakeNodeHandler.Get(tCtx, "node2", metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("Can't get current node2...")
 		return
@@ -2407,9 +2716,232 @@ func TestApplyNoExecuteTaints(t *testing.T) {
 
 	// Make node3 healthy again.
 	node2.Status = healthyNodeNewStatus
-	_, err = fakeNodeHandler.UpdateStatus(ctx, node2, metav1.UpdateOptions{})
+	_, err = fakeNodeHandler.UpdateStatus(tCtx, node2, metav1.UpdateOptions{})
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Error(err.Error())
+		return
+	}
+	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if err := nodeController.monitorNodeHealth(tCtx); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	nodeController.doNoExecuteTaintingPass(tCtx)
+
+	node2, err = fakeNodeHandler.Get(tCtx, "node2", metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("Can't get current node2...")
+		return
+	}
+	// We should not see any taint on the node(especially the Not-Ready taint with NoExecute effect).
+	if taintutils.TaintExists(node2.Spec.Taints, NotReadyTaintTemplate) || len(node2.Spec.Taints) > 0 {
+		t.Errorf("Found taint %v in %v, which should not be present", NotReadyTaintTemplate, node2.Spec.Taints)
+	}
+
+	node3, err := fakeNodeHandler.Get(tCtx, "node3", metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("Can't get current node3...")
+		return
+	}
+	node3.Status = unhealthyNodeNewStatus
+	_, err = fakeNodeHandler.UpdateStatus(tCtx, node3, metav1.UpdateOptions{})
+	if err != nil {
+		t.Error(err.Error())
+		return
+	}
+	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if err := nodeController.monitorNodeHealth(tCtx); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	// Before taint manager work, the status has been replaced(maybe merge-patch replace).
+	node3.Status.Conditions = overrideNodeNewStatusConditions
+	_, err = fakeNodeHandler.UpdateStatus(tCtx, node3, metav1.UpdateOptions{})
+	if err != nil {
+		t.Error(err.Error())
+		return
+	}
+	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	nodeController.doNoExecuteTaintingPass(tCtx)
+	node3, err = fakeNodeHandler.Get(tCtx, "node3", metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("Can't get current node3...")
+		return
+	}
+	// We should not see any taint on the node(especially the Not-Ready taint with NoExecute effect).
+	if taintutils.TaintExists(node3.Spec.Taints, NotReadyTaintTemplate) || len(node3.Spec.Taints) > 0 {
+		t.Errorf("Found taint %v in %v, which should not be present", NotReadyTaintTemplate, node3.Spec.Taints)
+	}
+}
+
+// TestApplyNoExecuteTaintsToUnreachableNode ensures a NoExecute taint is applied to node that hasn't posted the
+// node status for a period greater than nodeMonitorGracePeriod.
+func TestApplyNoExecuteTaintsToUnreachableNode(t *testing.T) {
+	// TODO: Remove skip once https://github.com/kubernetes/kubernetes/pull/114607 merges.
+	if goruntime.GOOS == "windows" {
+		t.Skip("Skipping test on Windows.")
+	}
+	time1 := metav1.Date(2017, 1, 1, 12, 0, 0, 0, time.UTC)
+	// time2 is set to NodeMonitorGracePeriod plus 1 second after time1.
+	time2 := metav1.Time{Time: time1.Add(testNodeMonitorGracePeriod + time.Second)}
+
+	fakeNodeHandler := &testutil.FakeNodeHandler{
+		Existing: []*v1.Node{
+			// Unreachable Taint with effect 'NoExecute' should be applied to this node after 2015-01-01 12:00:40.
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels: map[string]string{
+						v1.LabelTopologyRegion:          "region1",
+						v1.LabelTopologyZone:            "zone1",
+						v1.LabelFailureDomainBetaRegion: "region1",
+						v1.LabelFailureDomainBetaZone:   "zone1",
+					},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionTrue,
+							LastHeartbeatTime:  time1,
+							LastTransitionTime: time1,
+						},
+					},
+				},
+			},
+			// Because of the logic that prevents NC from evicting anything when all Nodes are NotReady
+			// we need second healthy node in tests.
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node1",
+					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+					Labels: map[string]string{
+						v1.LabelTopologyRegion:          "region1",
+						v1.LabelTopologyZone:            "zone1",
+						v1.LabelFailureDomainBetaRegion: "region1",
+						v1.LabelFailureDomainBetaZone:   "zone1",
+					},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionTrue,
+							LastHeartbeatTime:  time1,
+							LastTransitionTime: time1,
+						},
+					},
+				},
+			},
+		},
+		Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+	}
+	_, ctx := ktesting.NewTestContext(t)
+	nodeController, _ := newNodeLifecycleControllerFromClient(
+		ctx,
+		fakeNodeHandler,
+		testRateLimiterQPS,
+		testRateLimiterQPS,
+		testLargeClusterThreshold,
+		testUnhealthyThreshold,
+		testNodeMonitorGracePeriod,
+		testNodeStartupGracePeriod,
+		testNodeMonitorPeriod,
+	)
+	// No taint should be added when the NodeReady conditions were not set longer ago than NodeMonitorGracePeriod.
+	nodeController.now = func() metav1.Time { return time1 }
+	nodeController.recorder = testutil.NewFakeRecorder()
+	nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(fakeNodeHandler.Clientset)
+	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if err := nodeController.monitorNodeHealth(ctx); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	nodeController.doNoExecuteTaintingPass(ctx)
+	node0, err := fakeNodeHandler.Get(ctx, "node0", metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("Can't get current node0...")
+		return
+	}
+	if len(node0.Spec.Taints) > 0 {
+		t.Errorf("Got unexpected taints %v", node0.Spec.Taints)
+	}
+	node1, err := fakeNodeHandler.Get(ctx, "node1", metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("Can't get current node1...")
+		return
+	}
+	if len(node1.Spec.Taints) > 0 {
+		t.Errorf("Got unexpected taints %v", node1.Spec.Taints)
+	}
+
+	// Advance the clock to time2 to expire the previous NodeReady condition.
+	nodeController.now = func() metav1.Time { return time2 }
+	// Only node1 sends a new heartbeat at time2.
+	node1.Status = v1.NodeStatus{
+		Conditions: []v1.NodeCondition{
+			{
+				Type:               v1.NodeReady,
+				Status:             v1.ConditionTrue,
+				LastHeartbeatTime:  time2,
+				LastTransitionTime: time1,
+			},
+		},
+	}
+	_, err = fakeNodeHandler.UpdateStatus(ctx, node1, metav1.UpdateOptions{})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+		return
+	}
+	// Unreachable taint should be added to node0 and not node1 because the former's NodeReadyCondition was set longer ago than NodeMonitorGracePeriod.
+	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if err := nodeController.monitorNodeHealth(ctx); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	nodeController.doNoExecuteTaintingPass(ctx)
+
+	node0, err = fakeNodeHandler.Get(ctx, "node0", metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("Can't get current node0...")
+		return
+	}
+	if !taintutils.TaintExists(node0.Spec.Taints, UnreachableTaintTemplate) {
+		t.Errorf("Can't find taint %v in %v", UnreachableTaintTemplate, node0.Spec.Taints)
+	}
+	node1, err = fakeNodeHandler.Get(ctx, "node1", metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("Can't get current node1...")
+		return
+	}
+	if len(node1.Spec.Taints) > 0 {
+		t.Errorf("Got unexpected taints %v", node1.Spec.Taints)
+	}
+
+	// Unreachable taint should be deleted from node0 after it sends a new heartbeat.
+	node0.Status = v1.NodeStatus{
+		Conditions: []v1.NodeCondition{
+			{
+				Type:               v1.NodeReady,
+				Status:             v1.ConditionTrue,
+				LastHeartbeatTime:  time2,
+				LastTransitionTime: time2,
+			},
+		},
+	}
+	_, err = fakeNodeHandler.UpdateStatus(ctx, node0, metav1.UpdateOptions{})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
 		return
 	}
 	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
@@ -2420,14 +2952,14 @@ func TestApplyNoExecuteTaints(t *testing.T) {
 	}
 	nodeController.doNoExecuteTaintingPass(ctx)
 
-	node2, err = fakeNodeHandler.Get(ctx, "node2", metav1.GetOptions{})
+	node0, err = fakeNodeHandler.Get(ctx, "node0", metav1.GetOptions{})
 	if err != nil {
-		t.Errorf("Can't get current node2...")
+		t.Errorf("Can't get current node0...")
 		return
 	}
-	// We should not see any taint on the node(especially the Not-Ready taint with NoExecute effect).
-	if taintutils.TaintExists(node2.Spec.Taints, NotReadyTaintTemplate) || len(node2.Spec.Taints) > 0 {
-		t.Errorf("Found taint %v in %v, which should not be present", NotReadyTaintTemplate, node2.Spec.Taints)
+	// We should not see any taint on the node.
+	if len(node0.Spec.Taints) > 0 {
+		t.Errorf("Got unexpected taints %v", node0.Spec.Taints)
 	}
 }
 
@@ -2524,9 +3056,9 @@ func TestApplyNoExecuteTaintsToNodesEnqueueTwice(t *testing.T) {
 			},
 		},
 	}
-	_, ctx := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
 	nodeController, _ := newNodeLifecycleControllerFromClient(
-		ctx,
+		tCtx,
 		fakeNodeHandler,
 		testRateLimiterQPS,
 		testRateLimiterQPS,
@@ -2543,23 +3075,23 @@ func TestApplyNoExecuteTaintsToNodesEnqueueTwice(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 	// 1. monitor node health twice, add untainted node once
-	if err := nodeController.monitorNodeHealth(ctx); err != nil {
+	if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if err := nodeController.monitorNodeHealth(ctx); err != nil {
+	if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 
 	// 2. mark node0 healthy
-	node0, err := fakeNodeHandler.Get(ctx, "node0", metav1.GetOptions{})
+	node0, err := fakeNodeHandler.Get(tCtx, "node0", metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("Can't get current node0...")
 		return
 	}
 	node0.Status = healthyNodeNewStatus
-	_, err = fakeNodeHandler.UpdateStatus(ctx, node0, metav1.UpdateOptions{})
+	_, err = fakeNodeHandler.UpdateStatus(tCtx, node0, metav1.UpdateOptions{})
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Error(err.Error())
 		return
 	}
 
@@ -2640,17 +3172,17 @@ func TestApplyNoExecuteTaintsToNodesEnqueueTwice(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 	// 3. start monitor node health again, add untainted node twice, construct UniqueQueue with duplicated node cache
-	if err := nodeController.monitorNodeHealth(ctx); err != nil {
+	if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 
 	// 4. do NoExecute taint pass
 	// when processing with node0, condition.Status is NodeReady, and return true with default case
 	// then remove the set value and queue value both, the taint job never stuck
-	nodeController.doNoExecuteTaintingPass(ctx)
+	nodeController.doNoExecuteTaintingPass(tCtx)
 
 	// 5. get node3 and node5, see if it has ready got NoExecute taint
-	node3, err := fakeNodeHandler.Get(ctx, "node3", metav1.GetOptions{})
+	node3, err := fakeNodeHandler.Get(tCtx, "node3", metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("Can't get current node3...")
 		return
@@ -2658,7 +3190,7 @@ func TestApplyNoExecuteTaintsToNodesEnqueueTwice(t *testing.T) {
 	if !taintutils.TaintExists(node3.Spec.Taints, UnreachableTaintTemplate) || len(node3.Spec.Taints) == 0 {
 		t.Errorf("Not found taint %v in %v, which should be present in %s", UnreachableTaintTemplate, node3.Spec.Taints, node3.Name)
 	}
-	node5, err := fakeNodeHandler.Get(ctx, "node5", metav1.GetOptions{})
+	node5, err := fakeNodeHandler.Get(tCtx, "node5", metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("Can't get current node5...")
 		return
@@ -2747,9 +3279,9 @@ func TestSwapUnreachableNotReadyTaints(t *testing.T) {
 	originalTaint := UnreachableTaintTemplate
 	updatedTaint := NotReadyTaintTemplate
 
-	_, ctx := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
 	nodeController, _ := newNodeLifecycleControllerFromClient(
-		ctx,
+		tCtx,
 		fakeNodeHandler,
 		testRateLimiterQPS,
 		testRateLimiterQPS,
@@ -2765,17 +3297,17 @@ func TestSwapUnreachableNotReadyTaints(t *testing.T) {
 	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if err := nodeController.monitorNodeHealth(ctx); err != nil {
+	if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	nodeController.doNoExecuteTaintingPass(ctx)
+	nodeController.doNoExecuteTaintingPass(tCtx)
 
-	node0, err := fakeNodeHandler.Get(ctx, "node0", metav1.GetOptions{})
+	node0, err := fakeNodeHandler.Get(tCtx, "node0", metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("Can't get current node0...")
 		return
 	}
-	node1, err := fakeNodeHandler.Get(ctx, "node1", metav1.GetOptions{})
+	node1, err := fakeNodeHandler.Get(tCtx, "node1", metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("Can't get current node1...")
 		return
@@ -2789,26 +3321,26 @@ func TestSwapUnreachableNotReadyTaints(t *testing.T) {
 
 	node0.Status = newNodeStatus
 	node1.Status = healthyNodeNewStatus
-	_, err = fakeNodeHandler.UpdateStatus(ctx, node0, metav1.UpdateOptions{})
+	_, err = fakeNodeHandler.UpdateStatus(tCtx, node0, metav1.UpdateOptions{})
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Error(err.Error())
 		return
 	}
-	_, err = fakeNodeHandler.UpdateStatus(ctx, node1, metav1.UpdateOptions{})
+	_, err = fakeNodeHandler.UpdateStatus(tCtx, node1, metav1.UpdateOptions{})
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Error(err.Error())
 		return
 	}
 
 	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if err := nodeController.monitorNodeHealth(ctx); err != nil {
+	if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	nodeController.doNoExecuteTaintingPass(ctx)
+	nodeController.doNoExecuteTaintingPass(tCtx)
 
-	node0, err = fakeNodeHandler.Get(ctx, "node0", metav1.GetOptions{})
+	node0, err = fakeNodeHandler.Get(tCtx, "node0", metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("Can't get current node0...")
 		return
@@ -2851,9 +3383,9 @@ func TestTaintsNodeByCondition(t *testing.T) {
 		Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
 	}
 
-	_, ctx := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
 	nodeController, _ := newNodeLifecycleControllerFromClient(
-		ctx,
+		tCtx,
 		fakeNodeHandler,
 		testRateLimiterQPS,
 		testRateLimiterQPS,
@@ -3004,11 +3536,15 @@ func TestTaintsNodeByCondition(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		fakeNodeHandler.Update(ctx, test.Node, metav1.UpdateOptions{})
+		if _, err := fakeNodeHandler.Update(tCtx, test.Node, metav1.UpdateOptions{}); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
 		if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		nodeController.doNoScheduleTaintingPass(ctx, test.Node.Name)
+		if err := nodeController.doNoScheduleTaintingPass(tCtx, test.Node.Name); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
 		if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -3054,9 +3590,9 @@ func TestNodeEventGeneration(t *testing.T) {
 		Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
 	}
 
-	_, ctx := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
 	nodeController, _ := newNodeLifecycleControllerFromClient(
-		ctx,
+		tCtx,
 		fakeNodeHandler,
 		testRateLimiterQPS,
 		testRateLimiterQPS,
@@ -3074,7 +3610,7 @@ func TestNodeEventGeneration(t *testing.T) {
 	if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if err := nodeController.monitorNodeHealth(ctx); err != nil {
+	if err := nodeController.monitorNodeHealth(tCtx); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 	if len(fakeRecorder.Events) != 1 {
@@ -3127,9 +3663,9 @@ func TestReconcileNodeLabels(t *testing.T) {
 		Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
 	}
 
-	_, ctx := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
 	nodeController, _ := newNodeLifecycleControllerFromClient(
-		ctx,
+		tCtx,
 		fakeNodeHandler,
 		testRateLimiterQPS,
 		testRateLimiterQPS,
@@ -3216,11 +3752,15 @@ func TestReconcileNodeLabels(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		fakeNodeHandler.Update(ctx, test.Node, metav1.UpdateOptions{})
+		if _, err := fakeNodeHandler.Update(tCtx, test.Node, metav1.UpdateOptions{}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		nodeController.reconcileNodeLabels(ctx, test.Node.Name)
+		if err := nodeController.reconcileNodeLabels(tCtx, test.Node.Name); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -3270,9 +3810,9 @@ func TestTryUpdateNodeHealth(t *testing.T) {
 		Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
 	}
 
-	_, ctx := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
 	nodeController, _ := newNodeLifecycleControllerFromClient(
-		ctx,
+		tCtx,
 		fakeNodeHandler,
 		testRateLimiterQPS,
 		testRateLimiterQPS,
@@ -3444,7 +3984,7 @@ func TestTryUpdateNodeHealth(t *testing.T) {
 				probeTimestamp:           test.node.CreationTimestamp,
 				readyTransitionTimestamp: test.node.CreationTimestamp,
 			})
-			_, _, currentReadyCondition, err := nodeController.tryUpdateNodeHealth(ctx, test.node)
+			_, _, currentReadyCondition, err := nodeController.tryUpdateNodeHealth(tCtx, test.node)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -3474,6 +4014,144 @@ func Test_isNodeExcludedFromDisruptionChecks(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if result := isNodeExcludedFromDisruptionChecks(tt.input); result != tt.want {
 				t.Errorf("isNodeExcludedFromDisruptionChecks() = %v, want %v", result, tt.want)
+			}
+		})
+	}
+}
+
+func TestProcessPodMarkPodNotReady(t *testing.T) {
+	fakeNow := metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	table := []struct {
+		desc                    string
+		fakeNodeHandler         *testutil.FakeNodeHandler
+		pod                     *v1.Pod
+		expectedPodStatusUpdate bool
+		monitorNodeHealth       bool
+	}{
+		{
+			desc: "Do not mark pod as NotReady when the scheduled node's healthy is not gathered yet",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              "node0",
+							CreationTimestamp: fakeNow,
+						},
+						Status: v1.NodeStatus{
+							Conditions: []v1.NodeCondition{
+								{
+									Type:               v1.NodeReady,
+									Status:             v1.ConditionFalse,
+									LastHeartbeatTime:  fakeNow,
+									LastTransitionTime: fakeNow,
+								},
+							},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			pod:                     testutil.NewPod("pod0", "node0"),
+			monitorNodeHealth:       false,
+			expectedPodStatusUpdate: false,
+		},
+		{
+			desc: "Do not mark pod as NotReady when the scheduled node is ready",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              "node0",
+							CreationTimestamp: fakeNow,
+						},
+						Status: v1.NodeStatus{
+							Conditions: []v1.NodeCondition{
+								{
+									Type:               v1.NodeReady,
+									Status:             v1.ConditionTrue,
+									LastHeartbeatTime:  fakeNow,
+									LastTransitionTime: fakeNow,
+								},
+							},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			pod:                     testutil.NewPod("pod0", "node0"),
+			monitorNodeHealth:       true,
+			expectedPodStatusUpdate: false,
+		},
+		{
+			desc: "Pod marked as NotReady when the scheduled node is not ready",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              "node0",
+							CreationTimestamp: fakeNow,
+						},
+						Status: v1.NodeStatus{
+							Conditions: []v1.NodeCondition{
+								{
+									Type:               v1.NodeReady,
+									Status:             v1.ConditionFalse,
+									LastHeartbeatTime:  fakeNow,
+									LastTransitionTime: fakeNow,
+								},
+							},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testutil.NewPod("pod0", "node0")}}),
+			},
+			pod:                     testutil.NewPod("pod0", "node0"),
+			monitorNodeHealth:       true,
+			expectedPodStatusUpdate: true,
+		},
+	}
+
+	for _, item := range table {
+		t.Run(item.desc, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+			nodeController, _ := newNodeLifecycleControllerFromClient(
+				tCtx,
+				item.fakeNodeHandler,
+				testRateLimiterQPS,
+				testRateLimiterQPS,
+				testLargeClusterThreshold,
+				testUnhealthyThreshold,
+				testNodeMonitorGracePeriod,
+				testNodeStartupGracePeriod,
+				testNodeMonitorPeriod,
+			)
+			nodeController.now = func() metav1.Time { return fakeNow }
+			nodeController.recorder = testutil.NewFakeRecorder()
+			nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(item.fakeNodeHandler.Clientset)
+			if err := nodeController.syncNodeStore(item.fakeNodeHandler); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if item.monitorNodeHealth {
+				if err := nodeController.monitorNodeHealth(tCtx); err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+
+			if err := nodeController.syncPodStore(item.pod); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			nodeController.podUpdated(nil, item.pod)
+			nodeController.processPod(tCtx, podUpdateItem{name: item.pod.Name, namespace: item.pod.Namespace})
+
+			podStatusUpdated := false
+			for _, action := range item.fakeNodeHandler.Actions() {
+				if action.GetVerb() == "update" && action.GetResource().Resource == "pods" && action.GetSubresource() == "status" {
+					podStatusUpdated = true
+				}
+			}
+			if podStatusUpdated != item.expectedPodStatusUpdate {
+				t.Errorf("expect pod status updated to be %v, but got %v", item.expectedPodStatusUpdate, podStatusUpdated)
 			}
 		})
 	}

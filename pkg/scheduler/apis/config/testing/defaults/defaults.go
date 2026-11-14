@@ -17,6 +17,9 @@ limitations under the License.
 package defaults
 
 import (
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 )
@@ -25,27 +28,32 @@ import (
 var PluginsV1 = &config.Plugins{
 	MultiPoint: config.PluginSet{
 		Enabled: []config.Plugin{
+			{Name: names.SchedulingGates},
 			{Name: names.PrioritySort},
-			{Name: names.NodeUnschedulable},
 			{Name: names.NodeName},
+			{Name: names.NodeUnschedulable},
 			{Name: names.TaintToleration, Weight: 3},
 			{Name: names.NodeAffinity, Weight: 2},
 			{Name: names.NodePorts},
+			{Name: names.DeferredPodScheduling},
 			{Name: names.NodeResourcesFit, Weight: 1},
 			{Name: names.VolumeRestrictions},
-			{Name: names.EBSLimits},
-			{Name: names.GCEPDLimits},
 			{Name: names.NodeVolumeLimits},
-			{Name: names.AzureDiskLimits},
 			{Name: names.VolumeBinding},
 			{Name: names.VolumeZone},
 			{Name: names.PodTopologySpread, Weight: 2},
 			{Name: names.InterPodAffinity, Weight: 2},
+			{Name: names.DynamicResources, Weight: 2},
 			{Name: names.DefaultPreemption},
 			{Name: names.NodeResourcesBalancedAllocation, Weight: 1},
 			{Name: names.ImageLocality, Weight: 1},
 			{Name: names.DefaultBinder},
-			{Name: names.SchedulingGates},
+			{Name: names.NodeDeclaredFeatures},
+		},
+	},
+	Reserve: config.PluginSet{
+		Disabled: []config.Plugin{
+			{Name: names.DefaultPreemption},
 		},
 	},
 }
@@ -55,6 +63,8 @@ var ExpandedPluginsV1 = &config.Plugins{
 	PreEnqueue: config.PluginSet{
 		Enabled: []config.Plugin{
 			{Name: names.SchedulingGates},
+			{Name: names.DynamicResources},
+			{Name: names.DefaultPreemption},
 		},
 	},
 	QueueSort: config.PluginSet{
@@ -64,41 +74,49 @@ var ExpandedPluginsV1 = &config.Plugins{
 	},
 	PreFilter: config.PluginSet{
 		Enabled: []config.Plugin{
+			{Name: names.NodeName},
 			{Name: names.NodeAffinity},
 			{Name: names.NodePorts},
+			{Name: names.DeferredPodScheduling},
 			{Name: names.NodeResourcesFit},
 			{Name: names.VolumeRestrictions},
-			{Name: names.EBSLimits},
-			{Name: names.GCEPDLimits},
 			{Name: names.NodeVolumeLimits},
-			{Name: names.AzureDiskLimits},
 			{Name: names.VolumeBinding},
 			{Name: names.VolumeZone},
 			{Name: names.PodTopologySpread},
 			{Name: names.InterPodAffinity},
+			{Name: names.DynamicResources},
+			{Name: names.NodeDeclaredFeatures},
 		},
 	},
 	Filter: config.PluginSet{
 		Enabled: []config.Plugin{
-			{Name: names.NodeUnschedulable},
 			{Name: names.NodeName},
+			{Name: names.NodeUnschedulable},
 			{Name: names.TaintToleration},
 			{Name: names.NodeAffinity},
 			{Name: names.NodePorts},
+			{Name: names.DeferredPodScheduling},
 			{Name: names.NodeResourcesFit},
 			{Name: names.VolumeRestrictions},
-			{Name: names.EBSLimits},
-			{Name: names.GCEPDLimits},
 			{Name: names.NodeVolumeLimits},
-			{Name: names.AzureDiskLimits},
 			{Name: names.VolumeBinding},
 			{Name: names.VolumeZone},
 			{Name: names.PodTopologySpread},
 			{Name: names.InterPodAffinity},
+			{Name: names.DynamicResources},
+			{Name: names.NodeDeclaredFeatures},
 		},
 	},
 	PostFilter: config.PluginSet{
 		Enabled: []config.Plugin{
+			{Name: names.DynamicResources},
+			{Name: names.DefaultPreemption},
+		},
+	},
+	PodGroupPostFilter: config.PluginSet{
+		Enabled: []config.Plugin{
+			{Name: names.DynamicResources},
 			{Name: names.DefaultPreemption},
 		},
 	},
@@ -107,6 +125,7 @@ var ExpandedPluginsV1 = &config.Plugins{
 			{Name: names.TaintToleration},
 			{Name: names.NodeAffinity},
 			{Name: names.NodeResourcesFit},
+			{Name: names.VolumeBinding},
 			{Name: names.PodTopologySpread},
 			{Name: names.InterPodAffinity},
 			{Name: names.NodeResourcesBalancedAllocation},
@@ -123,10 +142,6 @@ var ExpandedPluginsV1 = &config.Plugins{
 			// - This is a score coming from user preference.
 			{Name: names.NodeAffinity, Weight: 2},
 			{Name: names.NodeResourcesFit, Weight: 1},
-			// Weight is tripled because:
-			// - This is a score coming from user preference.
-			// - Usage of node tainting to group nodes in the cluster is increasing becoming a use-case
-			//	 for many user workloads
 			{Name: names.VolumeBinding, Weight: 1},
 			// Weight is doubled because:
 			// - This is a score coming from user preference.
@@ -135,6 +150,9 @@ var ExpandedPluginsV1 = &config.Plugins{
 			// Weight is doubled because:
 			// - This is a score coming from user preference.
 			{Name: names.InterPodAffinity, Weight: 2},
+			// Weight is doubled because:
+			// - This is a score coming from user preference.
+			{Name: names.DynamicResources, Weight: 2},
 			{Name: names.NodeResourcesBalancedAllocation, Weight: 1},
 			{Name: names.ImageLocality, Weight: 1},
 		},
@@ -142,16 +160,24 @@ var ExpandedPluginsV1 = &config.Plugins{
 	Reserve: config.PluginSet{
 		Enabled: []config.Plugin{
 			{Name: names.VolumeBinding},
+			{Name: names.DynamicResources},
 		},
 	},
 	PreBind: config.PluginSet{
 		Enabled: []config.Plugin{
 			{Name: names.VolumeBinding},
+			{Name: names.DynamicResources},
 		},
 	},
 	Bind: config.PluginSet{
 		Enabled: []config.Plugin{
+			{Name: names.DeferredPodScheduling},
 			{Name: names.DefaultBinder},
+		},
+	},
+	PlacementScore: config.PluginSet{
+		Enabled: []config.Plugin{
+			{Name: names.NodeResourcesFit, Weight: 1},
 		},
 	},
 }
@@ -163,6 +189,13 @@ var PluginConfigsV1 = []config.PluginConfig{
 		Args: &config.DefaultPreemptionArgs{
 			MinCandidateNodesPercentage: 10,
 			MinCandidateNodesAbsolute:   100,
+		},
+	},
+	{
+		Name: "DynamicResources",
+		Args: &config.DynamicResourcesArgs{
+			FilterTimeout:  &metav1.Duration{Duration: 10 * time.Second},
+			BindingTimeout: &metav1.Duration{Duration: 10 * time.Minute},
 		},
 	},
 	{
@@ -200,6 +233,10 @@ var PluginConfigsV1 = []config.PluginConfig{
 		Name: "VolumeBinding",
 		Args: &config.VolumeBindingArgs{
 			BindTimeoutSeconds: 600,
+			Shape: []config.UtilizationShapePoint{
+				{Utilization: 0, Score: 10},
+				{Utilization: 100, Score: 0},
+			},
 		},
 	},
 }

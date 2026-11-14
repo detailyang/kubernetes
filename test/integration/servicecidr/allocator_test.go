@@ -28,32 +28,34 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/client-go/kubernetes"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
+	"k8s.io/client-go/informers"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/ktesting"
 	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
-	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/controller/servicecidrs"
 	"k8s.io/kubernetes/test/integration/framework"
-	"k8s.io/kubernetes/test/utils/ktesting"
-	netutils "k8s.io/utils/net"
 )
 
-func TestServiceAlloc(t *testing.T) {
+func TestServiceAllocation(t *testing.T) {
 	// Create an IPv4 single stack control-plane
 	serviceCIDR := "192.168.0.0/29"
-
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	client, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.ServiceClusterIPRanges = serviceCIDR
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	s1 := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		[]string{
+			"--service-cluster-ip-range=" + serviceCIDR,
+			"--advertise-address=10.0.0.2",
+			"--disable-admission-plugins=ServiceAccount",
 		},
-	})
-	defer tearDownFn()
+		etcdOptions)
+	defer s1.TearDownFn()
+
+	client, err := clientset.NewForConfig(s1.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	svc := func(i int) *v1.Service {
 		return &v1.Service{
@@ -70,18 +72,18 @@ func TestServiceAlloc(t *testing.T) {
 	}
 
 	// Wait until the default "kubernetes" service is created.
-	if err := wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
+	if err := wait.PollUntilContextTimeout(context.Background(), 250*time.Millisecond, 15*time.Second, true, func(context.Context) (bool, error) {
 		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(context.TODO(), "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
 		return !apierrors.IsNotFound(err), nil
 	}); err != nil {
-		t.Fatalf("creating kubernetes service timed out")
+		t.Fatalf("creating kubernetes service timed out: %v", err)
 	}
 
 	// make 5 more services to take up all IPs
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if _, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(context.TODO(), svc(i), metav1.CreateOptions{}); err != nil {
 			t.Error(err)
 		}
@@ -109,29 +111,37 @@ func TestServiceAlloc(t *testing.T) {
 		t.Fatalf("got unexpected error: %v", err)
 	}
 
-	// This time creating the second service should work.
-	if _, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(context.TODO(), svc(8), metav1.CreateOptions{}); err != nil {
-		t.Fatalf("got unexpected error: %v", err)
+	// The ipallocator has an informer, and it needs to wait for the deletion to be propagated before it can allocate the IP again.
+	// This time creating the second service should work, assume a maximum of 2 seconds for the informer to catch up.
+	err = wait.PollUntilContextTimeout(context.Background(), 250*time.Millisecond, 2*time.Second, true, func(ctx context.Context) (bool, error) {
+		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svc(8), metav1.CreateOptions{})
+		return err == nil, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected creation failure: %v", err)
 	}
 }
 
-func TestServiceAllocIPAddress(t *testing.T) {
+func TestServiceAllocIPAddressLargeCIDR(t *testing.T) {
 	// Create an IPv6 single stack control-plane with a large range
 	serviceCIDR := "2001:db8::/64"
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.MultiCIDRServiceAllocator, true)()
-
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	client, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
-		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
-			opts.ServiceClusterIPRanges = serviceCIDR
-			opts.GenericServerRunOptions.AdvertiseAddress = netutils.ParseIPSloppy("2001:db8::10")
-			opts.APIEnablement.RuntimeConfig.Set("networking.k8s.io/v1alpha1=true")
+	tCtx := ktesting.Init(t)
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	s1 := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		[]string{
+			"--service-cluster-ip-range=" + serviceCIDR,
+			"--advertise-address=2001:db8::10",
+			"--disable-admission-plugins=ServiceAccount",
 		},
-	})
-	defer tearDownFn()
+		etcdOptions)
+	defer s1.TearDownFn()
+
+	client, err := clientset.NewForConfig(s1.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	svc := func(i int) *v1.Service {
 		return &v1.Service{
@@ -149,7 +159,7 @@ func TestServiceAllocIPAddress(t *testing.T) {
 
 	// Wait until the default "kubernetes" service is created.
 	if err := wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
-		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
+		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(tCtx, "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
@@ -159,12 +169,12 @@ func TestServiceAllocIPAddress(t *testing.T) {
 	}
 
 	// create 5 random services and check that the Services have an IP associated
-	for i := 0; i < 5; i++ {
-		svc, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svc(i), metav1.CreateOptions{})
+	for i := range 5 {
+		svc, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, svc(i), metav1.CreateOptions{})
 		if err != nil {
 			t.Error(err)
 		}
-		_, err = client.NetworkingV1alpha1().IPAddresses().Get(ctx, svc.Spec.ClusterIP, metav1.GetOptions{})
+		_, err = client.NetworkingV1().IPAddresses().Get(tCtx, svc.Spec.ClusterIP, metav1.GetOptions{})
 		if err != nil {
 			t.Error(err)
 		}
@@ -174,10 +184,11 @@ func TestServiceAllocIPAddress(t *testing.T) {
 	// because it is not reasonable to create 2^64 services
 	lastSvc := svc(8)
 	lastSvc.Spec.ClusterIP = "2001:db8::ffff:ffff:ffff:ffff"
-	if _, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(context.TODO(), lastSvc, metav1.CreateOptions{}); err != nil {
+	if _, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(tCtx, lastSvc, metav1.CreateOptions{}); err != nil {
 		t.Errorf("unexpected error text: %v", err)
 	}
-	_, err := client.NetworkingV1alpha1().IPAddresses().Get(context.TODO(), lastSvc.Spec.ClusterIP, metav1.GetOptions{})
+
+	_, err = client.NetworkingV1().IPAddresses().Get(context.TODO(), lastSvc.Spec.ClusterIP, metav1.GetOptions{})
 	if err != nil {
 		t.Error(err)
 	}
@@ -185,15 +196,11 @@ func TestServiceAllocIPAddress(t *testing.T) {
 }
 
 func TestMigrateService(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.MultiCIDRServiceAllocator, true)()
-	//logs.GlogSetter("7")
-
 	etcdOptions := framework.SharedEtcd()
-	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	apiServerOptions := &kubeapiservertesting.TestServerInstanceOptions{}
 	s := kubeapiservertesting.StartTestServerOrDie(t,
 		apiServerOptions,
 		[]string{
-			"--runtime-config=networking.k8s.io/v1alpha1=true",
 			"--service-cluster-ip-range=10.0.0.0/24",
 			"--advertise-address=10.1.1.1",
 			"--disable-admission-plugins=ServiceAccount",
@@ -230,23 +237,16 @@ func TestMigrateService(t *testing.T) {
 	}
 	t.Logf("Service stored in etcd %v", string(svcJSON))
 
-	kubeclient, err := kubernetes.NewForConfig(s.ClientConfig)
+	kubeclient, err := clientset.NewForConfig(s.ClientConfig)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	ns := framework.CreateNamespaceOrDie(kubeclient, namespace, t)
 	defer framework.DeleteNamespaceOrDie(kubeclient, ns, t)
 
-	// TODO: Understand why the Service can not be obtained with a List, it only works if we trigger an event
-	// by updating the Service.
-	_, err = kubeclient.CoreV1().Services(namespace).Update(context.Background(), svc, metav1.UpdateOptions{})
-	if err != nil {
-		t.Error(err)
-	}
-
 	err = wait.PollImmediate(1*time.Second, 10*time.Second, func() (bool, error) {
 		// The repair loop must create the IP address associated
-		_, err = kubeclient.NetworkingV1alpha1().IPAddresses().Get(context.TODO(), svc.Spec.ClusterIP, metav1.GetOptions{})
+		_, err = kubeclient.NetworkingV1().IPAddresses().Get(context.TODO(), svc.Spec.ClusterIP, metav1.GetOptions{})
 		if err != nil {
 			return false, nil
 		}
@@ -254,89 +254,6 @@ func TestMigrateService(t *testing.T) {
 	})
 	if err != nil {
 		t.Error(err)
-	}
-
-}
-
-func TestSkewedAllocators(t *testing.T) {
-	svc := func(i int) *v1.Service {
-		return &v1.Service{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: fmt.Sprintf("svc-%v", i),
-			},
-			Spec: v1.ServiceSpec{
-				Type: v1.ServiceTypeClusterIP,
-				Ports: []v1.ServicePort{
-					{Port: 80},
-				},
-			},
-		}
-	}
-
-	etcdOptions := framework.SharedEtcd()
-	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
-	// s1 uses IPAddress allocator
-	s1 := kubeapiservertesting.StartTestServerOrDie(t, apiServerOptions,
-		[]string{
-			"--runtime-config=networking.k8s.io/v1alpha1=true",
-			"--service-cluster-ip-range=10.0.0.0/24",
-			"--disable-admission-plugins=ServiceAccount",
-			fmt.Sprintf("--feature-gates=%s=true", features.MultiCIDRServiceAllocator)},
-		etcdOptions)
-	defer s1.TearDownFn()
-
-	kubeclient1, err := kubernetes.NewForConfig(s1.ClientConfig)
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	// create 5 random services and check that the Services have an IP associated
-	for i := 0; i < 5; i++ {
-		service, err := kubeclient1.CoreV1().Services(metav1.NamespaceDefault).Create(context.TODO(), svc(i), metav1.CreateOptions{})
-		if err != nil {
-			t.Error(err)
-			continue
-		}
-		_, err = kubeclient1.NetworkingV1alpha1().IPAddresses().Get(context.TODO(), service.Spec.ClusterIP, metav1.GetOptions{})
-		if err != nil {
-			t.Error(err)
-		}
-	}
-
-	// s2 uses bitmap allocator
-	s2 := kubeapiservertesting.StartTestServerOrDie(t, apiServerOptions,
-		[]string{
-			"--runtime-config=networking.k8s.io/v1alpha1=false",
-			"--service-cluster-ip-range=10.0.0.0/24",
-			"--disable-admission-plugins=ServiceAccount",
-			fmt.Sprintf("--feature-gates=%s=false", features.MultiCIDRServiceAllocator)},
-		etcdOptions)
-	defer s2.TearDownFn()
-
-	kubeclient2, err := kubernetes.NewForConfig(s2.ClientConfig)
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	// create 5 random services and check that the Services have an IP associated
-	for i := 5; i < 10; i++ {
-		service, err := kubeclient2.CoreV1().Services(metav1.NamespaceDefault).Create(context.TODO(), svc(i), metav1.CreateOptions{})
-		if err != nil {
-			t.Error(err)
-		}
-
-		err = wait.PollImmediate(1*time.Second, 10*time.Second, func() (bool, error) {
-			// The repair loop must create the IP address associated
-			_, err = kubeclient1.NetworkingV1alpha1().IPAddresses().Get(context.TODO(), service.Spec.ClusterIP, metav1.GetOptions{})
-			if err != nil {
-				return false, nil
-			}
-			return true, nil
-		})
-		if err != nil {
-			t.Error(err)
-		}
-
 	}
 
 }
@@ -360,29 +277,295 @@ func TestFlagsIPAllocator(t *testing.T) {
 	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
 	// s1 uses IPAddress allocator
 	s1 := kubeapiservertesting.StartTestServerOrDie(t, apiServerOptions,
-		[]string{
-			"--runtime-config=networking.k8s.io/v1alpha1=true",
-			"--service-cluster-ip-range=10.0.0.0/24",
-			fmt.Sprintf("--feature-gates=%s=true", features.MultiCIDRServiceAllocator)},
+		[]string{"--service-cluster-ip-range=10.0.0.0/24"},
 		etcdOptions)
 	defer s1.TearDownFn()
 
-	kubeclient1, err := kubernetes.NewForConfig(s1.ClientConfig)
+	kubeclient1, err := clientset.NewForConfig(s1.ClientConfig)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
 	// create 5 random services and check that the Services have an IP associated
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		service, err := kubeclient1.CoreV1().Services(metav1.NamespaceDefault).Create(context.TODO(), svc(i), metav1.CreateOptions{})
 		if err != nil {
 			t.Error(err)
 			continue
 		}
-		_, err = kubeclient1.NetworkingV1alpha1().IPAddresses().Get(context.TODO(), service.Spec.ClusterIP, metav1.GetOptions{})
+		_, err = kubeclient1.NetworkingV1().IPAddresses().Get(context.TODO(), service.Spec.ClusterIP, metav1.GetOptions{})
 		if err != nil {
 			t.Error(err)
 		}
 	}
 
+}
+
+// regression test for https://issues.k8s.io/135333
+func TestInvalidService(t *testing.T) {
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
+	s := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		[]string{
+			"--service-cluster-ip-range=10.0.0.0/24",
+			"--disable-admission-plugins=ServiceAccount",
+		},
+		etcdOptions)
+	defer s.TearDownFn()
+
+	client, err := clientset.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// ServiceCIDR controller
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resyncPeriod := 12 * time.Hour
+	informerFactory := informers.NewSharedInformerFactory(client, resyncPeriod)
+	go servicecidrs.NewController(
+		ctx,
+		informerFactory.Networking().V1().ServiceCIDRs(),
+		informerFactory.Networking().V1().IPAddresses(),
+		client,
+	).Run(ctx, 5)
+	informerFactory.Start(ctx.Done())
+	informerFactory.WaitForCacheSync(ctx.Done())
+
+	// Add a new service CIDR to be able to create new IPs.
+	cidr := makeServiceCIDR("test2", "10.168.0.0/24", "")
+	if _, err := client.NetworkingV1().ServiceCIDRs().Create(context.Background(), cidr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("got unexpected error: %v", err)
+	}
+	// wait ServiceCIDR is ready
+	if err := wait.PollUntilContextTimeout(context.Background(), 1*time.Second, time.Minute, false, func(ctx context.Context) (bool, error) {
+		cidr, err := client.NetworkingV1().ServiceCIDRs().Get(context.TODO(), cidr.Name, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		return isServiceCIDRReady(cidr), nil
+	}); err != nil {
+		t.Fatalf("waiting for service cidr ready condition %v", err)
+	}
+
+	// A service without a name keeps failing to allocate an IP address because
+	// it tries to create the IPAddress object with an invalid reference.
+	// Eventually the request times out causing high CPU usage during that time.
+	svc := &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type: v1.ServiceTypeClusterIP,
+			Ports: []v1.ServicePort{
+				{Port: 80},
+			},
+		},
+	}
+
+	// The request can not time out during the allocation and should return an invalid error instead.
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// It will fail because the service is missing a name
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svc, metav1.CreateOptions{})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if !apierrors.IsInvalid(err) {
+		t.Errorf("unexpected error reason: %v", err)
+	}
+
+}
+
+func TestLegacyServiceStatusUpdateDuplicateIP(t *testing.T) {
+	serviceCIDR := "192.168.0.0/29" // 6 usable IPs: .1 (kubernetes) and .2-.6
+	etcdOptions := framework.SharedEtcd()
+	apiServerOptions := &kubeapiservertesting.TestServerInstanceOptions{}
+	s := kubeapiservertesting.StartTestServerOrDie(t,
+		apiServerOptions,
+		[]string{
+			"--service-cluster-ip-range=" + serviceCIDR,
+			"--disable-admission-plugins=ServiceAccount",
+		},
+		etcdOptions)
+	defer s.TearDownFn()
+
+	client, err := clientset.NewForConfig(s.ClientConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Wait until the default "kubernetes" service (192.168.0.1) is created.
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 15*time.Second, true, func(context.Context) (bool, error) {
+		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return false, err
+		}
+		return !apierrors.IsNotFound(err), nil
+	}); err != nil {
+		t.Fatalf("creating kubernetes service timed out: %v", err)
+	}
+
+	// Store a legacy pre-1.20 Service directly in etcd with only spec.clusterIP set
+	// (spec.clusterIPs and spec.ipFamilies unset).
+	legacyServiceName := "legacy-lb-service"
+	legacyIP := "192.168.0.2"
+	legacySvc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              legacyServiceName,
+			Namespace:         metav1.NamespaceDefault,
+			CreationTimestamp: metav1.NewTime(time.Now().Add(1 * time.Hour)),
+			UID:               "08675309-9376-9376-9376-086753099999",
+		},
+		Spec: v1.ServiceSpec{
+			ClusterIP: legacyIP,
+			Type:      v1.ServiceTypeLoadBalancer,
+			Ports: []v1.ServicePort{
+				{
+					Name:     "http",
+					Port:     80,
+					NodePort: 30080,
+					Protocol: v1.ProtocolTCP,
+				},
+			},
+		},
+	}
+	svcJSON, err := runtime.Encode(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), legacySvc)
+	if err != nil {
+		t.Fatalf("Failed creating service JSON: %v", err)
+	}
+	key := "/" + etcdOptions.Prefix + "/services/specs/" + metav1.NamespaceDefault + "/" + legacyServiceName
+	if _, err := s.EtcdClient.Put(ctx, key, string(svcJSON)); err != nil {
+		t.Fatalf("Failed writing legacy service to etcd: %v", err)
+	}
+
+	// Wait for the repair controller to ensure IPAddress/192.168.0.2 exists for legacy-lb-service.
+	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		ipAddr, err := client.NetworkingV1().IPAddresses().Get(ctx, legacyIP, metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		return ipAddr.Spec.ParentRef != nil && ipAddr.Spec.ParentRef.Name == legacyServiceName, nil
+	}); err != nil {
+		t.Fatalf("timed out waiting for IPAddress %s to be created by repair controller: %v", legacyIP, err)
+	}
+
+	// Allocate the remaining 4 IPs in 192.168.0.0/29 (.3, .4, .5, .6).
+	for i := range 4 {
+		svcObj := &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("filler-svc-%d", i),
+			},
+			Spec: v1.ServiceSpec{
+				Type: v1.ServiceTypeClusterIP,
+				Ports: []v1.ServicePort{
+					{Port: 80},
+				},
+			},
+		}
+		if _, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, svcObj, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("failed to create filler-svc-%d: %v", i, err)
+		}
+	}
+
+	// Confirm the /29 range is now completely full.
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, makeService("should-fail-full"), metav1.CreateOptions{})
+	if err == nil || !strings.Contains(err.Error(), "range is full") {
+		t.Fatalf("expected 'range is full' error when CIDR is exhausted, got: %v", err)
+	}
+
+	// Start a watch on Services to observe the watch.Modified event emitted by UpdateStatus.
+	svcList, err := client.CoreV1().Services(metav1.NamespaceDefault).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to LIST services: %v", err)
+	}
+	gotLegacySvc, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, legacyServiceName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to GET legacy service: %v", err)
+	}
+	watchCtx, watchCancel := context.WithCancel(ctx)
+	defer watchCancel()
+	w, err := client.CoreV1().Services(metav1.NamespaceDefault).Watch(watchCtx, metav1.ListOptions{
+		ResourceVersion: svcList.ResourceVersion,
+	})
+	if err != nil {
+		t.Fatalf("failed to start service watch: %v", err)
+	}
+	defer w.Stop()
+
+	// Patch/Update the legacy Service's status (simulating cloud-controller-manager service-controller).
+	gotLegacySvc.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: "192.0.2.100"}}
+	if _, err := client.CoreV1().Services(metav1.NamespaceDefault).UpdateStatus(ctx, gotLegacySvc, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("UpdateStatus on legacy service failed: %v", err)
+	}
+
+	// Inspect the watched Service from the live watch event.
+	for {
+		select {
+		case event := <-w.ResultChan():
+			watchedSvc, ok := event.Object.(*v1.Service)
+			if !ok {
+				t.Fatalf("unexpected watch event (%v) object: %#v", event.Type, event.Object)
+			}
+			if watchedSvc.Name != legacyServiceName {
+				continue
+			}
+			if len(watchedSvc.Spec.ClusterIPs) == 0 {
+				t.Errorf("watched Service %s is missing Spec.ClusterIPs (got %v) even though Spec.ClusterIP=%q",
+					watchedSvc.Name, watchedSvc.Spec.ClusterIPs, watchedSvc.Spec.ClusterIP)
+			}
+			if len(watchedSvc.Spec.IPFamilies) == 0 {
+				t.Errorf("watched Service %s is missing Spec.IPFamilies (got %v)", watchedSvc.Name, watchedSvc.Spec.IPFamilies)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for watch event after UpdateStatus")
+		}
+		break
+	}
+	w.Stop()
+	watchCancel()
+
+	// Trigger ipallocator-repair-controller's IPAddress reconciliation (simulating the periodic resync).
+	ipAddr, err := client.NetworkingV1().IPAddresses().Get(ctx, legacyIP, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get IPAddress %s: %v", legacyIP, err)
+	}
+	if ipAddr.Annotations == nil {
+		ipAddr.Annotations = map[string]string{}
+	}
+	ipAddr.Annotations["resync-trigger"] = "true"
+	if _, err := client.NetworkingV1().IPAddresses().Update(ctx, ipAddr, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("failed to update IPAddress %s annotation: %v", legacyIP, err)
+	}
+
+	// Verify that the repair controller does not delete IPAddress/192.168.0.2 or allow
+	// a new Service to steal the IP address.
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 2*time.Second, true, func(ctx context.Context) (bool, error) {
+		_, getErr := client.NetworkingV1().IPAddresses().Get(ctx, legacyIP, metav1.GetOptions{})
+		if apierrors.IsNotFound(getErr) {
+			return true, nil
+		}
+		return false, nil
+	})
+	if err == nil {
+		// IPAddress was erroneously deleted by the repair controller!
+		// Attempt to create a new Service to show it steals 192.168.0.2.
+		var duplicateSvc *v1.Service
+		_ = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 3*time.Second, true, func(ctx context.Context) (bool, error) {
+			var createErr error
+			duplicateSvc, createErr = client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, makeService("new-service"), metav1.CreateOptions{})
+			return createErr == nil, nil
+		})
+		if duplicateSvc != nil {
+			t.Fatalf("IPAddress %s was erroneously deleted by repair controller and re-allocated to %s (both %s and %s now have ClusterIP %s!)",
+				legacyIP, duplicateSvc.Name, legacyServiceName, duplicateSvc.Name, duplicateSvc.Spec.ClusterIP)
+		}
+		t.Fatalf("IPAddress %s was erroneously deleted by repair controller after UpdateStatus on legacy service", legacyIP)
+	}
+
+	// Confirm the /29 range is still completely full and IPAddress/192.168.0.2 still belongs to legacy-lb-service.
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(ctx, makeService("new-service"), metav1.CreateOptions{})
+	if err == nil || !strings.Contains(err.Error(), "range is full") {
+		t.Fatalf("expected 'range is full' error when CIDR is exhausted, got: %v", err)
+	}
 }

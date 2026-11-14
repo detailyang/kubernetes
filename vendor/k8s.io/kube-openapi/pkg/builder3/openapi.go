@@ -156,7 +156,9 @@ func (o *openAPI) buildRequestBody(parameters []common.Parameter, consumes []str
 			}
 			r := &spec3.RequestBody{
 				RequestBodyProps: spec3.RequestBodyProps{
-					Content: map[string]*spec3.MediaType{},
+					Content:     map[string]*spec3.MediaType{},
+					Description: param.Description(),
+					Required:    param.Required(),
 				},
 			}
 			for _, consume := range consumes {
@@ -172,9 +174,9 @@ func (o *openAPI) buildRequestBody(parameters []common.Parameter, consumes []str
 	return nil, nil
 }
 
-func newOpenAPI(config *common.Config) openAPI {
+func newOpenAPI(config *common.OpenAPIV3Config) openAPI {
 	o := openAPI{
-		config: common.ConvertConfigToV3(config),
+		config: config,
 		spec: &spec3.OpenAPI{
 			Version: "3.0.0",
 			Info:    config.Info,
@@ -203,20 +205,8 @@ func newOpenAPI(config *common.Config) openAPI {
 	}
 
 	if o.config.GetOperationIDAndTagsFromRoute == nil {
-		// Map the deprecated handler to the common interface, if provided.
-		if o.config.GetOperationIDAndTags != nil {
-			o.config.GetOperationIDAndTagsFromRoute = func(r common.Route) (string, []string, error) {
-				restfulRouteAdapter, ok := r.(*restfuladapter.RouteAdapter)
-				if !ok {
-					return "", nil, fmt.Errorf("config.GetOperationIDAndTags specified but route is not a restful v1 Route")
-				}
-
-				return o.config.GetOperationIDAndTags(restfulRouteAdapter.Route)
-			}
-		} else {
-			o.config.GetOperationIDAndTagsFromRoute = func(r common.Route) (string, []string, error) {
-				return r.OperationName(), nil, nil
-			}
+		o.config.GetOperationIDAndTagsFromRoute = func(r common.Route) (string, []string, error) {
+			return r.OperationName(), nil, nil
 		}
 	}
 
@@ -283,7 +273,10 @@ func (o *openAPI) buildOpenAPISpec(webServices []common.RouteContainer) error {
 			sortParameters(pathItem.Parameters)
 
 			for _, route := range routes {
-				op, _ := o.buildOperations(route, inPathCommonParamsMap)
+				op, err := o.buildOperations(route, inPathCommonParamsMap)
+				if err != nil {
+					return err
+				}
 				sortParameters(op.Parameters)
 
 				switch strings.ToUpper(route.Method()) {
@@ -313,16 +306,19 @@ func (o *openAPI) buildOpenAPISpec(webServices []common.RouteContainer) error {
 // BuildOpenAPISpec builds OpenAPI v3 spec given a list of route containers and common.Config to customize it.
 //
 // Deprecated: BuildOpenAPISpecFromRoutes should be used instead.
-func BuildOpenAPISpec(webServices []*restful.WebService, config *common.Config) (*spec3.OpenAPI, error) {
+func BuildOpenAPISpec(webServices []*restful.WebService, config *common.OpenAPIV3Config) (*spec3.OpenAPI, error) {
 	return BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(webServices), config)
 }
 
 // BuildOpenAPISpecFromRoutes builds OpenAPI v3 spec given a list of route containers and common.Config to customize it.
-func BuildOpenAPISpecFromRoutes(webServices []common.RouteContainer, config *common.Config) (*spec3.OpenAPI, error) {
+func BuildOpenAPISpecFromRoutes(webServices []common.RouteContainer, config *common.OpenAPIV3Config) (*spec3.OpenAPI, error) {
 	a := newOpenAPI(config)
 	err := a.buildOpenAPISpec(webServices)
 	if err != nil {
 		return nil, err
+	}
+	if config.PostProcessSpec != nil {
+		return config.PostProcessSpec(a.spec)
 	}
 	return a.spec, nil
 }
@@ -330,7 +326,7 @@ func BuildOpenAPISpecFromRoutes(webServices []common.RouteContainer, config *com
 // BuildOpenAPIDefinitionsForResource builds a partial OpenAPI spec given a sample object and common.Config to customize it.
 // BuildOpenAPIDefinitionsForResources returns the OpenAPI spec which includes the definitions for the
 // passed type names.
-func BuildOpenAPIDefinitionsForResources(config *common.Config, names ...string) (map[string]*spec.Schema, error) {
+func BuildOpenAPIDefinitionsForResources(config *common.OpenAPIV3Config, names ...string) (map[string]*spec.Schema, error) {
 	o := newOpenAPI(config)
 	// We can discard the return value of toSchema because all we care about is the side effect of calling it.
 	// All the models created for this resource get added to o.swagger.Definitions
@@ -428,7 +424,8 @@ func (o *openAPI) buildParameter(restParam common.Parameter) (ret *spec3.Paramet
 
 func (o *openAPI) buildDefinitionRecursively(name string) error {
 	uniqueName, extensions := o.config.GetDefinitionName(name)
-	if _, ok := o.spec.Components.Schemas[uniqueName]; ok {
+	escapedName := common.EscapeJsonPointer(uniqueName)
+	if _, ok := o.spec.Components.Schemas[escapedName]; ok {
 		return nil
 	}
 	if item, ok := o.definitions[name]; ok {
@@ -448,7 +445,7 @@ func (o *openAPI) buildDefinitionRecursively(name string) error {
 		// delete the embedded v2 schema if exists, otherwise no-op
 		delete(schema.VendorExtensible.Extensions, common.ExtensionV2Schema)
 		schema = builderutil.WrapRefs(schema)
-		o.spec.Components.Schemas[uniqueName] = schema
+		o.spec.Components.Schemas[escapedName] = schema
 		for _, v := range item.Dependencies {
 			if err := o.buildDefinitionRecursively(v); err != nil {
 				return err

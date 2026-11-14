@@ -19,9 +19,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/pkg/v3/httputil"
@@ -36,6 +38,13 @@ var (
 	ErrLeaseHTTPTimeout = errors.New("waiting for node to catch up its applied index has timed out")
 )
 
+// maxLeaseHTTPRequestSize bounds how much of a request body ServeHTTP will
+// read into memory. Legitimate LeaseKeepAliveRequest and LeaseInternalRequest
+// messages only carry a lease ID (and a bool flag), so this is generous
+// headroom, not a realistic size. Matches connReadLimitByte in
+// server/etcdserver/api/rafthttp/http.go for consistency.
+const maxLeaseHTTPRequestSize = 64 * 1024
+
 // NewHandler returns an http Handler for lease renewals
 func NewHandler(l lease.Lessor, waitch func() <-chan struct{}) http.Handler {
 	return &leaseHandler{l, waitch}
@@ -47,14 +56,19 @@ type leaseHandler struct {
 }
 
 func (h *leaseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
+	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	defer r.Body.Close()
-	b, err := ioutil.ReadAll(r.Body)
+	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxLeaseHTTPRequestSize))
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "error reading body", http.StatusBadRequest)
 		return
 	}
@@ -63,7 +77,7 @@ func (h *leaseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case LeasePrefix:
 		lreq := pb.LeaseKeepAliveRequest{}
-		if uerr := lreq.Unmarshal(b); uerr != nil {
+		if uerr := proto.Unmarshal(b, &lreq); uerr != nil {
 			http.Error(w, "error unmarshalling request", http.StatusBadRequest)
 			return
 		}
@@ -73,9 +87,10 @@ func (h *leaseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, ErrLeaseHTTPTimeout.Error(), http.StatusRequestTimeout)
 			return
 		}
+		// gofail: var beforeServeHTTPLeaseRenew struct{}
 		ttl, rerr := h.l.Renew(lease.LeaseID(lreq.ID))
 		if rerr != nil {
-			if rerr == lease.ErrLeaseNotFound {
+			if errors.Is(rerr, lease.ErrLeaseNotFound) {
 				http.Error(w, rerr.Error(), http.StatusNotFound)
 				return
 			}
@@ -85,7 +100,7 @@ func (h *leaseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		// TODO: fill out ResponseHeader
 		resp := &pb.LeaseKeepAliveResponse{ID: lreq.ID, TTL: ttl}
-		v, err = resp.Marshal()
+		v, err = proto.Marshal(resp)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -93,7 +108,7 @@ func (h *leaseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	case LeaseInternalPrefix:
 		lreq := leasepb.LeaseInternalRequest{}
-		if lerr := lreq.Unmarshal(b); lerr != nil {
+		if lerr := proto.Unmarshal(b, &lreq); lerr != nil {
 			http.Error(w, "error unmarshalling request", http.StatusBadRequest)
 			return
 		}
@@ -103,6 +118,9 @@ func (h *leaseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, ErrLeaseHTTPTimeout.Error(), http.StatusRequestTimeout)
 			return
 		}
+
+		// gofail: var beforeLookupWhenForwardLeaseTimeToLive struct{}
+
 		l := h.l.Lookup(lease.LeaseID(lreq.LeaseTimeToLiveRequest.ID))
 		if l == nil {
 			http.Error(w, lease.ErrLeaseNotFound.Error(), http.StatusNotFound)
@@ -126,7 +144,15 @@ func (h *leaseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resp.LeaseTimeToLiveResponse.Keys = kbs
 		}
 
-		v, err = resp.Marshal()
+		// The leasor could be demoted if leader changed during lookup.
+		// We should return error to force retry instead of returning
+		// incorrect remaining TTL.
+		if l.Demoted() {
+			http.Error(w, lease.ErrNotPrimary.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		v, err = proto.Marshal(resp)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -145,18 +171,23 @@ func (h *leaseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // TODO: Batch request in future?
 func RenewHTTP(ctx context.Context, id lease.LeaseID, url string, rt http.RoundTripper) (int64, error) {
 	// will post lreq protobuf to leader
-	lreq, err := (&pb.LeaseKeepAliveRequest{ID: int64(id)}).Marshal()
+	lreq, err := proto.Marshal(&pb.LeaseKeepAliveRequest{ID: int64(id)})
 	if err != nil {
 		return -1, err
 	}
 
-	cc := &http.Client{Transport: rt}
-	req, err := http.NewRequest("POST", url, bytes.NewReader(lreq))
+	cc := &http.Client{
+		Transport: rt,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(lreq))
 	if err != nil {
 		return -1, err
 	}
+	req = req.WithContext(ctx)
 	req.Header.Set("Content-Type", "application/protobuf")
-	req.Cancel = ctx.Done()
 
 	resp, err := cc.Do(req)
 	if err != nil {
@@ -176,12 +207,12 @@ func RenewHTTP(ctx context.Context, id lease.LeaseID, url string, rt http.RoundT
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return -1, fmt.Errorf("lease: unknown error(%s)", string(b))
+		return -1, fmt.Errorf("lease: unknown error(%s)", b)
 	}
 
 	lresp := &pb.LeaseKeepAliveResponse{}
-	if err := lresp.Unmarshal(b); err != nil {
-		return -1, fmt.Errorf(`lease: %v. data = "%s"`, err, string(b))
+	if err := proto.Unmarshal(b, lresp); err != nil {
+		return -1, fmt.Errorf(`lease: %w. data = "%s"`, err, b)
 	}
 	if lresp.ID != int64(id) {
 		return -1, fmt.Errorf("lease: renew id mismatch")
@@ -192,17 +223,17 @@ func RenewHTTP(ctx context.Context, id lease.LeaseID, url string, rt http.RoundT
 // TimeToLiveHTTP retrieves lease information of the given lease ID.
 func TimeToLiveHTTP(ctx context.Context, id lease.LeaseID, keys bool, url string, rt http.RoundTripper) (*leasepb.LeaseInternalResponse, error) {
 	// will post lreq protobuf to leader
-	lreq, err := (&leasepb.LeaseInternalRequest{
+	lreq, err := proto.Marshal(&leasepb.LeaseInternalRequest{
 		LeaseTimeToLiveRequest: &pb.LeaseTimeToLiveRequest{
 			ID:   int64(id),
 			Keys: keys,
 		},
-	}).Marshal()
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(lreq))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(lreq))
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +241,12 @@ func TimeToLiveHTTP(ctx context.Context, id lease.LeaseID, keys bool, url string
 
 	req = req.WithContext(ctx)
 
-	cc := &http.Client{Transport: rt}
+	cc := &http.Client{
+		Transport: rt,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	var b []byte
 	// buffer errc channel so that errc don't block inside the go routinue
 	resp, err := cc.Do(req)
@@ -232,17 +268,33 @@ func TimeToLiveHTTP(ctx context.Context, id lease.LeaseID, keys bool, url string
 	}
 
 	lresp := &leasepb.LeaseInternalResponse{}
-	if err := lresp.Unmarshal(b); err != nil {
-		return nil, fmt.Errorf(`lease: %v. data = "%s"`, err, string(b))
+	if err := proto.Unmarshal(b, lresp); err != nil {
+		return nil, fmt.Errorf(`lease: %w. data = "%s"`, err, string(b))
 	}
 	if lresp.LeaseTimeToLiveResponse.ID != int64(id) {
-		return nil, fmt.Errorf("lease: renew id mismatch")
+		return nil, fmt.Errorf("lease: TTL id mismatch")
 	}
 	return lresp, nil
 }
 
+// maxLeaseHTTPResponseSize bounds how much of a lease HTTP response body
+// readResponse will read into memory. Unlike requests, a legitimate
+// LeaseInternalResponse can carry every key attached to a lease, so this
+// ceiling is deliberately generous -- it only guards against a misbehaving
+// or compromised peer forcing unbounded memory growth, not against large but
+// legitimate responses.
+const maxLeaseHTTPResponseSize = 100 * 1024 * 1024
+
 func readResponse(resp *http.Response) (b []byte, err error) {
-	b, err = ioutil.ReadAll(resp.Body)
+	b, err = io.ReadAll(io.LimitReader(resp.Body, maxLeaseHTTPResponseSize+1))
+	if err != nil {
+		httputil.GracefulClose(resp)
+		return nil, err
+	}
+	if len(b) > maxLeaseHTTPResponseSize {
+		resp.Body.Close()
+		return nil, fmt.Errorf("lease: response body exceeds %d bytes limit", maxLeaseHTTPResponseSize)
+	}
 	httputil.GracefulClose(resp)
-	return
+	return b, nil
 }

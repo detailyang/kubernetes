@@ -136,7 +136,7 @@ fi
 
 if [[ -d "./kubernetes" ]]; then
   if [[ -z "${KUBERNETES_SKIP_CONFIRM-}" ]]; then
-    echo "'kubernetes' directory already exist. Should we skip download step and start to create cluster based on it? [Y]/n"
+    echo "'kubernetes' directory already exists. Should we skip download step and start to create cluster based on it? [Y]/n"
     read -r confirm
     if [[ ! "${confirm}" =~ ^[nN]$ ]]; then
       echo "Skipping download step."
@@ -242,8 +242,8 @@ if [[ -z "${KUBERNETES_SKIP_CONFIRM-}" ]]; then
 fi
 
 if "${need_download}"; then
-  if [[ $(which gsutil) ]] && [[ "$kubernetes_tar_url" =~ ^https://storage.googleapis.com/.* ]]; then
-    gsutil cp "${kubernetes_tar_url//'https://storage.googleapis.com/'/gs://}" "${file}"
+  if [[ $(which gcloud) ]] && [[ "$kubernetes_tar_url" =~ ^https://storage.googleapis.com/.* ]]; then
+    gcloud storage cp "${kubernetes_tar_url//'https://storage.googleapis.com/'/gs://}" "${file}"
   elif [[ $(which curl) ]]; then
     # if the url belongs to GCS API we should use oauth2_token in the headers
     curl_headers=""
@@ -255,7 +255,7 @@ if "${need_download}"; then
   elif [[ $(which wget) ]]; then
     wget "${kubernetes_tar_url}"
   else
-    echo "Couldn't find gsutil, curl, or wget.  Bailing out."
+    echo "Couldn't find gcloud, curl, or wget.  Bailing out."
     exit 1
   fi
 fi

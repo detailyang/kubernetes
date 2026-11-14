@@ -17,6 +17,7 @@ limitations under the License.
 package options
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -26,31 +27,46 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/spf13/pflag"
 
-	eventv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/version"
+
+	"k8s.io/apiserver/pkg/apis/apiserver"
 	apiserveroptions "k8s.io/apiserver/pkg/server/options"
+	basecompatibility "k8s.io/component-base/compatibility"
+
+	componentbaseconfig "k8s.io/component-base/config"
+	"k8s.io/component-base/featuregate"
+	"k8s.io/component-base/logs"
+	"k8s.io/component-base/metrics"
+
 	cpconfig "k8s.io/cloud-provider/config"
 	serviceconfig "k8s.io/cloud-provider/controllers/service/config"
 	cpoptions "k8s.io/cloud-provider/options"
-	componentbaseconfig "k8s.io/component-base/config"
-	"k8s.io/component-base/logs"
-	"k8s.io/component-base/metrics"
+
+	eventv1 "k8s.io/api/events/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	clientgofeaturegate "k8s.io/client-go/features"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	cmconfig "k8s.io/controller-manager/config"
 	cmoptions "k8s.io/controller-manager/options"
+	cmfeatures "k8s.io/controller-manager/pkg/features"
 	migration "k8s.io/controller-manager/pkg/leadermigration/options"
-	netutils "k8s.io/utils/net"
-
 	kubecontrollerconfig "k8s.io/kubernetes/cmd/kube-controller-manager/app/config"
 	kubectrlmgrconfig "k8s.io/kubernetes/pkg/controller/apis/config"
 	csrsigningconfig "k8s.io/kubernetes/pkg/controller/certificates/signer/config"
 	cronjobconfig "k8s.io/kubernetes/pkg/controller/cronjob/config"
 	daemonconfig "k8s.io/kubernetes/pkg/controller/daemon/config"
 	deploymentconfig "k8s.io/kubernetes/pkg/controller/deployment/config"
+	devicetaintevictionconfig "k8s.io/kubernetes/pkg/controller/devicetainteviction/config"
+	disruptionconfig "k8s.io/kubernetes/pkg/controller/disruption/config"
 	endpointconfig "k8s.io/kubernetes/pkg/controller/endpoint/config"
 	endpointsliceconfig "k8s.io/kubernetes/pkg/controller/endpointslice/config"
 	endpointslicemirroringconfig "k8s.io/kubernetes/pkg/controller/endpointslicemirroring/config"
+	evictionrequestconfig "k8s.io/kubernetes/pkg/controller/evictionrequest/config"
 	garbagecollectorconfig "k8s.io/kubernetes/pkg/controller/garbagecollector/config"
+	imperativeevictionresponderconfig "k8s.io/kubernetes/pkg/controller/imperativeevictionresponder/config"
 	jobconfig "k8s.io/kubernetes/pkg/controller/job/config"
 	namespaceconfig "k8s.io/kubernetes/pkg/controller/namespace/config"
 	nodeipamconfig "k8s.io/kubernetes/pkg/controller/nodeipam/config"
@@ -59,6 +75,7 @@ import (
 	podgcconfig "k8s.io/kubernetes/pkg/controller/podgc/config"
 	replicasetconfig "k8s.io/kubernetes/pkg/controller/replicaset/config"
 	replicationconfig "k8s.io/kubernetes/pkg/controller/replication/config"
+	resourceclaimconfig "k8s.io/kubernetes/pkg/controller/resourceclaim/config"
 	resourcequotaconfig "k8s.io/kubernetes/pkg/controller/resourcequota/config"
 	serviceaccountconfig "k8s.io/kubernetes/pkg/controller/serviceaccount/config"
 	statefulsetconfig "k8s.io/kubernetes/pkg/controller/statefulset/config"
@@ -67,6 +84,8 @@ import (
 	attachdetachconfig "k8s.io/kubernetes/pkg/controller/volume/attachdetach/config"
 	ephemeralvolumeconfig "k8s.io/kubernetes/pkg/controller/volume/ephemeral/config"
 	persistentvolumeconfig "k8s.io/kubernetes/pkg/controller/volume/persistentvolume/config"
+	kubefeatures "k8s.io/kubernetes/pkg/features"
+	netutils "k8s.io/utils/net"
 )
 
 var args = []string{
@@ -88,18 +107,23 @@ var args = []string{
 	"--cluster-signing-legacy-unknown-cert-file=/cluster-signing-legacy-unknown/cert-file",
 	"--cluster-signing-legacy-unknown-key-file=/cluster-signing-legacy-unknown/key-file",
 	"--concurrent-deployment-syncs=10",
+	"--concurrent-disruption-syncs=10",
+	"--concurrent-device-taint-eviction-syncs=10",
+	"--concurrent-resourceclaim-syncs=10",
+	"--concurrent-daemonset-syncs=10",
 	"--concurrent-horizontal-pod-autoscaler-syncs=10",
 	"--concurrent-statefulset-syncs=15",
 	"--concurrent-endpoint-syncs=10",
 	"--concurrent-ephemeralvolume-syncs=10",
+	"--concurrent-eviction-request-syncs=10",
 	"--concurrent-service-endpoint-syncs=10",
 	"--concurrent-gc-syncs=30",
 	"--concurrent-namespace-syncs=20",
+	"--concurrent-imperative-eviction-responder-syncs=17",
 	"--concurrent-job-syncs=10",
 	"--concurrent-cron-job-syncs=10",
 	"--concurrent-replicaset-syncs=10",
 	"--concurrent-resource-quota-syncs=10",
-	"--concurrent-service-syncs=2",
 	"--concurrent-serviceaccount-token-syncs=10",
 	"--concurrent_rc_syncs=10",
 	"--concurrent-validating-admission-policy-status-syncs=9",
@@ -113,11 +137,7 @@ var args = []string{
 	"--enable-hostpath-provisioner=true",
 	"--cluster-signing-duration=10h",
 	"--flex-volume-plugin-dir=/flex-volume-plugin",
-	"--volume-host-cidr-denylist=127.0.0.1/28,feed::/16",
-	"--volume-host-allow-local-loopback=false",
-	"--horizontal-pod-autoscaler-downscale-delay=2m",
 	"--horizontal-pod-autoscaler-sync-period=45s",
-	"--horizontal-pod-autoscaler-upscale-delay=1m",
 	"--horizontal-pod-autoscaler-downscale-stabilization=3m",
 	"--horizontal-pod-autoscaler-cpu-initialization-period=90s",
 	"--horizontal-pod-autoscaler-initial-readiness-delay=50s",
@@ -130,8 +150,9 @@ var args = []string{
 	"--leader-elect=false",
 	"--leader-elect-lease-duration=30s",
 	"--leader-elect-renew-deadline=15s",
-	"--leader-elect-resource-lock=configmap",
+	"--leader-elect-resource-lock=leases",
 	"--leader-elect-retry-period=5s",
+	"--leader-elect-recovery-deadline=90s",
 	"--legacy-service-account-token-clean-up-period=8760h",
 	"--master=192.168.4.20",
 	"--max-endpoints-per-slice=200",
@@ -166,11 +187,7 @@ var args = []string{
 }
 
 func TestAddFlags(t *testing.T) {
-	fs := pflag.NewFlagSet("addflagstest", pflag.ContinueOnError)
-	s, _ := NewKubeControllerManagerOptions()
-	for _, f := range s.Flags([]string{""}, []string{""}, nil).FlagSets {
-		fs.AddFlagSet(f)
-	}
+	fs, s := setupControllerManagerFlagSet(t)
 
 	fs.Parse(args)
 	// Sort GCIgnoredResources because it's built from a map, which means the
@@ -190,7 +207,7 @@ func TestAddFlags(t *testing.T) {
 				},
 				ControllerStartInterval: metav1.Duration{Duration: 2 * time.Minute},
 				LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
-					ResourceLock:      "configmap",
+					ResourceLock:      "leases",
 					LeaderElect:       false,
 					LeaseDuration:     metav1.Duration{Duration: 30 * time.Second},
 					RenewDeadline:     metav1.Duration{Duration: 15 * time.Second},
@@ -198,7 +215,8 @@ func TestAddFlags(t *testing.T) {
 					ResourceName:      "kube-controller-manager",
 					ResourceNamespace: "kube-system",
 				},
-				Controllers: []string{"foo", "bar"},
+				LeaderElectionRecoveryDeadline: metav1.Duration{Duration: 90 * time.Second},
+				Controllers:                    []string{"foo", "bar"},
 			},
 			Debugging: &cmoptions.DebuggingOptions{
 				DebuggingConfiguration: &componentbaseconfig.DebuggingConfiguration{
@@ -212,7 +230,6 @@ func TestAddFlags(t *testing.T) {
 			KubeCloudSharedConfiguration: &cpconfig.KubeCloudSharedConfiguration{
 				UseServiceAccountCredentials: true,
 				RouteReconciliationPeriod:    metav1.Duration{Duration: 30 * time.Second},
-				NodeMonitorPeriod:            metav1.Duration{Duration: 10 * time.Second},
 				ClusterName:                  "k8s",
 				ClusterCIDR:                  "1.2.3.4/24",
 				AllocateNodeCIDRs:            true,
@@ -224,11 +241,6 @@ func TestAddFlags(t *testing.T) {
 					Name:            "gce",
 					CloudConfigFile: "/cloud-config",
 				},
-			},
-		},
-		ServiceController: &cpoptions.ServiceControllerOptions{
-			ServiceControllerConfiguration: &serviceconfig.ServiceControllerConfiguration{
-				ConcurrentServiceSyncs: 2,
 			},
 		},
 		AttachDetachController: &AttachDetachControllerOptions{
@@ -262,12 +274,27 @@ func TestAddFlags(t *testing.T) {
 		},
 		DaemonSetController: &DaemonSetControllerOptions{
 			&daemonconfig.DaemonSetControllerConfiguration{
-				ConcurrentDaemonSetSyncs: 2,
+				ConcurrentDaemonSetSyncs: 10,
 			},
 		},
 		DeploymentController: &DeploymentControllerOptions{
 			&deploymentconfig.DeploymentControllerConfiguration{
 				ConcurrentDeploymentSyncs: 10,
+			},
+		},
+		DisruptionController: &DisruptionControllerOptions{
+			&disruptionconfig.DisruptionControllerConfiguration{
+				ConcurrentDisruptionSyncs: 10,
+			},
+		},
+		DeviceTaintEvictionController: &DeviceTaintEvictionControllerOptions{
+			&devicetaintevictionconfig.DeviceTaintEvictionControllerConfiguration{
+				ConcurrentSyncs: 10,
+			},
+		},
+		ResourceClaimController: &ResourceClaimControllerOptions{
+			&resourceclaimconfig.ResourceClaimControllerConfiguration{
+				ConcurrentSyncs: 10,
 			},
 		},
 		StatefulSetController: &StatefulSetControllerOptions{
@@ -300,6 +327,11 @@ func TestAddFlags(t *testing.T) {
 				ConcurrentEphemeralVolumeSyncs: 10,
 			},
 		},
+		EvictionRequestController: &EvictionRequestControllerOptions{
+			&evictionrequestconfig.EvictionRequestControllerConfiguration{
+				ConcurrentEvictionRequestSyncs: 10,
+			},
+		},
 		GarbageCollectorController: &GarbageCollectorControllerOptions{
 			&garbagecollectorconfig.GarbageCollectorControllerConfiguration{
 				ConcurrentGCSyncs: 30,
@@ -314,12 +346,15 @@ func TestAddFlags(t *testing.T) {
 			&poautosclerconfig.HPAControllerConfiguration{
 				ConcurrentHorizontalPodAutoscalerSyncs:              10,
 				HorizontalPodAutoscalerSyncPeriod:                   metav1.Duration{Duration: 45 * time.Second},
-				HorizontalPodAutoscalerUpscaleForbiddenWindow:       metav1.Duration{Duration: 1 * time.Minute},
-				HorizontalPodAutoscalerDownscaleForbiddenWindow:     metav1.Duration{Duration: 2 * time.Minute},
 				HorizontalPodAutoscalerDownscaleStabilizationWindow: metav1.Duration{Duration: 3 * time.Minute},
 				HorizontalPodAutoscalerCPUInitializationPeriod:      metav1.Duration{Duration: 90 * time.Second},
 				HorizontalPodAutoscalerInitialReadinessDelay:        metav1.Duration{Duration: 50 * time.Second},
 				HorizontalPodAutoscalerTolerance:                    0.1,
+			},
+		},
+		ImperativeEvictionResponderController: &ImperativeEvictionResponderControllerOptions{
+			&imperativeevictionresponderconfig.ImperativeEvictionResponderControllerConfiguration{
+				ConcurrentImperativeEvictionResponderSyncs: 17,
 			},
 		},
 		JobController: &JobControllerOptions{
@@ -353,6 +388,7 @@ func TestAddFlags(t *testing.T) {
 				NodeStartupGracePeriod:    metav1.Duration{Duration: 30 * time.Second},
 				LargeClusterSizeThreshold: 100,
 				UnhealthyZoneThreshold:    0.6,
+				NodeMonitorPeriod:         metav1.Duration{Duration: 10 * time.Second},
 			},
 		},
 		PersistentVolumeBinderController: &PersistentVolumeBinderControllerOptions{
@@ -370,8 +406,6 @@ func TestAddFlags(t *testing.T) {
 						IncrementTimeoutHostPath: 45,
 					},
 				},
-				VolumeHostCIDRDenylist:       []string{"127.0.0.1/28", "feed::/16"},
-				VolumeHostAllowLocalLoopback: false,
 			},
 		},
 		PodGCController: &PodGCControllerOptions{
@@ -424,7 +458,7 @@ func TestAddFlags(t *testing.T) {
 				PairName:      "kube-controller-manager",
 			},
 			HTTP2MaxStreamsPerConnection: 47,
-		}).WithLoopback(),
+		}),
 		Authentication: &apiserveroptions.DelegatingAuthenticationOptions{
 			CacheTTL:            10 * time.Second,
 			TokenRequestTimeout: 10 * time.Second,
@@ -432,10 +466,12 @@ func TestAddFlags(t *testing.T) {
 			ClientCert:          apiserveroptions.ClientCertAuthenticationOptions{},
 			RequestHeader: apiserveroptions.RequestHeaderAuthenticationOptions{
 				UsernameHeaders:     []string{"x-remote-user"},
+				UIDHeaders:          nil,
 				GroupHeaders:        []string{"x-remote-group"},
 				ExtraHeaderPrefixes: []string{"x-remote-extra-"},
 			},
 			RemoteKubeConfigFileOptional: true,
+			Anonymous:                    &apiserver.AnonymousAuthConfig{Enabled: true},
 		},
 		Authorization: &apiserveroptions.DelegatingAuthorizationOptions{
 			AllowCacheTTL:                10 * time.Second,
@@ -446,9 +482,12 @@ func TestAddFlags(t *testing.T) {
 			AlwaysAllowPaths:             []string{"/healthz", "/readyz", "/livez"}, // note: this does not match /healthz/ or /healthz/*
 			AlwaysAllowGroups:            []string{"system:masters"},
 		},
-		Master:  "192.168.4.20",
-		Metrics: &metrics.Options{},
-		Logs:    logs.NewOptions(),
+		Master:                    "192.168.4.20",
+		ControllerShutdownTimeout: 10 * time.Second,
+		Metrics:                   &metrics.Options{},
+		Logs:                      logs.NewOptions(),
+		// ignores comparing ComponentGlobalsRegistry in this test.
+		ComponentGlobalsRegistry: s.ComponentGlobalsRegistry,
 	}
 
 	// Sort GCIgnoredResources because it's built from a map, which means the
@@ -460,13 +499,92 @@ func TestAddFlags(t *testing.T) {
 	}
 }
 
-func TestApplyTo(t *testing.T) {
-	fs := pflag.NewFlagSet("addflagstest", pflag.ContinueOnError)
-	s, _ := NewKubeControllerManagerOptions()
-	// flag set to parse the args that are required to start the kube controller manager
-	for _, f := range s.Flags([]string{""}, []string{""}, nil).FlagSets {
-		fs.AddFlagSet(f)
+func TestValidateFlags(t *testing.T) {
+	testcases := []struct {
+		name    string
+		flags   []string // not a good place to test flagParse error
+		wantErr bool     // this won't apply to flagParse, it only apply to KubeControllerManagerOptions.Validate
+	}{
+		{
+			name:    "empty flags",
+			flags:   []string{},
+			wantErr: false,
+		},
+		{
+			name: "cloud provider empty flag",
+			flags: []string{
+				"--cloud-provider", "",
+			},
+			wantErr: false,
+		},
+		{
+			name: "cloud provider set but not external",
+			flags: []string{
+				"--cloud-provider=gce",
+			},
+			wantErr: true,
+		},
+		{
+			name: "cloud provider set to external",
+			flags: []string{
+				"--cloud-provider=external",
+			},
+			wantErr: false,
+		},
+		{
+			name: "nodeipam to cloudAllocator",
+			flags: []string{
+				"--cidr-allocator-type=CloudAllocator",
+			},
+			wantErr: true,
+		},
+		{
+			name: "nodeipam to rangeAllocator",
+			flags: []string{
+				"--cidr-allocator-type=RangeAllocator",
+			},
+			wantErr: false,
+		},
+		{
+			name: "nodeipam to IPAMFromCloud",
+			flags: []string{
+				"--cidr-allocator-type=IPAMFromCloud",
+			},
+			wantErr: true,
+		},
+		{
+			name: "concurrent daemonset syncs set to 0",
+			flags: []string{
+				"--concurrent-daemonset-syncs=0",
+			},
+			wantErr: true,
+		},
+		{
+			name: "concurrent eviction request syncs set to 0",
+			flags: []string{
+				"--concurrent-eviction-request-syncs=0",
+			},
+			wantErr: true,
+		},
 	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, s := setupControllerManagerFlagSet(t)
+			err := fs.Parse(tc.flags)
+			checkTestError(t, err, false, "")
+			err = s.Validate([]string{""}, []string{""}, nil)
+			if !tc.wantErr && err != nil {
+				t.Fatal(fmt.Errorf("expected no error, got %w", err))
+			} else if tc.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
+	}
+}
+
+func TestApplyTo(t *testing.T) {
+	fs, s := setupControllerManagerFlagSet(t)
 
 	fs.Parse(args)
 	// Sort GCIgnoredResources because it's built from a map, which means the
@@ -486,7 +604,7 @@ func TestApplyTo(t *testing.T) {
 				},
 				ControllerStartInterval: metav1.Duration{Duration: 2 * time.Minute},
 				LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
-					ResourceLock:      "configmap",
+					ResourceLock:      "leases",
 					LeaderElect:       false,
 					LeaseDuration:     metav1.Duration{Duration: 30 * time.Second},
 					RenewDeadline:     metav1.Duration{Duration: 15 * time.Second},
@@ -494,7 +612,8 @@ func TestApplyTo(t *testing.T) {
 					ResourceName:      "kube-controller-manager",
 					ResourceNamespace: "kube-system",
 				},
-				Controllers: []string{"foo", "bar"},
+				LeaderElectionRecoveryDeadline: metav1.Duration{Duration: 90 * time.Second},
+				Controllers:                    []string{"foo", "bar"},
 				Debugging: componentbaseconfig.DebuggingConfiguration{
 					EnableProfiling:           false,
 					EnableContentionProfiling: true,
@@ -503,7 +622,6 @@ func TestApplyTo(t *testing.T) {
 			KubeCloudShared: cpconfig.KubeCloudSharedConfiguration{
 				UseServiceAccountCredentials: true,
 				RouteReconciliationPeriod:    metav1.Duration{Duration: 30 * time.Second},
-				NodeMonitorPeriod:            metav1.Duration{Duration: 10 * time.Second},
 				ClusterName:                  "k8s",
 				ClusterCIDR:                  "1.2.3.4/24",
 				AllocateNodeCIDRs:            true,
@@ -514,9 +632,7 @@ func TestApplyTo(t *testing.T) {
 					CloudConfigFile: "/cloud-config",
 				},
 			},
-			ServiceController: serviceconfig.ServiceControllerConfiguration{
-				ConcurrentServiceSyncs: 2,
-			},
+			ServiceController: serviceconfig.ServiceControllerConfiguration{},
 			AttachDetachController: attachdetachconfig.AttachDetachControllerConfiguration{
 				ReconcilerSyncLoopPeriod:          metav1.Duration{Duration: 30 * time.Second},
 				DisableAttachDetachReconcilerSync: true,
@@ -543,10 +659,19 @@ func TestApplyTo(t *testing.T) {
 				},
 			},
 			DaemonSetController: daemonconfig.DaemonSetControllerConfiguration{
-				ConcurrentDaemonSetSyncs: 2,
+				ConcurrentDaemonSetSyncs: 10,
 			},
 			DeploymentController: deploymentconfig.DeploymentControllerConfiguration{
 				ConcurrentDeploymentSyncs: 10,
+			},
+			DisruptionController: disruptionconfig.DisruptionControllerConfiguration{
+				ConcurrentDisruptionSyncs: 10,
+			},
+			DeviceTaintEvictionController: devicetaintevictionconfig.DeviceTaintEvictionControllerConfiguration{
+				ConcurrentSyncs: 10,
+			},
+			ResourceClaimController: resourceclaimconfig.ResourceClaimControllerConfiguration{
+				ConcurrentSyncs: 10,
 			},
 			StatefulSetController: statefulsetconfig.StatefulSetControllerConfiguration{
 				ConcurrentStatefulSetSyncs: 15,
@@ -566,6 +691,9 @@ func TestApplyTo(t *testing.T) {
 			EphemeralVolumeController: ephemeralvolumeconfig.EphemeralVolumeControllerConfiguration{
 				ConcurrentEphemeralVolumeSyncs: 10,
 			},
+			EvictionRequestController: evictionrequestconfig.EvictionRequestControllerConfiguration{
+				ConcurrentEvictionRequestSyncs: 10,
+			},
 			GarbageCollectorController: garbagecollectorconfig.GarbageCollectorControllerConfiguration{
 				ConcurrentGCSyncs: 30,
 				GCIgnoredResources: []garbagecollectorconfig.GroupResource{
@@ -577,12 +705,13 @@ func TestApplyTo(t *testing.T) {
 			HPAController: poautosclerconfig.HPAControllerConfiguration{
 				ConcurrentHorizontalPodAutoscalerSyncs:              10,
 				HorizontalPodAutoscalerSyncPeriod:                   metav1.Duration{Duration: 45 * time.Second},
-				HorizontalPodAutoscalerUpscaleForbiddenWindow:       metav1.Duration{Duration: 1 * time.Minute},
-				HorizontalPodAutoscalerDownscaleForbiddenWindow:     metav1.Duration{Duration: 2 * time.Minute},
 				HorizontalPodAutoscalerDownscaleStabilizationWindow: metav1.Duration{Duration: 3 * time.Minute},
 				HorizontalPodAutoscalerCPUInitializationPeriod:      metav1.Duration{Duration: 90 * time.Second},
 				HorizontalPodAutoscalerInitialReadinessDelay:        metav1.Duration{Duration: 50 * time.Second},
 				HorizontalPodAutoscalerTolerance:                    0.1,
+			},
+			ImperativeEvictionResponderController: imperativeevictionresponderconfig.ImperativeEvictionResponderControllerConfiguration{
+				ConcurrentImperativeEvictionResponderSyncs: 17,
 			},
 			JobController: jobconfig.JobControllerConfiguration{
 				ConcurrentJobSyncs: 10,
@@ -606,6 +735,7 @@ func TestApplyTo(t *testing.T) {
 				NodeStartupGracePeriod:    metav1.Duration{Duration: 30 * time.Second},
 				LargeClusterSizeThreshold: 100,
 				UnhealthyZoneThreshold:    0.6,
+				NodeMonitorPeriod:         metav1.Duration{Duration: 10 * time.Second},
 			},
 			PersistentVolumeBinderController: persistentvolumeconfig.PersistentVolumeBinderControllerConfiguration{
 				PVClaimBinderSyncPeriod: metav1.Duration{Duration: 30 * time.Second},
@@ -621,8 +751,6 @@ func TestApplyTo(t *testing.T) {
 						IncrementTimeoutHostPath: 45,
 					},
 				},
-				VolumeHostCIDRDenylist:       []string{"127.0.0.1/28", "feed::/16"},
-				VolumeHostAllowLocalLoopback: false,
 			},
 			PodGCController: podgcconfig.PodGCControllerConfiguration{
 				TerminatedPodGCThreshold: 12000,
@@ -651,6 +779,7 @@ func TestApplyTo(t *testing.T) {
 				ConcurrentPolicySyncs: 9,
 			},
 		},
+		ControllerShutdownTimeout: 10 * time.Second,
 	}
 
 	// Sort GCIgnoredResources because it's built from a map, which means the
@@ -662,6 +791,74 @@ func TestApplyTo(t *testing.T) {
 
 	if !reflect.DeepEqual(expected.ComponentConfig, c.ComponentConfig) {
 		t.Errorf("Got different configuration than expected.\nDifference detected on:\n%s", cmp.Diff(expected.ComponentConfig, c.ComponentConfig))
+	}
+}
+
+func TestEmulatedVersion(t *testing.T) {
+
+	testcases := []struct {
+		name              string
+		flags             []string // not a good place to test flagParse error
+		wantErr           bool     // this won't apply to flagParse, it only apply to KubeControllerManagerOptions.Validate
+		errorSubString    string
+		wantFeaturesGates map[string]bool
+	}{
+		{
+			name:              "default feature gates at binary version",
+			flags:             []string{},
+			wantErr:           false,
+			wantFeaturesGates: map[string]bool{"kubeA": true, "kubeB": false},
+		},
+		{
+			name: "emulating version out of range",
+			flags: []string{
+				"--emulated-version=1.28",
+			},
+			wantErr:           true,
+			errorSubString:    "emulation version 1.28 is not between",
+			wantFeaturesGates: nil,
+		},
+		{
+			name: "default feature gates at emulated version",
+			flags: []string{
+				"--emulated-version=1.31",
+			},
+			wantFeaturesGates: map[string]bool{"kubeA": false, "kubeB": false},
+		},
+		{
+			name: "set feature gates at emulated version",
+			flags: []string{
+				"--emulated-version=1.31",
+				"--feature-gates=kubeA=false,kubeB=true",
+			},
+			wantFeaturesGates: map[string]bool{"kubeA": false, "kubeB": true},
+		},
+		{
+			name: "cannot set locked feature gate",
+			flags: []string{
+				"--emulated-version=1.32",
+				"--feature-gates=kubeA=false,kubeB=true",
+			},
+			errorSubString: "cannot set feature gate kubeA to false, feature is locked to true",
+			wantErr:        true,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, s := setupControllerManagerFlagSet(t)
+			fg := s.ComponentGlobalsRegistry.FeatureGateFor(basecompatibility.DefaultKubeComponent)
+			err := fs.Parse(tc.flags)
+			checkTestError(t, err, false, "")
+			err = s.Validate([]string{""}, []string{""}, nil)
+			checkTestError(t, err, tc.wantErr, tc.errorSubString)
+
+			for feature, expected := range tc.wantFeaturesGates {
+				if fg.Enabled(featuregate.Feature(feature)) != expected {
+					t.Errorf("expected %s to be %v", feature, expected)
+				}
+			}
+		})
 	}
 }
 
@@ -1043,8 +1240,6 @@ func TestValidateControllersOptions(t *testing.T) {
 				&poautosclerconfig.HPAControllerConfiguration{
 					ConcurrentHorizontalPodAutoscalerSyncs:              0,
 					HorizontalPodAutoscalerSyncPeriod:                   metav1.Duration{Duration: 45 * time.Second},
-					HorizontalPodAutoscalerUpscaleForbiddenWindow:       metav1.Duration{Duration: 1 * time.Minute},
-					HorizontalPodAutoscalerDownscaleForbiddenWindow:     metav1.Duration{Duration: 2 * time.Minute},
 					HorizontalPodAutoscalerDownscaleStabilizationWindow: metav1.Duration{Duration: 3 * time.Minute},
 					HorizontalPodAutoscalerCPUInitializationPeriod:      metav1.Duration{Duration: 90 * time.Second},
 					HorizontalPodAutoscalerInitialReadinessDelay:        metav1.Duration{Duration: 50 * time.Second},
@@ -1095,6 +1290,26 @@ func TestValidateControllersOptions(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:                   "EvictionRequestControllerOptions ConcurrentEvictionRequestSyncs equal 0",
+			expectErrors:           true,
+			expectedErrorSubString: "concurrent-eviction-request-syncs must not be less than 1",
+			options: &EvictionRequestControllerOptions{
+				&evictionrequestconfig.EvictionRequestControllerConfiguration{
+					ConcurrentEvictionRequestSyncs: 0,
+				},
+			},
+		},
+		{
+			name:                   "EvictionRequestControllerOptions ConcurrentEvictionRequestSyncs equal 0",
+			expectErrors:           true,
+			expectedErrorSubString: "concurrent-eviction-request-syncs must not be more than 50",
+			options: &EvictionRequestControllerOptions{
+				&evictionrequestconfig.EvictionRequestControllerConfiguration{
+					ConcurrentEvictionRequestSyncs: 51,
+				},
+			},
+		},
 		/* empty errs */
 		{
 			name:         "CronJobControllerOptions",
@@ -1120,6 +1335,42 @@ func TestValidateControllersOptions(t *testing.T) {
 			options: &DeploymentControllerOptions{
 				&deploymentconfig.DeploymentControllerConfiguration{
 					ConcurrentDeploymentSyncs: 10,
+				},
+			},
+		},
+		{
+			name:         "DisruptionControllerOptions",
+			expectErrors: false,
+			options: &DisruptionControllerOptions{
+				&disruptionconfig.DisruptionControllerConfiguration{
+					ConcurrentDisruptionSyncs: 10,
+				},
+			},
+		},
+		{
+			name:         "DeviceTaintEvictionControllerOptions",
+			expectErrors: false,
+			options: &DeviceTaintEvictionControllerOptions{
+				&devicetaintevictionconfig.DeviceTaintEvictionControllerConfiguration{
+					ConcurrentSyncs: 10,
+				},
+			},
+		},
+		{
+			name:         "EvictionRequestControllerOptions",
+			expectErrors: false,
+			options: &EvictionRequestControllerOptions{
+				&evictionrequestconfig.EvictionRequestControllerConfiguration{
+					ConcurrentEvictionRequestSyncs: 10,
+				},
+			},
+		},
+		{
+			name:         "ResourceClaimControllerOptions",
+			expectErrors: false,
+			options: &ResourceClaimControllerOptions{
+				&resourceclaimconfig.ResourceClaimControllerConfiguration{
+					ConcurrentSyncs: 10,
 				},
 			},
 		},
@@ -1150,6 +1401,35 @@ func TestValidateControllersOptions(t *testing.T) {
 						{Group: eventv1.GroupName, Resource: "events"},
 					},
 					EnableGarbageCollector: false,
+				},
+			},
+		},
+		{
+			name:         "ImperativeEvictionResponderControllerConfiguration",
+			expectErrors: false,
+			options: &ImperativeEvictionResponderControllerOptions{
+				&imperativeevictionresponderconfig.ImperativeEvictionResponderControllerConfiguration{
+					ConcurrentImperativeEvictionResponderSyncs: 17,
+				},
+			},
+		},
+		{
+			name:                   "ImperativeEvictionResponderControllerConfiguration lower than minConcurrentImperativeEvictionResponderSyncs (1)",
+			expectErrors:           true,
+			expectedErrorSubString: "concurrent-imperative-eviction-responder-syncs must not be less than 1",
+			options: &ImperativeEvictionResponderControllerOptions{
+				&imperativeevictionresponderconfig.ImperativeEvictionResponderControllerConfiguration{
+					ConcurrentImperativeEvictionResponderSyncs: 0,
+				},
+			},
+		},
+		{
+			name:                   "ImperativeEvictionResponderControllerConfiguration greater than maxConcurrentImperativeEvictionResponderSyncs (50)",
+			expectErrors:           true,
+			expectedErrorSubString: "concurrent-imperative-eviction-responder-syncs must not be more than 50",
+			options: &ImperativeEvictionResponderControllerOptions{
+				&imperativeevictionresponderconfig.ImperativeEvictionResponderControllerConfiguration{
+					ConcurrentImperativeEvictionResponderSyncs: 51,
 				},
 			},
 		},
@@ -1251,6 +1531,30 @@ func TestValidateControllersOptions(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:         "EvictionRequestControllerOptions valid",
+			expectErrors: false,
+			options: &EvictionRequestControllerOptions{
+				&evictionrequestconfig.EvictionRequestControllerConfiguration{
+					ConcurrentEvictionRequestSyncs: 5,
+				},
+			},
+		},
+		{
+			name:                   "EvictionRequestControllerOptions zero syncs",
+			expectErrors:           true,
+			expectedErrorSubString: "concurrent-eviction-request-syncs must not be less than 1",
+			options: &EvictionRequestControllerOptions{
+				&evictionrequestconfig.EvictionRequestControllerConfiguration{
+					ConcurrentEvictionRequestSyncs: 0,
+				},
+			},
+		},
+		{
+			name:         "EvictionRequestControllerOptions nil",
+			expectErrors: false,
+			options:      (*EvictionRequestControllerOptions)(nil),
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1331,6 +1635,117 @@ func TestControllerManagerAliases(t *testing.T) {
 	}
 }
 
+func TestWatchListClientFlagUsage(t *testing.T) {
+	fs := pflag.NewFlagSet("addflagstest", pflag.ContinueOnError)
+	s, _ := NewKubeControllerManagerOptions()
+	for _, f := range s.Flags([]string{""}, []string{""}, nil).FlagSets {
+		fs.AddFlagSet(f)
+	}
+
+	assertWatchListClientFeatureDefaultValue(t)
+	assertWatchListCommandLineDefaultValue(t, fs)
+}
+
+func TestWatchListClientFlagChange(t *testing.T) {
+	fs := pflag.NewFlagSet("addflagstest", pflag.ContinueOnError)
+	s, err := NewKubeControllerManagerOptions()
+	if err != nil {
+		t.Fatal(fmt.Errorf("NewKubeControllerManagerOptions failed with %w", err))
+	}
+
+	for _, f := range s.Flags([]string{""}, []string{""}, nil).FlagSets {
+		fs.AddFlagSet(f)
+	}
+
+	assertWatchListClientFeatureDefaultValue(t)
+	assertWatchListCommandLineDefaultValue(t, fs)
+
+	args := []string{fmt.Sprintf("--feature-gates=%v=true", clientgofeaturegate.WatchListClient)}
+	if err := fs.Parse(args); err != nil {
+		t.Fatal(fmt.Errorf("FlatSet.Parse failed with %w", err))
+	}
+
+	// this is needed to Apply parsed flags to GlobalRegistry, so the DefaultFeatureGate values can be set from the flag
+	err = s.ComponentGlobalsRegistry.Set()
+	if err != nil {
+		t.Fatal(fmt.Errorf("ComponentGlobalsRegistry.Set failed with %w", err))
+	}
+
+	watchListClientValue := clientgofeaturegate.FeatureGates().Enabled(clientgofeaturegate.WatchListClient)
+	if !watchListClientValue {
+		t.Fatalf("expected %q feature gate to be enabled after setting the command line flag", clientgofeaturegate.WatchListClient)
+	}
+}
+
+func assertWatchListClientFeatureDefaultValue(t *testing.T) {
+	watchListClientDefaultValue := clientgofeaturegate.FeatureGates().Enabled(clientgofeaturegate.WatchListClient)
+	if !watchListClientDefaultValue {
+		t.Fatalf("expected %q feature gate to be enabled for KCM", clientgofeaturegate.WatchListClient)
+	}
+}
+
+func assertWatchListCommandLineDefaultValue(t *testing.T, fs *pflag.FlagSet) {
+	fgFlagName := "feature-gates"
+	fg := fs.Lookup(fgFlagName)
+	if fg == nil {
+		t.Fatalf("didn't find %q flag", fgFlagName)
+	}
+
+	expectedWatchListClientString := "WatchListClient=true|false (BETA - default=true)"
+	if !strings.Contains(fg.Usage, expectedWatchListClientString) {
+		t.Fatalf("%q flag doesn't contain the expected usage for %v feature gate.\nExpected = %v\nUsage = %v", fgFlagName, clientgofeaturegate.WatchListClient, expectedWatchListClientString, fg.Usage)
+	}
+}
+
+func setupControllerManagerFlagSet(t *testing.T) (*pflag.FlagSet, *KubeControllerManagerOptions) {
+	fs := pflag.NewFlagSet("addflagstest", pflag.ContinueOnError)
+	s, err := NewKubeControllerManagerOptions()
+	if err != nil {
+		t.Fatal(fmt.Errorf("NewKubeControllerManagerOptions failed with %w", err))
+	}
+
+	componentGlobalsRegistry := basecompatibility.NewComponentGlobalsRegistry()
+
+	verKube := basecompatibility.NewEffectiveVersionFromString("1.32", "1.31", "1.31")
+	fg := featuregate.NewVersionedFeatureGate(version.MustParse("1.32"))
+	utilruntime.Must(fg.AddVersioned(map[featuregate.Feature]featuregate.VersionedSpecs{
+		"kubeA": {
+			{Version: version.MustParse("1.30"), Default: false, PreRelease: featuregate.Beta},
+			{Version: version.MustParse("1.32"), Default: true, LockToDefault: true, PreRelease: featuregate.GA},
+		},
+		"kubeB": {
+			{Version: version.MustParse("1.31"), Default: false, PreRelease: featuregate.Alpha},
+		},
+	}))
+	utilruntime.Must(componentGlobalsRegistry.Register(basecompatibility.DefaultKubeComponent, verKube, fg))
+	s.ComponentGlobalsRegistry = componentGlobalsRegistry
+
+	for _, f := range s.Flags([]string{""}, []string{""}, nil).FlagSets {
+		fs.AddFlagSet(f)
+	}
+	return fs, s
+}
+
+// caution: checkTestError use t.Fatal, to simplify caller handling.
+// it also means it may break test code execution flow.
+func checkTestError(t *testing.T, err error, expectingErr bool, expectedErrorSubString string) {
+	if !expectingErr {
+		if err != nil { // not expecting, but got error
+			t.Fatal(fmt.Errorf("expected no error, got %w", err))
+		}
+		return // not expecting, and no error
+	}
+
+	// from this point we do expecting error
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	if expectedErrorSubString != "" && !strings.Contains(err.Error(), expectedErrorSubString) {
+		t.Fatalf("expected error to contain %q, but got %q", expectedErrorSubString, err.Error())
+	}
+}
+
 type sortedGCIgnoredResources []garbagecollectorconfig.GroupResource
 
 func (r sortedGCIgnoredResources) Len() int {
@@ -1348,4 +1763,36 @@ func (r sortedGCIgnoredResources) Less(i, j int) bool {
 
 func (r sortedGCIgnoredResources) Swap(i, j int) {
 	r[i], r[j] = r[j], r[i]
+}
+
+func TestValidateLeaderElectionRecoveryDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		recovery, coordinated bool
+		wantErr               string
+	}{
+		{name: "gate off", wantErr: "leader-elect-recovery-deadline requires the LeaderElectionRecovery feature gate"},
+		{name: "gate on", recovery: true},
+		{name: "gate on with coordinated leader election", recovery: true, coordinated: true, wantErr: "leader-elect-recovery-deadline is not yet supported with the CoordinatedLeaderElection feature gate"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, cmfeatures.LeaderElectionRecovery, tc.recovery)
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, kubefeatures.CoordinatedLeaderElection, tc.coordinated)
+			s, err := NewKubeControllerManagerOptions()
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.Generic.LeaderElectionRecoveryDeadline = metav1.Duration{Duration: 30 * time.Second}
+			got := ""
+			if err := s.Validate([]string{""}, []string{""}, nil); err != nil {
+				got = err.Error()
+			}
+			if tc.wantErr == "" && strings.Contains(got, "leader-elect-recovery-deadline") {
+				t.Errorf("unexpected recovery deadline error: %s", got)
+			}
+			if tc.wantErr != "" && !strings.Contains(got, tc.wantErr) {
+				t.Errorf("expected an error containing %q, got %q", tc.wantErr, got)
+			}
+		})
+	}
 }

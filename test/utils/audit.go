@@ -34,20 +34,23 @@ import (
 
 // AuditEvent is a simplified representation of an audit event for testing purposes
 type AuditEvent struct {
-	ID                 types.UID
-	Level              auditinternal.Level
-	Stage              auditinternal.Stage
-	RequestURI         string
-	Verb               string
-	Code               int32
-	User               string
-	ImpersonatedUser   string
-	ImpersonatedGroups string
-	Resource           string
-	Namespace          string
-	RequestObject      bool
-	ResponseObject     bool
-	AuthorizeDecision  string
+	ID                      types.UID
+	Level                   auditinternal.Level
+	Stage                   auditinternal.Stage
+	RequestURI              string
+	Verb                    string
+	Code                    int32
+	StatusMessage           string
+	User                    string
+	ImpersonatedUser        string
+	ImpersonatedUID         string
+	ImpersonatedGroups      string
+	ImpersonationConstraint *string
+	Resource                string
+	Namespace               string
+	RequestObject           bool
+	ResponseObject          bool
+	AuthorizeDecision       string
 
 	// The Check functions in this package takes ownerships of these maps. You should
 	// not reference these maps after calling the Check functions.
@@ -66,6 +69,7 @@ type MissingEventsReport struct {
 	LastEventChecked  *auditinternal.Event
 	NumEventsChecked  int
 	MissingEvents     []AuditEvent
+	AllEvents         []AuditEvent
 }
 
 // String returns a human readable string representation of the report
@@ -118,6 +122,7 @@ func CheckAuditLinesFiltered(stream io.Reader, expected []AuditEvent, version sc
 		}
 
 		expectations.Mark(event)
+		missingReport.AllEvents = append(missingReport.AllEvents, event)
 	}
 	if err := scanner.Err(); err != nil {
 		return missingReport, err
@@ -126,55 +131,6 @@ func CheckAuditLinesFiltered(stream io.Reader, expected []AuditEvent, version sc
 	missingReport.MissingEvents = expectations.Missing()
 	missingReport.NumEventsChecked = i
 	return missingReport, nil
-}
-
-// CheckAuditList searches an audit event list for the expected audit events.
-func CheckAuditList(el auditinternal.EventList, expected []AuditEvent) (missing []AuditEvent, err error) {
-	expectations := newAuditEventTracker(expected)
-
-	for _, e := range el.Items {
-		event, err := testEventFromInternal(&e)
-		if err != nil {
-			return expected, err
-		}
-
-		expectations.Mark(event)
-	}
-
-	return expectations.Missing(), nil
-}
-
-// CheckForDuplicates checks a list for duplicate events
-func CheckForDuplicates(el auditinternal.EventList) (auditinternal.EventList, error) {
-	// existingEvents holds a slice of audit events that have been seen
-	existingEvents := []AuditEvent{}
-	duplicates := auditinternal.EventList{}
-	for _, e := range el.Items {
-		event, err := testEventFromInternal(&e)
-		if err != nil {
-			return duplicates, err
-		}
-		event.ID = e.AuditID
-		for _, existing := range existingEvents {
-			if reflect.DeepEqual(existing, event) {
-				duplicates.Items = append(duplicates.Items, e)
-				continue
-			}
-		}
-		existingEvents = append(existingEvents, event)
-	}
-
-	var err error
-	if len(duplicates.Items) > 0 {
-		err = fmt.Errorf("failed duplicate check")
-	}
-
-	return duplicates, err
-}
-
-// testEventFromInternal takes an internal audit event and returns a test event
-func testEventFromInternal(e *auditinternal.Event) (AuditEvent, error) {
-	return testEventFromInternalFiltered(e, nil)
 }
 
 // testEventFromInternalFiltered takes an internal audit event and returns a test event, customAnnotationsFilter
@@ -194,6 +150,7 @@ func testEventFromInternalFiltered(e *auditinternal.Event, customAnnotationsFilt
 	}
 	if e.ResponseStatus != nil {
 		event.Code = e.ResponseStatus.Code
+		event.StatusMessage = e.ResponseStatus.Message
 	}
 	if e.ResponseObject != nil {
 		event.ResponseObject = true
@@ -203,8 +160,12 @@ func testEventFromInternalFiltered(e *auditinternal.Event, customAnnotationsFilt
 	}
 	if e.ImpersonatedUser != nil {
 		event.ImpersonatedUser = e.ImpersonatedUser.Username
+		event.ImpersonatedUID = e.ImpersonatedUser.UID
 		sort.Strings(e.ImpersonatedUser.Groups)
 		event.ImpersonatedGroups = strings.Join(e.ImpersonatedUser.Groups, ",")
+	}
+	if e.AuthenticationMetadata != nil {
+		event.ImpersonationConstraint = &e.AuthenticationMetadata.ImpersonationConstraint
 	}
 	event.AuthorizeDecision = e.Annotations["authorization.k8s.io/decision"]
 	for k, v := range e.Annotations {

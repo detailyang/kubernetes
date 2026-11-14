@@ -18,19 +18,23 @@ package interpodaffinity
 
 import (
 	"context"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2/ktesting"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	plugintesting "k8s.io/kubernetes/pkg/scheduler/framework/plugins/testing"
-	"k8s.io/kubernetes/pkg/scheduler/internal/cache"
+	schedruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
+	tf "k8s.io/kubernetes/pkg/scheduler/testing/framework"
 )
 
 var nsLabelT1 = map[string]string{"team": "team1"}
@@ -327,6 +331,66 @@ func TestPreferredAffinity(t *testing.T) {
 			},
 		},
 	}
+	affinityNegativeNamespaceSelector := &v1.Affinity{
+		PodAffinity: &v1.PodAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []v1.WeightedPodAffinityTerm{
+				{
+					Weight: 5,
+					PodAffinityTerm: v1.PodAffinityTerm{
+						LabelSelector: &metav1.LabelSelector{
+							MatchExpressions: []metav1.LabelSelectorRequirement{
+								{
+									Key:      "security",
+									Operator: metav1.LabelSelectorOpIn,
+									Values:   []string{"S1"},
+								},
+							},
+						},
+						TopologyKey: "region",
+						NamespaceSelector: &metav1.LabelSelector{
+							MatchExpressions: []metav1.LabelSelectorRequirement{
+								{
+									Key:      "team",
+									Operator: metav1.LabelSelectorOpNotIn,
+									Values:   []string{"team1"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	antiAffinityNegativeNamespaceSelector := &v1.Affinity{
+		PodAntiAffinity: &v1.PodAntiAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []v1.WeightedPodAffinityTerm{
+				{
+					Weight: 5,
+					PodAffinityTerm: v1.PodAffinityTerm{
+						LabelSelector: &metav1.LabelSelector{
+							MatchExpressions: []metav1.LabelSelectorRequirement{
+								{
+									Key:      "security",
+									Operator: metav1.LabelSelectorOpIn,
+									Values:   []string{"S1"},
+								},
+							},
+						},
+						TopologyKey: "region",
+						NamespaceSelector: &metav1.LabelSelector{
+							MatchExpressions: []metav1.LabelSelectorRequirement{
+								{
+									Key:      "team",
+									Operator: metav1.LabelSelectorOpNotIn,
+									Values:   []string{"team1"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
 	invalidAffinityLabels := &v1.Affinity{
 		PodAffinity: &v1.PodAffinity{
 			PreferredDuringSchedulingIgnoredDuringExecution: []v1.WeightedPodAffinityTerm{
@@ -374,10 +438,10 @@ func TestPreferredAffinity(t *testing.T) {
 		pod                                *v1.Pod
 		pods                               []*v1.Pod
 		nodes                              []*v1.Node
-		expectedList                       framework.NodeScoreList
+		expectedList                       fwk.NodeScoreList
 		name                               string
 		ignorePreferredTermsOfExistingPods bool
-		wantStatus                         *framework.Status
+		wantStatus                         *fwk.Status
 	}{
 		{
 			name: "all nodes are same priority as Affinity is nil",
@@ -387,7 +451,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelAzAz1}},
 			},
-			wantStatus: framework.NewStatus(framework.Skip),
+			wantStatus: fwk.NewStatus(fwk.Skip),
 		},
 		// the node(node1) that have the label {"region": "China"} (match the topology key) and that have existing pods that match the labelSelector get high score
 		// the node(node3) that don't have the label {"region": "whatever the value is"} (mismatch the topology key) but that have existing pods that match the labelSelector get low score
@@ -406,7 +470,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelAzAz1}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: 0}, {Name: "node3", Score: 0}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: 0}, {Name: "node3", Score: 0}},
 		},
 		// the node1(node1) that have the label {"region": "China"} (match the topology key) and that have existing pods that match the labelSelector get high score
 		// the node2(node2) that have the label {"region": "China"}, match the topology key and have the same label value with node1, get the same high score with node1
@@ -423,7 +487,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgChinaAzAz1}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelRgIndia}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: framework.MaxNodeScore}, {Name: "node3", Score: 0}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: fwk.MaxNodeScore}, {Name: "node3", Score: 0}},
 		},
 		// there are 2 regions, say regionChina(node1,node3,node4) and regionIndia(node2,node5), both regions have nodes that match the preference.
 		// But there are more nodes(actually more existing pods) in regionChina that match the preference than regionIndia.
@@ -447,7 +511,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node4", Labels: labelRgChina}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node5", Labels: labelRgIndia}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: 0}, {Name: "node3", Score: framework.MaxNodeScore}, {Name: "node4", Score: framework.MaxNodeScore}, {Name: "node5", Score: 0}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: 0}, {Name: "node3", Score: fwk.MaxNodeScore}, {Name: "node4", Score: fwk.MaxNodeScore}, {Name: "node5", Score: 0}},
 		},
 		// Test with the different operators and values for pod affinity scheduling preference, including some match failures.
 		{
@@ -463,7 +527,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelAzAz1}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: 20}, {Name: "node2", Score: framework.MaxNodeScore}, {Name: "node3", Score: 0}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: 20}, {Name: "node2", Score: fwk.MaxNodeScore}, {Name: "node3", Score: 0}},
 		},
 		// Test the symmetry cases for affinity, the difference between affinity and symmetry is not the pod wants to run together with some existing pods,
 		// but the existing pods have the inter pod affinity preference while the pod to schedule satisfy the preference.
@@ -479,7 +543,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelAzAz1}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: framework.MaxNodeScore}, {Name: "node3", Score: 0}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: fwk.MaxNodeScore}, {Name: "node3", Score: 0}},
 		},
 		{
 			name: "Affinity symmetry with namespace selector",
@@ -493,7 +557,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelAzAz1}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: 0}, {Name: "node3", Score: 0}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: 0}, {Name: "node3", Score: 0}},
 		},
 		{
 			name: "AntiAffinity symmetry with namespace selector",
@@ -507,7 +571,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelAzAz1}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: framework.MaxNodeScore}, {Name: "node3", Score: framework.MaxNodeScore}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: fwk.MaxNodeScore}, {Name: "node3", Score: fwk.MaxNodeScore}},
 		},
 		{
 			name: "Affinity symmetry: considered RequiredDuringSchedulingIgnoredDuringExecution in pod affinity symmetry",
@@ -521,7 +585,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelAzAz1}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: framework.MaxNodeScore}, {Name: "node3", Score: 0}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: fwk.MaxNodeScore}, {Name: "node3", Score: 0}},
 		},
 
 		// The pod to schedule prefer to stay away from some existing pods at node level using the pod anti affinity.
@@ -541,7 +605,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelAzAz1}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgChina}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: framework.MaxNodeScore}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: fwk.MaxNodeScore}},
 		},
 		{
 			name: "Anti Affinity: pod that does not match topology key & match the pods in nodes will get higher score comparing to others ",
@@ -554,7 +618,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelAzAz1}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgChina}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: framework.MaxNodeScore}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: fwk.MaxNodeScore}},
 		},
 		{
 			name: "Anti Affinity: one node has more matching pods comparing to other node, so the node which has more unmatches will get high score",
@@ -568,7 +632,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelAzAz1}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: framework.MaxNodeScore}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: fwk.MaxNodeScore}},
 		},
 		// Test the symmetry cases for anti affinity
 		{
@@ -582,7 +646,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelAzAz1}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelAzAz2}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: framework.MaxNodeScore}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: fwk.MaxNodeScore}},
 		},
 		// Test both  affinity and anti-affinity
 		{
@@ -596,7 +660,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelRgChina}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelAzAz1}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: 0}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: 0}},
 		},
 		// Combined cases considering both affinity and anti-affinity, the pod to schedule and existing pods have the same labels (they are in the same RC/service),
 		// the pod prefer to run together with its brother pods in the same region, but wants to stay away from them at node level,
@@ -621,7 +685,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node4", Labels: labelRgChina}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node5", Labels: labelRgIndia}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: 0}, {Name: "node3", Score: framework.MaxNodeScore}, {Name: "node4", Score: framework.MaxNodeScore}, {Name: "node5", Score: 0}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: 0}, {Name: "node3", Score: fwk.MaxNodeScore}, {Name: "node4", Score: fwk.MaxNodeScore}, {Name: "node5", Score: 0}},
 		},
 		// Consider Affinity, Anti Affinity and symmetry together.
 		// for Affinity, the weights are:                8,  0,  0,  0
@@ -643,7 +707,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelRgIndia}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node4", Labels: labelAzAz2}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: 0}, {Name: "node3", Score: framework.MaxNodeScore}, {Name: "node4", Score: 0}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: 0}, {Name: "node3", Score: fwk.MaxNodeScore}, {Name: "node4", Score: 0}},
 		},
 		// Cover https://github.com/kubernetes/kubernetes/issues/82796 which panics upon:
 		// 1. Some nodes in a topology don't have pods with affinity, but other nodes in the same topology have.
@@ -659,12 +723,12 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelRgChina}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgChina}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: 0}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: 0}},
 		},
 		{
 			name:       "invalid Affinity fails PreScore",
 			pod:        &v1.Pod{Spec: v1.PodSpec{NodeName: "", Affinity: invalidAffinityLabels}},
-			wantStatus: framework.NewStatus(framework.Error, `Invalid value: "{{.bad-value.}}"`),
+			wantStatus: fwk.NewStatus(fwk.Error, `Invalid value: "{{.bad-value.}}"`),
 			nodes: []*v1.Node{
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelRgChina}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgChina}},
@@ -673,7 +737,7 @@ func TestPreferredAffinity(t *testing.T) {
 		{
 			name:       "invalid AntiAffinity fails PreScore",
 			pod:        &v1.Pod{Spec: v1.PodSpec{NodeName: "", Affinity: invalidAntiAffinityLabels}},
-			wantStatus: framework.NewStatus(framework.Error, `Invalid value: "{{.bad-value.}}"`),
+			wantStatus: fwk.NewStatus(fwk.Error, `Invalid value: "{{.bad-value.}}"`),
 			nodes: []*v1.Node{
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelRgChina}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgChina}},
@@ -692,7 +756,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelRgChina}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: 0}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: 0}},
 		},
 		{
 			name: "Affinity with pods matching both NamespaceSelector and Namespaces fields",
@@ -707,7 +771,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelRgChina}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: 0}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: 0}},
 		},
 		{
 			name: "Affinity with pods matching NamespaceSelector",
@@ -722,7 +786,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelRgChina}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: framework.MaxNodeScore}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: fwk.MaxNodeScore}},
 		},
 		{
 			name: "Affinity with pods matching both NamespaceSelector and Namespaces fields",
@@ -737,7 +801,35 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelRgChina}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 			},
-			expectedList: []framework.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: framework.MaxNodeScore}},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: fwk.MaxNodeScore}},
+		},
+		{
+			name: "Affinity with pods correctly enforcing negative NamespaceSelector",
+			pod:  &v1.Pod{Spec: v1.PodSpec{Affinity: affinityNegativeNamespaceSelector}, ObjectMeta: metav1.ObjectMeta{Namespace: "subteam1.team1", Labels: podLabelSecurityS1}},
+			pods: []*v1.Pod{
+				{Spec: v1.PodSpec{NodeName: "node1"}, ObjectMeta: metav1.ObjectMeta{Namespace: "subteam1.team1", Labels: podLabelSecurityS1}},
+				{Spec: v1.PodSpec{NodeName: "node1"}, ObjectMeta: metav1.ObjectMeta{Namespace: "subteam1.team1", Labels: podLabelSecurityS1}},
+				{Spec: v1.PodSpec{NodeName: "node2"}, ObjectMeta: metav1.ObjectMeta{Namespace: "subteam1.team2", Labels: podLabelSecurityS1}},
+			},
+			nodes: []*v1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelRgChina}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
+			},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: fwk.MaxScore}},
+		},
+		{
+			name: "AntiAffinity with pods correctly enforcing negative NamespaceSelector",
+			pod:  &v1.Pod{Spec: v1.PodSpec{Affinity: antiAffinityNegativeNamespaceSelector}, ObjectMeta: metav1.ObjectMeta{Namespace: "subteam1.team1", Labels: podLabelSecurityS1}},
+			pods: []*v1.Pod{
+				{Spec: v1.PodSpec{NodeName: "node1"}, ObjectMeta: metav1.ObjectMeta{Namespace: "subteam1.team1", Labels: podLabelSecurityS1}},
+				{Spec: v1.PodSpec{NodeName: "node1"}, ObjectMeta: metav1.ObjectMeta{Namespace: "subteam1.team1", Labels: podLabelSecurityS1}},
+				{Spec: v1.PodSpec{NodeName: "node2"}, ObjectMeta: metav1.ObjectMeta{Namespace: "subteam1.team2", Labels: podLabelSecurityS1}},
+			},
+			nodes: []*v1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelRgChina}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
+			},
+			expectedList: []fwk.NodeScore{{Name: "node1", Score: fwk.MaxScore}, {Name: "node2", Score: 0}},
 		},
 		{
 			name: "Ignore preferred terms of existing pods",
@@ -750,8 +842,8 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelRgChina}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 			},
-			expectedList:                       []framework.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: 0}},
-			wantStatus:                         framework.NewStatus(framework.Skip),
+			expectedList:                       []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: 0}},
+			wantStatus:                         fwk.NewStatus(fwk.Skip),
 			ignorePreferredTermsOfExistingPods: true,
 		},
 		{
@@ -765,7 +857,7 @@ func TestPreferredAffinity(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: labelRgChina}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "node2", Labels: labelRgIndia}},
 			},
-			expectedList:                       []framework.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: framework.MaxNodeScore}},
+			expectedList:                       []fwk.NodeScore{{Name: "node1", Score: 0}, {Name: "node2", Score: fwk.MaxNodeScore}},
 			ignorePreferredTermsOfExistingPods: false,
 		},
 		{
@@ -773,7 +865,7 @@ func TestPreferredAffinity(t *testing.T) {
 			pod:        &v1.Pod{Spec: v1.PodSpec{NodeName: ""}, ObjectMeta: metav1.ObjectMeta{Labels: podLabelSecurityS2}},
 			pods:       []*v1.Pod{},
 			nodes:      []*v1.Node{},
-			wantStatus: framework.NewStatus(framework.Skip),
+			wantStatus: fwk.NewStatus(fwk.Skip),
 		},
 	}
 	for _, test := range tests {
@@ -782,8 +874,9 @@ func TestPreferredAffinity(t *testing.T) {
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
 			state := framework.NewCycleState()
-			p := plugintesting.SetupPluginWithInformers(ctx, t, New, &config.InterPodAffinityArgs{HardPodAffinityWeight: 1, IgnorePreferredTermsOfExistingPods: test.ignorePreferredTermsOfExistingPods}, cache.NewSnapshot(test.pods, test.nodes), namespaces)
-			status := p.(framework.PreScorePlugin).PreScore(ctx, state, test.pod, test.nodes)
+			p := plugintesting.SetupPluginWithInformers(ctx, t, schedruntime.FactoryAdapter(feature.Features{}, New), &config.InterPodAffinityArgs{HardPodAffinityWeight: 1, IgnorePreferredTermsOfExistingPods: test.ignorePreferredTermsOfExistingPods}, cache.NewSnapshot(test.pods, test.nodes), namespaces)
+			nodeInfos := tf.BuildNodeInfos(test.nodes)
+			status := p.(fwk.PreScorePlugin).PreScore(ctx, state, test.pod, nodeInfos)
 
 			if !status.IsSuccess() {
 				if status.Code() != test.wantStatus.Code() {
@@ -796,17 +889,17 @@ func TestPreferredAffinity(t *testing.T) {
 				return
 			}
 
-			var gotList framework.NodeScoreList
-			for _, n := range test.nodes {
-				nodeName := n.ObjectMeta.Name
-				score, status := p.(framework.ScorePlugin).Score(ctx, state, test.pod, nodeName)
+			var gotList fwk.NodeScoreList
+			for _, nodeInfo := range nodeInfos {
+				nodeName := nodeInfo.Node().Name
+				score, status := p.(fwk.ScorePlugin).Score(ctx, state, test.pod, nodeInfo)
 				if !status.IsSuccess() {
 					t.Errorf("unexpected error from Score: %v", status)
 				}
-				gotList = append(gotList, framework.NodeScore{Name: nodeName, Score: score})
+				gotList = append(gotList, fwk.NodeScore{Name: nodeName, Score: score})
 			}
 
-			status = p.(framework.ScorePlugin).ScoreExtensions().NormalizeScore(ctx, state, test.pod, gotList)
+			status = p.(fwk.ScorePlugin).ScoreExtensions().NormalizeScore(ctx, state, test.pod, gotList)
 			if !status.IsSuccess() {
 				t.Errorf("unexpected error from NormalizeScore: %v", status)
 			}
@@ -864,9 +957,9 @@ func TestPreferredAffinityWithHardPodAffinitySymmetricWeight(t *testing.T) {
 		pods                  []*v1.Pod
 		nodes                 []*v1.Node
 		hardPodAffinityWeight int32
-		expectedList          framework.NodeScoreList
+		expectedList          fwk.NodeScoreList
 		name                  string
-		wantStatus            *framework.Status
+		wantStatus            *fwk.Status
 	}{
 		{
 			name: "with default weight",
@@ -881,7 +974,7 @@ func TestPreferredAffinityWithHardPodAffinitySymmetricWeight(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelAzAz1}},
 			},
 			hardPodAffinityWeight: v1.DefaultHardPodAffinitySymmetricWeight,
-			expectedList:          []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: framework.MaxNodeScore}, {Name: "node3", Score: 0}},
+			expectedList:          []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: fwk.MaxNodeScore}, {Name: "node3", Score: 0}},
 		},
 		{
 			name: "with zero weight",
@@ -896,7 +989,7 @@ func TestPreferredAffinityWithHardPodAffinitySymmetricWeight(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelAzAz1}},
 			},
 			hardPodAffinityWeight: 0,
-			wantStatus:            framework.NewStatus(framework.Skip),
+			wantStatus:            fwk.NewStatus(fwk.Skip),
 		},
 		{
 			name: "with no matching namespace",
@@ -911,7 +1004,7 @@ func TestPreferredAffinityWithHardPodAffinitySymmetricWeight(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelAzAz1}},
 			},
 			hardPodAffinityWeight: v1.DefaultHardPodAffinitySymmetricWeight,
-			wantStatus:            framework.NewStatus(framework.Skip),
+			wantStatus:            fwk.NewStatus(fwk.Skip),
 		},
 		{
 			name: "with matching NamespaceSelector",
@@ -926,7 +1019,7 @@ func TestPreferredAffinityWithHardPodAffinitySymmetricWeight(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelAzAz1}},
 			},
 			hardPodAffinityWeight: v1.DefaultHardPodAffinitySymmetricWeight,
-			expectedList:          []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: framework.MaxNodeScore}, {Name: "node3", Score: 0}},
+			expectedList:          []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: fwk.MaxNodeScore}, {Name: "node3", Score: 0}},
 		},
 		{
 			name: "with matching Namespaces",
@@ -941,7 +1034,7 @@ func TestPreferredAffinityWithHardPodAffinitySymmetricWeight(t *testing.T) {
 				{ObjectMeta: metav1.ObjectMeta{Name: "node3", Labels: labelAzAz1}},
 			},
 			hardPodAffinityWeight: v1.DefaultHardPodAffinitySymmetricWeight,
-			expectedList:          []framework.NodeScore{{Name: "node1", Score: framework.MaxNodeScore}, {Name: "node2", Score: framework.MaxNodeScore}, {Name: "node3", Score: 0}},
+			expectedList:          []fwk.NodeScore{{Name: "node1", Score: fwk.MaxNodeScore}, {Name: "node2", Score: fwk.MaxNodeScore}, {Name: "node3", Score: 0}},
 		},
 	}
 	for _, test := range tests {
@@ -950,8 +1043,9 @@ func TestPreferredAffinityWithHardPodAffinitySymmetricWeight(t *testing.T) {
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
 			state := framework.NewCycleState()
-			p := plugintesting.SetupPluginWithInformers(ctx, t, New, &config.InterPodAffinityArgs{HardPodAffinityWeight: test.hardPodAffinityWeight}, cache.NewSnapshot(test.pods, test.nodes), namespaces)
-			status := p.(framework.PreScorePlugin).PreScore(ctx, state, test.pod, test.nodes)
+			p := plugintesting.SetupPluginWithInformers(ctx, t, schedruntime.FactoryAdapter(feature.Features{}, New), &config.InterPodAffinityArgs{HardPodAffinityWeight: test.hardPodAffinityWeight}, cache.NewSnapshot(test.pods, test.nodes), namespaces)
+			nodeInfos := tf.BuildNodeInfos(test.nodes)
+			status := p.(fwk.PreScorePlugin).PreScore(ctx, state, test.pod, nodeInfos)
 			if !test.wantStatus.Equal(status) {
 				t.Errorf("InterPodAffinity#PreScore() returned unexpected status.Code got: %v, want: %v", status.Code(), test.wantStatus.Code())
 			}
@@ -959,23 +1053,27 @@ func TestPreferredAffinityWithHardPodAffinitySymmetricWeight(t *testing.T) {
 				return
 			}
 
-			var gotList framework.NodeScoreList
-			for _, n := range test.nodes {
-				nodeName := n.ObjectMeta.Name
-				score, status := p.(framework.ScorePlugin).Score(ctx, state, test.pod, nodeName)
+			var gotList fwk.NodeScoreList
+			for _, nodeInfo := range nodeInfos {
+				nodeName := nodeInfo.Node().Name
+				nodeInfo, err := p.(*InterPodAffinity).sharedLister.NodeInfos().Get(nodeName)
+				if err != nil {
+					t.Errorf("failed to get node %q from snapshot: %v", nodeName, err)
+				}
+				score, status := p.(fwk.ScorePlugin).Score(ctx, state, test.pod, nodeInfo)
 				if !status.IsSuccess() {
 					t.Errorf("unexpected error: %v", status)
 				}
-				gotList = append(gotList, framework.NodeScore{Name: nodeName, Score: score})
+				gotList = append(gotList, fwk.NodeScore{Name: nodeName, Score: score})
 			}
 
-			status = p.(framework.ScorePlugin).ScoreExtensions().NormalizeScore(ctx, state, test.pod, gotList)
+			status = p.(fwk.ScorePlugin).ScoreExtensions().NormalizeScore(ctx, state, test.pod, gotList)
 			if !status.IsSuccess() {
 				t.Errorf("unexpected error: %v", status)
 			}
 
-			if !reflect.DeepEqual(test.expectedList, gotList) {
-				t.Errorf("expected:\n\t%+v,\ngot:\n\t%+v", test.expectedList, gotList)
+			if diff := cmp.Diff(test.expectedList, gotList); diff != "" {
+				t.Errorf("unexpected NodeScoreList (-want,+got):\n%s", diff)
 			}
 		})
 	}

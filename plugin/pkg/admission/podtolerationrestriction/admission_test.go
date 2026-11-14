@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -355,8 +356,30 @@ func newHandlerForTest(c kubernetes.Interface) (*Plugin, informers.SharedInforme
 		return nil, nil, err
 	}
 	handler := NewPodTolerationsPlugin(pluginConfig)
-	pluginInitializer := genericadmissioninitializer.New(c, nil, f, nil, nil, nil)
+	pluginInitializer := genericadmissioninitializer.New(c, nil, f, nil, nil, nil, nil, nil)
 	pluginInitializer.Initialize(handler)
 	err = admission.ValidateInitialization(handler)
 	return handler, f, err
+}
+
+// TestDynamicSubresource verifies that updates through pods/dynamic are checked against the
+// tolerations whitelist.
+func TestDynamicSubresource(t *testing.T) {
+	handler, _, err := newHandlerForTest(fake.NewSimpleClientset(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "testNamespace"}}))
+	if err != nil {
+		t.Fatalf("unexpected error initializing handler: %v", err)
+	}
+	handler.SetReadyFunc(func() bool { return true })
+	handler.pluginConfig = &pluginapi.Configuration{Whitelist: []api.Toleration{{Key: "allowed", Operator: api.TolerationOpExists}}}
+
+	oldPod := &api.Pod{ObjectMeta: metav1.ObjectMeta{Name: "testPod", Namespace: "testNamespace"}}
+	pod := oldPod.DeepCopy()
+	pod.Spec.Tolerations = []api.Toleration{{Key: "disallowed", Operator: api.TolerationOpExists}}
+
+	for subresource, expectErr := range map[string]bool{"": true, "dynamic": true, "status": false} {
+		attrs := admission.NewAttributesRecord(pod, oldPod, api.Kind("Pod").WithVersion("version"), "testNamespace", "testPod", api.Resource("pods").WithVersion("version"), subresource, admission.Update, &metav1.UpdateOptions{}, false, nil)
+		if err := handler.Validate(t.Context(), attrs, nil); (err != nil) != expectErr {
+			t.Errorf("subresource %q: expected error %v, got %v", subresource, expectErr, err)
+		}
+	}
 }

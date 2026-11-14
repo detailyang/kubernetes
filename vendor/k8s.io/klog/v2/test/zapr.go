@@ -18,11 +18,6 @@ package test
 
 // ZaprOutputMappingDirect provides a mapping from klog output to the
 // corresponding zapr output when zapr is called directly.
-//
-// # Experimental
-//
-// Notice: This package is EXPERIMENTAL and may be changed or removed in a
-// later release.
 func ZaprOutputMappingDirect() map[string]string {
 	return map[string]string{
 		`I output.go:<LINE>] "test" akey="<&>"
@@ -37,11 +32,15 @@ func ZaprOutputMappingDirect() map[string]string {
 `: `{"caller":"test/output.go:<LINE>","msg":"helper","v":0,"akey":"avalue"}
 `,
 
-		`I output.go:<LINE>] "test" akey="avalue" akey="avalue2"
-`: `{"caller":"test/output.go:<LINE>","msg":"test","v":0,"akey":"avalue","akey":"avalue2"}
+		`I output.go:<LINE>] "test-arguments" akey="avalue2"
+`: `{"caller":"test/output.go:<LINE>","msg":"test-arguments","v":0,"akey":"avalue","akey":"avalue2"}
 `,
 
-		`I output.go:<LINE>] "hello/world: test" akey="avalue"
+		`I output.go:<LINE>] "test-with-values" akey="avalue2"
+`: `{"caller":"test/output.go:<LINE>","msg":"test-with-values","akey":"avalue","v":0,"akey":"avalue2"}
+`,
+
+		`I output.go:<LINE>] "test" logger="hello.world" akey="avalue"
 `: `{"logger":"hello.world","caller":"test/output.go:<LINE>","msg":"test","v":0,"akey":"avalue"}
 `,
 
@@ -97,7 +96,7 @@ func ZaprOutputMappingDirect() map[string]string {
 `: `{"caller":"test/output.go:<LINE>","msg":"test","v":0,"akey":"avalue"}
 `,
 
-		`I output.go:<LINE>] "me: test" akey="avalue"
+		`I output.go:<LINE>] "test" logger="me" akey="avalue"
 `: `{"logger":"me","caller":"test/output.go:<LINE>","msg":"test","v":0,"akey":"avalue"}
 `,
 
@@ -171,22 +170,22 @@ I output.go:<LINE>] "odd WithValues" keyWithoutValue="(MISSING)"
 
 		// klog.Info
 		`I output.go:<LINE>] "helloworld\n"
-`: `{"caller":"test/output.go:<LINE>","msg":"helloworld\n","v":0}
+`: `{"caller":"test/output.go:<LINE>","msg":"helloworld","v":0}
 `,
 
 		// klog.Infoln
 		`I output.go:<LINE>] "hello world\n"
-`: `{"caller":"test/output.go:<LINE>","msg":"hello world\n","v":0}
+`: `{"caller":"test/output.go:<LINE>","msg":"hello world","v":0}
 `,
 
 		// klog.Error
 		`E output.go:<LINE>] "helloworld\n"
-`: `{"caller":"test/output.go:<LINE>","msg":"helloworld\n"}
+`: `{"caller":"test/output.go:<LINE>","msg":"helloworld"}
 `,
 
 		// klog.Errorln
 		`E output.go:<LINE>] "hello world\n"
-`: `{"caller":"test/output.go:<LINE>","msg":"hello world\n"}
+`: `{"caller":"test/output.go:<LINE>","msg":"hello world"}
 `,
 
 		// klog.ErrorS
@@ -201,12 +200,12 @@ I output.go:<LINE>] "odd WithValues" keyWithoutValue="(MISSING)"
 
 		// klog.V(1).Info
 		`I output.go:<LINE>] "hellooneworld\n"
-`: `{"caller":"test/output.go:<LINE>","msg":"hellooneworld\n","v":1}
+`: `{"caller":"test/output.go:<LINE>","msg":"hellooneworld","v":1}
 `,
 
 		// klog.V(1).Infoln
 		`I output.go:<LINE>] "hello one world\n"
-`: `{"caller":"test/output.go:<LINE>","msg":"hello one world\n","v":1}
+`: `{"caller":"test/output.go:<LINE>","msg":"hello one world","v":1}
 `,
 
 		// klog.V(1).ErrorS
@@ -264,6 +263,26 @@ I output.go:<LINE>] "odd WithValues" keyWithoutValue="(MISSING)"
 		`I output.go:<LINE>] "cycle" list="<internal error: json: unsupported value: encountered a cycle via *test.myList>"
 `: `{"caller":"test/output.go:<LINE>","msg":"cycle","v":0,"listError":"json: unsupported value: encountered a cycle via *test.myList"}
 `,
+
+		`I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" span="0102030405060708"
+I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" span="1112131415161718"
+I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" span="0102030405060708"
+I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" span="2122232425262728"
+`: `{"caller":"test/output.go:<LINE>","msg":"duplicates","trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","v":0}
+{"caller":"test/output.go:<LINE>","msg":"duplicates","trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","trace":"101112131415161718191a1b1c1d1e1f","span":"1112131415161718","v":0}
+{"caller":"test/output.go:<LINE>","msg":"duplicates","trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","v":0}
+{"caller":"test/output.go:<LINE>","msg":"duplicates","trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","trace":"101112131415161718191a1b1c1d1e1f","span":"2122232425262728","v":0}
+`,
+
+		`I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" span="0102030405060708" a=1
+I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" a=1 b=2 span="1112131415161718"
+I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" span="0102030405060708" a=1
+I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" a=1 c=3 span="2122232425262728" d=4
+`: `{"caller":"test/output.go:<LINE>","msg":"duplicates","trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","a":1,"v":0}
+{"caller":"test/output.go:<LINE>","msg":"duplicates","trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","a":1,"b":2,"trace":"101112131415161718191a1b1c1d1e1f","span":"1112131415161718","v":0}
+{"caller":"test/output.go:<LINE>","msg":"duplicates","trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","a":1,"v":0}
+{"caller":"test/output.go:<LINE>","msg":"duplicates","trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","a":1,"c":3,"trace":"101112131415161718191a1b1c1d1e1f","span":"2122232425262728","d":4,"v":0}
+`,
 	}
 }
 
@@ -280,23 +299,16 @@ I output.go:<LINE>] "odd WithValues" keyWithoutValue="(MISSING)"
 //   - Output does that without emitting the warning that we get
 //     from zapr.
 //   - zap drops keys with missing values, here we get "(MISSING)".
-//   - zap does not de-duplicate key/value pairs, here klog does that
-//     for it.
-//
-// # Experimental
-//
-// Notice: This package is EXPERIMENTAL and may be changed or removed in a
-// later release.
 func ZaprOutputMappingIndirect() map[string]string {
 	mapping := ZaprOutputMappingDirect()
 
 	for key, value := range map[string]string{
-		`I output.go:<LINE>] "hello/world: test" akey="avalue"
-`: `{"caller":"test/output.go:<LINE>","msg":"hello/world: test","v":0,"akey":"avalue"}
+		`I output.go:<LINE>] "test" logger="hello.world" akey="avalue"
+`: `{"caller":"test/output.go:<LINE>","msg":"test","v":0,"logger":"hello.world","akey":"avalue"}
 `,
 
-		`I output.go:<LINE>] "me: test" akey="avalue"
-`: `{"caller":"test/output.go:<LINE>","msg":"me: test","v":0,"akey":"avalue"}
+		`I output.go:<LINE>] "test" logger="me" akey="avalue"
+`: `{"caller":"test/output.go:<LINE>","msg":"test","v":0,"logger":"me","akey":"avalue"}
 `,
 
 		`I output.go:<LINE>] "odd parameters" basekey1="basevar1" basekey2="(MISSING)" akey="avalue" akey2="(MISSING)"
@@ -321,12 +333,16 @@ I output.go:<LINE>] "odd WithValues" keyWithoutValue="(MISSING)"
 `: `{"caller":"test/output.go:<LINE>","msg":"test","v":0,"akey9":"avalue9","akey8":"avalue8","akey1":"avalue1","akey5":"avalue5","akey4":"avalue4"}
 `,
 
-		`I output.go:<LINE>] "test" akey="avalue2"
-`: `{"caller":"test/output.go:<LINE>","msg":"test","v":0,"akey":"avalue2"}
+		`I output.go:<LINE>] "test-arguments" akey="avalue2"
+`: `{"caller":"test/output.go:<LINE>","msg":"test-arguments","v":0,"akey":"avalue","akey":"avalue2"}
+`,
+
+		`I output.go:<LINE>] "test-with-values" akey="avalue2"
+`: `{"caller":"test/output.go:<LINE>","msg":"test-with-values","v":0,"akey":"avalue","akey":"avalue2"}
 `,
 
 		`I output.go:<LINE>] "test" X="y" duration="1m0s" A="b"
-`: `{"caller":"test/output.go:<LINE>","msg":"test","v":0,"X":"y","duration":"1m0s","A":"b"}
+`: `{"caller":"test/output.go:<LINE>","msg":"test","v":0,"duration":"1h0m0s","X":"y","duration":"1m0s","A":"b"}
 `,
 
 		`I output.go:<LINE>] "test" firstKey=1
@@ -355,6 +371,26 @@ I output.go:<LINE>] "test" firstKey=1 secondKey=3
 		// discards these messages.
 		`I output.go:<LINE>] "v=11: you see me because of -vmodule output=11"
 `: ``,
+
+		`I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" span="0102030405060708"
+I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" span="1112131415161718"
+I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" span="0102030405060708"
+I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" span="2122232425262728"
+`: `{"caller":"test/output.go:<LINE>","msg":"duplicates","v":0,"trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708"}
+{"caller":"test/output.go:<LINE>","msg":"duplicates","v":0,"trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","trace":"101112131415161718191a1b1c1d1e1f","span":"1112131415161718"}
+{"caller":"test/output.go:<LINE>","msg":"duplicates","v":0,"trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708"}
+{"caller":"test/output.go:<LINE>","msg":"duplicates","v":0,"trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","trace":"101112131415161718191a1b1c1d1e1f","span":"2122232425262728"}
+`,
+
+		`I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" span="0102030405060708" a=1
+I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" a=1 b=2 span="1112131415161718"
+I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" span="0102030405060708" a=1
+I output.go:<LINE>] "duplicates" trace="101112131415161718191a1b1c1d1e1f" a=1 c=3 span="2122232425262728" d=4
+`: `{"caller":"test/output.go:<LINE>","msg":"duplicates","v":0,"trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","a":1}
+{"caller":"test/output.go:<LINE>","msg":"duplicates","v":0,"trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","a":1,"b":2,"trace":"101112131415161718191a1b1c1d1e1f","span":"1112131415161718"}
+{"caller":"test/output.go:<LINE>","msg":"duplicates","v":0,"trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","a":1}
+{"caller":"test/output.go:<LINE>","msg":"duplicates","v":0,"trace":"101112131415161718191a1b1c1d1e1f","span":"0102030405060708","a":1,"c":3,"trace":"101112131415161718191a1b1c1d1e1f","span":"2122232425262728","d":4}
+`,
 	} {
 		mapping[key] = value
 	}

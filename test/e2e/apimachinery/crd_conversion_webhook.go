@@ -34,18 +34,17 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/ktesting/format"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2edeployment "k8s.io/kubernetes/test/e2e/framework/deployment"
+	e2eendpointslice "k8s.io/kubernetes/test/e2e/framework/endpointslice"
 	"k8s.io/kubernetes/test/utils/crd"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 	admissionapi "k8s.io/pod-security-admission/api"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/test/integration"
-
-	// ensure libs have a chance to initialize
-	_ "github.com/stretchr/testify/assert"
 )
 
 const (
@@ -149,8 +148,8 @@ var _ = SIGDescribe("CustomResourceConversionWebhook [Privileged:ClusterAdmin]",
 						Service: &apiextensionsv1.ServiceReference{
 							Namespace: f.Namespace.Name,
 							Name:      serviceCRDName,
-							Path:      pointer.String("/crdconvert"),
-							Port:      pointer.Int32(servicePort),
+							Path:      ptr.To("/crdconvert"),
+							Port:      ptr.To[int32](servicePort),
 						},
 					},
 					ConversionReviewVersions: []string{"v1", "v1beta1"},
@@ -184,8 +183,8 @@ var _ = SIGDescribe("CustomResourceConversionWebhook [Privileged:ClusterAdmin]",
 						Service: &apiextensionsv1.ServiceReference{
 							Namespace: f.Namespace.Name,
 							Name:      serviceCRDName,
-							Path:      pointer.String("/crdconvert"),
-							Port:      pointer.Int32(servicePort),
+							Path:      ptr.To("/crdconvert"),
+							Port:      ptr.To[int32](servicePort),
 						},
 					},
 					ConversionReviewVersions: []string{"v1", "v1beta1"},
@@ -342,7 +341,7 @@ func deployCustomResourceWebhookAndService(ctx context.Context, f *framework.Fra
 	framework.ExpectNoError(err, "creating service %s in namespace %s", serviceCRDName, namespace)
 
 	ginkgo.By("Verifying the service has paired with the endpoint")
-	err = framework.WaitForServiceEndpointsNum(ctx, client, namespace, serviceCRDName, 1, 1*time.Second, 30*time.Second)
+	err = e2eendpointslice.WaitForEndpointCount(ctx, client, namespace, serviceCRDName, 1)
 	framework.ExpectNoError(err, "waiting for service %s/%s have %d endpoint", namespace, serviceCRDName, 1)
 }
 
@@ -447,7 +446,7 @@ func testCRListConversion(ctx context.Context, f *framework.Framework, testCrd *
 	// Just retrying fixes that.
 	//
 	// TODO: we have to wait for the storage version to become effective. Storage version changes are not instant.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		_, err = customResourceClients["v1"].Create(ctx, crInstance, metav1.CreateOptions{})
 		if err == nil {
 			break
@@ -460,25 +459,29 @@ func testCRListConversion(ctx context.Context, f *framework.Framework, testCrd *
 	ginkgo.By("List CRs in v1")
 	list, err := customResourceClients["v1"].List(ctx, metav1.ListOptions{})
 	framework.ExpectNoError(err)
-	gomega.Expect(len(list.Items)).To(gomega.BeIdenticalTo(2))
-	framework.ExpectEqual((list.Items[0].GetName() == name1 && list.Items[1].GetName() == name2) ||
-		(list.Items[0].GetName() == name2 && list.Items[1].GetName() == name1), true)
+	gomega.Expect(list.Items).To(gomega.HaveLen(2))
+	if !((list.Items[0].GetName() == name1 && list.Items[1].GetName() == name2) ||
+		(list.Items[0].GetName() == name2 && list.Items[1].GetName() == name1)) {
+		framework.Failf("failed to find v1 objects with names %s and %s in the list: \n%s", name1, name2, format.Object(list.Items, 1))
+	}
 	verifyV1Object(crd, &list.Items[0])
 	verifyV1Object(crd, &list.Items[1])
 
 	ginkgo.By("List CRs in v2")
 	list, err = customResourceClients["v2"].List(ctx, metav1.ListOptions{})
 	framework.ExpectNoError(err)
-	gomega.Expect(len(list.Items)).To(gomega.BeIdenticalTo(2))
-	framework.ExpectEqual((list.Items[0].GetName() == name1 && list.Items[1].GetName() == name2) ||
-		(list.Items[0].GetName() == name2 && list.Items[1].GetName() == name1), true)
+	gomega.Expect(list.Items).To(gomega.HaveLen(2))
+	if !((list.Items[0].GetName() == name1 && list.Items[1].GetName() == name2) ||
+		(list.Items[0].GetName() == name2 && list.Items[1].GetName() == name1)) {
+		framework.Failf("failed to find v2 objects with names %s and %s in the list: \n%s", name1, name2, format.Object(list.Items, 1))
+	}
 	verifyV2Object(crd, &list.Items[0])
 	verifyV2Object(crd, &list.Items[1])
 }
 
 // waitWebhookConversionReady sends stub custom resource creation requests requiring conversion until one succeeds.
 func waitWebhookConversionReady(ctx context.Context, f *framework.Framework, crd *apiextensionsv1.CustomResourceDefinition, customResourceClients map[string]dynamic.ResourceInterface, version string) {
-	framework.ExpectNoError(wait.PollImmediateWithContext(ctx, 100*time.Millisecond, 30*time.Second, func(ctx context.Context) (bool, error) {
+	framework.ExpectNoError(wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
 		crInstance := &unstructured.Unstructured{
 			Object: map[string]interface{}{
 				"kind":       crd.Spec.Names.Kind,

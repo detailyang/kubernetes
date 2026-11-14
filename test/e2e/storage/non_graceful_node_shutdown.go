@@ -42,7 +42,6 @@ import (
 /*
 This test assumes the following:
 - The infra is GCP.
-- NodeOutOfServiceVolumeDetach feature is enabled.
 
 This test performs the following:
 - Deploys a gce-pd csi driver
@@ -57,7 +56,7 @@ This test performs the following:
 - Removes the `out-of-service` taint from the node.
 */
 
-var _ = utils.SIGDescribe("[Feature:NodeOutOfServiceVolumeDetach] [Disruptive] [LinuxOnly] NonGracefulNodeShutdown", func() {
+var _ = utils.SIGDescribe(framework.WithDisruptive(), framework.WithProvider("gce"), "[LinuxOnly] NonGracefulNodeShutdown", func() {
 	var (
 		c  clientset.Interface
 		ns string
@@ -68,7 +67,6 @@ var _ = utils.SIGDescribe("[Feature:NodeOutOfServiceVolumeDetach] [Disruptive] [
 	ginkgo.BeforeEach(func(ctx context.Context) {
 		c = f.ClientSet
 		ns = f.Namespace.Name
-		e2eskipper.SkipUnlessProviderIs("gce")
 		nodeList, err := e2enode.GetReadySchedulableNodes(ctx, c)
 		if err != nil {
 			framework.Logf("Failed to list node: %v", err)
@@ -79,7 +77,7 @@ var _ = utils.SIGDescribe("[Feature:NodeOutOfServiceVolumeDetach] [Disruptive] [
 	})
 
 	ginkgo.Describe("[NonGracefulNodeShutdown] pod that uses a persistent volume via gce pd driver", func() {
-		ginkgo.It("should get immediately rescheduled to a different node after non graceful node shutdown ", func(ctx context.Context) {
+		ginkgo.It("should get immediately rescheduled to a different node after non graceful node shutdown", func(ctx context.Context) {
 			// Install gce pd csi driver
 			ginkgo.By("deploying csi gce-pd driver")
 			driver := drivers.InitGcePDCSIDriver()

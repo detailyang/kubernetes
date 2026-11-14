@@ -1,3 +1,5 @@
+//go:build !windows
+
 /*
 Copyright 2022 The Kubernetes Authors.
 
@@ -115,7 +117,6 @@ func TestTimeouts(t *testing.T) {
 	}
 
 	for _, tt := range testCases {
-		tt := tt
 		t.Run(tt.desc, func(t *testing.T) {
 			t.Parallel()
 			var (

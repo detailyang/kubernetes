@@ -24,10 +24,12 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
 	api "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilversion "k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
@@ -37,6 +39,7 @@ import (
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
+	"k8s.io/mount-utils"
 )
 
 const (
@@ -142,7 +145,7 @@ func newTestPluginWithVolumeHost(t *testing.T, client *fakeclient.Clientset, hos
 }
 
 func registerFakePlugin(pluginName, endpoint string, versions []string, t *testing.T) {
-	highestSupportedVersions, err := highestSupportedVersion(versions)
+	highestSupportedVersions, err := utilversion.HighestSupportedVersion(versions)
 	if err != nil {
 		t.Fatalf("unexpected error parsing versions (%v) for pluginName %q endpoint %q: %#v", versions, pluginName, endpoint, err)
 	}
@@ -369,13 +372,14 @@ func TestPluginConstructVolumeSpec(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ReadWriteOncePod, tc.seLinuxMountEnabled)()
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SELinuxMountReadWriteOncePod, tc.seLinuxMountEnabled)()
+			if !tc.seLinuxMountEnabled {
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, utilversion.MustParse("1.35"))
+			}
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SELinuxMountReadWriteOncePod, tc.seLinuxMountEnabled)
 
 			mounter, err := plug.NewMounter(
 				tc.originSpec,
 				&api.Pod{ObjectMeta: meta.ObjectMeta{UID: tc.podUID, Namespace: testns}},
-				volume.VolumeOptions{},
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -509,7 +513,6 @@ func TestPluginConstructVolumeSpecWithInline(t *testing.T) {
 			mounter, err := plug.NewMounter(
 				tc.originSpec,
 				&api.Pod{ObjectMeta: meta.ObjectMeta{UID: tc.podUID, Namespace: testns}},
-				volume.VolumeOptions{},
 			)
 			if tc.shouldFail && err != nil {
 				t.Log(err)
@@ -616,7 +619,6 @@ func TestPluginNewMounter(t *testing.T) {
 			mounter, err := plug.NewMounter(
 				test.spec,
 				&api.Pod{ObjectMeta: meta.ObjectMeta{UID: test.podUID, Namespace: test.namespace}},
-				volume.VolumeOptions{},
 			)
 			if test.shouldFail != (err != nil) {
 				t.Fatal("Unexpected error:", err)
@@ -719,7 +721,6 @@ func TestPluginNewMounterWithInline(t *testing.T) {
 				mounter, err := plug.NewMounter(
 					test.spec,
 					&api.Pod{ObjectMeta: meta.ObjectMeta{UID: test.podUID, Namespace: test.namespace}},
-					volume.VolumeOptions{},
 				)
 
 				// Some test cases are meant to fail because their input data is broken.
@@ -1113,7 +1114,6 @@ func TestPluginNewBlockMapper(t *testing.T) {
 	mounter, err := plug.NewBlockVolumeMapper(
 		volume.NewSpecFromPersistentVolume(pv, pv.Spec.PersistentVolumeSource.CSI.ReadOnly),
 		&api.Pod{ObjectMeta: meta.ObjectMeta{UID: testPodUID, Namespace: testns}},
-		volume.VolumeOptions{},
 	)
 	if err != nil {
 		t.Fatalf("Failed to make a new BlockMapper: %v", err)
@@ -1358,7 +1358,7 @@ func TestValidatePlugin(t *testing.T) {
 
 	for _, tc := range testCases {
 		// Arrange & Act
-		err := PluginHandler.ValidatePlugin(tc.pluginName, tc.endpoint, tc.versions)
+		err := PluginHandler.ValidatePlugin(t.Context(), tc.pluginName, tc.endpoint, tc.versions)
 
 		// Assert
 		if tc.shouldFail && err == nil {
@@ -1411,7 +1411,7 @@ func TestValidatePluginExistingDriver(t *testing.T) {
 
 	for _, tc := range testCases {
 		// Arrange & Act
-		highestSupportedVersions1, err := highestSupportedVersion(tc.versions1)
+		highestSupportedVersions1, err := utilversion.HighestSupportedVersion(tc.versions1)
 		if err != nil {
 			t.Fatalf("unexpected error parsing version for testcase: %#v: %v", tc, err)
 		}
@@ -1423,7 +1423,7 @@ func TestValidatePluginExistingDriver(t *testing.T) {
 		})
 
 		// Arrange & Act
-		err = PluginHandler.ValidatePlugin(tc.pluginName2, tc.endpoint2, tc.versions2)
+		err = PluginHandler.ValidatePlugin(t.Context(), tc.pluginName2, tc.endpoint2, tc.versions2)
 
 		// Assert
 		if tc.shouldFail && err == nil {
@@ -1435,108 +1435,250 @@ func TestValidatePluginExistingDriver(t *testing.T) {
 	}
 }
 
-func TestHighestSupportedVersion(t *testing.T) {
-	testCases := []struct {
-		versions                        []string
-		expectedHighestSupportedVersion string
-		shouldFail                      bool
+func TestGetNodeAllocatableUpdatePeriod(t *testing.T) {
+	tests := []struct {
+		name     string
+		driver   *storage.CSIDriver
+		expected time.Duration
 	}{
 		{
-			versions:                        []string{"v1.0.0"},
-			expectedHighestSupportedVersion: "1.0.0",
-			shouldFail:                      false,
+			name:     "nil driver",
+			driver:   nil,
+			expected: 0,
 		},
 		{
-			versions:   []string{"0.3.0"},
-			shouldFail: true,
+			name: "nil NodeAllocatableUpdatePeriodSeconds",
+			driver: &storage.CSIDriver{
+				Spec: storage.CSIDriverSpec{
+					NodeAllocatableUpdatePeriodSeconds: nil,
+				},
+			},
+			expected: 0,
 		},
 		{
-			versions:   []string{"0.2.0"},
-			shouldFail: true,
-		},
-		{
-			versions:                        []string{"1.0.0"},
-			expectedHighestSupportedVersion: "1.0.0",
-			shouldFail:                      false,
-		},
-		{
-			versions:   []string{"v0.3.0"},
-			shouldFail: true,
-		},
-		{
-			versions:   []string{"0.2.0"},
-			shouldFail: true,
-		},
-		{
-			versions:   []string{"0.2.0", "v0.3.0"},
-			shouldFail: true,
-		},
-		{
-			versions:                        []string{"0.2.0", "v1.0.0"},
-			expectedHighestSupportedVersion: "1.0.0",
-			shouldFail:                      false,
-		},
-		{
-			versions:                        []string{"0.2.0", "v1.2.3"},
-			expectedHighestSupportedVersion: "1.2.3",
-			shouldFail:                      false,
-		},
-		{
-			versions:                        []string{"v1.2.3", "v0.3.0"},
-			expectedHighestSupportedVersion: "1.2.3",
-			shouldFail:                      false,
-		},
-		{
-			versions:                        []string{"v1.2.3", "v0.3.0", "2.0.1"},
-			expectedHighestSupportedVersion: "1.2.3",
-			shouldFail:                      false,
-		},
-		{
-			versions:                        []string{"v1.2.3", "4.9.12", "v0.3.0", "2.0.1"},
-			expectedHighestSupportedVersion: "1.2.3",
-			shouldFail:                      false,
-		},
-		{
-			versions:                        []string{"4.9.12", "2.0.1"},
-			expectedHighestSupportedVersion: "",
-			shouldFail:                      true,
-		},
-		{
-			versions:                        []string{"v1.2.3", "boo", "v0.3.0", "2.0.1"},
-			expectedHighestSupportedVersion: "1.2.3",
-			shouldFail:                      false,
-		},
-		{
-			versions:                        []string{},
-			expectedHighestSupportedVersion: "",
-			shouldFail:                      true,
-		},
-		{
-			versions:                        []string{"var", "boo", "foo"},
-			expectedHighestSupportedVersion: "",
-			shouldFail:                      true,
+			name: "NodeAllocatableUpdatePeriodSeconds set to 60",
+			driver: &storage.CSIDriver{
+				Spec: storage.CSIDriverSpec{
+					NodeAllocatableUpdatePeriodSeconds: &[]int64{60}[0],
+				},
+			},
+			expected: 60 * time.Second,
 		},
 	}
 
-	for _, tc := range testCases {
-		// Arrange & Act
-		actual, err := highestSupportedVersion(tc.versions)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := getNodeAllocatableUpdatePeriod(tc.driver)
+			if actual != tc.expected {
+				t.Errorf("Expected %v, got %v", tc.expected, actual)
+			}
+		})
+	}
+}
 
-		// Assert
-		if tc.shouldFail && err == nil {
-			t.Fatalf("expecting highestSupportedVersion to fail, but got nil error for testcase: %#v", tc)
-		}
-		if !tc.shouldFail && err != nil {
-			t.Fatalf("unexpected error during ValidatePlugin for testcase: %#v\r\n err:%v", tc, err)
-		}
-		if tc.expectedHighestSupportedVersion != "" {
-			result, err := actual.Compare(tc.expectedHighestSupportedVersion)
-			if err != nil {
-				t.Fatalf("comparison failed with %v for testcase %#v", err, tc)
+func TestIsResourceExhaustError(t *testing.T) {
+	tests := []struct {
+		name       string
+		attachment *storage.VolumeAttachment
+		expected   bool
+	}{
+		{
+			name:       "nil attachment",
+			attachment: nil,
+			expected:   false,
+		},
+		{
+			name: "nil AttachError",
+			attachment: &storage.VolumeAttachment{
+				Status: storage.VolumeAttachmentStatus{
+					AttachError: nil,
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "nil ErrorCode",
+			attachment: &storage.VolumeAttachment{
+				Status: storage.VolumeAttachmentStatus{
+					AttachError: &storage.VolumeError{
+						Message:   "an error occurred",
+						ErrorCode: nil,
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "non-resource exhausted error code",
+			attachment: &storage.VolumeAttachment{
+				Status: storage.VolumeAttachmentStatus{
+					AttachError: &storage.VolumeError{
+						Message: "volume not found",
+						ErrorCode: func() *int32 {
+							code := int32(codes.NotFound)
+							return &code
+						}(),
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "resource exhausted error code",
+			attachment: &storage.VolumeAttachment{
+				Status: storage.VolumeAttachmentStatus{
+					AttachError: &storage.VolumeError{
+						Message: "resource exhausted",
+						ErrorCode: func() *int32 {
+							code := int32(codes.ResourceExhausted)
+							return &code
+						}(),
+					},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := isResourceExhaustError(tc.attachment)
+			if actual != tc.expected {
+				t.Errorf("Expected isResourceExhaustError to return %v, but got %v", tc.expected, actual)
 			}
-			if result != 0 {
-				t.Fatalf("expectedHighestSupportedVersion %v, but got %v for tc: %#v", tc.expectedHighestSupportedVersion, actual, tc)
-			}
-		}
+		})
+	}
+}
+
+// TestPluginConstructVolumeSpecFallsBackToGlobalMount covers issue #101791.
+//
+// Scenario: kubelet restarts, the pod-local vol_data.json is missing or
+// unreadable, but the global mount's vol_data.json (written by
+// csiAttacher.MountDevice) is intact. Before the fix, ConstructVolumeSpec
+// errored out, marking the volume as failed-reconstruction and letting the
+// global mount leak (corruption risk on RWO volumes).
+//
+// With the fix, ConstructVolumeSpec follows the mount reference the pod-local
+// bind mount still holds to the global mount it was staged at, and rebuilds
+// the spec from the vol_data.json stored beside it.
+func TestPluginConstructVolumeSpecFallsBackToGlobalMount(t *testing.T) {
+	plug, tmpDir := newTestPlugin(t, nil)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	const (
+		specVolID = "orphaned-pv"
+		volHandle = "orphaned-handle"
+	)
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIGlobalMountReconstruction, true)
+	registerFakePlugin(testDriver, "endpoint", []string{"1.0.0"}, t)
+
+	// Arrange: pod-local mount dir exists but has NO vol_data.json
+	// (corrupt or wiped case).
+	podLocalDir := filepath.Join(tmpDir, "pods", "pod-uid", "volumes", "kubernetes.io~csi", specVolID)
+	if err := os.MkdirAll(filepath.Join(podLocalDir, "mount"), 0o755); err != nil {
+		t.Fatalf("setup pod-local dir: %v", err)
+	}
+
+	// Arrange: global mount dir has a complete vol_data.json with
+	// specVolID (as MountDevice now writes).
+	if resolved, err := filepath.EvalSymlinks(tmpDir); err == nil {
+		tmpDir = resolved
+		podLocalDir = filepath.Join(tmpDir, "pods", "pod-uid", "volumes", "kubernetes.io~csi", specVolID)
+	}
+	globalDataDir := filepath.Join(tmpDir, "plugins", CSIPluginName, testDriver, generateSha(volHandle))
+	if err := os.MkdirAll(filepath.Join(globalDataDir, globalMountInGlobalPath), 0o755); err != nil {
+		t.Fatalf("setup global dir: %v", err)
+	}
+	globalData := map[string]string{
+		volDataKey.specVolID:           specVolID,
+		volDataKey.volHandle:           volHandle,
+		volDataKey.driverName:          testDriver,
+		volDataKey.volumeLifecycleMode: string(storage.VolumeLifecyclePersistent),
+	}
+	if err := saveVolumeData(globalDataDir, volDataFileName, globalData); err != nil {
+		t.Fatalf("save global vol_data.json: %v", err)
+	}
+
+	// Arrange: the pod-local mount is still a bind mount of the global one,
+	// which is what the fallback follows.
+	fake, ok := plug.host.GetMounter().(*mount.FakeMounter)
+	if !ok {
+		t.Fatalf("expected a fake mounter, got %T", plug.host.GetMounter())
+	}
+	fake.MountPoints = []mount.MountPoint{
+		{Device: "/dev/sdb", Path: filepath.Join(globalDataDir, globalMountInGlobalPath)},
+		{Device: "/dev/sdb", Path: filepath.Join(podLocalDir, "mount")},
+	}
+
+	// Act
+	rec, err := plug.ConstructVolumeSpec(specVolID, podLocalDir)
+	if err != nil {
+		t.Fatalf("ConstructVolumeSpec did not fall back to global mount data: %v", err)
+	}
+
+	// Assert: spec carries the fields we stored in the global JSON.
+	if rec.Spec == nil || rec.Spec.PersistentVolume == nil || rec.Spec.PersistentVolume.Spec.CSI == nil {
+		t.Fatalf("ConstructVolumeSpec returned incomplete spec: %+v", rec)
+	}
+	csi := rec.Spec.PersistentVolume.Spec.CSI
+	if csi.Driver != testDriver {
+		t.Errorf("Driver: got %q, want %q", csi.Driver, testDriver)
+	}
+	if csi.VolumeHandle != volHandle {
+		t.Errorf("VolumeHandle: got %q, want %q", csi.VolumeHandle, volHandle)
+	}
+}
+
+// TestPluginConstructVolumeSpecGateOffKeepsOldBehavior is the other half of
+// issue #101791: with CSIGlobalMountReconstruction disabled, the very same
+// on-disk layout must still fail reconstruction exactly as it did before this
+// change. The gate is alpha and off by default, so this is what every cluster
+// gets until an operator opts in.
+func TestPluginConstructVolumeSpecGateOffKeepsOldBehavior(t *testing.T) {
+	plug, tmpDir := newTestPlugin(t, nil)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	const (
+		specVolID = "orphaned-pv"
+		volHandle = "orphaned-handle"
+	)
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIGlobalMountReconstruction, false)
+	registerFakePlugin(testDriver, "endpoint", []string{"1.0.0"}, t)
+
+	// Same arrangement as the gate-on test, bind mount included, so that the
+	// only difference between the two is the gate.
+	if resolved, err := filepath.EvalSymlinks(tmpDir); err == nil {
+		tmpDir = resolved
+	}
+	podLocalDir := filepath.Join(tmpDir, "pods", "pod-uid", "volumes", "kubernetes.io~csi", specVolID)
+	if err := os.MkdirAll(filepath.Join(podLocalDir, "mount"), 0o755); err != nil {
+		t.Fatalf("setup pod-local dir: %v", err)
+	}
+	globalDataDir := filepath.Join(tmpDir, "plugins", CSIPluginName, testDriver, generateSha(volHandle))
+	if err := os.MkdirAll(filepath.Join(globalDataDir, globalMountInGlobalPath), 0o755); err != nil {
+		t.Fatalf("setup global dir: %v", err)
+	}
+	globalData := map[string]string{
+		volDataKey.specVolID:           specVolID,
+		volDataKey.volHandle:           volHandle,
+		volDataKey.driverName:          testDriver,
+		volDataKey.volumeLifecycleMode: string(storage.VolumeLifecyclePersistent),
+	}
+	if err := saveVolumeData(globalDataDir, volDataFileName, globalData); err != nil {
+		t.Fatalf("save global vol_data.json: %v", err)
+	}
+
+	fake, ok := plug.host.GetMounter().(*mount.FakeMounter)
+	if !ok {
+		t.Fatalf("expected a fake mounter, got %T", plug.host.GetMounter())
+	}
+	fake.MountPoints = []mount.MountPoint{
+		{Device: "/dev/sdb", Path: filepath.Join(globalDataDir, globalMountInGlobalPath)},
+		{Device: "/dev/sdb", Path: filepath.Join(podLocalDir, "mount")},
+	}
+
+	// Act + assert: the global file is ignored and reconstruction still fails.
+	if _, err := plug.ConstructVolumeSpec(specVolID, podLocalDir); err == nil {
+		t.Fatal("ConstructVolumeSpec succeeded with the gate off; the fallback must not run unless the feature is enabled")
 	}
 }

@@ -19,6 +19,7 @@ package ephemeral
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -71,11 +72,12 @@ type ephemeralController struct {
 	// recorder is used to record events in the API server
 	recorder record.EventRecorder
 
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 }
 
 // NewController creates an ephemeral volume controller.
 func NewController(
+	ctx context.Context,
 	kubeClient clientset.Interface,
 	podInformer coreinformers.PodInformer,
 	pvcInformer coreinformers.PersistentVolumeClaimInformer) (Controller, error) {
@@ -87,29 +89,42 @@ func NewController(
 		podSynced:  podInformer.Informer().HasSynced,
 		pvcLister:  pvcInformer.Lister(),
 		pvcsSynced: pvcInformer.Informer().HasSynced,
-		queue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "ephemeral_volume"),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: new(klog.FromContext(ctx)),
+				Name:   "ephemeral_volume",
+			},
+		),
 	}
 
 	ephemeralvolumemetrics.RegisterMetrics()
 
-	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster := record.NewBroadcaster(record.WithContext(ctx))
 	eventBroadcaster.StartLogging(klog.Infof)
 	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
 	ec.recorder = eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "ephemeral_volume"})
 
-	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	logger := klog.FromContext(ctx)
+	_, err := podInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc: ec.enqueuePod,
 		// The pod spec is immutable. Therefore the controller can ignore pod updates
 		// because there cannot be any changes that have to be copied into the generated
 		// PVC.
 		// Deletion of the PVC is handled through the owner reference and garbage collection.
 		// Therefore pod deletions also can be ignored.
-	})
-	pvcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	}, cache.HandlerOptions{Logger: &logger})
+	if err != nil {
+		return nil, fmt.Errorf("could not add pod event handler: %w", err)
+	}
+	_, err = pvcInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		DeleteFunc: ec.onPVCDelete,
-	})
+	}, cache.HandlerOptions{Logger: &logger})
+	if err != nil {
+		return nil, fmt.Errorf("could not add pvc event handler: %w", err)
+	}
 	if err := common.AddPodPVCIndexerIfNotPresent(ec.podIndexer); err != nil {
-		return nil, fmt.Errorf("could not initialize pvc protection controller: %w", err)
+		return nil, fmt.Errorf("could not initialize ephemeral volume controller: %w", err)
 	}
 
 	return ec, nil
@@ -163,20 +178,27 @@ func (ec *ephemeralController) onPVCDelete(obj interface{}) {
 }
 
 func (ec *ephemeralController) Run(ctx context.Context, workers int) {
-	defer runtime.HandleCrash()
-	defer ec.queue.ShutDown()
+	defer runtime.HandleCrashWithContext(ctx)
+
 	logger := klog.FromContext(ctx)
 	logger.Info("Starting ephemeral volume controller")
-	defer logger.Info("Shutting down ephemeral volume controller")
 
-	if !cache.WaitForNamedCacheSync("ephemeral", ctx.Done(), ec.podSynced, ec.pvcsSynced) {
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down ephemeral volume controller")
+		ec.queue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, ec.podSynced, ec.pvcsSynced) {
 		return
 	}
 
 	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, ec.runWorker, time.Second)
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, ec.runWorker, time.Second)
+		})
 	}
-
 	<-ctx.Done()
 }
 
@@ -192,7 +214,7 @@ func (ec *ephemeralController) processNextWorkItem(ctx context.Context) bool {
 	}
 	defer ec.queue.Done(key)
 
-	err := ec.syncHandler(ctx, key.(string))
+	err := ec.syncHandler(ctx, key)
 	if err == nil {
 		ec.queue.Forget(key)
 		return true

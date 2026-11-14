@@ -22,7 +22,10 @@ import (
 	"strings"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/cache"
 	cliflag "k8s.io/component-base/cli/flag"
 
 	api "k8s.io/kubernetes/pkg/apis/core"
@@ -32,12 +35,12 @@ import (
 	_ "k8s.io/kubernetes/pkg/features" // add the kubernetes feature gates
 	kubeoptions "k8s.io/kubernetes/pkg/kubeapiserver/options"
 	kubeletclient "k8s.io/kubernetes/pkg/kubelet/client"
+	podregistry "k8s.io/kubernetes/pkg/registry/core/pod"
 )
 
 // ServerRunOptions runs a kubernetes api server.
 type ServerRunOptions struct {
 	*controlplaneapiserver.Options // embedded to avoid noise in existing consumers
-	CloudProvider                  *kubeoptions.CloudProviderOptions
 
 	Extra
 }
@@ -60,13 +63,16 @@ type Extra struct {
 	EndpointReconcilerType string
 
 	MasterCount int
+
+	DisablePodSubresources []string
+
+	InformerName *cache.InformerName
 }
 
-// NewServerRunOptions creates a new ServerRunOptions object with default parameters
+// NewServerRunOptions creates and returns ServerRunOptions according to the given featureGate and effectiveVersion of the server binary to run.
 func NewServerRunOptions() *ServerRunOptions {
 	s := ServerRunOptions{
-		Options:       controlplaneapiserver.NewOptions(),
-		CloudProvider: kubeoptions.NewCloudProviderOptions(),
+		Options: controlplaneapiserver.NewOptions(),
 
 		Extra: Extra{
 			EndpointReconcilerType: string(reconcilers.LeaseEndpointReconcilerType),
@@ -92,13 +98,14 @@ func NewServerRunOptions() *ServerRunOptions {
 		},
 	}
 
+	s.Options.SystemNamespaces = append(s.Options.SystemNamespaces, v1.NamespaceNodeLease)
+
 	return &s
 }
 
 // Flags returns flags for a specific APIServer by section name
 func (s *ServerRunOptions) Flags() (fss cliflag.NamedFlagSets) {
 	s.Options.AddFlags(&fss)
-	s.CloudProvider.AddFlags(fss.FlagSet("cloud provider"))
 
 	// Note: the weird ""+ in below lines seems to be the only way to get gofmt to
 	// arrange these text blocks sensibly. Grrr.
@@ -152,6 +159,11 @@ func (s *ServerRunOptions) Flags() (fss cliflag.NamedFlagSets) {
 	fs.IntVar(&s.MasterCount, "apiserver-count", s.MasterCount,
 		"The number of apiservers running in the cluster, must be a positive number. (In use when --endpoint-reconciler-type=master-count is enabled.)")
 	fs.MarkDeprecated("apiserver-count", "apiserver-count is deprecated and will be removed in a future version.")
+
+	fs.StringSliceVar(&s.DisablePodSubresources, "disable-pod-subresources", s.DisablePodSubresources, ""+
+		"Comma-separated list of pod subresources to disable on the API server. "+
+		"Valid values are: "+strings.Join(sets.List(podregistry.DisableablePodSubresources()), ", ")+". "+
+		"Core lifecycle subresources ("+strings.Join(sets.List(podregistry.NonDisableablePodSubresources()), ", ")+") cannot be disabled.")
 
 	return fss
 }

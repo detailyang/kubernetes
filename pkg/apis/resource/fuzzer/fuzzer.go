@@ -17,24 +17,114 @@ limitations under the License.
 package fuzzer
 
 import (
-	fuzz "github.com/google/gofuzz"
+	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	runtimeserializer "k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/kubernetes/pkg/apis/resource"
+	"sigs.k8s.io/randfill"
 )
 
 // Funcs contains the fuzzer functions for the resource group.
+//
+// Leaving fields empty which then get replaced by the default
+// leads to errors during roundtrip tests.
 var Funcs = func(codecs runtimeserializer.CodecFactory) []interface{} {
 	return []interface{}{
-		func(obj *resource.ResourceClaimSpec, c fuzz.Continue) {
-			c.FuzzNoCustom(obj) // fuzz self without calling this function again
+		func(r *resource.ExactDeviceRequest, c randfill.Continue) {
+			c.FillNoCustom(r) // fuzz self without calling this function again
 
-			// Custom fuzzing for allocation mode: pick one valid mode randomly.
-			modes := []resource.AllocationMode{
-				resource.AllocationModeImmediate,
-				resource.AllocationModeWaitForFirstConsumer,
+			if r.AllocationMode == "" {
+				r.AllocationMode = []resource.DeviceAllocationMode{
+					resource.DeviceAllocationModeAll,
+					resource.DeviceAllocationModeExactCount,
+				}[c.Int31n(2)]
 			}
-			obj.AllocationMode = modes[c.Rand.Intn(len(modes))]
+		},
+		func(r *resource.DeviceSubRequest, c randfill.Continue) {
+			c.FillNoCustom(r) // fuzz self without calling this function again
+
+			if r.AllocationMode == "" {
+				r.AllocationMode = []resource.DeviceAllocationMode{
+					resource.DeviceAllocationModeAll,
+					resource.DeviceAllocationModeExactCount,
+				}[c.Int31n(2)]
+			}
+		},
+		func(r *resource.DeviceAllocationConfiguration, c randfill.Continue) {
+			c.FillNoCustom(r)
+			if r.Source == "" {
+				r.Source = []resource.AllocationConfigSource{
+					resource.AllocationConfigSourceClass,
+					resource.AllocationConfigSourceClaim,
+				}[c.Int31n(2)]
+			}
+		},
+		func(r *resource.DeviceToleration, c randfill.Continue) {
+			c.FillNoCustom(r)
+			if r.Operator == "" {
+				r.Operator = []resource.DeviceTolerationOperator{
+					resource.DeviceTolerationOpEqual,
+					resource.DeviceTolerationOpExists,
+				}[c.Int31n(2)]
+			}
+		},
+		func(r *resource.DeviceTaint, c randfill.Continue) {
+			c.FillNoCustom(r)
+			if r.TimeAdded == nil {
+				// Current time is more or less random.
+				// Truncate to seconds because sub-second resolution
+				// does not survive round-tripping.
+				r.TimeAdded = &metav1.Time{Time: time.Now().Truncate(time.Second)}
+			}
+		},
+		func(r *resource.OpaqueDeviceConfiguration, c randfill.Continue) {
+			c.FillNoCustom(r)
+			// Match the fuzzer default content for runtime.Object.
+			//
+			// This is necessary because randomly generated content
+			// might be valid JSON which changes during re-encoding.
+			r.Parameters = runtime.RawExtension{Raw: []byte(`{"apiVersion":"unknown.group/unknown","kind":"Something","someKey":"someValue"}`)}
+		},
+		func(r *resource.AllocatedDeviceStatus, c randfill.Continue) {
+			c.FillNoCustom(r)
+			// Match the fuzzer default content for runtime.Object.
+			//
+			// This is necessary because randomly generated content
+			// might be valid JSON which changes during re-encoding.
+			r.Data = &runtime.RawExtension{Raw: []byte(`{"apiVersion":"unknown.group/unknown","kind":"Something","someKey":"someValue"}`)}
+		},
+		func(r *resource.ResourceSliceSpec, c randfill.Continue) {
+			c.FillNoCustom(r)
+			// Setting AllNodes to false is not allowed. It must be
+			// either true or nil.
+			if r.AllNodes != nil && !*r.AllNodes {
+				r.AllNodes = nil
+			}
+			if r.NodeName != nil && *r.NodeName == "" {
+				r.NodeName = nil
+			}
+		},
+		func(r *resource.ResourcePoolStatusRequestStatus, c randfill.Continue) {
+			c.FillNoCustom(r)
+			// Empty slices become nil after round-tripping through JSON.
+			// Ensure they are either nil or have at least one element.
+			if len(r.Pools) == 0 {
+				r.Pools = nil
+			}
+			if len(r.Conditions) == 0 {
+				r.Conditions = nil
+			}
+		},
+		func(r *resource.ResourcePoolStatusRequestSpec, c randfill.Continue) {
+			c.FillNoCustom(r)
+			// Limit has a default value of 100, so ensure it's set
+			// to prevent defaulting during round-trip.
+			if r.Limit == nil {
+				limit := int32(c.Int31n(1000) + 1)
+				r.Limit = &limit
+			}
 		},
 	}
 }

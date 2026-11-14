@@ -25,6 +25,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -34,17 +35,18 @@ import (
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
+var defaultURLScheme = kubeadmapiv1.DefaultContainerRuntimeURLScheme
 var testResetConfig = fmt.Sprintf(`apiVersion: %s
 kind: ResetConfiguration
 force: true
 dryRun: true
 cleanupTmpDir: true
-criSocket: unix:///var/run/fake.sock
+criSocket: %s:///var/run/fake.sock
 certificatesDir: /etc/kubernetes/pki2
 ignorePreflightErrors:
 - a
 - b
-`, kubeadmapiv1.SchemeGroupVersion.String())
+`, kubeadmapiv1.SchemeGroupVersion.String(), defaultURLScheme)
 
 func TestNewResetData(t *testing.T) {
 	// create temp directory
@@ -79,7 +81,7 @@ func TestNewResetData(t *testing.T) {
 				options.CertificatesDir:       "/tmp",
 				options.NodeCRISocket:         constants.CRISocketCRIO,
 				options.IgnorePreflightErrors: "all",
-				options.ForceReset:            "true",
+				options.Force:                 "true",
 				options.DryRun:                "true",
 				options.CleanupTmpDir:         "true",
 			},
@@ -105,7 +107,7 @@ func TestNewResetData(t *testing.T) {
 			name: "fails if preflight ignores all but has individual check",
 			flags: map[string]string{
 				options.IgnorePreflightErrors: "all,something-else",
-				options.NodeCRISocket:         "unix:///var/run/crio/crio.sock",
+				options.NodeCRISocket:         fmt.Sprintf("%s:///var/run/crio/crio.sock", defaultURLScheme),
 			},
 			expectError: "don't specify individual checks if 'all' is used",
 		},
@@ -113,7 +115,7 @@ func TestNewResetData(t *testing.T) {
 			name: "pre-flights errors from CLI args",
 			flags: map[string]string{
 				options.IgnorePreflightErrors: "a,b",
-				options.NodeCRISocket:         "unix:///var/run/crio/crio.sock",
+				options.NodeCRISocket:         fmt.Sprintf("%s:///var/run/crio/crio.sock", defaultURLScheme),
 			},
 			validate: expectedResetIgnorePreflightErrors(sets.New("a", "b")),
 		},
@@ -124,8 +126,8 @@ func TestNewResetData(t *testing.T) {
 				options.CfgPath: configFilePath,
 			},
 			data: &resetData{
-				certificatesDir:       "/etc/kubernetes/pki2",      // cover the case that default is overridden as well
-				criSocketPath:         "unix:///var/run/fake.sock", // cover the case that default is overridden as well
+				certificatesDir:       "/etc/kubernetes/pki2",                                   // cover the case that default is overridden as well
+				criSocketPath:         fmt.Sprintf("%s:///var/run/fake.sock", defaultURLScheme), // cover the case that default is overridden as well
 				ignorePreflightErrors: sets.New("a", "b"),
 				forceReset:            true,
 				dryRun:                true,
@@ -134,7 +136,7 @@ func TestNewResetData(t *testing.T) {
 					TypeMeta:              metav1.TypeMeta{Kind: "", APIVersion: ""},
 					Force:                 true,
 					CertificatesDir:       "/etc/kubernetes/pki2",
-					CRISocket:             "unix:///var/run/fake.sock",
+					CRISocket:             fmt.Sprintf("%s:///var/run/fake.sock", defaultURLScheme),
 					IgnorePreflightErrors: []string{"a", "b"},
 					CleanupTmpDir:         true,
 					DryRun:                true,
@@ -176,15 +178,15 @@ func TestNewResetData(t *testing.T) {
 			name: "--cri-socket flag is not allowed to mix with config",
 			flags: map[string]string{
 				options.CfgPath:       configFilePath,
-				options.NodeCRISocket: "unix:///var/run/bogus.sock",
+				options.NodeCRISocket: fmt.Sprintf("%s:///var/run/bogus.sock", defaultURLScheme),
 			},
 			expectError: "can not mix '--config' with arguments",
 		},
 		{
 			name: "--force flag is not allowed to mix with config",
 			flags: map[string]string{
-				options.CfgPath:    configFilePath,
-				options.ForceReset: "false",
+				options.CfgPath: configFilePath,
+				options.Force:   "false",
 			},
 			expectError: "can not mix '--config' with arguments",
 		},
@@ -218,6 +220,9 @@ func TestNewResetData(t *testing.T) {
 			resetOptions := newResetOptions()
 			cmd := newCmdReset(nil, nil, resetOptions)
 
+			// make sure all cases use dry-run as we are not constructing a kubeconfig
+			tc.flags[options.DryRun] = "true"
+
 			// sets cmd flags (that will be reflected on the reset options)
 			for f, v := range tc.flags {
 				cmd.Flags().Set(f, v)
@@ -233,7 +238,7 @@ func TestNewResetData(t *testing.T) {
 			}
 
 			if tc.data != nil {
-				if diff := cmp.Diff(tc.data, data, cmp.AllowUnexported(resetData{}), cmpopts.IgnoreFields(resetData{}, "client", "cfg")); diff != "" {
+				if diff := cmp.Diff(tc.data, data, cmp.AllowUnexported(resetData{}), cmpopts.IgnoreFields(resetData{}, "client", "resetCfg.Timeouts")); diff != "" {
 					t.Fatalf("newResetData returned data (-want,+got):\n%s", diff)
 				}
 			}

@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 /*
 Copyright 2019 The Kubernetes Authors.
@@ -42,6 +41,17 @@ const (
 	maxListTries = 10
 )
 
+// Decode kernel mount table escapes in one pass so literal escape sequences stay intact.
+var mountPathUnescaper = strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
+
+func unescapeMountPath(path string) string {
+	// Most mount paths contain no escapes; avoid allocating a copy for each field.
+	if !strings.ContainsRune(path, '\\') {
+		return path
+	}
+	return mountPathUnescaper.Replace(path)
+}
+
 // IsCorruptedMnt return true if err is about corrupted mount point
 func IsCorruptedMnt(err error) bool {
 	if err == nil {
@@ -61,11 +71,17 @@ func IsCorruptedMnt(err error) bool {
 		underlyingError = err
 	}
 
-	return underlyingError == syscall.ENOTCONN || underlyingError == syscall.ESTALE || underlyingError == syscall.EIO || underlyingError == syscall.EACCES || underlyingError == syscall.EHOSTDOWN
+	return errors.Is(underlyingError, syscall.ENOTCONN) ||
+		errors.Is(underlyingError, syscall.ESTALE) ||
+		errors.Is(underlyingError, syscall.EIO) ||
+		errors.Is(underlyingError, syscall.EACCES) ||
+		errors.Is(underlyingError, syscall.EHOSTDOWN) ||
+		errors.Is(underlyingError, syscall.EWOULDBLOCK) ||
+		errors.Is(underlyingError, syscall.ENODEV)
 }
 
 // MountInfo represents a single line in /proc/<pid>/mountinfo.
-type MountInfo struct { // nolint: golint
+type MountInfo struct {
 	// Unique ID for the mount (maybe reused after umount).
 	ID int
 	// The ID of the parent mount (or of self for the root of this mount namespace's mount tree).
@@ -137,8 +153,8 @@ func ParseMountInfo(filename string) ([]MountInfo, error) {
 			ParentID:     parentID,
 			Major:        major,
 			Minor:        minor,
-			Root:         fields[3],
-			MountPoint:   fields[4],
+			Root:         unescapeMountPath(fields[3]),
+			MountPoint:   unescapeMountPath(fields[4]),
 			MountOptions: splitMountOptions(fields[5]),
 		}
 		// All fields until "-" are "optional fields".
@@ -152,7 +168,7 @@ func ParseMountInfo(filename string) ([]MountInfo, error) {
 			return nil, fmt.Errorf("expect 3 fields in %s, got %d", line, len(fields)-i)
 		}
 		info.FsType = fields[i]
-		info.Source = fields[i+1]
+		info.Source = unescapeMountPath(fields[i+1])
 		info.SuperOptions = splitMountOptions(fields[i+2])
 		infos = append(infos, info)
 	}
@@ -176,7 +192,7 @@ func splitMountOptions(s string) []string {
 // isMountPointMatch returns true if the path in mp is the same as dir.
 // Handles case where mountpoint dir has been renamed due to stale NFS mount.
 func isMountPointMatch(mp MountPoint, dir string) bool {
-	return strings.TrimSuffix(mp.Path, "\\040(deleted)") == dir
+	return mp.Path == dir || strings.TrimSuffix(mp.Path, " (deleted)") == dir
 }
 
 // PathExists returns true if the specified path exists.

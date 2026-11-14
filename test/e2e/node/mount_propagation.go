@@ -101,7 +101,7 @@ var _ = SIGDescribe("Mount propagation", func() {
 		// Fail the test if the namespace is not set. We expect that the
 		// namespace is unique and we might delete user data if it's not.
 		if len(f.Namespace.Name) == 0 {
-			framework.ExpectNotEqual(f.Namespace.Name, "")
+			gomega.Expect(f.Namespace.Name).NotTo(gomega.BeEmpty())
 			return
 		}
 
@@ -182,22 +182,19 @@ var _ = SIGDescribe("Mount propagation", func() {
 					gomega.Expect(stdout).To(gomega.Equal(mountName), msg)
 				} else {
 					// We *expect* cat to return error here
-					framework.ExpectError(err, msg)
+					gomega.Expect(err).To(gomega.HaveOccurred(), msg)
 				}
 			}
 		}
 
 		// Find the kubelet PID to ensure we're working with the kubelet's mount namespace
-		cmd = "pidof kubelet"
-		kubeletPid, err := hostExec.IssueCommandWithResult(ctx, cmd, node)
-		framework.ExpectNoError(err, "Checking kubelet pid")
-		kubeletPid = strings.TrimSuffix(kubeletPid, "\n")
-		gomega.Expect(strings.Count(kubeletPid, " ")).To(gomega.Equal(0), "kubelet should only have a single PID in the system (pidof returned %q)", kubeletPid)
-		enterKubeletMountNS := fmt.Sprintf("nsenter -t %s -m", kubeletPid)
+		kubeletPid := pidOfKubelet(ctx, hostExec, node)
+		enterKubeletMountNS := fmt.Sprintf("nsenter -t %d -m", kubeletPid)
 
 		// Check that the master and host mounts are propagated to the container runtime's mount namespace
 		for _, mountName := range []string{"host", master.Name} {
 			cmd := fmt.Sprintf("%s cat \"%s/%s/file\"", enterKubeletMountNS, hostDir, mountName)
+			framework.Logf("running command '%s' on node '%s'", cmd, node.Name)
 			output, err := hostExec.IssueCommandWithResult(ctx, cmd, node)
 			framework.ExpectNoError(err, "host container namespace should see mount from %s: %s", mountName, output)
 			output = strings.TrimSuffix(output, "\n")
@@ -207,6 +204,7 @@ var _ = SIGDescribe("Mount propagation", func() {
 		// Check that the slave, private, and default mounts are not propagated to the container runtime's mount namespace
 		for _, podName := range []string{slave.Name, private.Name, defaultPropagation.Name} {
 			cmd := fmt.Sprintf("%s test ! -e \"%s/%s/file\"", enterKubeletMountNS, hostDir, podName)
+			framework.Logf("running command '%s' on node '%s'", cmd, node.Name)
 			output, err := hostExec.IssueCommandWithResult(ctx, cmd, node)
 			framework.ExpectNoError(err, "host container namespace shouldn't see mount from %s: %s", podName, output)
 		}

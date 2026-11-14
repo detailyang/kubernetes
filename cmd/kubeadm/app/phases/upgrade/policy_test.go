@@ -17,9 +17,12 @@ limitations under the License.
 package upgrade
 
 import (
+	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/util/version"
+
+	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
 func TestEnforceVersionPolicies(t *testing.T) {
@@ -90,6 +93,24 @@ func TestEnforceVersionPolicies(t *testing.T) {
 			},
 			newK8sVersion:         "v1.13.0",
 			expectedMandatoryErrs: 1, // can't upgrade two minor versions
+		},
+		{
+			name: "upgrading with n-3 kubelet is supported",
+			vg: &fakeVersionGetter{
+				clusterVersion: "v1.14.3",
+				kubeletVersion: "v1.12.3",
+				kubeadmVersion: "v1.15.0",
+			},
+			newK8sVersion: "v1.15.0",
+		},
+		{
+			name: "upgrading with n-4 kubelet is not supported",
+			vg: &fakeVersionGetter{
+				clusterVersion: "v1.14.3",
+				kubeletVersion: "v1.11.3",
+				kubeadmVersion: "v1.15.0",
+			},
+			newK8sVersion:         "v1.15.0",
 			expectedSkippableErrs: 1, // kubelet <-> apiserver skew too large
 		},
 		{
@@ -123,13 +144,22 @@ func TestEnforceVersionPolicies(t *testing.T) {
 			expectedMandatoryErrs: 1,
 		},
 		{
-			name: "the maximum skew between the cluster version and the kubelet versions should be one minor version. This may be forced through though.",
+			name: "the maximum skew between the cluster version and the kubelet versions should be three minor version.",
 			vg: &fakeVersionGetter{
-				clusterVersion: "v1.12.0",
+				clusterVersion: "v1.13.0",
 				kubeletVersion: "v1.10.8",
-				kubeadmVersion: "v1.12.0",
+				kubeadmVersion: "v1.13.0",
 			},
-			newK8sVersion:         "v1.12.0",
+			newK8sVersion: "v1.13.0",
+		},
+		{
+			name: "the maximum skew between the cluster version and the kubelet versions should be three minor version. This may be forced through though.",
+			vg: &fakeVersionGetter{
+				clusterVersion: "v1.14.0",
+				kubeletVersion: "v1.10.8",
+				kubeadmVersion: "v1.14.0",
+			},
+			newK8sVersion:         "v1.14.0",
 			expectedSkippableErrs: 1,
 		},
 		{
@@ -230,4 +260,31 @@ func TestEnforceVersionPolicies(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEnforceVersionPoliciesMinimumVersionError(t *testing.T) {
+	// The cluster runs a patch release above the minimum supported control plane version
+	// and the version to upgrade to is below that minimum.
+	minimumControlPlaneVersion := constants.MinimumControlPlaneVersion
+	clusterVersion := minimumControlPlaneVersion.WithPatch(3)
+	newK8sVersion := minimumControlPlaneVersion.WithPreRelease("alpha.0")
+	vg := &fakeVersionGetter{
+		clusterVersion: clusterVersion.String(),
+		kubeletVersion: clusterVersion.String(),
+		kubeadmVersion: clusterVersion.String(),
+	}
+
+	skewErrs := EnforceVersionPolicies(vg, newK8sVersion.String(), newK8sVersion, true, true)
+	if skewErrs == nil {
+		t.Fatal("expected errors but got none")
+	}
+	for _, err := range skewErrs.Mandatory {
+		if strings.Contains(err.Error(), "minimum supported version") {
+			if !strings.Contains(err.Error(), minimumControlPlaneVersion.String()) {
+				t.Errorf("expected the error to name the minimum supported version %q, got: %v", minimumControlPlaneVersion, err)
+			}
+			return
+		}
+	}
+	t.Errorf("expected a minimum supported version error, got: %v", skewErrs.Mandatory)
 }

@@ -35,19 +35,15 @@ import (
 
 var _ = common.SIGDescribe("Metrics", func() {
 	f := framework.NewDefaultFramework("metrics")
-	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
-	var c, ec clientset.Interface
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+	var c clientset.Interface
 	var grabber *e2emetrics.Grabber
 	ginkgo.BeforeEach(func(ctx context.Context) {
 		var err error
 		c = f.ClientSet
-		ec = f.KubemarkExternalClusterClientSet
 		gomega.Eventually(ctx, func() error {
-			grabber, err = e2emetrics.NewMetricsGrabber(ctx, c, ec, f.ClientConfig(), true, true, true, true, true, true)
-			if err != nil {
-				framework.ExpectNoError(err, "failed to create metrics grabber")
-			}
-			return nil
+			grabber, err = e2emetrics.NewMetricsGrabber(ctx, c, f.ClientConfig(), true, true, true, true, true, true)
+			return err
 		}, 5*time.Minute, 10*time.Second).Should(gomega.BeNil())
 	})
 
@@ -59,11 +55,11 @@ var _ = common.SIGDescribe("Metrics", func() {
 	ginkgo.It("should grab all metrics from kubelet /metrics/resource endpoint", func(ctx context.Context) {
 		ginkgo.By("Connecting to kubelet's /metrics/resource endpoint")
 		node, err := e2enode.GetRandomReadySchedulableNode(ctx, f.ClientSet)
+		framework.ExpectNoError(err)
+		response, err := grabber.GrabResourceMetricsFromKubelet(ctx, node.Name)
 		if errors.Is(err, e2emetrics.MetricsGrabbingDisabledError) {
 			e2eskipper.Skipf("%v", err)
 		}
-		framework.ExpectNoError(err)
-		response, err := grabber.GrabResourceMetricsFromKubelet(ctx, node.Name)
 		framework.ExpectNoError(err)
 		gomega.Expect(response).NotTo(gomega.BeEmpty())
 	})

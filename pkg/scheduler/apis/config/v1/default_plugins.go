@@ -17,13 +17,15 @@ limitations under the License.
 package v1
 
 import (
+	"slices"
+
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
 	v1 "k8s.io/kube-scheduler/config/v1"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 // getDefaultPlugins returns the default set of plugins.
@@ -31,25 +33,29 @@ func getDefaultPlugins() *v1.Plugins {
 	plugins := &v1.Plugins{
 		MultiPoint: v1.PluginSet{
 			Enabled: []v1.Plugin{
+				{Name: names.SchedulingGates},
 				{Name: names.PrioritySort},
-				{Name: names.NodeUnschedulable},
 				{Name: names.NodeName},
-				{Name: names.TaintToleration, Weight: pointer.Int32(3)},
-				{Name: names.NodeAffinity, Weight: pointer.Int32(2)},
+				{Name: names.NodeUnschedulable},
+				{Name: names.TaintToleration, Weight: ptr.To[int32](3)},
+				{Name: names.NodeAffinity, Weight: ptr.To[int32](2)},
 				{Name: names.NodePorts},
-				{Name: names.NodeResourcesFit, Weight: pointer.Int32(1)},
+				{Name: names.NodeResourcesFit, Weight: ptr.To[int32](1)},
 				{Name: names.VolumeRestrictions},
-				{Name: names.EBSLimits},
-				{Name: names.GCEPDLimits},
 				{Name: names.NodeVolumeLimits},
-				{Name: names.AzureDiskLimits},
 				{Name: names.VolumeBinding},
 				{Name: names.VolumeZone},
-				{Name: names.PodTopologySpread, Weight: pointer.Int32(2)},
-				{Name: names.InterPodAffinity, Weight: pointer.Int32(2)},
+				{Name: names.PodTopologySpread, Weight: ptr.To[int32](2)},
+				{Name: names.InterPodAffinity, Weight: ptr.To[int32](2)},
+				// DynamicResources should come before DefaultPreemption because if
+				// there is a problem with a Pod and PostFilter gets called to
+				// resolve the problem, it is better to first deallocate an
+				// idle ResourceClaim than it is to evict some Pod that might
+				// be doing useful work.
+				{Name: names.DynamicResources, Weight: ptr.To[int32](2)},
 				{Name: names.DefaultPreemption},
-				{Name: names.NodeResourcesBalancedAllocation, Weight: pointer.Int32(1)},
-				{Name: names.ImageLocality, Weight: pointer.Int32(1)},
+				{Name: names.NodeResourcesBalancedAllocation, Weight: ptr.To[int32](1)},
+				{Name: names.ImageLocality, Weight: ptr.To[int32](1)},
 				{Name: names.DefaultBinder},
 			},
 		},
@@ -60,26 +66,31 @@ func getDefaultPlugins() *v1.Plugins {
 }
 
 func applyFeatureGates(config *v1.Plugins) {
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodSchedulingReadiness) {
-		config.MultiPoint.Enabled = append(config.MultiPoint.Enabled, v1.Plugin{Name: names.SchedulingGates})
+	if utilfeature.DefaultFeatureGate.Enabled(features.NodeDeclaredFeatures) {
+		config.MultiPoint.Enabled = append(config.MultiPoint.Enabled, v1.Plugin{Name: names.NodeDeclaredFeatures})
 	}
-	if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
-		// This plugin should come before DefaultPreemption because if
-		// there is a problem with a Pod and PostFilter gets called to
-		// resolve the problem, it is better to first deallocate an
-		// idle ResourceClaim than it is to evict some Pod that might
-		// be doing useful work.
-		for i := range config.MultiPoint.Enabled {
-			if config.MultiPoint.Enabled[i].Name == names.DefaultPreemption {
-				extended := make([]v1.Plugin, 0, len(config.MultiPoint.Enabled)+1)
-				extended = append(extended, config.MultiPoint.Enabled[:i]...)
-				extended = append(extended, v1.Plugin{Name: names.DynamicResources})
-				extended = append(extended, config.MultiPoint.Enabled[i:]...)
-				config.MultiPoint.Enabled = extended
-				break
-			}
-		}
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScalingSchedulerPreemption) {
+		applyDeferredPodScheduling(config)
 	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.GenericWorkload) {
+		applyGangScheduling(config)
+	} else {
+		// DefaultPreemption is listed in MultiPoint.Enabled and implements ReservePlugin
+		// only for PodGroup preemption, so disable its Reserve extension when GenericWorkload is off.
+		config.Reserve.Disabled = append(config.Reserve.Disabled, v1.Plugin{Name: names.DefaultPreemption})
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.TopologyAwareWorkloadScheduling) {
+		applyTopologyAwareWorkloadScheduling(config)
+	}
+}
+
+func applyGangScheduling(config *v1.Plugins) {
+	config.MultiPoint.Enabled = append(config.MultiPoint.Enabled, v1.Plugin{Name: names.GangScheduling})
+}
+
+func applyTopologyAwareWorkloadScheduling(config *v1.Plugins) {
+	config.MultiPoint.Enabled = append(config.MultiPoint.Enabled, v1.Plugin{Name: names.TopologyPlacementGenerator})
+	config.MultiPoint.Enabled = append(config.MultiPoint.Enabled, v1.Plugin{Name: names.PodGroupPodsCount, Weight: ptr.To[int32](1)})
 }
 
 // mergePlugins merges the custom set into the given default one, handling disabled sets.
@@ -101,6 +112,10 @@ func mergePlugins(logger klog.Logger, defaultPlugins, customPlugins *v1.Plugins)
 	defaultPlugins.PreBind = mergePluginSet(logger, defaultPlugins.PreBind, customPlugins.PreBind)
 	defaultPlugins.Bind = mergePluginSet(logger, defaultPlugins.Bind, customPlugins.Bind)
 	defaultPlugins.PostBind = mergePluginSet(logger, defaultPlugins.PostBind, customPlugins.PostBind)
+	defaultPlugins.PlacementGenerate = mergePluginSet(logger, defaultPlugins.PlacementGenerate, customPlugins.PlacementGenerate)
+	defaultPlugins.PlacementScore = mergePluginSet(logger, defaultPlugins.PlacementScore, customPlugins.PlacementScore)
+	defaultPlugins.PlacementFeasible = mergePluginSet(logger, defaultPlugins.PlacementFeasible, customPlugins.PlacementFeasible)
+	defaultPlugins.PodGroupPostFilter = mergePluginSet(logger, defaultPlugins.PodGroupPostFilter, customPlugins.PodGroupPostFilter)
 	return defaultPlugins
 }
 
@@ -113,7 +128,7 @@ func mergePluginSet(logger klog.Logger, defaultPluginSet, customPluginSet v1.Plu
 	disabledPlugins := sets.New[string]()
 	enabledCustomPlugins := make(map[string]pluginIndex)
 	// replacedPluginIndex is a set of index of plugins, which have replaced the default plugins.
-	replacedPluginIndex := sets.NewInt()
+	replacedPluginIndex := sets.New[int]()
 	var disabled []v1.Plugin
 	for _, disabledPlugin := range customPluginSet.Disabled {
 		// if the user is manually disabling any (or all, with "*") default plugins for an extension point,
@@ -159,4 +174,20 @@ func mergePluginSet(logger klog.Logger, defaultPluginSet, customPluginSet v1.Plu
 		}
 	}
 	return v1.PluginSet{Enabled: enabledPlugins, Disabled: disabled}
+}
+
+// applyDeferredPodScheduling inserts the DeferredPodScheduling plugin.
+// It must be placed before NodeResourcesFit so that if a node has preemption disabled,
+// the pod fails on DeferredPodScheduling first. This ensures DeferredPodScheduling is recorded
+// as the failing plugin, allowing its Queueing Hint to trigger a retry when the policy is enabled.
+// It must run after basic filters like NodeName to avoid useless retries on irrelevant node events.
+func applyDeferredPodScheduling(config *v1.Plugins) {
+	idx := slices.IndexFunc(config.MultiPoint.Enabled, func(p v1.Plugin) bool {
+		return p.Name == names.NodeResourcesFit
+	})
+	if idx != -1 {
+		config.MultiPoint.Enabled = slices.Insert(config.MultiPoint.Enabled, idx, v1.Plugin{Name: names.DeferredPodScheduling})
+	} else {
+		config.MultiPoint.Enabled = append(config.MultiPoint.Enabled, v1.Plugin{Name: names.DeferredPodScheduling})
+	}
 }

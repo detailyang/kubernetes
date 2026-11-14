@@ -19,8 +19,8 @@ limitations under the License.
 package clientset
 
 import (
-	"fmt"
-	"net/http"
+	fmt "fmt"
+	http "net/http"
 
 	discovery "k8s.io/client-go/discovery"
 	rest "k8s.io/client-go/rest"
@@ -30,7 +30,7 @@ import (
 )
 
 type Interface interface {
-	Discovery() discovery.DiscoveryInterface
+	Discovery() discovery.DiscoveryInterfaces
 	ApiregistrationV1() apiregistrationv1.ApiregistrationV1Interface
 	ApiregistrationV1beta1() apiregistrationv1beta1.ApiregistrationV1beta1Interface
 }
@@ -53,7 +53,7 @@ func (c *Clientset) ApiregistrationV1beta1() apiregistrationv1beta1.Apiregistrat
 }
 
 // Discovery retrieves the DiscoveryClient
-func (c *Clientset) Discovery() discovery.DiscoveryInterface {
+func (c *Clientset) Discovery() discovery.DiscoveryInterfaces {
 	if c == nil {
 		return nil
 	}

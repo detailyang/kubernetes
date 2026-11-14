@@ -20,11 +20,9 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"time"
 
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	coreinformers "k8s.io/client-go/informers/core/v1"
-	networkinginformers "k8s.io/client-go/informers/networking/v1alpha1"
 	clientset "k8s.io/client-go/kubernetes"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -36,21 +34,8 @@ import (
 	"k8s.io/kubernetes/pkg/controller/nodeipam/ipam"
 )
 
-const (
-	// ipamResyncInterval is the amount of time between when the cloud and node
-	// CIDR range assignments are synchronized.
-	ipamResyncInterval = 30 * time.Second
-	// ipamMaxBackoff is the maximum backoff for retrying synchronization of a
-	// given in the error state.
-	ipamMaxBackoff = 10 * time.Second
-	// ipamInitialRetry is the initial retry interval for retrying synchronization of a
-	// given in the error state.
-	ipamInitialBackoff = 250 * time.Millisecond
-)
-
 // ipamController is an interface abstracting an interface for
-// legacy mode. It is needed to ensure correct building for
-// both provider-specific and providerless environments.
+// legacy mode.
 type ipamController interface {
 	Run(ctx context.Context)
 }
@@ -65,8 +50,6 @@ type Controller struct {
 	secondaryServiceCIDR *net.IPNet
 	kubeClient           clientset.Interface
 	eventBroadcaster     record.EventBroadcaster
-	// Method for easy mocking in unittest.
-	lookupIP func(host string) ([]net.IP, error)
 
 	nodeLister         corelisters.NodeLister
 	nodeInformerSynced cache.InformerSynced
@@ -83,7 +66,6 @@ type Controller struct {
 func NewNodeIpamController(
 	ctx context.Context,
 	nodeInformer coreinformers.NodeInformer,
-	clusterCIDRInformer networkinginformers.ClusterCIDRInformer,
 	cloud cloudprovider.Interface,
 	kubeClient clientset.Interface,
 	clusterCIDRs []*net.IPNet,
@@ -92,7 +74,6 @@ func NewNodeIpamController(
 	nodeCIDRMaskSizes []int,
 	allocatorType ipam.CIDRAllocatorType) (*Controller, error) {
 
-	logger := klog.FromContext(ctx)
 	if kubeClient == nil {
 		return nil, fmt.Errorf("kubeClient is nil when starting Controller")
 	}
@@ -114,8 +95,7 @@ func NewNodeIpamController(
 	ic := &Controller{
 		cloud:                cloud,
 		kubeClient:           kubeClient,
-		eventBroadcaster:     record.NewBroadcaster(),
-		lookupIP:             net.LookupIP,
+		eventBroadcaster:     record.NewBroadcaster(record.WithContext(ctx)),
 		clusterCIDRs:         clusterCIDRs,
 		serviceCIDR:          serviceCIDR,
 		secondaryServiceCIDR: secondaryServiceCIDR,
@@ -125,7 +105,7 @@ func NewNodeIpamController(
 	// TODO: Abstract this check into a generic controller manager should run method.
 	if ic.allocatorType == ipam.IPAMFromClusterAllocatorType || ic.allocatorType == ipam.IPAMFromCloudAllocatorType {
 		var err error
-		ic.legacyIPAM, err = createLegacyIPAM(logger, ic, nodeInformer, cloud, kubeClient, clusterCIDRs, serviceCIDR, nodeCIDRMaskSizes)
+		ic.legacyIPAM, err = createLegacyIPAM(ctx, ic, nodeInformer, cloud, kubeClient, clusterCIDRs, serviceCIDR, nodeCIDRMaskSizes)
 		if err != nil {
 			return nil, err
 		}
@@ -139,7 +119,7 @@ func NewNodeIpamController(
 			NodeCIDRMaskSizes:    nodeCIDRMaskSizes,
 		}
 
-		ic.cidrAllocator, err = ipam.New(ctx, kubeClient, cloud, nodeInformer, clusterCIDRInformer, ic.allocatorType, allocatorParams)
+		ic.cidrAllocator, err = ipam.New(ctx, kubeClient, cloud, nodeInformer, ic.allocatorType, allocatorParams)
 		if err != nil {
 			return nil, err
 		}
@@ -153,26 +133,24 @@ func NewNodeIpamController(
 
 // Run starts an asynchronous loop that monitors the status of cluster nodes.
 func (nc *Controller) Run(ctx context.Context) {
-	defer utilruntime.HandleCrash()
+	defer utilruntime.HandleCrashWithContext(ctx)
 
 	// Start event processing pipeline.
-	nc.eventBroadcaster.StartStructuredLogging(0)
+	nc.eventBroadcaster.StartStructuredLogging(3)
 	nc.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: nc.kubeClient.CoreV1().Events("")})
 	defer nc.eventBroadcaster.Shutdown()
 	klog.FromContext(ctx).Info("Starting ipam controller")
 	defer klog.FromContext(ctx).Info("Shutting down ipam controller")
 
-	if !cache.WaitForNamedCacheSync("node", ctx.Done(), nc.nodeInformerSynced) {
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, nc.nodeInformerSynced) {
 		return
 	}
 
 	if nc.allocatorType == ipam.IPAMFromClusterAllocatorType || nc.allocatorType == ipam.IPAMFromCloudAllocatorType {
-		go nc.legacyIPAM.Run(ctx)
+		nc.legacyIPAM.Run(ctx)
 	} else {
-		go nc.cidrAllocator.Run(ctx)
+		nc.cidrAllocator.Run(ctx)
 	}
-
-	<-ctx.Done()
 }
 
 // RunWithMetrics is a wrapper for Run that also tracks starting and stopping of the nodeipam controller with additional metric

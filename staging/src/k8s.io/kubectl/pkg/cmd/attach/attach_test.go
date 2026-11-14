@@ -22,10 +22,13 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -43,13 +46,11 @@ import (
 )
 
 type fakeRemoteAttach struct {
-	method string
-	url    *url.URL
-	err    error
+	url *url.URL
+	err error
 }
 
-func (f *fakeRemoteAttach) Attach(method string, url *url.URL, config *restclient.Config, stdin io.Reader, stdout, stderr io.Writer, tty bool, terminalSizeQueue remotecommand.TerminalSizeQueue) error {
-	f.method = method
+func (f *fakeRemoteAttach) Attach(url *url.URL, config *restclient.Config, stdin io.Reader, stdout, stderr io.Writer, tty bool, terminalSizeQueue remotecommand.TerminalSizeQueue) error {
 	f.url = url
 	return f.err
 }
@@ -138,7 +139,7 @@ func TestPodAndContainerAttach(t *testing.T) {
 			options:         &AttachOptions{StreamOptions: exec.StreamOptions{ContainerName: "wrong"}, GetPodTimeout: 10},
 			args:            []string{"foo"},
 			expectedPodName: "foo",
-			expectError:     "container wrong not found in pod foo",
+			expectError:     "container wrong is not valid for pod foo out of: bar, debugger (ephem), initfoo (init)",
 			obj:             attachPod(),
 		},
 		{
@@ -243,6 +244,7 @@ func TestAttach(t *testing.T) {
 		pod                                                         *corev1.Pod
 		remoteAttachErr                                             bool
 		expectedErr                                                 string
+		expectedErrOut                                              []string
 	}{
 		{
 			name:         "pod attach",
@@ -252,6 +254,10 @@ func TestAttach(t *testing.T) {
 			attachPath:   "/api/" + version + "/namespaces/test/pods/foo/attach",
 			pod:          attachPod(),
 			container:    "bar",
+			expectedErrOut: []string{
+				"All commands and output from this session will be recorded in container logs, including credentials and sensitive information passed through the command prompt.",
+				"If you don't see a command prompt, try pressing enter.",
+			},
 		},
 		{
 			name:            "pod attach error",
@@ -272,7 +278,7 @@ func TestAttach(t *testing.T) {
 			attachPath:   "/api/" + version + "/namespaces/test/pods/foo/attach",
 			pod:          attachPod(),
 			container:    "foo",
-			expectedErr:  "cannot attach to the container: container foo not found in pod foo",
+			expectedErr:  "cannot attach to the container: container foo is not valid for pod foo out of: bar, debugger (ephem), initfoo (init)",
 		},
 	}
 	for _, test := range tests {
@@ -306,19 +312,20 @@ func TestAttach(t *testing.T) {
 			if test.remoteAttachErr {
 				remoteAttach.err = fmt.Errorf("attach error")
 			}
-			options := &AttachOptions{
-				StreamOptions: exec.StreamOptions{
-					ContainerName: test.container,
-					IOStreams:     genericiooptions.NewTestIOStreamsDiscard(),
-				},
-				Attach:        remoteAttach,
-				GetPodTimeout: 1000,
+			streams, _, _, errOut := genericiooptions.NewTestIOStreams()
+
+			flags := NewAttachFlags(streams)
+			cmd := &cobra.Command{Use: "attach"}
+			flags.AddFlags(cmd)
+
+			require.NoError(t, cmd.Flags().Set("container", test.container))
+
+			options, err := flags.ToOptions(tf, cmd, []string{"foo"})
+			if err != nil {
+				t.Fatal(err)
 			}
 
-			options.restClientGetter = tf
-			options.Namespace = "test"
-			options.Resources = []string{"foo"}
-			options.Builder = tf.NewBuilder
+			options.Attach = remoteAttach
 			options.AttachablePodFn = fakeAttachablePodFn(test.pod)
 			options.AttachFunc = func(opts *AttachOptions, containerToAttach *corev1.Container, raw bool, sizeQueue remotecommand.TerminalSizeQueue) func() error {
 				return func() error {
@@ -327,11 +334,11 @@ func TestAttach(t *testing.T) {
 						return err
 					}
 
-					return options.Attach.Attach("POST", u, nil, nil, nil, nil, raw, sizeQueue)
+					return options.Attach.Attach(u, nil, nil, nil, nil, raw, sizeQueue)
 				}
 			}
 
-			err := options.Run()
+			err = options.Run()
 			if test.expectedErr != "" && err.Error() != test.expectedErr {
 				t.Errorf("%s: Unexpected exec error: %v", test.name, err)
 				return
@@ -347,11 +354,16 @@ func TestAttach(t *testing.T) {
 				t.Errorf("%s: Did not get expected path for exec request: %q %q", test.name, test.attachPath, remoteAttach.url.Path)
 				return
 			}
-			if remoteAttach.method != "POST" {
-				t.Errorf("%s: Did not get method for attach request: %s", test.name, remoteAttach.method)
-			}
 			if remoteAttach.url.Query().Get("container") != "bar" {
 				t.Errorf("%s: Did not have query parameters: %s", test.name, remoteAttach.url.Query())
+			}
+			if test.expectedErrOut != nil {
+				for _, expect := range test.expectedErrOut {
+					if !strings.Contains(errOut.String(), expect) {
+						t.Errorf("%s: expected message %s not found, got: %s", test.name, expect, strings.ReplaceAll(errOut.String(), "\n", ""))
+						return
+					}
+				}
 			}
 		})
 	}
@@ -404,22 +416,20 @@ func TestAttachWarnings(t *testing.T) {
 			}
 			tf.ClientConfigVal = &restclient.Config{APIPath: "/api", ContentConfig: restclient.ContentConfig{NegotiatedSerializer: scheme.Codecs, GroupVersion: &schema.GroupVersion{Version: test.version}}}
 
-			options := &AttachOptions{
-				StreamOptions: exec.StreamOptions{
-					Stdin:         test.stdin,
-					TTY:           test.tty,
-					ContainerName: test.container,
-					IOStreams:     streams,
-				},
+			flags := NewAttachFlags(streams)
+			cmd := &cobra.Command{Use: "attach"}
+			flags.AddFlags(cmd)
 
-				Attach:        &fakeRemoteAttach{},
-				GetPodTimeout: 1000,
+			require.NoError(t, cmd.Flags().Set("container", test.container))
+			require.NoError(t, cmd.Flags().Set("stdin", strconv.FormatBool(test.stdin)))
+			require.NoError(t, cmd.Flags().Set("tty", strconv.FormatBool(test.tty)))
+
+			options, err := flags.ToOptions(tf, cmd, []string{"foo"})
+			if err != nil {
+				t.Fatal(err)
 			}
 
-			options.restClientGetter = tf
-			options.Namespace = "test"
-			options.Resources = []string{"foo"}
-			options.Builder = tf.NewBuilder
+			options.Attach = &fakeRemoteAttach{}
 			options.AttachablePodFn = fakeAttachablePodFn(test.pod)
 			options.AttachFunc = func(opts *AttachOptions, containerToAttach *corev1.Container, raw bool, sizeQueue remotecommand.TerminalSizeQueue) func() error {
 				return func() error {
@@ -428,7 +438,7 @@ func TestAttachWarnings(t *testing.T) {
 						return err
 					}
 
-					return options.Attach.Attach("POST", u, nil, nil, nil, nil, raw, sizeQueue)
+					return options.Attach.Attach(u, nil, nil, nil, nil, raw, sizeQueue)
 				}
 			}
 
@@ -500,7 +510,7 @@ func TestReattachMessage(t *testing.T) {
 			container: "bar",
 			rawTTY:    true,
 			stdin:     true,
-			expected:  "Session ended, resume using",
+			expected:  "Session ended, resume using 'kubectl foo -c bar -n test -i -t' command",
 		},
 		{
 			name:      "no stdin",
@@ -531,7 +541,7 @@ func TestReattachMessage(t *testing.T) {
 			container: "bar",
 			rawTTY:    true,
 			stdin:     true,
-			expected:  "",
+			expected:  "Session ended, resume using 'kubectl foo -c bar -n test -i -t' command",
 		},
 		{
 			name:      "ephemeral container",
@@ -539,7 +549,7 @@ func TestReattachMessage(t *testing.T) {
 			container: "debugger",
 			rawTTY:    true,
 			stdin:     true,
-			expected:  "Session ended, the ephemeral container will not be restarted",
+			expected:  "Session ended, the ephemeral container will not be restarted but may be reattached using 'kubectl foo -c debugger -n test -i -t' if it is still running",
 		},
 	}
 	for _, test := range tests {
@@ -548,7 +558,8 @@ func TestReattachMessage(t *testing.T) {
 				StreamOptions: exec.StreamOptions{
 					Stdin: test.stdin,
 				},
-				Pod: test.pod,
+				CommandName: "kubectl",
+				Pod:         test.pod,
 			}
 			if msg := options.reattachMessage(test.container, test.rawTTY); test.expected == "" && msg != "" {
 				t.Errorf("reattachMessage(%v, %v) = %q, want empty string", test.container, test.rawTTY, msg)
@@ -557,4 +568,21 @@ func TestReattachMessage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCreateExecutor(t *testing.T) {
+	url, err := url.Parse("http://localhost:8080/index.html")
+	if err != nil {
+		t.Fatalf("unable to parse test url: %v", err)
+	}
+	config := cmdtesting.DefaultClientConfig()
+	// WebSockets with SPDY fallback is always used.
+	executor, err := createExecutor(url, config)
+	if err != nil {
+		t.Fatalf("unable to create executor: %v", err)
+	}
+	if _, isFallback := executor.(*remotecommand.FallbackExecutor); !isFallback {
+		t.Errorf("expected fallback executor, got %#v", executor)
+	}
+
 }

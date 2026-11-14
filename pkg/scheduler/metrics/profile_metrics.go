@@ -19,9 +19,12 @@ package metrics
 // This file contains helpers for metrics that are associated to a profile.
 
 var (
-	ScheduledResult     = "scheduled"
-	UnschedulableResult = "unschedulable"
-	ErrorResult         = "error"
+	ScheduledResult           = "scheduled"
+	UnschedulableResult       = "unschedulable"
+	WaitingOnPreemptionResult = "waiting_on_preemption"
+	ErrorResult               = "error"
+	FeasibleResult            = "feasible"
+	InfeasibleResult          = "infeasible"
 )
 
 // PodScheduled can records a successful scheduling attempt and the duration
@@ -45,4 +48,51 @@ func PodScheduleError(profile string, duration float64) {
 func observeScheduleAttemptAndLatency(result, profile string, duration float64) {
 	schedulingLatency.WithLabelValues(result, profile).Observe(duration)
 	scheduleAttempts.WithLabelValues(result, profile).Inc()
+}
+
+// PodGroupScheduled can records a successful pod group scheduling attempt and the duration
+// since `start`.
+func PodGroupScheduled(profile, entityType string, duration float64) {
+	observePodGroupScheduleAttemptAndLatency(ScheduledResult, profile, entityType, duration)
+}
+
+// PodGroupUnschedulable can records a pod group scheduling attempt for an unschedulable pod group
+// and the duration since `start`.
+func PodGroupUnschedulable(profile, entityType string, duration float64) {
+	observePodGroupScheduleAttemptAndLatency(UnschedulableResult, profile, entityType, duration)
+}
+
+// PodGroupWaitingOnPreemption can records a pod group scheduling attempt for an unschedulable pod group
+// waiting on preemption, and the duration since `start`.
+func PodGroupWaitingOnPreemption(profile, entityType string, duration float64) {
+	observePodGroupScheduleAttemptAndLatency(WaitingOnPreemptionResult, profile, entityType, duration)
+}
+
+// PodGroupScheduleError records a pod group scheduling attempt that had an error, and the
+// duration since `start`.
+func PodGroupScheduleError(profile, entityType string, duration float64) {
+	observePodGroupScheduleAttemptAndLatency(ErrorResult, profile, entityType, duration)
+}
+
+func observePodGroupScheduleAttemptAndLatency(result, profile, entityType string, duration float64) {
+	PodGroupSchedulingLatency.WithLabelValues(result, profile, entityType).Observe(duration)
+	PodGroupScheduleAttempts.WithLabelValues(result, profile, entityType).Inc()
+}
+
+// PodGroupAlgorithmLatency records the scheduling algorithm duration for a pod group.
+func PodGroupAlgorithmLatency(profile, entityType string, duration float64) {
+	PodGroupSchedulingAlgorithmLatency.WithLabelValues(profile, entityType).Observe(duration)
+}
+
+// RecordGeneratedPlacements records the number of candidate placements generated for an
+// entity in a single scheduling cycle.
+func RecordGeneratedPlacements(profile, entityType string, count int) {
+	GeneratedPlacementsTotal.WithLabelValues(profile, entityType).Add(float64(count))
+}
+
+// ObservePlacementEvaluation records a single candidate placement evaluation and the
+// duration, by result.
+func ObservePlacementEvaluation(result, profile, entityType string, duration float64) {
+	PlacementEvaluations.WithLabelValues(result, profile, entityType).Inc()
+	PlacementEvaluationDuration.WithLabelValues(result, profile, entityType).Observe(duration)
 }

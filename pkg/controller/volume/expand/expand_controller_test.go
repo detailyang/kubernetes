@@ -30,11 +30,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	coretesting "k8s.io/client-go/testing"
 	csitrans "k8s.io/csi-translation-lib"
 	csitranslationplugins "k8s.io/csi-translation-lib/plugins"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/pkg/controller"
 	controllervolumetesting "k8s.io/kubernetes/pkg/controller/volume/attachdetach/testing"
 	"k8s.io/kubernetes/pkg/volume"
@@ -90,23 +90,23 @@ func TestSyncHandler(t *testing.T) {
 		},
 	}
 
-	for _, tc := range tests {
-		test := tc
-		fakeKubeClient := controllervolumetesting.CreateTestClient()
+	for _, test := range tests {
+		tCtx := ktesting.Init(t)
+		fakeKubeClient := controllervolumetesting.CreateTestClient(tCtx.Logger())
 		informerFactory := informers.NewSharedInformerFactory(fakeKubeClient, controller.NoResyncPeriodFunc())
 		pvcInformer := informerFactory.Core().V1().PersistentVolumeClaims()
 
 		pvc := test.pvc
-		if tc.pv != nil {
-			informerFactory.Core().V1().PersistentVolumes().Informer().GetIndexer().Add(tc.pv)
+		if test.pv != nil {
+			_ = informerFactory.Core().V1().PersistentVolumes().Informer().GetIndexer().Add(test.pv)
 		}
 
-		if tc.pvc != nil {
+		if test.pvc != nil {
 			informerFactory.Core().V1().PersistentVolumeClaims().Informer().GetIndexer().Add(pvc)
 		}
 		allPlugins := []volume.VolumePlugin{}
 		translator := csitrans.New()
-		expc, err := NewExpandController(fakeKubeClient, pvcInformer, nil, allPlugins, translator, csimigration.NewPluginManager(translator, utilfeature.DefaultFeatureGate))
+		expc, err := NewExpandController(tCtx, fakeKubeClient, pvcInformer, allPlugins, translator, csimigration.NewPluginManager(translator))
 		if err != nil {
 			t.Fatalf("error creating expand controller : %v", err)
 		}

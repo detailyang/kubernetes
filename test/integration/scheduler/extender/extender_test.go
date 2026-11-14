@@ -36,13 +36,14 @@ import (
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
 	"k8s.io/kubernetes/pkg/scheduler"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	schedulerutils "k8s.io/kubernetes/test/integration/scheduler"
 	testutils "k8s.io/kubernetes/test/integration/util"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 )
 
 // imported from testutils
 var (
-	createNode = testutils.CreateNode
+	createNode = schedulerutils.CreateNode
 )
 
 const (
@@ -368,7 +369,7 @@ func DoTestPodScheduling(ns *v1.Namespace, t *testing.T, cs clientset.Interface)
 	goodCondition := v1.NodeCondition{
 		Type:              v1.NodeReady,
 		Status:            v1.ConditionTrue,
-		Reason:            fmt.Sprintf("schedulable condition"),
+		Reason:            "schedulable condition",
 		LastHeartbeatTime: metav1.Time{Time: time.Now()},
 	}
 	node := &v1.Node{
@@ -381,7 +382,7 @@ func DoTestPodScheduling(ns *v1.Namespace, t *testing.T, cs clientset.Interface)
 		},
 	}
 
-	for ii := 0; ii < 5; ii++ {
+	for ii := range 5 {
 		node.Name = fmt.Sprintf("machine%d", ii+1)
 		if _, err := createNode(cs, node); err != nil {
 			t.Fatalf("Failed to create nodes: %v", err)
@@ -411,7 +412,7 @@ func DoTestPodScheduling(ns *v1.Namespace, t *testing.T, cs clientset.Interface)
 	}
 
 	err = wait.PollUntilContextTimeout(context.TODO(), time.Second, wait.ForeverTestTimeout, false,
-		testutils.PodScheduled(cs, myPod.Namespace, myPod.Name))
+		schedulerutils.PodScheduled(cs, myPod.Namespace, myPod.Name))
 	if err != nil {
 		t.Fatalf("Failed to schedule pod: %v", err)
 	}

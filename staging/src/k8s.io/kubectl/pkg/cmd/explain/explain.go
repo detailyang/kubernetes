@@ -40,7 +40,7 @@ var (
 		This command describes the fields associated with each supported API resource.
 		Fields are identified via a simple JSONPath identifier:
 
-			<type>.<fieldName>[.<fieldName>]
+			TYPE.FIELDNAME[.FIELDNAME]
 
 		Information about each field is retrieved from the server in OpenAPI format.`))
 
@@ -51,91 +51,123 @@ var (
 		# Get all the fields in the resource
 		kubectl explain pods --recursive
 
+		# Get fields in the resource up to a specific recursive depth
+		kubectl explain pods --recursive --max-depth=2
+
 		# Get the explanation for deployment in supported api versions
 		kubectl explain deployments --api-version=apps/v1
 
 		# Get the documentation of a specific field of a resource
-		kubectl explain pods.spec.containers
-		
-		# Get the documentation of resources in different format
-		kubectl explain deployment --output=plaintext-openapiv2`))
+		kubectl explain pods.spec.containers`))
+)
 
+const (
 	plaintextTemplateName          = "plaintext"
 	plaintextOpenAPIV2TemplateName = "plaintext-openapiv2"
 )
 
-type ExplainOptions struct {
-	genericiooptions.IOStreams
-
-	CmdParent  string
-	APIVersion string
-	Recursive  bool
-
-	args []string
-
-	Mapper meta.RESTMapper
-	Schema openapi.Resources
-
-	// Name of the template to use with the openapiv3 template renderer.
+// ExplainFlags directly reflect the information that CLI is gathering via flags.
+// They will be converted to Options, which reflect the runtime requirements for
+// the command.
+type ExplainFlags struct {
+	APIVersion   string
 	OutputFormat string
+	Recursive    bool
+	MaxDepth     int
 
-	// Client capable of fetching openapi documents from the user's cluster
-	OpenAPIV3Client openapiclient.Client
+	genericiooptions.IOStreams
 }
 
-func NewExplainOptions(parent string, streams genericiooptions.IOStreams) *ExplainOptions {
-	return &ExplainOptions{
-		IOStreams:    streams,
-		CmdParent:    parent,
+// NewExplainFlags returns a default ExplainFlags
+func NewExplainFlags(streams genericiooptions.IOStreams) *ExplainFlags {
+	return &ExplainFlags{
 		OutputFormat: plaintextTemplateName,
+		IOStreams:    streams,
 	}
+}
+
+// AddFlags registers flags for a cli
+func (flags *ExplainFlags) AddFlags(cmd *cobra.Command) {
+	cmd.Flags().BoolVarP(&flags.Recursive, "recursive", "R", flags.Recursive, "Print the fields of fields. Use --max-depth to cap the recursion depth.")
+	cmd.Flags().StringVar(&flags.APIVersion, "api-version", flags.APIVersion, "Get different explanations for particular API version (API group/version)")
+	cmd.Flags().StringVarP(&flags.OutputFormat, "output", "o", plaintextTemplateName, "Format in which to render the schema (plaintext, or the deprecated plaintext-openapiv2)")
+	cmd.Flags().IntVar(&flags.MaxDepth, "max-depth", flags.MaxDepth, "Maximum recursion depth when printing nested fields with --recursive. 0 means no limit. Requires --recursive when greater than 0.")
+}
+
+// ToOptions converts from CLI inputs to runtime input
+func (flags *ExplainFlags) ToOptions(f cmdutil.Factory, parent string, args []string) (*ExplainOptions, error) {
+	mapper, err := f.ToRESTMapper()
+	if err != nil {
+		return nil, err
+	}
+
+	// Only openapi v3 needs the discovery client.
+	openAPIV3Client, err := f.OpenAPIV3Client()
+	if err != nil {
+		return nil, err
+	}
+
+	o := &ExplainOptions{
+		IOStreams: flags.IOStreams,
+
+		Recursive:    flags.Recursive,
+		APIVersion:   flags.APIVersion,
+		OutputFormat: flags.OutputFormat,
+		MaxDepth:     flags.MaxDepth,
+
+		CmdParent: parent,
+		args:      args,
+
+		Mapper:        mapper,
+		openAPIGetter: f,
+
+		OpenAPIV3Client: openAPIV3Client,
+	}
+
+	return o, nil
 }
 
 // NewCmdExplain returns a cobra command for swagger docs
 func NewCmdExplain(parent string, f cmdutil.Factory, streams genericiooptions.IOStreams) *cobra.Command {
-	o := NewExplainOptions(parent, streams)
+	flags := NewExplainFlags(streams)
 
 	cmd := &cobra.Command{
-		Use:                   "explain TYPE [--recursive=FALSE|TRUE] [--api-version=api-version-group] [--output=plaintext|plaintext-openapiv2]",
+		Use:                   "explain TYPE [--recursive=FALSE|TRUE] [--api-version=api-version-group] [-o|--output=plaintext|plaintext-openapiv2]",
 		DisableFlagsInUseLine: true,
 		Short:                 i18n.T("Get documentation for a resource"),
 		Long:                  explainLong + "\n\n" + cmdutil.SuggestAPIResources(parent),
+		ValidArgsFunction:     resourceFieldCompletionFunc(f, func() string { return flags.APIVersion }),
 		Example:               explainExamples,
 		Run: func(cmd *cobra.Command, args []string) {
-			cmdutil.CheckErr(o.Complete(f, cmd, args))
+			o, err := flags.ToOptions(f, parent, args)
+			cmdutil.CheckErr(err)
 			cmdutil.CheckErr(o.Validate())
 			cmdutil.CheckErr(o.Run())
 		},
 	}
-	cmd.Flags().BoolVar(&o.Recursive, "recursive", o.Recursive, "When true, print the name of all the fields recursively. Otherwise, print the available fields with their description.")
-	cmd.Flags().StringVar(&o.APIVersion, "api-version", o.APIVersion, "Use given api-version (group/version) of the resource.")
 
-	// Only enable --output as a valid flag if the feature is enabled
-	cmd.Flags().StringVar(&o.OutputFormat, "output", plaintextTemplateName, "Format in which to render the schema. Valid values are: (plaintext, plaintext-openapiv2).")
+	flags.AddFlags(cmd)
 
 	return cmd
 }
 
-func (o *ExplainOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []string) error {
-	var err error
-	o.Mapper, err = f.ToRESTMapper()
-	if err != nil {
-		return err
-	}
+type ExplainOptions struct {
+	genericiooptions.IOStreams
 
-	o.Schema, err = f.OpenAPISchema()
-	if err != nil {
-		return err
-	}
+	Recursive  bool
+	APIVersion string
+	// Name of the template to use with the openapiv3 template renderer.
+	OutputFormat string
+	MaxDepth     int
 
-	// Only openapi v3 needs the discovery client.
-	o.OpenAPIV3Client, err = f.OpenAPIV3Client()
-	if err != nil {
-		return err
-	}
+	CmdParent string
+	args      []string
 
-	o.args = args
-	return nil
+	Mapper        meta.RESTMapper
+	openAPIGetter openapi.OpenAPIResourcesGetter
+
+	// Client capable of fetching openapi documents from the user's cluster
+	OpenAPIV3Client openapiclient.Client
 }
 
 func (o *ExplainOptions) Validate() error {
@@ -144,6 +176,12 @@ func (o *ExplainOptions) Validate() error {
 	}
 	if len(o.args) > 1 {
 		return fmt.Errorf("We accept only this format: explain RESOURCE\n")
+	}
+	if o.MaxDepth > 0 && !o.Recursive {
+		return fmt.Errorf("--max-depth requires --recursive")
+	}
+	if o.MaxDepth < 0 {
+		return fmt.Errorf("--max-depth must be non-negative")
 	}
 
 	return nil
@@ -169,18 +207,13 @@ func (o *ExplainOptions) Run() error {
 		}
 	}
 
-	// Fallback to openapiv2 implementation using special template name
+	// The deprecated plaintext-openapiv2 output renders from the deprecated
+	// /openapi/v2 endpoint. It is used only when asked for: every supported
+	// server serves /openapi/v3, so there is no fallback to it.
 	switch o.OutputFormat {
 	case plaintextOpenAPIV2TemplateName:
+		fmt.Fprintln(o.ErrOut, "warning: --output=plaintext-openapiv2 is deprecated and will be removed in a future release. Use --output=plaintext.") //nolint:errcheck
 		return o.renderOpenAPIV2(fullySpecifiedGVR, fieldsPath)
-	case plaintextTemplateName:
-		// Check whether the server reponds to OpenAPIV3.
-		if _, err := o.OpenAPIV3Client.Paths(); err != nil {
-			// Use v2 renderer if server does not support v3
-			return o.renderOpenAPIV2(fullySpecifiedGVR, fieldsPath)
-		}
-
-		fallthrough
 	default:
 		if len(o.APIVersion) > 0 {
 			apiVersion, err := schema.ParseGroupVersion(o.APIVersion)
@@ -197,6 +230,7 @@ func (o *ExplainOptions) Run() error {
 			o.OpenAPIV3Client,
 			fullySpecifiedGVR,
 			o.Recursive,
+			o.MaxDepth,
 			o.OutputFormat,
 		)
 	}
@@ -224,10 +258,14 @@ func (o *ExplainOptions) renderOpenAPIV2(
 		gvk = apiVersion.WithKind(gvk.Kind)
 	}
 
-	schema := o.Schema.LookupResource(gvk)
+	resources, err := o.openAPIGetter.OpenAPISchema()
+	if err != nil {
+		return err
+	}
+	schema := resources.LookupResource(gvk)
 	if schema == nil {
 		return fmt.Errorf("couldn't find resource for %q", gvk)
 	}
 
-	return explain.PrintModelDescription(fieldsPath, o.Out, schema, gvk, o.Recursive)
+	return explain.PrintModelDescription(fieldsPath, o.Out, schema, gvk, o.Recursive, o.MaxDepth)
 }

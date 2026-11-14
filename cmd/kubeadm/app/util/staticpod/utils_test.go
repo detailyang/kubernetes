@@ -17,20 +17,24 @@ limitations under the License.
 package staticpod
 
 import (
+	_ "embed"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	goruntime "runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	testutil "k8s.io/kubernetes/cmd/kubeadm/test"
 )
 
 func TestComponentResources(t *testing.T) {
@@ -575,100 +579,21 @@ func TestVolumeMountMapToSlice(t *testing.T) {
 	}
 }
 
-func TestGetExtraParameters(t *testing.T) {
-	var tests = []struct {
-		name      string
-		overrides map[string]string
-		defaults  map[string]string
-		expected  []string
-	}{
-		{
-			name: "with admission-control default NamespaceLifecycle",
-			overrides: map[string]string{
-				"admission-control": "NamespaceLifecycle,LimitRanger",
-			},
-			defaults: map[string]string{
-				"admission-control": "NamespaceLifecycle",
-				"allow-privileged":  "true",
-			},
-			expected: []string{
-				"--admission-control=NamespaceLifecycle,LimitRanger",
-				"--allow-privileged=true",
-			},
-		},
-		{
-			name: "without admission-control default",
-			overrides: map[string]string{
-				"admission-control": "NamespaceLifecycle,LimitRanger",
-			},
-			defaults: map[string]string{
-				"allow-privileged": "true",
-			},
-			expected: []string{
-				"--admission-control=NamespaceLifecycle,LimitRanger",
-				"--allow-privileged=true",
-			},
-		},
-	}
+var (
+	//go:embed testdata/valid-pod.yaml
+	validPod string
 
-	for _, rt := range tests {
-		t.Run(rt.name, func(t *testing.T) {
-			actual := GetExtraParameters(rt.overrides, rt.defaults)
-			sort.Strings(actual)
-			sort.Strings(rt.expected)
-			if !reflect.DeepEqual(actual, rt.expected) {
-				t.Errorf("failed getExtraParameters:\nexpected:\n%v\nsaw:\n%v", rt.expected, actual)
-			}
-		})
-	}
-}
+	//go:embed testdata/valid-pod-different-order.yaml
+	validPodWithDifferentFieldsOrder string
 
-const (
-	validPod = `
-apiVersion: v1
-kind: Pod
-metadata:
-  labels:
-    component: etcd
-    tier: control-plane
-  name: etcd
-  namespace: kube-system
-spec:
-  containers:
-  - image: gcr.io/google_containers/etcd-amd64:3.1.11
-status: {}
-`
-	validPodWithDifferentFieldsOrder = `
-apiVersion: v1
-kind: Pod
-metadata:
-  labels:
-    tier: control-plane
-    component: etcd
-  name: etcd
-  namespace: kube-system
-spec:
-  containers:
-  - image: gcr.io/google_containers/etcd-amd64:3.1.11
-status: {}
-`
-	validPod2 = `
-apiVersion: v1
-kind: Pod
-metadata:
-  labels:
-    component: etcd
-    tier: control-plane
-  name: etcd
-  namespace: kube-system
-spec:
-  containers:
-  - image: gcr.io/google_containers/etcd-amd64:3.1.12
-status: {}
-`
+	//go:embed testdata/invalid-with-default-fields.yaml
+	invalidWithDefaultFields string
 
-	invalidPod = `---{ broken yaml @@@`
+	//go:embed testdata/valid-pod2.yaml
+	validPod2 string
 )
+
+const invalidPod = `---{ broken yaml @@@`
 
 func TestReadStaticPodFromDisk(t *testing.T) {
 	tests := []struct {
@@ -699,8 +624,7 @@ func TestReadStaticPodFromDisk(t *testing.T) {
 
 	for _, rt := range tests {
 		t.Run(rt.description, func(t *testing.T) {
-			tmpdir := testutil.SetupTempDir(t)
-			defer os.RemoveAll(tmpdir)
+			tmpdir := t.TempDir()
 
 			manifestPath := filepath.Join(tmpdir, "pod.yaml")
 			if rt.writeManifest {
@@ -724,11 +648,105 @@ func TestReadStaticPodFromDisk(t *testing.T) {
 	}
 }
 
+// getFileNotFoundForOS returns the expected error message for a file not found error on the current OS
+// - on Windows, the error message is "The system cannot find the file specified"
+// - on other, the error message is "no such file or directory"
+func getFileNotFoundForOS() string {
+	if goruntime.GOOS == "windows" {
+		return "The system cannot find the file specified"
+	} else {
+		return "no such file or directory"
+	}
+}
+
+func TestReadMultipleStaticPodsFromDisk(t *testing.T) {
+	getTestPod := func(name string) *v1.Pod {
+		return &v1.Pod{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Pod",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name,
+			},
+		}
+	}
+
+	testCases := []struct {
+		name                  string
+		setup                 func(dir string)
+		components            []string
+		expected              []*v1.Pod
+		expectedErrorContains []string
+	}{
+		{
+			name: "valid: all pods are written and read",
+			setup: func(dir string) {
+				var pod *v1.Pod
+				pod = getTestPod("a")
+				_ = WriteStaticPodToDisk(kubeadmconstants.KubeAPIServer, dir, *pod)
+				pod = getTestPod("b")
+				_ = WriteStaticPodToDisk(kubeadmconstants.KubeControllerManager, dir, *pod)
+				pod = getTestPod("c")
+				_ = WriteStaticPodToDisk(kubeadmconstants.KubeScheduler, dir, *pod)
+			},
+			components: kubeadmconstants.ControlPlaneComponents,
+			expected: []*v1.Pod{
+				getTestPod("a"),
+				getTestPod("b"),
+				getTestPod("c"),
+			},
+		},
+		{
+			name:       "invalid: all pods returned errors",
+			setup:      func(dir string) {},
+			components: kubeadmconstants.ControlPlaneComponents,
+			expectedErrorContains: []string{
+				"kube-apiserver.yaml: " + getFileNotFoundForOS(),
+				"kube-controller-manager.yaml: " + getFileNotFoundForOS(),
+				"kube-scheduler.yaml: " + getFileNotFoundForOS(),
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tc.setup(dir)
+			m, err := ReadMultipleStaticPodsFromDisk(dir, tc.components...)
+			if err != nil {
+				for _, ec := range tc.expectedErrorContains {
+					if !strings.Contains(err.Error(), ec) {
+						t.Fatalf("expected error to contain string: %s\nerror:\n%v", ec, err)
+					}
+				}
+			}
+
+			// Compare sorted result to expected result.
+			var actual []*v1.Pod
+			for _, v := range m {
+				actual = append(actual, v)
+			}
+			sort.Slice(actual, func(a, b int) bool {
+				return actual[a].Name < actual[b].Name
+			})
+			sort.Slice(tc.expected, func(a, b int) bool {
+				return actual[a].Name < actual[b].Name
+			})
+
+			if diff := cmp.Diff(tc.expected, actual); diff != "" {
+				t.Fatalf("unexpected difference (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestManifestFilesAreEqual(t *testing.T) {
 	var tests = []struct {
 		description    string
 		podYamls       []string
 		expectedResult bool
+		expectedDiff   string
 		expectErr      bool
 	}{
 		{
@@ -748,6 +766,19 @@ func TestManifestFilesAreEqual(t *testing.T) {
 			podYamls:       []string{validPod, validPod2},
 			expectedResult: false,
 			expectErr:      false,
+			expectedDiff: `@@ -11 +11 @@
+-  - image: gcr.io/google_containers/etcd-amd64:3.1.11
++  - image: gcr.io/google_containers/etcd-amd64:3.1.12
+`,
+		},
+		{
+			description:    "manifests are not equal for adding new defaults",
+			podYamls:       []string{validPod, invalidWithDefaultFields},
+			expectedResult: false,
+			expectErr:      false,
+			expectedDiff: `@@ -13,0 +14 @@
++  restartPolicy: Always
+`,
 		},
 		{
 			description:    "first manifest doesn't exist",
@@ -765,11 +796,10 @@ func TestManifestFilesAreEqual(t *testing.T) {
 
 	for _, rt := range tests {
 		t.Run(rt.description, func(t *testing.T) {
-			tmpdir := testutil.SetupTempDir(t)
-			defer os.RemoveAll(tmpdir)
+			tmpdir := t.TempDir()
 
 			// write 2 manifests
-			for i := 0; i < 2; i++ {
+			for i := range 2 {
 				if rt.podYamls[i] != "" {
 					manifestPath := filepath.Join(tmpdir, strconv.Itoa(i)+".yaml")
 					err := os.WriteFile(manifestPath, []byte(rt.podYamls[i]), 0644)
@@ -780,7 +810,7 @@ func TestManifestFilesAreEqual(t *testing.T) {
 			}
 
 			// compare them
-			result, actualErr := ManifestFilesAreEqual(filepath.Join(tmpdir, "0.yaml"), filepath.Join(tmpdir, "1.yaml"))
+			result, diff, actualErr := ManifestFilesAreEqual(filepath.Join(tmpdir, "0.yaml"), filepath.Join(tmpdir, "1.yaml"))
 			if result != rt.expectedResult {
 				t.Errorf(
 					"ManifestFilesAreEqual failed\n%s\nexpected result: %t\nactual result: %t",
@@ -796,6 +826,14 @@ func TestManifestFilesAreEqual(t *testing.T) {
 					rt.expectErr,
 					(actualErr != nil),
 					actualErr,
+				)
+			}
+			if !strings.Contains(diff, rt.expectedDiff) {
+				t.Errorf(
+					"ManifestFilesAreEqual diff doesn't expected\n%s\n\texpected diff: %s\n\tactual diff: %s",
+					rt.description,
+					rt.expectedDiff,
+					diff,
 				)
 			}
 		})

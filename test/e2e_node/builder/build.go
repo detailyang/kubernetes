@@ -17,7 +17,6 @@ limitations under the License.
 package builder
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,10 +27,13 @@ import (
 	"k8s.io/kubernetes/test/utils"
 )
 
-var k8sBinDir = flag.String("k8s-bin-dir", "", "Directory containing k8s kubelet binaries.")
-var useDockerizedBuild = flag.Bool("use-dockerized-build", false, "Use dockerized build for test artifacts")
-var targetBuildArch = flag.String("target-build-arch", "linux/amd64", "Target architecture for the test artifacts for dockerized build")
+var k8sBinDir = CommandLine.String("k8s-bin-dir", "", "Directory containing k8s kubelet binaries.")
+var useDockerizedBuild = CommandLine.Bool("use-dockerized-build", false, "Use dockerized build for test artifacts")
+var targetBuildArch = CommandLine.String("target-build-arch", "linux/amd64", "Target architecture for the test artifacts for dockerized build")
 
+// buildTargets is what the `test/e2e_node/runners/remote` builds via `make WHAT=`
+// when invoked via "make test-e2e-node". In this mode, separate binaries are
+// used for each command.
 var buildTargets = []string{
 	"cmd/kubelet",
 	"test/e2e_node/e2e_node.test",
@@ -40,19 +42,28 @@ var buildTargets = []string{
 	"test/e2e_node/plugins/gcp-credential-provider",
 }
 
-// BuildGo builds k8s binaries.
+// BuildGo builds some default k8s binaries.
 func BuildGo() error {
-	klog.Infof("Building k8s binaries...")
+	return BuildTargets(buildTargets...)
+}
+
+// BuildTargets builds the specified k8s binaries (= WHAT targets).
+func BuildTargets(targets ...string) error {
 	k8sRoot, err := utils.GetK8sRootDir()
 	if err != nil {
 		return fmt.Errorf("failed to locate kubernetes root directory %v", err)
 	}
-	targets := strings.Join(buildTargets, " ")
-	cmd := exec.Command("make", "-C", k8sRoot, fmt.Sprintf("WHAT=%s", targets))
+	arch := GetTargetBuildArch()
+	klog.Infof("Building k8s binaries %v in %q for %s...", targets, k8sRoot, arch)
+	what := strings.Join(targets, " ")
+	cmd := exec.Command("make", "-C", k8sRoot,
+		fmt.Sprintf("WHAT=%s", what))
 	if IsDockerizedBuild() {
 		klog.Infof("Building dockerized k8s binaries targets %s for architecture %s", targets, GetTargetBuildArch())
 		// Multi-architecture build is only supported in dockerized build
-		cmd = exec.Command(filepath.Join(k8sRoot, "build/run.sh"), "make", fmt.Sprintf("WHAT=%s", targets), fmt.Sprintf("KUBE_BUILD_PLATFORMS=%s", GetTargetBuildArch()))
+		cmd = exec.Command(filepath.Join(k8sRoot, "build/run.sh"), "make", fmt.Sprintf("WHAT=%s", what), fmt.Sprintf("KUBE_BUILD_PLATFORMS=%s", arch))
+		// Ensure we run this command in k8s root directory for dockerized build
+		cmd.Dir = k8sRoot
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

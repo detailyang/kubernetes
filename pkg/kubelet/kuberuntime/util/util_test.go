@@ -22,18 +22,26 @@ import (
 	"github.com/stretchr/testify/require"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/version"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/ktesting"
+	pkgfeatures "k8s.io/kubernetes/pkg/features"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	kubecontainertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
 
 func TestPodSandboxChanged(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	for desc, test := range map[string]struct {
 		pod               *v1.Pod
 		status            *kubecontainer.PodStatus
 		expectedChanged   bool
 		expectedAttempt   uint32
 		expectedSandboxID string
+		expectedReason    string
 	}{
 		"Pod with no existing sandboxes": {
 			pod:               &v1.Pod{},
@@ -41,6 +49,7 @@ func TestPodSandboxChanged(t *testing.T) {
 			expectedChanged:   true,
 			expectedAttempt:   0,
 			expectedSandboxID: "",
+			expectedReason:    kubetypes.PodSandboxNotReadyMsgNoPodSandbox,
 		},
 		"Pod with multiple ready sandbox statuses": {
 			pod: &v1.Pod{},
@@ -61,6 +70,7 @@ func TestPodSandboxChanged(t *testing.T) {
 			expectedChanged:   true,
 			expectedAttempt:   2,
 			expectedSandboxID: "sandboxID2",
+			expectedReason:    kubetypes.PodSandboxNotReadyMsgMultipleSandboxes,
 		},
 		"Pod with no ready sandbox statuses": {
 			pod: &v1.Pod{},
@@ -81,6 +91,7 @@ func TestPodSandboxChanged(t *testing.T) {
 			expectedChanged:   true,
 			expectedAttempt:   2,
 			expectedSandboxID: "sandboxID2",
+			expectedReason:    kubetypes.PodSandboxNotReadyMsgSandboxNotReady,
 		},
 		"Pod with ready sandbox status but network namespace mismatch": {
 			pod: &v1.Pod{
@@ -107,6 +118,7 @@ func TestPodSandboxChanged(t *testing.T) {
 			expectedChanged:   true,
 			expectedAttempt:   1,
 			expectedSandboxID: "",
+			expectedReason:    kubetypes.PodSandboxNotReadyMsgNetworkNamespaceMode,
 		},
 		"Pod with ready sandbox status but no IP": {
 			pod: &v1.Pod{
@@ -129,6 +141,7 @@ func TestPodSandboxChanged(t *testing.T) {
 			expectedChanged:   true,
 			expectedAttempt:   1,
 			expectedSandboxID: "sandboxID1",
+			expectedReason:    kubetypes.PodSandboxNotReadyMsgNoIPAddress,
 		},
 		"Pod with ready sandbox status with IP": {
 			pod: &v1.Pod{
@@ -151,21 +164,39 @@ func TestPodSandboxChanged(t *testing.T) {
 			expectedChanged:   false,
 			expectedAttempt:   0,
 			expectedSandboxID: "sandboxID1",
+			expectedReason:    "",
 		},
 	} {
 		t.Run(desc, func(t *testing.T) {
-			changed, attempt, id := PodSandboxChanged(test.pod, test.status)
+			changed, attempt, id, reason := PodSandboxChanged(logger, test.pod, test.status)
 			require.Equal(t, test.expectedChanged, changed)
 			require.Equal(t, test.expectedAttempt, attempt)
 			require.Equal(t, test.expectedSandboxID, id)
+			require.Equal(t, test.expectedReason, reason)
 		})
 	}
 }
 
+type fakeRuntimeHandlerResolver struct{}
+
+func (*fakeRuntimeHandlerResolver) LookupRuntimeHandler(s *string) (string, error) {
+	return "", nil
+}
+
 func TestNamespacesForPod(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	usernsIDs := &runtimeapi.IDMapping{
+		HostId:      65536,
+		ContainerId: 0,
+		Length:      65536,
+	}
+
 	for desc, test := range map[string]struct {
-		input    *v1.Pod
-		expected *runtimeapi.NamespaceOption
+		input           *v1.Pod
+		runtimeHandlers map[string]kubecontainer.RuntimeHandler
+		usernsEnabled   bool
+		expected        *runtimeapi.NamespaceOption
+		expErr          bool
 	}{
 		"nil pod -> default v1 namespaces": {
 			input: nil,
@@ -221,11 +252,88 @@ func TestNamespacesForPod(t *testing.T) {
 				Pid:     runtimeapi.NamespaceMode_CONTAINER,
 			},
 		},
+		"hostUsers: false and feature enabled": {
+			input: &v1.Pod{
+				Spec: v1.PodSpec{
+					HostUsers: &[]bool{false}[0],
+				},
+			},
+			usernsEnabled: true,
+			runtimeHandlers: map[string]kubecontainer.RuntimeHandler{
+				"": {
+					SupportsUserNamespaces: true,
+				},
+			},
+			expected: &runtimeapi.NamespaceOption{
+				Ipc:     runtimeapi.NamespaceMode_POD,
+				Network: runtimeapi.NamespaceMode_POD,
+				Pid:     runtimeapi.NamespaceMode_CONTAINER,
+				UsernsOptions: &runtimeapi.UserNamespace{
+					Mode: runtimeapi.NamespaceMode_POD,
+					Uids: []*runtimeapi.IDMapping{usernsIDs},
+					Gids: []*runtimeapi.IDMapping{usernsIDs},
+				},
+			},
+		},
+		// The hostUsers field can't be set to any value if the feature is disabled.
+		"hostUsers: false and feature disabled --> error": {
+			input: &v1.Pod{
+				Spec: v1.PodSpec{
+					HostUsers: &[]bool{false}[0],
+				},
+			},
+			usernsEnabled: false,
+			expErr:        true,
+		},
+		// The hostUsers field can't be set to any value if the feature is disabled.
+		"hostUsers: true and feature disabled --> error": {
+			input: &v1.Pod{
+				Spec: v1.PodSpec{
+					HostUsers: &[]bool{true}[0],
+				},
+			},
+			usernsEnabled: false,
+			expErr:        true,
+		},
+		"error if runtime handler not found": {
+			input: &v1.Pod{
+				Spec: v1.PodSpec{
+					HostUsers: &[]bool{false}[0],
+				},
+			},
+			usernsEnabled: true,
+			runtimeHandlers: map[string]kubecontainer.RuntimeHandler{
+				"other": {},
+			},
+			expErr: true,
+		},
+		"error if runtime handler does not support userns": {
+			input: &v1.Pod{
+				Spec: v1.PodSpec{
+					HostUsers: &[]bool{false}[0],
+				},
+			},
+			usernsEnabled: true,
+			expErr:        true,
+		},
 	} {
 		t.Run(desc, func(t *testing.T) {
-			actual, err := NamespacesForPod(test.input, &kubecontainertest.FakeRuntimeHelper{})
-			require.NoError(t, err)
-			require.Equal(t, test.expected, actual)
+			if !test.usernsEnabled {
+				// Set emulation version so that the feature gate can be disabled in the test
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.35"))
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, pkgfeatures.UserNamespacesSupport, false)
+			}
+
+			fakeRuntimeHelper := kubecontainertest.FakeRuntimeHelper{
+				RuntimeHandlers: test.runtimeHandlers,
+			}
+			actual, err := NamespacesForPod(tCtx, test.input, &fakeRuntimeHelper, &fakeRuntimeHandlerResolver{})
+			if test.expErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, test.expected, actual)
+			}
 		})
 	}
 }

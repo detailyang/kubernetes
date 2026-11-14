@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -26,7 +25,7 @@ import (
 	"reflect"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
@@ -57,10 +56,10 @@ func TestGetEtcdCertVolumes(t *testing.T) {
 			volMount: []v1.VolumeMount{},
 		},
 		{
-			name:     "Should ignore files in /etc/pki",
-			ca:       "/etc/pki/my-etcd-ca.crt",
-			cert:     "/etc/pki/my-etcd.crt",
-			key:      "/etc/pki/my-etcd.key",
+			name:     "Should ignore files in /etc/pki/ca-trust",
+			ca:       "/etc/pki/ca-trust/my-etcd-ca.crt",
+			cert:     "/etc/pki/ca-trust/my-etcd.crt",
+			key:      "/etc/pki/ca-trust/my-etcd.key",
 			vol:      []v1.Volume{},
 			volMount: []v1.VolumeMount{},
 		},
@@ -519,16 +518,14 @@ func TestGetHostPathVolumesForTheControlPlane(t *testing.T) {
 	defer os.RemoveAll(tmpdir)
 
 	// set up tmp caCertsExtraVolumePaths for testing
-	caCertsExtraVolumePaths = []string{fmt.Sprintf("%s/etc/pki", tmpdir), fmt.Sprintf("%s/usr/share/ca-certificates", tmpdir)}
-	defer func() { caCertsExtraVolumePaths = []string{"/etc/pki", "/usr/share/ca-certificates"} }()
+	originalCACertsExtraVolumePaths := caCertsExtraVolumePaths
+	caCertsExtraVolumePaths = []string{fmt.Sprintf("%s/etc/pki/ca-trust", tmpdir), fmt.Sprintf("%s/usr/share/ca-certificates", tmpdir)}
+	defer func() { caCertsExtraVolumePaths = originalCACertsExtraVolumePaths }()
 
 	for _, rt := range tests {
 		t.Run(rt.name, func(t *testing.T) {
 			mounts := getHostPathVolumesForTheControlPlane(rt.cfg)
 
-			// Avoid unit test errors when the flexvolume is mounted
-			delete(mounts.volumes[kubeadmconstants.KubeControllerManager], flexvolumeDirVolumeName)
-			delete(mounts.volumeMounts[kubeadmconstants.KubeControllerManager], flexvolumeDirVolumeName)
 			if !reflect.DeepEqual(mounts.volumes, rt.vol) {
 				t.Errorf(
 					"failed getHostPathVolumesForTheControlPlane:\n\texpected: %v\n\t  actual: %v",

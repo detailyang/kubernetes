@@ -54,7 +54,6 @@ var (
 	probeFilePath   = probeVolumePath + "/probe-file"
 	fileName        = "test-file"
 	retryDuration   = 20
-	mountImage      = imageutils.GetE2EImage(imageutils.Agnhost)
 )
 
 type subPathTestSuite struct {
@@ -91,8 +90,8 @@ func (s *subPathTestSuite) GetTestSuiteInfo() storageframework.TestSuiteInfo {
 	return s.tsInfo
 }
 
-func (s *subPathTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
-	skipVolTypePatterns(pattern, driver, storageframework.NewVolTypeMap(
+func (s *subPathTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) string {
+	return checkVolTypePatterns(pattern, driver, storageframework.NewVolTypeMap(
 		storageframework.PreprovisionedPV,
 		storageframework.InlineVolume))
 }
@@ -237,7 +236,7 @@ func (s *subPathTestSuite) DefineTests(driver storageframework.TestDriver, patte
 		TestBasicSubpath(ctx, f, f.Namespace.Name, l.pod)
 	})
 
-	ginkgo.It("should fail if subpath directory is outside the volume [Slow][LinuxOnly]", func(ctx context.Context) {
+	f.It("should fail if subpath directory is outside the volume", f.WithSlow(), "[LinuxOnly]", func(ctx context.Context) {
 		init(ctx)
 		ginkgo.DeferCleanup(cleanup)
 
@@ -253,7 +252,7 @@ func (s *subPathTestSuite) DefineTests(driver storageframework.TestDriver, patte
 		testPodFailSubpath(ctx, f, l.pod, false)
 	})
 
-	ginkgo.It("should fail if subpath file is outside the volume [Slow][LinuxOnly]", func(ctx context.Context) {
+	f.It("should fail if subpath file is outside the volume", f.WithSlow(), "[LinuxOnly]", func(ctx context.Context) {
 		init(ctx)
 		ginkgo.DeferCleanup(cleanup)
 
@@ -264,7 +263,7 @@ func (s *subPathTestSuite) DefineTests(driver storageframework.TestDriver, patte
 		testPodFailSubpath(ctx, f, l.pod, false)
 	})
 
-	ginkgo.It("should fail if non-existent subpath is outside the volume [Slow][LinuxOnly]", func(ctx context.Context) {
+	f.It("should fail if non-existent subpath is outside the volume", f.WithSlow(), "[LinuxOnly]", func(ctx context.Context) {
 		init(ctx)
 		ginkgo.DeferCleanup(cleanup)
 
@@ -275,7 +274,7 @@ func (s *subPathTestSuite) DefineTests(driver storageframework.TestDriver, patte
 		testPodFailSubpath(ctx, f, l.pod, false)
 	})
 
-	ginkgo.It("should fail if subpath with backstepping is outside the volume [Slow][LinuxOnly]", func(ctx context.Context) {
+	f.It("should fail if subpath with backstepping is outside the volume", f.WithSlow(), "[LinuxOnly]", func(ctx context.Context) {
 		init(ctx)
 		ginkgo.DeferCleanup(cleanup)
 
@@ -291,7 +290,7 @@ func (s *subPathTestSuite) DefineTests(driver storageframework.TestDriver, patte
 		testPodFailSubpath(ctx, f, l.pod, false)
 	})
 
-	ginkgo.It("should support creating multiple subpath from same volumes [Slow]", func(ctx context.Context) {
+	f.It("should support creating multiple subpath from same volumes", f.WithSlow(), func(ctx context.Context) {
 		init(ctx)
 		ginkgo.DeferCleanup(cleanup)
 
@@ -317,7 +316,7 @@ func (s *subPathTestSuite) DefineTests(driver storageframework.TestDriver, patte
 		testMultipleReads(ctx, f, l.pod, 0, filepath1, filepath2)
 	})
 
-	ginkgo.It("should support restarting containers using directory as subpath [Slow]", func(ctx context.Context) {
+	f.It("should support restarting containers using directory as subpath", f.WithSlow(), func(ctx context.Context) {
 		init(ctx)
 		ginkgo.DeferCleanup(cleanup)
 
@@ -328,7 +327,7 @@ func (s *subPathTestSuite) DefineTests(driver storageframework.TestDriver, patte
 		testPodContainerRestart(ctx, f, l.pod)
 	})
 
-	ginkgo.It("should support restarting containers using file as subpath [Slow][LinuxOnly]", func(ctx context.Context) {
+	f.It("should support restarting containers using file as subpath", f.WithSlow(), "[LinuxOnly]", func(ctx context.Context) {
 		init(ctx)
 		ginkgo.DeferCleanup(cleanup)
 
@@ -338,7 +337,7 @@ func (s *subPathTestSuite) DefineTests(driver storageframework.TestDriver, patte
 		testPodContainerRestart(ctx, f, l.pod)
 	})
 
-	ginkgo.It("should unmount if pod is gracefully deleted while kubelet is down [Disruptive][Slow][LinuxOnly]", func(ctx context.Context) {
+	f.It("should unmount if pod is gracefully deleted while kubelet is down", f.WithDisruptive(), f.WithSlow(), "[LinuxOnly]", func(ctx context.Context) {
 		e2eskipper.SkipUnlessSSHKeyPresent()
 		init(ctx)
 		ginkgo.DeferCleanup(cleanup)
@@ -351,7 +350,7 @@ func (s *subPathTestSuite) DefineTests(driver storageframework.TestDriver, patte
 		testSubpathReconstruction(ctx, f, l.hostExec, l.pod, false)
 	})
 
-	ginkgo.It("should unmount if pod is force deleted while kubelet is down [Disruptive][Slow][LinuxOnly]", func(ctx context.Context) {
+	f.It("should unmount if pod is force deleted while kubelet is down", f.WithDisruptive(), f.WithSlow(), "[LinuxOnly]", func(ctx context.Context) {
 		e2eskipper.SkipUnlessSSHKeyPresent()
 		init(ctx)
 		ginkgo.DeferCleanup(cleanup)
@@ -363,6 +362,18 @@ func (s *subPathTestSuite) DefineTests(driver storageframework.TestDriver, patte
 
 		testSubpathReconstruction(ctx, f, l.hostExec, l.pod, true)
 	})
+
+	f.It("should remount stale subpath bind mount after network filesystem disruption [LinuxOnly]",
+		f.WithDisruptive(), f.WithSlow(), func(ctx context.Context) {
+			init(ctx)
+			ginkgo.DeferCleanup(cleanup)
+
+			if strings.HasPrefix(driverName, "hostPath") {
+				e2eskipper.Skipf("Driver %s uses a local hostPath volume; stale-mount scenario requires a network filesystem, skipping", driverName)
+			}
+
+			testSubpathStaleBindMountRemount(ctx, f, l.pod)
+		})
 
 	ginkgo.It("should support readOnly directory specified in the volumeMount", func(ctx context.Context) {
 		init(ctx)
@@ -422,7 +433,7 @@ func (s *subPathTestSuite) DefineTests(driver storageframework.TestDriver, patte
 		testReadFile(ctx, f, l.filePathInSubpath, l.pod, 0)
 	})
 
-	ginkgo.It("should verify container cannot write to subpath readonly volumes [Slow]", func(ctx context.Context) {
+	f.It("should verify container cannot write to subpath readonly volumes", f.WithSlow(), func(ctx context.Context) {
 		init(ctx)
 		ginkgo.DeferCleanup(cleanup)
 		if l.roVolSource == nil {
@@ -450,7 +461,7 @@ func (s *subPathTestSuite) DefineTests(driver storageframework.TestDriver, patte
 
 		// Change volume container to busybox so we can exec later
 		l.pod.Spec.Containers[1].Image = e2epod.GetDefaultTestImage()
-		l.pod.Spec.Containers[1].Command = e2epod.GenerateScriptCmd("sleep 100000")
+		l.pod.Spec.Containers[1].Command = e2epod.GenerateScriptCmd(e2epod.InfiniteSleepCommand)
 		l.pod.Spec.Containers[1].Args = nil
 
 		ginkgo.By(fmt.Sprintf("Creating pod %s", l.pod.Name))
@@ -578,8 +589,8 @@ func SubpathTestPod(f *framework.Framework, subpath, volumeType string, source *
 }
 
 func containerIsUnused(container *v1.Container) bool {
-	// mountImage with nil command and nil Args or with just "mounttest" as Args does nothing. Leave everything else
-	return container.Image == mountImage && container.Command == nil &&
+	// agnhost image with nil command and nil Args or with just "mounttest" as Args does nothing. Leave everything else
+	return container.Image == imageutils.GetE2EImage(imageutils.Agnhost) && container.Command == nil &&
 		(container.Args == nil || (len(container.Args) == 1 && container.Args[0] == "mounttest"))
 }
 
@@ -794,10 +805,10 @@ func testPodContainerRestartWithHooks(ctx context.Context, f *framework.Framewor
 	pod.Spec.RestartPolicy = v1.RestartPolicyOnFailure
 
 	pod.Spec.Containers[0].Image = e2epod.GetDefaultTestImage()
-	pod.Spec.Containers[0].Command = e2epod.GenerateScriptCmd("sleep 100000")
+	pod.Spec.Containers[0].Command = e2epod.GenerateScriptCmd(e2epod.InfiniteSleepCommandWithoutGracefulShutdown)
 	pod.Spec.Containers[0].Args = nil
 	pod.Spec.Containers[1].Image = e2epod.GetDefaultTestImage()
-	pod.Spec.Containers[1].Command = e2epod.GenerateScriptCmd("sleep 100000")
+	pod.Spec.Containers[1].Command = e2epod.GenerateScriptCmd(e2epod.InfiniteSleepCommandWithoutGracefulShutdown)
 	pod.Spec.Containers[1].Args = nil
 	hooks.AddLivenessProbe(pod, probeFilePath)
 
@@ -807,8 +818,8 @@ func testPodContainerRestartWithHooks(ctx context.Context, f *framework.Framewor
 	pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 	framework.ExpectNoError(err, "while creating pod")
 	ginkgo.DeferCleanup(e2epod.DeletePodWithWait, f.ClientSet, pod)
-	err = e2epod.WaitTimeoutForPodRunningInNamespace(ctx, f.ClientSet, pod.Name, pod.Namespace, f.Timeouts.PodStart)
-	framework.ExpectNoError(err, "while waiting for pod to be running")
+	err = e2epod.WaitTimeoutForPodRunningReadyInNamespace(ctx, f.ClientSet, pod.Name, pod.Namespace, f.Timeouts.PodStart)
+	framework.ExpectNoError(err, "while waiting for pod to be running and ready")
 
 	ginkgo.By("Failing liveness probe")
 	hooks.FailLivenessProbe(pod, probeFilePath)
@@ -972,10 +983,10 @@ func testSubpathReconstruction(ctx context.Context, f *framework.Framework, host
 
 	// Change to busybox
 	pod.Spec.Containers[0].Image = e2epod.GetDefaultTestImage()
-	pod.Spec.Containers[0].Command = e2epod.GenerateScriptCmd("sleep 100000")
+	pod.Spec.Containers[0].Command = e2epod.GenerateScriptCmd(e2epod.InfiniteSleepCommand)
 	pod.Spec.Containers[0].Args = nil
 	pod.Spec.Containers[1].Image = e2epod.GetDefaultTestImage()
-	pod.Spec.Containers[1].Command = e2epod.GenerateScriptCmd("sleep 100000")
+	pod.Spec.Containers[1].Command = e2epod.GenerateScriptCmd(e2epod.InfiniteSleepCommand)
 	pod.Spec.Containers[1].Args = nil
 	// If grace period is too short, then there is not enough time for the volume
 	// manager to cleanup the volumes
@@ -998,7 +1009,7 @@ func testSubpathReconstruction(ctx context.Context, f *framework.Framework, host
 			podNode = &nodeList.Items[i]
 		}
 	}
-	framework.ExpectNotEqual(podNode, nil, "pod node should exist in schedulable nodes")
+	gomega.Expect(podNode).ToNot(gomega.BeNil(), "pod node should exist in schedulable nodes")
 
 	storageutils.TestVolumeUnmountsFromDeletedPodWithForceOption(ctx, f.ClientSet, f, pod, forceDelete, true, nil, volumePath)
 
@@ -1038,4 +1049,101 @@ func podContainerExec(pod *v1.Pod, containerIndex int, command string) (string, 
 		option = "-c"
 	}
 	return e2ekubectl.RunKubectl(pod.Namespace, "exec", pod.Name, "--container", pod.Spec.Containers[containerIndex].Name, "--", shell, option, command)
+}
+
+// testSubpathStaleBindMountRemount exercises the recovery path for stale
+// subPath bind mounts.
+func testSubpathStaleBindMountRemount(ctx context.Context, f *framework.Framework, pod *v1.Pod) {
+	pod.Spec.Containers[0].Image = e2epod.GetDefaultTestImage()
+	// ls /data verifies the subPath mount is working. and sleep keeps the container
+	// alive so we can observe when it crashes and restarts.
+	pod.Spec.Containers[0].Command = []string{"sh", "-c",
+		fmt.Sprintf("ls %s && trap exit TERM; while true; do sleep 1; done", volumePath)}
+	pod.Spec.Containers[0].Args = nil
+	gracePeriod := int64(10)
+	pod.Spec.TerminationGracePeriodSeconds = &gracePeriod
+	pod.Spec.RestartPolicy = v1.RestartPolicyAlways
+
+	ginkgo.By(fmt.Sprintf("Creating pod %s with subPath mount", pod.Name))
+	removeUnusedContainers(pod)
+	pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "creating pod with subPath mount")
+	ginkgo.DeferCleanup(e2epod.DeletePodWithWait, f.ClientSet, pod)
+
+	err = e2epod.WaitTimeoutForPodRunningInNamespace(ctx, f.ClientSet, pod.Name, pod.Namespace, f.Timeouts.PodStart)
+	framework.ExpectNoError(err, "waiting for pod with subPath mount to reach Running")
+
+	pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, pod.Name, metav1.GetOptions{})
+	framework.ExpectNoError(err, "refreshing pod after Running")
+
+	nodeList, err := e2enode.GetReadySchedulableNodes(ctx, f.ClientSet)
+	framework.ExpectNoError(err, "listing schedulable nodes")
+	var podNode *v1.Node
+	for i := range nodeList.Items {
+		if nodeList.Items[i].Name == pod.Spec.NodeName {
+			podNode = &nodeList.Items[i]
+			break
+		}
+	}
+	gomega.Expect(podNode).NotTo(gomega.BeNil(), "pod node must be in the schedulable node list")
+
+	hostExec := storageutils.NewHostExec(f)
+	ginkgo.DeferCleanup(hostExec.Cleanup)
+
+	subpathGlob := fmt.Sprintf("/var/lib/kubelet/pods/%s/volume-subpaths/*/*/*", pod.UID)
+	ginkgo.By(fmt.Sprintf("Waiting for and then lazy-unmounting subPath bind mounts: %s", subpathGlob))
+
+	// wait for bind-mount targets to exist.
+	var bindTargets string
+	gomega.Eventually(ctx, func() string {
+		out, _ := hostExec.IssueCommandWithResult(ctx,
+			fmt.Sprintf("ls -d %s 2>/dev/null | head -1", subpathGlob), podNode)
+		bindTargets = strings.TrimSpace(out)
+		return bindTargets
+	}, 60*time.Second, 2*time.Second).ShouldNot(gomega.BeEmpty(),
+		"subPath bind-mount target must exist within 60s of pod Running")
+	framework.Logf("Found subPath bind target: %s", bindTargets)
+
+	// lazy-unmount the subPath bind-mount targets while the pod is running.
+	// the container will crash because its subPath mount disappears.
+	umountCmd := fmt.Sprintf(
+		`for mp in $(ls -d %s 2>/dev/null); do umount --lazy "$mp" && echo "unmounted $mp" || true; done`,
+		subpathGlob,
+	)
+	result, err := hostExec.IssueCommandWithResult(ctx, umountCmd, podNode)
+	framework.ExpectNoError(err, "lazy-unmounting subPath bind mounts: %s", result)
+	framework.Logf("umount result: %s", result)
+
+	// stop the container so kubelet restarts it and calls
+	// prepareSubpathTarget on the stale bind mount.
+	ginkgo.By("Stopping app container to trigger restart through stale bind-mount path")
+	// PID 1 is the sh that traps TERM and exits.
+	stdout, stderr, err := e2epod.ExecCommandInContainerWithFullOutput(f, pod.Name, pod.Spec.Containers[0].Name, "kill", "1")
+	framework.ExpectNoError(err, "sending TERM to PID 1 in pod %s: stdout=%q stderr=%q", pod.Name, stdout, stderr)
+
+	// wait for the container to restart and reach Running with restarts >= 1.
+	ginkgo.By("Waiting for container to restart with a fresh bind mount")
+	err = wait.PollUntilContextTimeout(ctx, 3*time.Second, f.Timeouts.PodStart, true,
+		func(ctx context.Context) (bool, error) {
+			p, getErr := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, pod.Name, metav1.GetOptions{})
+			if getErr != nil {
+				framework.Logf("Error getting pod: %v", getErr)
+				return false, nil
+			}
+			for _, cs := range p.Status.ContainerStatuses {
+				if cs.Name == p.Spec.Containers[0].Name {
+					framework.Logf("Container %s: restarts=%d, running=%v",
+						cs.Name, cs.RestartCount, cs.State.Running != nil)
+					if cs.RestartCount >= 1 && cs.State.Running != nil {
+						return true, nil
+					}
+				}
+			}
+			return false, nil
+		},
+	)
+	framework.ExpectNoError(err,
+		"pod %s container did not restart and reach Running after stale bind mount remount — "+
+			"check kubelet logs for prepareSubpathTarget errors",
+		pod.Name)
 }

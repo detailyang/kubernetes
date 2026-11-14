@@ -35,6 +35,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/endpointslice/metrics"
 	"k8s.io/endpointslice/topologycache"
+	"k8s.io/endpointslice/trafficdist"
 	endpointsliceutil "k8s.io/endpointslice/util"
 	"k8s.io/klog/v2"
 )
@@ -55,6 +56,22 @@ type Reconciler struct {
 	controllerName string
 }
 
+type ReconcilerOption func(*Reconciler)
+
+// validTrafficDistribution determines whether TrafficDistribution is set and valid for
+// this cluster.
+func (r *Reconciler) validTrafficDistribution(trafficDistribution *string) bool {
+	if trafficDistribution == nil {
+		return false
+	}
+	if *trafficDistribution == corev1.ServiceTrafficDistributionPreferClose ||
+		*trafficDistribution == corev1.ServiceTrafficDistributionPreferSameZone ||
+		*trafficDistribution == corev1.ServiceTrafficDistributionPreferSameNode {
+		return true
+	}
+	return false
+}
+
 // endpointMeta includes the attributes we group slices on, this type helps with
 // that logic in Reconciler
 type endpointMeta struct {
@@ -72,7 +89,7 @@ func (r *Reconciler) Reconcile(logger klog.Logger, service *corev1.Service, pods
 	slicesByAddressType := make(map[discovery.AddressType][]*discovery.EndpointSlice) // slices by address type
 
 	// addresses that this service supports [o(1) find]
-	serviceSupportedAddressesTypes := getAddressTypesForService(logger, service)
+	serviceSupportedAddressesTypes := getAddressTypesForService(service)
 
 	// loop through slices identifying their address type.
 	// slices that no longer match address type supported by services
@@ -114,16 +131,25 @@ func (r *Reconciler) Reconcile(logger klog.Logger, service *corev1.Service, pods
 	// delete those which are of addressType that is no longer supported
 	// by the service
 	for _, sliceToDelete := range slicesToDelete {
-		err := r.client.DiscoveryV1().EndpointSlices(service.Namespace).Delete(context.TODO(), sliceToDelete.Name, metav1.DeleteOptions{})
-		if err != nil {
+		if err := r.deleteEndpointSlice(service, sliceToDelete); err != nil {
 			errs = append(errs, fmt.Errorf("error deleting %s EndpointSlice for Service %s/%s: %w", sliceToDelete.Name, service.Namespace, service.Name, err))
-		} else {
-			r.endpointSliceTracker.ExpectDeletion(sliceToDelete)
-			metrics.EndpointSliceChanges.WithLabelValues("delete").Inc()
 		}
 	}
 
 	return utilerrors.NewAggregate(errs)
+}
+
+// deleteEndpointSlice tolerates slices that have already been deleted.
+func (r *Reconciler) deleteEndpointSlice(service *corev1.Service, endpointSlice *discovery.EndpointSlice) error {
+	err := r.client.DiscoveryV1().EndpointSlices(service.Namespace).Delete(context.TODO(), endpointSlice.Name, metav1.DeleteOptions{})
+	if err != nil {
+		return utilerrors.FilterOut(err, errors.IsNotFound)
+	}
+
+	r.endpointSliceTracker.ExpectDeletion(endpointSlice)
+	metrics.EndpointSliceChanges.WithLabelValues("delete").Inc()
+	metrics.EndpointSliceChangesTotal.WithLabelValues("delete").Inc()
+	return nil
 }
 
 // reconcileByAddressType takes a set of pods currently matching a service selector and
@@ -261,9 +287,32 @@ func (r *Reconciler) reconcileByAddressType(logger klog.Logger, service *corev1.
 		Unchanged:   unchangedSlices(existingSlices, slicesToUpdate, slicesToDelete),
 	}
 
+	canUseTrafficDistribution := r.validTrafficDistribution(service.Spec.TrafficDistribution) && !hintsEnabled(service.Annotations)
+
+	// Check if we need to add/remove hints based on the topology annotation.
+	//
+	// This if/else clause can be removed once the annotation has been deprecated.
+	// Ref: https://github.com/kubernetes/enhancements/tree/master/keps/sig-network/4444-service-routing-preference
 	if r.topologyCache != nil && hintsEnabled(service.Annotations) {
+		// Reaching this point means that we need to configure hints based on the
+		// topology annotation.
 		slicesToCreate, slicesToUpdate, events = r.topologyCache.AddHints(logger, si)
+
 	} else {
+		// Reaching this point means that we will not be configuring hints based on
+		// the topology annotation. We need to do 2 things:
+		//  1. If hints were added previously based on the annotation, we need to
+		//     clear up any locally cached hints from the topologyCache object.
+		//  2. Optionally remove the actual hints from the EndpointSlice if we know
+		//     that the `trafficDistribution` field is also NOT being used. In other
+		//     words, if we know that the `trafficDistribution` field has been
+		//     correctly configured by the customer, we DO NOT remove the hints and
+		//     wait for the trafficDist handlers to correctly configure them. Always
+		//     unconditionally removing hints here (and letting them get readded by
+		//     the trafficDist) adds extra overhead in the form of DeepCopy (done
+		//     within topologyCache.RemoveHints)
+
+		// Check 1.
 		if r.topologyCache != nil {
 			if r.topologyCache.HasPopulatedHints(si.ServiceKey) {
 				logger.Info("TopologyAwareHints annotation has changed, removing hints", "serviceKey", si.ServiceKey, "addressType", si.AddressType)
@@ -275,8 +324,20 @@ func (r *Reconciler) reconcileByAddressType(logger klog.Logger, service *corev1.
 			}
 			r.topologyCache.RemoveHints(si.ServiceKey, addressType)
 		}
-		slicesToCreate, slicesToUpdate = topologycache.RemoveHintsFromSlices(si)
+
+		// Check 2.
+		if !canUseTrafficDistribution {
+			slicesToCreate, slicesToUpdate = topologycache.RemoveHintsFromSlices(si)
+		}
 	}
+
+	if canUseTrafficDistribution {
+		r.metricsCache.UpdateTrafficDistributionForService(serviceNN, service.Spec.TrafficDistribution)
+		slicesToCreate, slicesToUpdate, _ = trafficdist.ReconcileHints(service.Spec.TrafficDistribution, slicesToCreate, slicesToUpdate, unchangedSlices(existingSlices, slicesToUpdate, slicesToDelete))
+	} else {
+		r.metricsCache.UpdateTrafficDistributionForService(serviceNN, nil)
+	}
+
 	err := r.finalize(service, slicesToCreate, slicesToUpdate, slicesToDelete, triggerTime)
 	if err != nil {
 		errs = append(errs, err)
@@ -288,8 +349,8 @@ func (r *Reconciler) reconcileByAddressType(logger klog.Logger, service *corev1.
 
 }
 
-func NewReconciler(client clientset.Interface, nodeLister corelisters.NodeLister, maxEndpointsPerSlice int32, endpointSliceTracker *endpointsliceutil.EndpointSliceTracker, topologyCache *topologycache.TopologyCache, eventRecorder record.EventRecorder, controllerName string) *Reconciler {
-	return &Reconciler{
+func NewReconciler(client clientset.Interface, nodeLister corelisters.NodeLister, maxEndpointsPerSlice int32, endpointSliceTracker *endpointsliceutil.EndpointSliceTracker, topologyCache *topologycache.TopologyCache, eventRecorder record.EventRecorder, controllerName string, options ...ReconcilerOption) *Reconciler {
+	r := &Reconciler{
 		client:               client,
 		nodeLister:           nodeLister,
 		maxEndpointsPerSlice: maxEndpointsPerSlice,
@@ -299,17 +360,26 @@ func NewReconciler(client clientset.Interface, nodeLister corelisters.NodeLister
 		eventRecorder:        eventRecorder,
 		controllerName:       controllerName,
 	}
+	for _, option := range options {
+		option(r)
+	}
+	return r
 }
 
 // placeholderSliceCompare is a conversion func for comparing two placeholder endpoint slices.
 // It only compares the specific fields we care about.
 var placeholderSliceCompare = conversion.EqualitiesOrDie(
-	func(a, b metav1.OwnerReference) bool {
-		return a.String() == b.String()
-	},
 	func(a, b metav1.ObjectMeta) bool {
 		if a.Namespace != b.Namespace {
 			return false
+		}
+		if len(a.OwnerReferences) != len(b.OwnerReferences) {
+			return false
+		}
+		for i := range a.OwnerReferences {
+			if a.OwnerReferences[i].UID != b.OwnerReferences[i].UID {
+				return false
+			}
 		}
 		for k, v := range a.Labels {
 			if b.Labels[k] != v {
@@ -375,6 +445,7 @@ func (r *Reconciler) finalize(
 			}
 			r.endpointSliceTracker.Update(createdSlice)
 			metrics.EndpointSliceChanges.WithLabelValues("create").Inc()
+			metrics.EndpointSliceChangesTotal.WithLabelValues("create").Inc()
 		}
 	}
 
@@ -386,24 +457,26 @@ func (r *Reconciler) finalize(
 		}
 		r.endpointSliceTracker.Update(updatedSlice)
 		metrics.EndpointSliceChanges.WithLabelValues("update").Inc()
+		metrics.EndpointSliceChangesTotal.WithLabelValues("update").Inc()
 	}
 
 	for _, endpointSlice := range slicesToDelete {
-		err := r.client.DiscoveryV1().EndpointSlices(service.Namespace).Delete(context.TODO(), endpointSlice.Name, metav1.DeleteOptions{})
-		if err != nil {
+		if err := r.deleteEndpointSlice(service, endpointSlice); err != nil {
 			return fmt.Errorf("failed to delete %s EndpointSlice for Service %s/%s: %v", endpointSlice.Name, service.Namespace, service.Name, err)
 		}
-		r.endpointSliceTracker.ExpectDeletion(endpointSlice)
-		metrics.EndpointSliceChanges.WithLabelValues("delete").Inc()
 	}
 
 	topologyLabel := "Disabled"
 	if r.topologyCache != nil && hintsEnabled(service.Annotations) {
 		topologyLabel = "Auto"
 	}
+	var trafficDistribution string
+	if r.validTrafficDistribution(service.Spec.TrafficDistribution) && !hintsEnabled(service.Annotations) {
+		trafficDistribution = *service.Spec.TrafficDistribution
+	}
 
 	numSlicesChanged := len(slicesToCreate) + len(slicesToUpdate) + len(slicesToDelete)
-	metrics.EndpointSlicesChangedPerSync.WithLabelValues(topologyLabel).Observe(float64(numSlicesChanged))
+	metrics.EndpointSlicesChangedPerSync.WithLabelValues(topologyLabel, trafficDistribution).Observe(float64(numSlicesChanged))
 
 	return nil
 }

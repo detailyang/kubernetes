@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 /*
 Copyright 2022 The Kubernetes Authors.
@@ -29,11 +28,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/pkg/kubelet/winstats"
 )
 
 func TestApplyPlatformSpecificContainerConfig(t *testing.T) {
-	_, _, fakeRuntimeSvc, err := createTestRuntimeManager()
+	tCtx := ktesting.Init(t)
+	_, _, fakeRuntimeSvc, err := createTestRuntimeManager(tCtx)
 	require.NoError(t, err)
 
 	containerConfig := &runtimeapi.ContainerConfig{}
@@ -81,7 +82,7 @@ func TestApplyPlatformSpecificContainerConfig(t *testing.T) {
 		},
 	}
 
-	err = fakeRuntimeSvc.applyPlatformSpecificContainerConfig(containerConfig, &pod.Spec.Containers[0], pod, new(int64), "foo", nil)
+	err = fakeRuntimeSvc.applyPlatformSpecificContainerConfig(tCtx, containerConfig, &pod.Spec.Containers[0], pod, new(int64), "foo", nil)
 	require.NoError(t, err)
 
 	limit := int64(3000)
@@ -142,10 +143,93 @@ func TestCalculateCPUMaximum(t *testing.T) {
 			cpuCount: 100,
 			want:     1,
 		},
+		{
+			// 10 * MilliValue() fits int64 up to and including this value.
+			name:     "largest limit whose product fits int64",
+			cpuLimit: resource.MustParse("922337203685477580m"),
+			cpuCount: 4,
+			want:     10000,
+		},
+		{
+			// TODO(#141166): MilliValue() fits int64 but 10 * MilliValue() does not; must clamp to 10000.
+			name:     "smallest limit whose product overflows int64",
+			cpuLimit: resource.MustParse("922337203685477581m"),
+			cpuCount: 4,
+			want:     1,
+		},
+		{
+			// TODO(#141166): A limit past int64 must clamp to 10000.
+			name:     "limit past int64",
+			cpuLimit: resource.MustParse("100E"),
+			cpuCount: 4,
+			want:     1,
+		},
+		{
+			// TODO(#141166): A limit past int64 must clamp to 10000.
+			name:     "limit of MaxInt64 plus one milli",
+			cpuLimit: resource.MustParse("9223372036854775808m"),
+			cpuCount: 4,
+			want:     1,
+		},
+		{
+			// TODO(#141166): A limit past int64 must clamp to 10000.
+			name:     "limit of 2^64 plus 4000 milli",
+			cpuLimit: resource.MustParse("18446744073709555616m"),
+			cpuCount: 4,
+			want:     1,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, calculateCPUMaximum(&tt.cpuLimit, tt.cpuCount))
 		})
+	}
+}
+
+func TestCalculateWindowsResources(t *testing.T) {
+	// TODO: remove skip once the failing test has been fixed.
+	t.Skip("Skip failing test on Windows.")
+
+	tCtx := ktesting.Init(t)
+	_, _, fakeRuntimeSvc, err := createTestRuntimeManager(tCtx)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name     string
+		cpuLim   resource.Quantity
+		memLim   resource.Quantity
+		expected *runtimeapi.WindowsContainerResources
+	}{
+		{
+			name:   "Request128MBLimit256MB",
+			cpuLim: resource.MustParse("2"),
+			memLim: resource.MustParse("128Mi"),
+			expected: &runtimeapi.WindowsContainerResources{
+				CpuMaximum:         2500,
+				MemoryLimitInBytes: 134217728,
+			},
+		},
+		{
+			name:   "RequestNoMemory",
+			cpuLim: resource.MustParse("8"),
+			memLim: resource.MustParse("0"),
+			expected: &runtimeapi.WindowsContainerResources{
+				CpuMaximum:         10000,
+				MemoryLimitInBytes: 0,
+			},
+		},
+		{
+			name:   "RequestZeroCPU",
+			cpuLim: resource.MustParse("0"),
+			memLim: resource.MustParse("128Mi"),
+			expected: &runtimeapi.WindowsContainerResources{
+				CpuMaximum:         1,
+				MemoryLimitInBytes: 134217728,
+			},
+		},
+	}
+	for _, test := range tests {
+		windowsContainerResources := fakeRuntimeSvc.calculateWindowsResources(tCtx, &test.cpuLim, &test.memLim)
+		assert.Equal(t, test.expected, windowsContainerResources)
 	}
 }

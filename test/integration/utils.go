@@ -18,23 +18,22 @@ package integration
 
 import (
 	"context"
-	"testing"
 	"time"
 
-	"google.golang.org/grpc"
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
 	clientset "k8s.io/client-go/kubernetes"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
-
-	"go.etcd.io/etcd/client/pkg/v3/transport"
-	clientv3 "go.etcd.io/etcd/client/v3"
+	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
+	testutils "k8s.io/kubernetes/test/utils"
 )
 
 // DeletePodOrErrorf deletes a pod or fails with a call to t.Errorf.
-func DeletePodOrErrorf(t *testing.T, c clientset.Interface, ns, name string) {
+func DeletePodOrErrorf(t testutils.TB, c clientset.Interface, ns, name string) {
 	if err := c.CoreV1().Pods(ns).Delete(context.TODO(), name, metav1.DeleteOptions{}); err != nil {
 		t.Errorf("unable to delete pod %v: %v", name, err)
 	}
@@ -67,32 +66,7 @@ func WaitForPodToDisappear(podClient coreclient.PodInterface, podName string, in
 	})
 }
 
-// GetEtcdClients returns an initialized  clientv3.Client and clientv3.KV.
+// GetEtcdClients returns an initialized etcd clientv3.Client and clientv3.KV.
 func GetEtcdClients(config storagebackend.TransportConfig) (*clientv3.Client, clientv3.KV, error) {
-	tlsInfo := transport.TLSInfo{
-		CertFile:      config.CertFile,
-		KeyFile:       config.KeyFile,
-		TrustedCAFile: config.TrustedCAFile,
-	}
-
-	tlsConfig, err := tlsInfo.ClientConfig()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	cfg := clientv3.Config{
-		Endpoints:   config.ServerList,
-		DialTimeout: 20 * time.Second,
-		DialOptions: []grpc.DialOption{
-			grpc.WithBlock(), // block until the underlying connection is up
-		},
-		TLS: tlsConfig,
-	}
-
-	c, err := clientv3.New(cfg)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return c, clientv3.NewKV(c), nil
+	return kubeapiservertesting.GetEtcdClients(config)
 }

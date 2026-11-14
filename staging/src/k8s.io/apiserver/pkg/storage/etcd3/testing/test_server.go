@@ -17,9 +17,7 @@ limitations under the License.
 package testing
 
 import (
-	"testing"
-
-	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/kubernetes"
 
 	"k8s.io/apiserver/pkg/storage/etcd3/testserver"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
@@ -27,24 +25,23 @@ import (
 
 // EtcdTestServer encapsulates the datastructures needed to start local instance for testing
 type EtcdTestServer struct {
-	V3Client *clientv3.Client
+	V3Client *kubernetes.Client
 }
 
-func (e *EtcdTestServer) Terminate(t *testing.T) {
+func (e *EtcdTestServer) Terminate(t testserver.T) {
 	// no-op, server termination moved to test cleanup
 }
 
 // NewUnsecuredEtcd3TestClientServer creates a new client and server for testing
-func NewUnsecuredEtcd3TestClientServer(t *testing.T) (*EtcdTestServer, *storagebackend.Config) {
+func NewUnsecuredEtcd3TestClientServer(t testserver.T) (*EtcdTestServer, *storagebackend.Config) {
 	server := &EtcdTestServer{}
-	server.V3Client = testserver.RunEtcd(t, nil)
+	server.V3Client = testserver.RunEtcd(t)
 	config := &storagebackend.Config{
 		Type:   "etcd3",
 		Prefix: PathPrefix(),
 		Transport: storagebackend.TransportConfig{
 			ServerList: server.V3Client.Endpoints(),
 		},
-		Paging: true,
 	}
 	return server, config
 }

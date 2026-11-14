@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//go:generate mockgen -source=handler.go -destination=testing/mock_stats_provider.go -package=testing Provider
+//go:generate mockery
 package stats
 
 import (
@@ -23,8 +23,7 @@ import (
 	"net/http"
 
 	restful "github.com/emicklei/go-restful/v3"
-	cadvisorapi "github.com/google/cadvisor/info/v1"
-	cadvisorv2 "github.com/google/cadvisor/info/v2"
+	cadvisorapi "github.com/google/cadvisor/lib/model"
 	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
@@ -51,31 +50,27 @@ type Provider interface {
 	// for more details.
 	ListPodStatsAndUpdateCPUNanoCoreUsage(ctx context.Context) ([]statsapi.PodStats, error)
 	// ImageFsStats returns the stats of the image filesystem.
-	ImageFsStats(ctx context.Context) (*statsapi.FsStats, error)
-
+	// Kubelet allows three options for container filesystems
+	// Everything is on node fs (so no image filesystem)
+	// Container storage is on a dedicated disk (imageFs is separate from root)
+	// Container Filesystem is on root and Images are stored on ImageFs
+	// First return parameter is the image filesystem and
+	// second parameter is the container filesystem
+	ImageFsStats(ctx context.Context) (imageFs *statsapi.FsStats, containerFs *statsapi.FsStats, callErr error)
 	// The following stats are provided by cAdvisor.
 	//
 	// GetCgroupStats returns the stats and the networking usage of the cgroup
 	// with the specified cgroupName.
-	GetCgroupStats(cgroupName string, updateStats bool) (*statsapi.ContainerStats, *statsapi.NetworkStats, error)
+	GetCgroupStats(ctx context.Context, cgroupName string, updateStats bool) (*statsapi.ContainerStats, *statsapi.NetworkStats, error)
 	// GetCgroupCPUAndMemoryStats returns the CPU and memory stats of the cgroup with the specified cgroupName.
 	GetCgroupCPUAndMemoryStats(cgroupName string, updateStats bool) (*statsapi.ContainerStats, error)
 
 	// RootFsStats returns the stats of the node root filesystem.
 	RootFsStats() (*statsapi.FsStats, error)
 
-	// The following stats are provided by cAdvisor for legacy usage.
-	//
-	// GetContainerInfo returns the information of the container with the
-	// containerName managed by the pod with the uid.
-	GetContainerInfo(ctx context.Context, podFullName string, uid types.UID, containerName string, req *cadvisorapi.ContainerInfoRequest) (*cadvisorapi.ContainerInfo, error)
-	// GetRawContainerInfo returns the information of the container with the
-	// containerName. If subcontainers is true, this function will return the
-	// information of all the sub-containers as well.
-	GetRawContainerInfo(containerName string, req *cadvisorapi.ContainerInfoRequest, subcontainers bool) (map[string]*cadvisorapi.ContainerInfo, error)
 	// GetRequestedContainersInfo returns the information of the container with
 	// the containerName, and with the specified cAdvisor options.
-	GetRequestedContainersInfo(containerName string, options cadvisorv2.RequestOptions) (map[string]*cadvisorapi.ContainerInfo, error)
+	GetRequestedContainersInfo(containerName string, options cadvisorapi.RequestOptions) (map[string]*cadvisorapi.ContainerInfo, error)
 
 	// The following information is provided by Kubelet.
 	//
@@ -83,7 +78,7 @@ type Provider interface {
 	// namespace.
 	GetPodByName(namespace, name string) (*v1.Pod, bool)
 	// GetNode returns the spec of the local node.
-	GetNode() (*v1.Node, error)
+	GetNode(context.Context) (*v1.Node, error)
 	// GetNodeConfig returns the configuration of the local node.
 	GetNodeConfig() cm.NodeConfig
 	// ListVolumesForPod returns the stats of the volume used by the pod with
@@ -142,10 +137,11 @@ func CreateHandlers(rootPath string, provider Provider, summaryProvider SummaryP
 // If "only_cpu_and_memory" GET param is true then only cpu and memory is returned in response.
 func (h *handler) handleSummary(request *restful.Request, response *restful.Response) {
 	ctx := request.Request.Context()
+	logger := klog.FromContext(ctx)
 	onlyCPUAndMemory := false
 	err := request.Request.ParseForm()
 	if err != nil {
-		handleError(response, "/stats/summary", fmt.Errorf("parse form failed: %w", err))
+		handleError(logger, response, "/stats/summary", fmt.Errorf("parse form failed: %w", err))
 		return
 	}
 	if onlyCluAndMemoryParam, found := request.Request.Form["only_cpu_and_memory"]; found &&
@@ -161,27 +157,27 @@ func (h *handler) handleSummary(request *restful.Request, response *restful.Resp
 		summary, err = h.summaryProvider.Get(ctx, forceStatsUpdate)
 	}
 	if err != nil {
-		handleError(response, "/stats/summary", err)
+		handleError(logger, response, "/stats/summary", err)
 	} else {
-		writeResponse(response, summary)
+		writeResponse(logger, response, summary)
 	}
 }
 
-func writeResponse(response *restful.Response, stats interface{}) {
+func writeResponse(logger klog.Logger, response *restful.Response, stats interface{}) {
 	if err := response.WriteAsJson(stats); err != nil {
-		klog.ErrorS(err, "Error writing response")
+		logger.Error(err, "Error writing response")
 	}
 }
 
 // handleError serializes an error object into an HTTP response.
 // request is provided for logging.
-func handleError(response *restful.Response, request string, err error) {
+func handleError(logger klog.Logger, response *restful.Response, request string, err error) {
 	switch err {
 	case kubecontainer.ErrContainerNotFound:
 		response.WriteError(http.StatusNotFound, err)
 	default:
 		msg := fmt.Sprintf("Internal Error: %v", err)
-		klog.ErrorS(err, "HTTP InternalServerError serving", "request", request)
+		logger.Error(err, "HTTP InternalServerError serving", "request", request)
 		response.WriteErrorString(http.StatusInternalServerError, msg)
 	}
 }

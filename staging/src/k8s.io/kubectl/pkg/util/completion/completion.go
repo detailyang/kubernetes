@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"k8s.io/utils/ptr"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
@@ -36,6 +37,10 @@ import (
 	"k8s.io/kubectl/pkg/polymorphichelpers"
 	"k8s.io/kubectl/pkg/scheme"
 )
+
+// CompletionFunc is the signature cobra expects for shell completion functions,
+// as returned by the completion helpers in this package.
+type CompletionFunc func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective)
 
 var factory cmdutil.Factory
 
@@ -89,6 +94,36 @@ func PodResourceNameCompletionFunc(f cmdutil.Factory) func(*cobra.Command, []str
 		directive := cobra.ShellCompDirectiveNoFileComp
 		if len(args) == 0 {
 			comps, directive = doPodResourceCompletion(f, toComplete)
+		}
+		return comps, directive
+	}
+}
+
+// ResourceAndPortCompletionFunc Returns a completion function that completes, as a first argument:
+// 1- resources that match the toComplete prefix
+// 2- the ports of the specific resource. i.e: container ports for pod resources and port for services
+func ResourceAndPortCompletionFunc(f cmdutil.Factory) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+	return func(_ *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		var comps []string
+		var resourceType string
+		directive := cobra.ShellCompDirectiveNoFileComp
+		if len(args) == 0 {
+			comps, directive = doPodResourceCompletion(f, toComplete)
+		} else if len(args) == 1 {
+			t := strings.Split(args[0], "/")
+			// if we specify directly the pod, then resource type is pod, otherwise it would be the resource type passed
+			// by the user
+			if len(t) == 1 {
+				resourceType = "pod"
+			} else {
+				resourceType = t[0]
+			}
+			if resourceType == "service" || resourceType == "services" || resourceType == "svc" {
+				comps = CompGetServicePorts(f, t[1], toComplete)
+			} else {
+				podName := convertResourceNameToPodName(f, args[0])
+				comps = CompGetPodContainerPorts(f, podName, toComplete)
+			}
 		}
 		return comps, directive
 	}
@@ -165,6 +200,30 @@ func CompGetResource(f cmdutil.Factory, resourceName string, toComplete string) 
 func CompGetContainers(f cmdutil.Factory, podName string, toComplete string) []string {
 	template := "{{ range .spec.initContainers }}{{ .name }} {{end}}{{ range .spec.containers  }}{{ .name }} {{ end }}"
 	return CompGetFromTemplate(&template, f, "", []string{"pod", podName}, toComplete)
+}
+
+// CompGetPodContainerPorts retrieves the list of ports for containers within the specified pod that start with `toComplete`.
+func CompGetPodContainerPorts(f cmdutil.Factory, podName string, toComplete string) []string {
+	var template string
+	exposedPort := strings.Split(toComplete, ":")[0]
+
+	if toComplete == "" {
+		exposedPort = "{{ .containerPort }}"
+	}
+	template = fmt.Sprintf("{{ range .spec.containers }}{{ range .ports }}%s:{{ .containerPort }} {{ end }}{{ end }}", exposedPort)
+	return CompGetFromTemplate(&template, f, "", []string{"pod", podName}, toComplete)
+}
+
+// CompGetServicePorts gets the list of ports of the specified service which begin with `toComplete`.
+func CompGetServicePorts(f cmdutil.Factory, serviceName string, toComplete string) []string {
+	var template string
+	exposedPort := strings.Split(toComplete, ":")[0]
+
+	if toComplete == "" {
+		exposedPort = "{{ .port }}"
+	}
+	template = fmt.Sprintf("{{ range .spec.ports }}%s:{{ .port }} {{ end }}", exposedPort)
+	return CompGetFromTemplate(&template, f, "", []string{"service", serviceName}, toComplete)
 }
 
 // CompGetFromTemplate executes a Get operation using the specified template and args and returns the results
@@ -258,22 +317,28 @@ func ListUsersInConfig(toComplete string) []string {
 	return ret
 }
 
-// compGetResourceList returns the list of api resources which begin with `toComplete`.
-func compGetResourceList(restClientGetter genericclioptions.RESTClientGetter, cmd *cobra.Command, toComplete string) []string {
+// CompGetResourceList returns the list of api resources which begin with `toComplete`.
+// When verbs are provided, the result is limited to resources supporting all of them
+// (e.g. "get"); passing no verbs returns every resource, which is what commands like
+// `kubectl explain` need since they operate on any resource, not only gettable ones.
+func CompGetResourceList(restClientGetter genericclioptions.RESTClientGetter, cmd *cobra.Command, toComplete string, verbs ...string) []string {
 	buf := new(bytes.Buffer)
 	streams := genericiooptions.IOStreams{In: os.Stdin, Out: buf, ErrOut: io.Discard}
-	o := apiresources.NewAPIResourceOptions(streams)
-
-	o.Complete(restClientGetter, cmd, nil)
+	flags := apiresources.NewAPIResourceFlags(restClientGetter, streams)
 
 	// Get the list of resources
-	o.Output = "name"
-	o.Cached = true
-	o.Verbs = []string{"get"}
+	flags.PrintFlags.OutputFormat = ptr.To("name")
+	flags.Cached = true
+	flags.Verbs = verbs
 	// TODO:Should set --request-timeout=5s
 
+	o, err := flags.ToOptions(cmd, nil)
+	if err != nil {
+		return []string{}
+	}
+
 	// Ignore errors as the output may still be valid
-	o.RunAPIResources()
+	_ = o.RunAPIResources()
 
 	// Resources can be a comma-separated list.  The last element is then
 	// the one we should complete.  For example if toComplete=="pods,secre"
@@ -322,7 +387,7 @@ func resourceTypeAndNameCompletionFunc(f cmdutil.Factory, allowedTypes []string,
 					// So we suggest resource types and let the shell add a space after
 					// the completion.
 					if len(allowedTypes) == 0 {
-						comps = compGetResourceList(f, cmd, toComplete)
+						comps = CompGetResourceList(f, cmd, toComplete, "get")
 					} else {
 						for _, c := range allowedTypes {
 							if strings.HasPrefix(c, toComplete) {
@@ -339,7 +404,7 @@ func resourceTypeAndNameCompletionFunc(f cmdutil.Factory, allowedTypes []string,
 						directive |= cobra.ShellCompDirectiveNoSpace
 
 						if len(allowedTypes) == 0 {
-							typeComps := compGetResourceList(f, cmd, toComplete)
+							typeComps := CompGetResourceList(f, cmd, toComplete, "get")
 							for _, c := range typeComps {
 								comps = append(comps, fmt.Sprintf("%s/", c))
 							}

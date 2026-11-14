@@ -64,6 +64,8 @@ spec:
     singular: singularValue
   preserveUnknownFields: true
   scope: scopeValue
+  selectableFields:
+  - jsonPath: jsonPathValue
   subresources:
     scale:
       labelSelectorPath: labelSelectorPathValue
@@ -132,6 +134,7 @@ spec:
       - fieldPath: fieldPathValue
         message: messageValue
         messageExpression: messageExpressionValue
+        optionalOldSelf: true
         reason: reasonValue
         rule: ruleValue
   version: versionValue
@@ -208,8 +211,11 @@ spec:
         - fieldPath: fieldPathValue
           message: messageValue
           messageExpression: messageExpressionValue
+          optionalOldSelf: true
           reason: reasonValue
           rule: ruleValue
+    selectableFields:
+    - jsonPath: jsonPathValue
     served: true
     storage: true
     subresources:
@@ -231,8 +237,10 @@ status:
   conditions:
   - lastTransitionTime: "2003-01-01T01:01:01Z"
     message: messageValue
+    observedGeneration: 6
     reason: reasonValue
     status: statusValue
     type: typeValue
+  observedGeneration: 4
   storedVersions:
   - storedVersionsValue

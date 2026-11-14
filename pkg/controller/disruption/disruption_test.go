@@ -49,11 +49,11 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/ktesting"
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
 	"k8s.io/kubernetes/pkg/controller"
-	"k8s.io/kubernetes/test/utils/ktesting"
 	clocktesting "k8s.io/utils/clock/testing"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 type pdbStates map[string]policy.PodDisruptionBudget
@@ -188,8 +188,8 @@ func newFakeDisruptionControllerWithTime(ctx context.Context, now time.Time) (*d
 	dc.dListerSynced = alwaysReady
 	dc.ssListerSynced = alwaysReady
 	dc.recorder = record.NewFakeRecorder(100)
-	informerFactory.Start(ctx.Done())
-	informerFactory.WaitForCacheSync(ctx.Done())
+	informerFactory.StartWithContext(ctx)
+	informerFactory.WaitForCacheSyncWithContext(ctx)
 
 	return &disruptionController{
 		dc,
@@ -509,7 +509,7 @@ func TestIntegerMaxUnavailableWithScaling(t *testing.T) {
 	ps.VerifyPdbStatus(t, pdbName, 0, 1, 5, 7, map[string]metav1.Time{})
 
 	// Update scale of ReplicaSet and check PDB
-	rs.Spec.Replicas = pointer.Int32(5)
+	rs.Spec.Replicas = ptr.To[int32](5)
 	update(t, dc.rsStore, rs)
 
 	dc.sync(ctx, pdbName)
@@ -535,7 +535,7 @@ func TestPercentageMaxUnavailableWithScaling(t *testing.T) {
 	ps.VerifyPdbStatus(t, pdbName, 0, 1, 4, 7, map[string]metav1.Time{})
 
 	// Update scale of ReplicaSet and check PDB
-	rs.Spec.Replicas = pointer.Int32(3)
+	rs.Spec.Replicas = ptr.To[int32](3)
 	update(t, dc.rsStore, rs)
 
 	dc.sync(ctx, pdbName)
@@ -625,7 +625,7 @@ func TestTotalUnmanagedPods(t *testing.T) {
 	dc.sync(ctx, pdbName)
 	var pods []*v1.Pod
 	pods = append(pods, pod)
-	_, unmanagedPods, _ := dc.getExpectedScale(ctx, pdb, pods)
+	_, unmanagedPods, _ := dc.getExpectedScale(ctx, pods)
 	if len(unmanagedPods) != 1 {
 		t.Fatalf("expected one pod to be unmanaged pod but found %d", len(unmanagedPods))
 	}
@@ -1029,7 +1029,7 @@ func TestPDBNotExist(t *testing.T) {
 func TestUpdateDisruptedPods(t *testing.T) {
 	_, ctx := ktesting.NewTestContext(t)
 	dc, ps := newFakeDisruptionController(ctx)
-	dc.recheckQueue = workqueue.NewNamedDelayingQueue("pdb_queue")
+	dc.recheckQueue = workqueue.NewTypedDelayingQueueWithConfig(workqueue.TypedDelayingQueueConfig[string]{Name: "pdb_queue"})
 	pdb, pdbName := newMinAvailablePodDisruptionBudget(t, intstr.FromInt32(1))
 	currentTime := dc.clock.Now()
 	pdb.Status.DisruptedPods = map[string]metav1.Time{
@@ -1538,12 +1538,10 @@ func TestStalePodDisruption(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, ctx := ktesting.NewTestContext(t)
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-			dc, _ := newFakeDisruptionControllerWithTime(ctx, now)
-			go dc.Run(ctx)
-			if _, err := dc.coreClient.CoreV1().Pods(tc.pod.Namespace).Create(ctx, tc.pod, metav1.CreateOptions{}); err != nil {
+			tCtx := ktesting.Init(t)
+			dc, _ := newFakeDisruptionControllerWithTime(tCtx, now)
+			go dc.Run(tCtx, 1)
+			if _, err := dc.coreClient.CoreV1().Pods(tc.pod.Namespace).Create(tCtx, tc.pod, metav1.CreateOptions{}); err != nil {
 				t.Fatalf("Failed to create pod: %v", err)
 			}
 			dc.clock.Sleep(tc.timePassed)
@@ -1552,7 +1550,7 @@ func TestStalePodDisruption(t *testing.T) {
 			}
 			diff := ""
 			if err := wait.Poll(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
-				pod, err := dc.kubeClient.CoreV1().Pods(tc.pod.Namespace).Get(ctx, tc.pod.Name, metav1.GetOptions{})
+				pod, err := dc.kubeClient.CoreV1().Pods(tc.pod.Namespace).Get(tCtx, tc.pod.Name, metav1.GetOptions{})
 				if err != nil {
 					t.Fatalf("Failed getting updated pod: %v", err)
 				}
@@ -1562,6 +1560,170 @@ func TestStalePodDisruption(t *testing.T) {
 				t.Fatalf("Failed waiting for worker to sync: %v, (-want,+got):\n%s", err, diff)
 			}
 		})
+	}
+}
+
+func TestKeepExistingPDBConditionDuringSync(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	dc, ps := newFakeDisruptionController(ctx)
+
+	pdb, pdbName := newMinAvailablePodDisruptionBudget(t, intstr.FromInt32(3))
+	pdb.Spec.Selector = &metav1.LabelSelector{}
+
+	pdb.Status.Conditions = append(pdb.Status.Conditions, metav1.Condition{
+		Type:               "ExistingTestCondition",
+		Status:             metav1.ConditionTrue,
+		Message:            "This is a test condition",
+		Reason:             "Test",
+		LastTransitionTime: metav1.Now(),
+	})
+
+	add(t, dc.pdbStore, pdb)
+	if err := dc.sync(ctx, pdbName); err != nil {
+		t.Fatalf("Failed to sync PDB: %v", err)
+	}
+	ps.VerifyPdbStatus(t, pdbName, 0, 0, 3, 0, map[string]metav1.Time{})
+
+	actualPDB := ps.Get(pdbName)
+	condition := apimeta.FindStatusCondition(actualPDB.Status.Conditions, "ExistingTestCondition")
+	if len(actualPDB.Status.Conditions) != 2 {
+		t.Fatalf("Expected 2 conditions, but got %d", len(actualPDB.Status.Conditions))
+	}
+	if condition == nil {
+		t.Fatalf("Expected ExistingTestCondition condition, but didn't find it")
+	}
+}
+
+// getQueuedPDBKeys drains the disruption workqueue and returns the enqueued PDB keys.
+func getQueuedPDBKeys(t *testing.T, dc *disruptionController) []string {
+	t.Helper()
+	var keys []string
+	for dc.queue.Len() > 0 {
+		key, quit := dc.queue.Get()
+		if quit {
+			t.Fatal("queue shut down while draining PDB keys")
+		}
+		keys = append(keys, key)
+		dc.queue.Done(key)
+	}
+	return keys
+}
+
+func pdbKey(t *testing.T, pdb *policy.PodDisruptionBudget) string {
+	t.Helper()
+	key, err := controller.KeyFunc(pdb)
+	if err != nil {
+		t.Fatalf("Unexpected error naming pdb %q: %v", pdb.Name, err)
+	}
+	return key
+}
+
+// Label changes must wake PDBs that matched the pod before the change, even if
+// they no longer match afterwards (otherwise their status stays stale).
+func TestUpdatePodEnqueuesPreviouslyMatchingPDB(t *testing.T) {
+	logger, ctx := ktesting.NewTestContext(t)
+	dc, _ := newFakeDisruptionController(ctx)
+
+	oldPDB, _ := newMinAvailablePodDisruptionBudget(t, intstr.FromInt32(1))
+	oldPDB.Name = "old-pdb"
+	oldPDB.Spec.Selector = newSel(map[string]string{"app": "old"})
+	oldKey := pdbKey(t, oldPDB)
+
+	newPDB, _ := newMinAvailablePodDisruptionBudget(t, intstr.FromInt32(1))
+	newPDB.Name = "new-pdb"
+	newPDB.Spec.Selector = newSel(map[string]string{"app": "new"})
+	newKey := pdbKey(t, newPDB)
+
+	add(t, dc.pdbStore, oldPDB)
+	add(t, dc.pdbStore, newPDB)
+
+	oldPod, _ := newPod(t, "pod")
+	oldPod.Labels = map[string]string{"app": "old"}
+	curPod := oldPod.DeepCopy()
+	curPod.Labels = map[string]string{"app": "new"}
+
+	dc.updatePod(logger, oldPod, curPod)
+
+	got := getQueuedPDBKeys(t, dc)
+	want := []string{oldKey, newKey}
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+		t.Fatalf("enqueued PDB keys mismatch (-want,+got):\n%s", diff)
+	}
+}
+
+// When multiple PDBs match one pod, all of them must be enqueued so each status
+// can be updated (overlap is unsupported for eviction, but status still matters).
+func TestAddPodEnqueuesAllMatchingPDBs(t *testing.T) {
+	logger, ctx := ktesting.NewTestContext(t)
+	dc, _ := newFakeDisruptionController(ctx)
+
+	pdbA, _ := newMinAvailablePodDisruptionBudget(t, intstr.FromInt32(1))
+	pdbA.Name = "pdb-a"
+	keyA := pdbKey(t, pdbA)
+
+	pdbB, _ := newMinAvailablePodDisruptionBudget(t, intstr.FromInt32(1))
+	pdbB.Name = "pdb-b"
+	keyB := pdbKey(t, pdbB)
+
+	add(t, dc.pdbStore, pdbA)
+	add(t, dc.pdbStore, pdbB)
+
+	pod, _ := newPod(t, "pod") // labels foo=bar; both PDBs use that selector
+	dc.addPod(logger, pod)
+
+	got := getQueuedPDBKeys(t, dc)
+	want := []string{keyA, keyB}
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+		t.Fatalf("enqueued PDB keys mismatch (-want,+got):\n%s", diff)
+	}
+
+	// FakeRecorder is synchronous; the event is already on the channel after addPod.
+	wantEvent := fmt.Sprintf(
+		`%s %s Pod %q/%q matches multiple PodDisruptionBudgets %q. Overlapping PDBs are unsupported for eviction.`,
+		v1.EventTypeWarning, "MultiplePodDisruptionBudgets", pod.Namespace, pod.Name, []string{"pdb-a", "pdb-b"},
+	)
+	select {
+	case gotEvent := <-dc.recorder.(*record.FakeRecorder).Events:
+		if diff := cmp.Diff(wantEvent, gotEvent); diff != "" {
+			t.Fatalf("event mismatch (-want,+got):\n%s", diff)
+		}
+	default:
+		t.Fatal("expected MultiplePodDisruptionBudgets event, got none")
+	}
+}
+
+// Overlapping PDBs that only matched the pod's old labels must not emit
+// MultiplePodDisruptionBudgets (warn only for the current pod).
+func TestUpdatePodDoesNotWarnForOldPodMultiplePDBs(t *testing.T) {
+	logger, ctx := ktesting.NewTestContext(t)
+	dc, _ := newFakeDisruptionController(ctx)
+
+	oldPDBa, _ := newMinAvailablePodDisruptionBudget(t, intstr.FromInt32(1))
+	oldPDBa.Name = "old-pdb-a"
+	oldPDBa.Spec.Selector = newSel(map[string]string{"app": "old"})
+
+	oldPDBb, _ := newMinAvailablePodDisruptionBudget(t, intstr.FromInt32(1))
+	oldPDBb.Name = "old-pdb-b"
+	oldPDBb.Spec.Selector = newSel(map[string]string{"app": "old"})
+
+	newPDB, _ := newMinAvailablePodDisruptionBudget(t, intstr.FromInt32(1))
+	newPDB.Name = "new-pdb"
+	newPDB.Spec.Selector = newSel(map[string]string{"app": "new"})
+
+	add(t, dc.pdbStore, oldPDBa)
+	add(t, dc.pdbStore, oldPDBb)
+	add(t, dc.pdbStore, newPDB)
+
+	oldPod, _ := newPod(t, "pod")
+	oldPod.Labels = map[string]string{"app": "old"}
+	curPod := oldPod.DeepCopy()
+	curPod.Labels = map[string]string{"app": "new"}
+
+	dc.updatePod(logger, oldPod, curPod)
+
+	events := dc.recorder.(*record.FakeRecorder).Events
+	if len(events) != 0 {
+		t.Fatalf("unexpected event for old-pod overlap: %v", <-events)
 	}
 }
 

@@ -33,7 +33,6 @@ import (
 )
 
 const (
-	proxyTimeout = 2 * time.Minute
 	// dockerOperationsLatencyKey is the key for the operation latency metrics.
 	// Taken from k8s.io/kubernetes/pkg/kubelet/dockershim/metrics
 	dockerOperationsLatencyKey = "docker_operations_duration_seconds"
@@ -119,7 +118,7 @@ func getKubeletMetricsFromNode(ctx context.Context, c clientset.Interface, nodeN
 	if c == nil {
 		return GrabKubeletMetricsWithoutProxy(ctx, nodeName, "/metrics")
 	}
-	grabber, err := NewMetricsGrabber(ctx, c, nil, nil, true, false, false, false, false, false)
+	grabber, err := NewMetricsGrabber(ctx, c, nil, true, false, false, false, false, false)
 	if err != nil {
 		return KubeletMetrics{}, err
 	}

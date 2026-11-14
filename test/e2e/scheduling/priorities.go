@@ -26,9 +26,6 @@ import (
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 
-	// ensure libs have a chance to initialize
-	_ "github.com/stretchr/testify/assert"
-
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -86,7 +83,7 @@ func nodesAreTooUtilized(ctx context.Context, cs clientset.Interface, nodeList *
 }
 
 // This test suite is used to verifies scheduler priority functions based on the default provider
-var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
+var _ = SIGDescribe("SchedulerPriorities", framework.WithSerial(), func() {
 	var cs clientset.Interface
 	var nodeList *v1.NodeList
 	var systemPodsNo int
@@ -108,9 +105,9 @@ var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
 		framework.ExpectNoErrorWithOffset(0, err)
 
 		err = framework.CheckTestingNSDeletedExcept(ctx, cs, ns)
-		framework.ExpectNoError(err)
-		err = e2epod.WaitForPodsRunningReady(ctx, cs, metav1.NamespaceSystem, int32(systemPodsNo), 0, framework.PodReadyBeforeTimeout)
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "wait for other test namespaces to be deleted before testing scheduling in %q", ns)
+		err = e2epod.WaitForPodsRunningReady(ctx, cs, metav1.NamespaceSystem, systemPodsNo, framework.PodReadyBeforeTimeout)
+		framework.ExpectNoError(err, "wait for %d pods in namespace %q to become running and ready", systemPodsNo, metav1.NamespaceSystem)
 
 		// skip if the most utilized node has less than the cri-o minMemLimit available
 		// otherwise we will not be able to run the test pod once all nodes are balanced
@@ -133,7 +130,7 @@ var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
 		k := v1.LabelHostname
 		ginkgo.By("Verifying the node has a label " + k)
 		node, err := cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "get Node %q", nodeName)
 		if _, hasLabel := node.Labels[k]; !hasLabel {
 			// If the label is not exists, label all nodes for testing.
 
@@ -157,7 +154,7 @@ var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
 
 		// make the nodes have balanced cpu,mem usage
 		err = createBalancedPodForNodes(ctx, f, cs, ns, nodeList.Items, podRequestedResource, 0.6)
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "balance node resource usage before testing scheduling priorities")
 		ginkgo.By("Trying to launch the pod with podAntiAffinity.")
 		labelPodName := "pod-with-pod-antiaffinity"
 		pod = createPausePod(ctx, f, pausePodConfig{
@@ -195,17 +192,17 @@ var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
 			},
 		})
 		ginkgo.By("Wait the pod becomes running")
-		framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name))
+		framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name), "wait for Pod %q in namespace %q to run", pod.Name, f.Namespace.Name)
 		labelPod, err := cs.CoreV1().Pods(ns).Get(ctx, labelPodName, metav1.GetOptions{})
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "get Pod %q in namespace %q", labelPodName, ns)
 		ginkgo.By("Verify the pod was scheduled to the expected node.")
-		framework.ExpectNotEqual(labelPod.Spec.NodeName, nodeName)
+		gomega.Expect(labelPod.Spec.NodeName).ToNot(gomega.Equal(nodeName))
 	})
 
 	ginkgo.It("Pod should be preferably scheduled to nodes pod can tolerate", func(ctx context.Context) {
 		// make the nodes have balanced cpu,mem usage ratio
 		err := createBalancedPodForNodes(ctx, f, cs, ns, nodeList.Items, podRequestedResource, 0.5)
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "balance node resource usage before testing scheduling priorities")
 		// Apply 10 taints to first node
 		nodeName := nodeList.Items[0].Name
 
@@ -213,7 +210,7 @@ var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
 		// Generate 10 tolerable taints for the first node (and matching tolerations)
 		tolerableTaints := make([]v1.Taint, 0)
 		var tolerations []v1.Toleration
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			testTaint := getRandomTaint()
 			tolerableTaints = append(tolerableTaints, testTaint)
 			tolerations = append(tolerations, v1.Toleration{Key: testTaint.Key, Value: testTaint.Value, Effect: testTaint.Effect})
@@ -222,7 +219,7 @@ var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
 		intolerableTaints := make(map[string][]v1.Taint)
 		for i := 1; i < len(nodeList.Items); i++ {
 			nodeTaints := make([]v1.Taint, 0)
-			for i := 0; i < 10; i++ {
+			for range 10 {
 				nodeTaints = append(nodeTaints, getRandomTaint())
 			}
 			intolerableTaints[nodeList.Items[i].Name] = nodeTaints
@@ -252,11 +249,11 @@ var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
 			Name:        tolerationPodName,
 			Tolerations: tolerations,
 		})
-		framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name))
+		framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name), "wait for Pod %q in namespace %q to run", pod.Name, f.Namespace.Name)
 
 		ginkgo.By("Pod should prefer scheduled to the node that pod can tolerate.")
 		tolePod, err := cs.CoreV1().Pods(ns).Get(ctx, tolerationPodName, metav1.GetOptions{})
-		framework.ExpectNoError(err)
+		framework.ExpectNoError(err, "get Pod %q in namespace %q", tolerationPodName, ns)
 		gomega.Expect(tolePod.Spec.NodeName).To(gomega.Equal(nodeName))
 	})
 
@@ -285,13 +282,13 @@ var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
 			var nodes []v1.Node
 			for _, nodeName := range nodeNames {
 				node, err := cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
-				framework.ExpectNoError(err)
+				framework.ExpectNoError(err, "get Node %q", nodeName)
 				nodes = append(nodes, *node)
 			}
 
 			// Make the nodes have balanced cpu,mem usage.
 			err := createBalancedPodForNodes(ctx, f, cs, ns, nodes, podRequestedResource, 0.5)
-			framework.ExpectNoError(err)
+			framework.ExpectNoError(err, "balance node resource usage before testing scheduling priorities")
 
 			replicas := 4
 			podLabel := "e2e-pts-score"
@@ -540,9 +537,10 @@ func getNonZeroRequests(pod *v1.Pod) Resource {
 	result := Resource{}
 	for i := range pod.Spec.Containers {
 		container := &pod.Spec.Containers[i]
-		cpu, memory := schedutil.GetNonzeroRequests(&container.Resources.Requests)
-		result.MilliCPU += cpu
-		result.Memory += memory
+		cpu := getNonZeroRequestForResource(v1.ResourceCPU, &container.Resources.Requests)
+		memory := getNonZeroRequestForResource(v1.ResourceMemory, &container.Resources.Requests)
+		result.MilliCPU += cpu.MilliValue()
+		result.Memory += memory.Value()
 	}
 	return result
 }
@@ -558,4 +556,32 @@ func getRandomTaint() v1.Taint {
 func addTaintToNode(ctx context.Context, cs clientset.Interface, nodeName string, testTaint v1.Taint) {
 	e2enode.AddOrUpdateTaintOnNode(ctx, cs, nodeName, testTaint)
 	e2enode.ExpectNodeHasTaint(ctx, cs, nodeName, &testTaint)
+}
+
+// getNonZeroRequestForResource returns the requested values,
+// if the resource has undefined request for CPU or memory, it returns a default value.
+func getNonZeroRequestForResource(resourceName v1.ResourceName, requests *v1.ResourceList) resource.Quantity {
+	if requests == nil {
+		return resource.Quantity{}
+	}
+	switch resourceName {
+	case v1.ResourceCPU:
+		// Override if un-set, but not if explicitly set to zero
+		if _, found := (*requests)[v1.ResourceCPU]; !found {
+			return *resource.NewMilliQuantity(schedutil.DefaultMilliCPURequest, resource.DecimalSI)
+		}
+		return requests.Cpu().DeepCopy()
+	case v1.ResourceMemory:
+		// Override if un-set, but not if explicitly set to zero
+		if _, found := (*requests)[v1.ResourceMemory]; !found {
+			return *resource.NewQuantity(schedutil.DefaultMemoryRequest, resource.DecimalSI)
+		}
+		return requests.Memory().DeepCopy()
+	default:
+		quantity, found := (*requests)[resourceName]
+		if !found {
+			return resource.Quantity{}
+		}
+		return quantity.DeepCopy()
+	}
 }

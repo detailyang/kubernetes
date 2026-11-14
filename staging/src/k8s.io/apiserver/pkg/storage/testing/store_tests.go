@@ -18,6 +18,7 @@ package testing
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"math"
@@ -29,6 +30,9 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -36,38 +40,55 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/apis/example"
+	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/value"
-	utilpointer "k8s.io/utils/pointer"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/utils/ptr"
 )
 
 type KeyValidation func(ctx context.Context, t *testing.T, key string)
 
 func RunTestCreate(ctx context.Context, t *testing.T, store storage.Interface, validation KeyValidation) {
-	out := &example.Pod{}
-	obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns", SelfLink: "testlink"}}
+	tests := []struct {
+		name          string
+		inputObj      *example.Pod
+		expectedError error
+	}{{
+		name:     "successful create",
+		inputObj: &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}},
+	}, {
+		name:          "create with ResourceVersion set",
+		inputObj:      &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "bar", Namespace: "test-ns", ResourceVersion: "1"}},
+		expectedError: storage.ErrResourceVersionSetOnCreate,
+	}}
 
-	// verify that kv pair is empty before set
-	key := computePodKey(obj)
-	if err := store.Get(ctx, key, storage.GetOptions{}, out); !storage.IsNotFound(err) {
-		t.Fatalf("expecting empty result on key %s, got %v", key, err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := &example.Pod{} // reset
+			// verify that kv pair is empty before set
+			key := computePodKey(tt.inputObj)
+			if err := store.Get(ctx, key, storage.GetOptions{}, out); !storage.IsNotFound(err) {
+				t.Fatalf("expecting empty result on key %s, got %v", key, err)
+			}
 
-	if err := store.Create(ctx, key, obj, out, 0); err != nil {
-		t.Fatalf("Set failed: %v", err)
+			err := store.Create(ctx, key, tt.inputObj, out, 0)
+			if !errors.Is(err, tt.expectedError) {
+				t.Errorf("expecting error %v, but get: %v", tt.expectedError, err)
+			}
+			if err != nil {
+				return
+			}
+			// basic tests of the output
+			if tt.inputObj.ObjectMeta.Name != out.ObjectMeta.Name {
+				t.Errorf("pod name want=%s, get=%s", tt.inputObj.ObjectMeta.Name, out.ObjectMeta.Name)
+			}
+			if out.ResourceVersion == "" {
+				t.Errorf("output should have non-empty resource version")
+			}
+			validation(ctx, t, key)
+		})
 	}
-	// basic tests of the output
-	if obj.ObjectMeta.Name != out.ObjectMeta.Name {
-		t.Errorf("pod name want=%s, get=%s", obj.ObjectMeta.Name, out.ObjectMeta.Name)
-	}
-	if out.ResourceVersion == "" {
-		t.Errorf("output should have non-empty resource version")
-	}
-	if out.SelfLink != "" {
-		t.Errorf("output should have empty selfLink")
-	}
-
-	validation(ctx, t, key)
 }
 
 func RunTestCreateWithTTL(ctx context.Context, t *testing.T, store storage.Interface) {
@@ -83,7 +104,7 @@ func RunTestCreateWithTTL(ctx context.Context, t *testing.T, store storage.Inter
 	if err != nil {
 		t.Fatalf("Watch failed: %v", err)
 	}
-	testCheckEventType(t, watch.Deleted, w)
+	testCheckEventType(t, w, watch.Deleted)
 }
 
 func RunTestCreateWithKeyExist(ctx context.Context, t *testing.T, store storage.Interface) {
@@ -97,7 +118,7 @@ func RunTestCreateWithKeyExist(ctx context.Context, t *testing.T, store storage.
 	}
 }
 
-func RunTestGet(ctx context.Context, t *testing.T, store storage.Interface) {
+func RunTestGet(ctx context.Context, t *testing.T, store storage.Interface, increaseRV IncreaseRVFunc) {
 	// create an object to test
 	key, createdObj := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}})
 	// update the object once to allow get by exact resource version to be tested
@@ -105,22 +126,17 @@ func RunTestGet(ctx context.Context, t *testing.T, store storage.Interface) {
 	updateObj.Annotations = map[string]string{"test-annotation": "1"}
 	storedObj := &example.Pod{}
 	err := store.GuaranteedUpdate(ctx, key, storedObj, true, nil,
-		func(_ runtime.Object, _ storage.ResponseMeta) (runtime.Object, *uint64, error) {
-			ttl := uint64(1)
-			return updateObj, &ttl, nil
-		}, nil)
+		storage.SimpleUpdate(func(_ runtime.Object) (runtime.Object, error) {
+			return updateObj, nil
+		}), nil)
 	if err != nil {
 		t.Fatalf("Update failed: %v", err)
 	}
-	// create an additional object to increment the resource version for pods above the resource version of the foo object
-	secondObj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "bar", Namespace: "test-ns"}}
-	lastUpdatedObj := &example.Pod{}
-	if err := store.Create(ctx, computePodKey(secondObj), secondObj, lastUpdatedObj, 0); err != nil {
-		t.Fatalf("Set failed: %v", err)
-	}
+	// Increase RV to test consistent Get.
+	lastUpdatedCurrentRV := int(increaseRV(ctx, t))
 
 	currentRV, _ := strconv.Atoi(storedObj.ResourceVersion)
-	lastUpdatedCurrentRV, _ := strconv.Atoi(lastUpdatedObj.ResourceVersion)
+	_, invalidRVErr := storage.APIObjectVersioner{}.ParseResourceVersion("invalid")
 
 	// TODO(jpbetz): Add exact test cases
 	tests := []struct {
@@ -129,6 +145,7 @@ func RunTestGet(ctx context.Context, t *testing.T, store storage.Interface) {
 		ignoreNotFound       bool
 		expectNotFoundErr    bool
 		expectRVTooLarge     bool
+		expectedErr          error
 		expectedOut          *example.Pod
 		expectedAlternatives []*example.Pod
 		rv                   string
@@ -171,20 +188,29 @@ func RunTestGet(ctx context.Context, t *testing.T, store storage.Interface) {
 		expectRVTooLarge: true,
 		rv:               strconv.FormatInt(math.MaxInt64, 10),
 	}, {
+		name:        "invalid resource version",
+		key:         key,
+		expectedErr: invalidRVErr,
+		rv:          "invalid",
+	}, {
 		name:              "get non-existing",
-		key:               "/non-existing",
+		key:               "/pods/non-existing",
 		ignoreNotFound:    false,
 		expectNotFoundErr: true,
 	}, {
+		name:        "get non-existing with resource version",
+		key:         "/pods/non-existing",
+		expectedErr: storage.NewKeyNotFoundError("/pods/non-existing", int64(lastUpdatedCurrentRV)),
+		rv:          fmt.Sprintf("%d", lastUpdatedCurrentRV),
+	}, {
 		name:              "get non-existing, ignore not found",
-		key:               "/non-existing",
+		key:               "/pods/non-existing",
 		ignoreNotFound:    true,
 		expectNotFoundErr: false,
 		expectedOut:       &example.Pod{},
 	}}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// For some asynchronous implementations of storage interface (in particular watchcache),
 			// certain requests may impact result of further requests. As an example, if we first
@@ -197,10 +223,17 @@ func RunTestGet(ctx context.Context, t *testing.T, store storage.Interface) {
 
 			out := &example.Pod{}
 			err := store.Get(ctx, tt.key, storage.GetOptions{IgnoreNotFound: tt.ignoreNotFound, ResourceVersion: tt.rv}, out)
+			if tt.expectedErr != nil {
+				assert.Equal(t, tt.expectedErr, err)
+				return
+			}
 			if tt.expectNotFoundErr {
-				if err == nil || !storage.IsNotFound(err) {
+				var storageErr *storage.StorageError
+				if !errors.As(err, &storageErr) || storageErr.Code != storage.ErrCodeKeyNotFound {
 					t.Errorf("expecting not found error, but get: %v", err)
+					return
 				}
+				assert.Equal(t, int64(lastUpdatedCurrentRV), storageErr.ResourceVersion)
 				return
 			}
 			if tt.expectRVTooLarge {
@@ -214,15 +247,8 @@ func RunTestGet(ctx context.Context, t *testing.T, store storage.Interface) {
 			}
 
 			if tt.expectedAlternatives == nil {
-				ExpectNoDiff(t, fmt.Sprintf("%s: incorrect pod", tt.name), tt.expectedOut, out)
+				expectNoDiff(t, fmt.Sprintf("%s: incorrect pod", tt.name), tt.expectedOut, out)
 			} else {
-				toInterfaceSlice := func(pods []*example.Pod) []interface{} {
-					result := make([]interface{}, 0, len(pods))
-					for i := range pods {
-						result = append(result, pods[i])
-					}
-					return result
-				}
 				ExpectContains(t, fmt.Sprintf("%s: incorrect pod", tt.name), toInterfaceSlice(tt.expectedAlternatives), out)
 			}
 		})
@@ -244,7 +270,7 @@ func RunTestUnconditionalDelete(ctx context.Context, t *testing.T, store storage
 		expectNotFoundErr: false,
 	}, {
 		name:              "non-existing key",
-		key:               "/non-existing",
+		key:               "/pods/non-existing",
 		expectedObj:       nil,
 		expectNotFoundErr: true,
 	}}
@@ -252,7 +278,7 @@ func RunTestUnconditionalDelete(ctx context.Context, t *testing.T, store storage
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			out := &example.Pod{} // reset
-			err := store.Delete(ctx, tt.key, out, nil, storage.ValidateAllObjectFunc, nil)
+			err := store.Delete(ctx, tt.key, out, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{})
 			if tt.expectNotFoundErr {
 				if err == nil || !storage.IsNotFound(err) {
 					t.Errorf("expecting not found error, but get: %s", err)
@@ -268,7 +294,7 @@ func RunTestUnconditionalDelete(ctx context.Context, t *testing.T, store storage
 				t.Errorf("expecting resource version to be updated, but get: %s", out.ResourceVersion)
 			}
 			out.ResourceVersion = storedObj.ResourceVersion
-			ExpectNoDiff(t, "incorrect pod:", tt.expectedObj, out)
+			expectNoDiff(t, "incorrect pod:", tt.expectedObj, out)
 		})
 	}
 }
@@ -294,7 +320,7 @@ func RunTestConditionalDelete(ctx context.Context, t *testing.T, store storage.I
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			out := &example.Pod{}
-			err := store.Delete(ctx, key, out, tt.precondition, storage.ValidateAllObjectFunc, nil)
+			err := store.Delete(ctx, key, out, tt.precondition, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{})
 			if tt.expectInvalidObjErr {
 				if err == nil || !storage.IsInvalidObj(err) {
 					t.Errorf("expecting invalid UID error, but get: %s", err)
@@ -310,7 +336,7 @@ func RunTestConditionalDelete(ctx context.Context, t *testing.T, store storage.I
 				t.Errorf("expecting resource version to be updated, but get: %s", out.ResourceVersion)
 			}
 			out.ResourceVersion = storedObj.ResourceVersion
-			ExpectNoDiff(t, "incorrect pod:", storedObj, out)
+			expectNoDiff(t, "incorrect pod:", storedObj, out)
 			obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns", UID: "A"}}
 			key, storedObj = testPropagateStore(ctx, t, store, obj)
 		})
@@ -346,7 +372,7 @@ func RunTestDeleteWithSuggestion(ctx context.Context, t *testing.T, store storag
 	key, originalPod := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "name", Namespace: "test-ns"}})
 
 	out := &example.Pod{}
-	if err := store.Delete(ctx, key, out, nil, storage.ValidateAllObjectFunc, originalPod); err != nil {
+	if err := store.Delete(ctx, key, out, nil, storage.ValidateAllObjectFunc, originalPod, storage.DeleteOptions{}); err != nil {
 		t.Errorf("Unexpected failure during deletion: %v", err)
 	}
 
@@ -370,12 +396,104 @@ func RunTestDeleteWithSuggestionAndConflict(ctx context.Context, t *testing.T, s
 	}
 
 	out := &example.Pod{}
-	if err := store.Delete(ctx, key, out, nil, storage.ValidateAllObjectFunc, originalPod); err != nil {
+	if err := store.Delete(ctx, key, out, nil, storage.ValidateAllObjectFunc, originalPod, storage.DeleteOptions{}); err != nil {
 		t.Errorf("Unexpected failure during deletion: %v", err)
 	}
 
 	if err := store.Get(ctx, key, storage.GetOptions{}, &example.Pod{}); !storage.IsNotFound(err) {
 		t.Errorf("Unexpected error on reading object: %v", err)
+	}
+	updatedPod.ObjectMeta.ResourceVersion = out.ObjectMeta.ResourceVersion
+	expectNoDiff(t, "incorrect pod:", updatedPod, out)
+}
+
+// RunTestDeleteWithConflict tests the case when another conflicting update happened before the delete completed.
+func RunTestDeleteWithConflict(ctx context.Context, t *testing.T, store storage.Interface) {
+	key, _ := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "name", Namespace: "test-ns"}})
+
+	// First update, so originalPod is outdated.
+	updatedPod := &example.Pod{}
+	validateCount := 0
+	updateCount := 0
+	// Simulate a conflicting update in the middle of delete.
+	validateAllWithUpdate := func(_ context.Context, _ runtime.Object) error {
+		validateCount++
+		if validateCount > 1 {
+			return nil
+		}
+		if err := store.GuaranteedUpdate(ctx, key, updatedPod, false, nil,
+			storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+				pod := obj.(*example.Pod)
+				pod.ObjectMeta.Labels = map[string]string{"foo": "bar"}
+				return pod, nil
+			}), nil); err != nil {
+			t.Errorf("Unexpected failure during updated: %v", err)
+		}
+		updateCount++
+		return nil
+	}
+
+	out := &example.Pod{}
+	if err := store.Delete(ctx, key, out, nil, validateAllWithUpdate, nil, storage.DeleteOptions{}); err != nil {
+		t.Errorf("Unexpected failure during deletion: %v", err)
+	}
+
+	if validateCount != 2 {
+		t.Errorf("Expect validateCount = %d, but got %d", 2, validateCount)
+	}
+	if updateCount != 1 {
+		t.Errorf("Expect updateCount = %d, but got %d", 1, updateCount)
+	}
+
+	if err := store.Get(ctx, key, storage.GetOptions{}, &example.Pod{}); !storage.IsNotFound(err) {
+		t.Errorf("Unexpected error on reading object: %v", err)
+	}
+	updatedPod.ObjectMeta.ResourceVersion = out.ObjectMeta.ResourceVersion
+	expectNoDiff(t, "incorrect pod:", updatedPod, out)
+
+	// Simulate a conflicting update in the middle of delete that causes preconditions to fail on retry.
+	key, _ = testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "name", Namespace: "test-ns", UID: "myUID"}})
+	validateCount = 0
+	validateWithUIDUpdate := func(_ context.Context, _ runtime.Object) error {
+		validateCount++
+		if validateCount == 1 {
+			if err := store.GuaranteedUpdate(ctx, key, updatedPod, false, nil,
+				storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+					pod := obj.(*example.Pod)
+					pod.ObjectMeta.UID = "otherUID"
+					return pod, nil
+				}), nil); err != nil {
+				t.Errorf("Unexpected failure during update: %v", err)
+			}
+		}
+		return nil
+	}
+	if err := store.Delete(ctx, key, out, storage.NewUIDPreconditions("myUID"), validateWithUIDUpdate, nil, storage.DeleteOptions{}); !storage.IsInvalidObj(err) {
+		t.Errorf("Expected invalid object error on precondition failure after conflict, got: %v", err)
+	}
+	if validateCount != 1 {
+		t.Errorf("Expect validateCount = 1, but got %d", validateCount)
+	}
+
+	// Simulate a conflicting delete in the middle of delete (with and without preconditions).
+	for _, prec := range []*storage.Preconditions{nil, storage.NewUIDPreconditions("myUID")} {
+		key, _ = testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "name", Namespace: "test-ns", UID: "myUID"}})
+		validateCount = 0
+		validateWithDelete := func(_ context.Context, _ runtime.Object) error {
+			validateCount++
+			if validateCount == 1 {
+				if err := store.Delete(ctx, key, &example.Pod{}, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{}); err != nil {
+					t.Errorf("Unexpected failure during background deletion: %v", err)
+				}
+			}
+			return nil
+		}
+		if err := store.Delete(ctx, key, out, prec, validateWithDelete, nil, storage.DeleteOptions{}); !storage.IsNotFound(err) {
+			t.Errorf("Expected not-found error when object is deleted concurrently, got: %v", err)
+		}
+		if validateCount != 1 {
+			t.Errorf("Expect validateCount = 1, but got %d", validateCount)
+		}
 	}
 }
 
@@ -384,13 +502,26 @@ func RunTestDeleteWithSuggestionOfDeletedObject(ctx context.Context, t *testing.
 
 	// First delete, so originalPod is outdated.
 	deletedPod := &example.Pod{}
-	if err := store.Delete(ctx, key, deletedPod, nil, storage.ValidateAllObjectFunc, originalPod); err != nil {
+	if err := store.Delete(ctx, key, deletedPod, nil, storage.ValidateAllObjectFunc, originalPod, storage.DeleteOptions{}); err != nil {
 		t.Errorf("Unexpected failure during deletion: %v", err)
 	}
 
 	// Now try deleting with stale object.
 	out := &example.Pod{}
-	if err := store.Delete(ctx, key, out, nil, storage.ValidateAllObjectFunc, originalPod); !storage.IsNotFound(err) {
+	if err := store.Delete(ctx, key, out, nil, storage.ValidateAllObjectFunc, originalPod, storage.DeleteOptions{}); !storage.IsNotFound(err) {
+		t.Errorf("Unexpected error during deletion: %v, expected not-found", err)
+	}
+
+	// Try deleting with stale object when preconditions fail on the suggestion.
+	if err := store.Delete(ctx, key, out, storage.NewUIDPreconditions("otherUID"), storage.ValidateAllObjectFunc, originalPod, storage.DeleteOptions{}); !storage.IsNotFound(err) {
+		t.Errorf("Unexpected error during deletion: %v, expected not-found", err)
+	}
+
+	// Try deleting with stale object when validateDeletion fails on the suggestion.
+	validateFail := func(_ context.Context, _ runtime.Object) error {
+		return fmt.Errorf("validation error")
+	}
+	if err := store.Delete(ctx, key, out, nil, validateFail, originalPod, storage.DeleteOptions{}); !storage.IsNotFound(err) {
 		t.Errorf("Unexpected error during deletion: %v, expected not-found", err)
 	}
 }
@@ -406,7 +537,8 @@ func RunTestValidateDeletionWithSuggestion(ctx context.Context, t *testing.T, st
 		return validationError
 	}
 	out := &example.Pod{}
-	if err := store.Delete(ctx, key, out, nil, validateNothing, originalPod); err != validationError {
+	// nolint:errorlint // not changing the level of assertion
+	if err := store.Delete(ctx, key, out, nil, validateNothing, originalPod, storage.DeleteOptions{}); err != validationError {
 		t.Errorf("Unexpected failure during deletion: %v", err)
 	}
 	if validationCalls != 1 {
@@ -434,7 +566,7 @@ func RunTestValidateDeletionWithSuggestion(ctx context.Context, t *testing.T, st
 		return nil
 	}
 
-	if err := store.Delete(ctx, key, out, nil, validateFresh, originalPod); err != nil {
+	if err := store.Delete(ctx, key, out, nil, validateFresh, originalPod, storage.DeleteOptions{}); err != nil {
 		t.Errorf("Unexpected failure during deletion: %v", err)
 	}
 
@@ -449,8 +581,73 @@ func RunTestValidateDeletionWithSuggestion(ctx context.Context, t *testing.T, st
 	}
 }
 
+// RunTestValidateDeletionWithOnlySuggestionValid tests the case of delete with validateDeletion function,
+// when the suggested cachedExistingObject passes the validate function while the current version does not pass the validate function.
+func RunTestValidateDeletionWithOnlySuggestionValid(ctx context.Context, t *testing.T, store storage.Interface) {
+	key, originalPod := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "name", Namespace: "test-ns", Labels: map[string]string{"foo": "bar"}}})
+
+	// Check that validaing fresh object fails is called once and fails.
+	validationCalls := 0
+	validationError := fmt.Errorf("validation error")
+	validateNothing := func(_ context.Context, _ runtime.Object) error {
+		validationCalls++
+		return validationError
+	}
+	out := &example.Pod{}
+	// nolint:errorlint // not changing the level of assertion
+	if err := store.Delete(ctx, key, out, nil, validateNothing, originalPod, storage.DeleteOptions{}); err != validationError {
+		t.Errorf("Unexpected failure during deletion: %v", err)
+	}
+	if validationCalls != 1 {
+		t.Errorf("validate function should have been called once, called %d", validationCalls)
+	}
+
+	// First update, so originalPod is outdated.
+	updatedPod := &example.Pod{}
+	if err := store.GuaranteedUpdate(ctx, key, updatedPod, false, nil,
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			pod := obj.(*example.Pod)
+			pod.ObjectMeta.Labels = map[string]string{"foo": "barbar"}
+			return pod, nil
+		}), nil); err != nil {
+		t.Errorf("Unexpected failure during updated: %v", err)
+	}
+
+	calls := 0
+	validateFresh := func(_ context.Context, obj runtime.Object) error {
+		calls++
+		pod := obj.(*example.Pod)
+		if pod.ObjectMeta.Labels == nil || pod.ObjectMeta.Labels["foo"] != "bar" {
+			return fmt.Errorf("stale object")
+		}
+		return nil
+	}
+
+	err := store.Delete(ctx, key, out, nil, validateFresh, originalPod, storage.DeleteOptions{})
+	if err == nil || err.Error() != "stale object" {
+		t.Errorf("expecting stale object error, but get: %s", err)
+	}
+
+	// Implementations of the storage interface are allowed to ignore the suggestion,
+	// in which case just one validation call is possible.
+	if calls > 2 {
+		t.Errorf("validate function should have been called at most twice, called %d", calls)
+	}
+
+	if err = store.Get(ctx, key, storage.GetOptions{}, out); err != nil {
+		t.Errorf("Unexpected error on reading object: %v", err)
+	}
+	expectNoDiff(t, "incorrect pod:", updatedPod, out)
+}
+
 func RunTestPreconditionalDeleteWithSuggestion(ctx context.Context, t *testing.T, store storage.Interface) {
 	key, originalPod := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "name", Namespace: "test-ns"}})
+
+	// Deleting with a current suggestion that fails preconditions should fail.
+	out := &example.Pod{}
+	if err := store.Delete(ctx, key, out, storage.NewUIDPreconditions("myUID"), storage.ValidateAllObjectFunc, originalPod, storage.DeleteOptions{}); !storage.IsInvalidObj(err) {
+		t.Errorf("Expected invalid UID error when current suggestion fails preconditions, got: %v", err)
+	}
 
 	// First update, so originalPod is outdated.
 	updatedPod := &example.Pod{}
@@ -463,10 +660,14 @@ func RunTestPreconditionalDeleteWithSuggestion(ctx context.Context, t *testing.T
 		t.Errorf("Unexpected failure during updated: %v", err)
 	}
 
+	// Deleting with an outdated suggestion where both suggestion and current object fail preconditions should fail.
+	if err := store.Delete(ctx, key, out, storage.NewUIDPreconditions("otherUID"), storage.ValidateAllObjectFunc, originalPod, storage.DeleteOptions{}); !storage.IsInvalidObj(err) {
+		t.Errorf("Expected invalid UID error when both outdated suggestion and live object fail preconditions, got: %v", err)
+	}
+
 	prec := storage.NewUIDPreconditions("myUID")
 
-	out := &example.Pod{}
-	if err := store.Delete(ctx, key, out, prec, storage.ValidateAllObjectFunc, originalPod); err != nil {
+	if err := store.Delete(ctx, key, out, prec, storage.ValidateAllObjectFunc, originalPod, storage.DeleteOptions{}); err != nil {
 		t.Errorf("Unexpected failure during deletion: %v", err)
 	}
 
@@ -475,8 +676,39 @@ func RunTestPreconditionalDeleteWithSuggestion(ctx context.Context, t *testing.T
 	}
 }
 
-func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, compaction Compaction, ignoreWatchCacheTests bool) {
-	initialRV, preset, err := seedMultiLevelData(ctx, store)
+// RunTestPreconditionalDeleteWithOnlySuggestionPass tests the case of delete with preconditions,
+// when the suggested cachedExistingObject passes the preconditions while the current version does not pass the preconditions.
+func RunTestPreconditionalDeleteWithOnlySuggestionPass(ctx context.Context, t *testing.T, store storage.Interface) {
+	key, originalPod := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "name", Namespace: "test-ns", UID: "myUID"}})
+
+	// First update, so originalPod is outdated.
+	updatedPod := &example.Pod{}
+	if err := store.GuaranteedUpdate(ctx, key, updatedPod, false, nil,
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			pod := obj.(*example.Pod)
+			pod.ObjectMeta.UID = "otherUID"
+			return pod, nil
+		}), nil); err != nil {
+		t.Errorf("Unexpected failure during updated: %v", err)
+	}
+
+	prec := storage.NewUIDPreconditions("myUID")
+	// Although originalPod passes the precondition, its delete would fail due to conflict.
+	// The 2nd try with updatedPod would fail the precondition.
+	out := &example.Pod{}
+	err := store.Delete(ctx, key, out, prec, storage.ValidateAllObjectFunc, originalPod, storage.DeleteOptions{})
+	if err == nil || !storage.IsInvalidObj(err) {
+		t.Errorf("expecting invalid UID error, but get: %s", err)
+	}
+
+	if err = store.Get(ctx, key, storage.GetOptions{}, out); err != nil {
+		t.Errorf("Unexpected error on reading object: %v", err)
+	}
+	expectNoDiff(t, "incorrect pod:", updatedPod, out)
+}
+
+func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, compact Compaction, watchCacheEnabled bool, recorder *KubernetesRecorder) {
+	initialRV, compactRV, createdPods, updatedPod, err := seedMultiLevelData(ctx, t, store, compact)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,11 +720,11 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 		Predicate:       storage.Everything,
 		Recursive:       true,
 	}
-	if err := store.GetList(ctx, "/second", storageOpts, list); err != nil {
+	if err := store.GetList(ctx, "/pods/second", storageOpts, list); err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
-	continueRV, _ := strconv.Atoi(list.ResourceVersion)
-	secondContinuation, err := storage.EncodeContinue("/second/foo", "/second/", int64(continueRV))
+	continueRV := mustParseResourceVersion(t, list.ResourceVersion)
+	secondContinuation, err := storage.EncodeContinue("/pods/second/foo", "/pods/second/", int64(continueRV))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -501,10 +733,8 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 		pod := obj.(*example.Pod)
 		return nil, fields.Set{"metadata.name": pod.Name, "spec.nodeName": pod.Spec.NodeName}, nil
 	}
-	// Use compact to increase etcd global revision without changes to any resources.
-	// The increase in resources version comes from Kubernetes compaction updating hidden key.
-	// Used to test consistent List to confirm it returns latest etcd revision.
-	compaction(ctx, t, initialRV)
+	// Compact and increase RV to test consistent List.
+	compact(ctx, t, compactRV)
 	currentRV := fmt.Sprintf("%d", continueRV+1)
 
 	tests := []struct {
@@ -517,22 +747,26 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 		expectedOut                []example.Pod
 		expectedAlternatives       [][]example.Pod
 		expectContinue             bool
+		expectContinueExact        string
 		expectedRemainingItemCount *int64
 		expectError                bool
 		expectRVTooLarge           bool
+		expectRVTooOld             bool
+		expectContinueTooOld       bool
 		expectRV                   string
 		expectRVFunc               func(string) error
+		expectCacherRequestsToEtcd func() []RecordedList
 	}{
 		{
 			name:        "rejects invalid resource version",
-			prefix:      "/pods",
+			prefix:      "/pods/",
 			pred:        storage.Everything,
 			rv:          "abc",
 			expectError: true,
 		},
 		{
 			name:   "rejects resource version and continue token",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Label:    labels.Everything(),
 				Field:    fields.Everything(),
@@ -544,7 +778,8 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 		},
 		{
 			name:             "rejects resource version set too high",
-			prefix:           "/pods",
+			prefix:           "/pods/",
+			pred:             storage.Everything,
 			rv:               strconv.FormatInt(math.MaxInt64, 10),
 			expectRVTooLarge: true,
 		},
@@ -552,29 +787,102 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			name:        "test List on existing key",
 			prefix:      "/pods/first/",
 			pred:        storage.Everything,
-			expectedOut: []example.Pod{*preset[0]},
+			expectedOut: []example.Pod{*updatedPod},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
 		},
 		{
 			name:                 "test List on existing key with resource version set to 0",
 			prefix:               "/pods/first/",
 			pred:                 storage.Everything,
-			expectedAlternatives: [][]example.Pod{{}, {*preset[0]}},
+			expectedAlternatives: [][]example.Pod{{}, {*updatedPod}},
 			rv:                   "0",
 		},
 		{
-			name:        "test List on existing key with resource version set before first write, match=Exact",
+			name:        "test List on existing key with resource version set before update, match=Exact",
 			prefix:      "/pods/first/",
 			pred:        storage.Everything,
-			expectedOut: []example.Pod{},
-			rv:          initialRV,
+			expectedOut: []example.Pod{*createdPods[0]},
+			rv:          compactRV,
 			rvMatch:     metav1.ResourceVersionMatchExact,
-			expectRV:    initialRV,
+			expectRV:    compactRV,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/first/",
+						Revision: mustParseResourceVersion(t, compactRV),
+					},
+				}
+			},
+		},
+		{
+			name:        "test List on existing key with resource version set before creation, match=Exact",
+			prefix:      "/pods/second/",
+			pred:        storage.Everything,
+			expectedOut: []example.Pod{},
+			rv:          compactRV,
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectRV:    compactRV,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/second/",
+						Revision: mustParseResourceVersion(t, compactRV),
+					},
+				}
+			},
+		},
+		{
+			name:        "test List on existing key with resource version set after creation, match=Exact",
+			prefix:      "/pods/second/",
+			pred:        storage.Everything,
+			expectedOut: []example.Pod{*createdPods[1]},
+			rv:          createdPods[1].ResourceVersion,
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectRV:    createdPods[1].ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/second/",
+						Revision: mustParseResourceVersion(t, createdPods[1].ResourceVersion),
+					},
+				}
+			},
+		},
+		{
+			name:           "test List on existing key with resource version set before first write, match=Exact",
+			prefix:         "/pods/first/",
+			pred:           storage.Everything,
+			rv:             initialRV,
+			rvMatch:        metav1.ResourceVersionMatchExact,
+			expectRVTooOld: true,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/first/",
+						Revision: mustParseResourceVersion(t, initialRV),
+					},
+				}
+			},
 		},
 		{
 			name:                 "test List on existing key with resource version set to 0, match=NotOlderThan",
 			prefix:               "/pods/first/",
 			pred:                 storage.Everything,
-			expectedAlternatives: [][]example.Pod{{}, {*preset[0]}},
+			expectedAlternatives: [][]example.Pod{{}, {*updatedPod}},
 			rv:                   "0",
 			rvMatch:              metav1.ResourceVersionMatchNotOlderThan,
 		},
@@ -590,7 +898,7 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			name:                 "test List on existing key with resource version set before first write, match=NotOlderThan",
 			prefix:               "/pods/first/",
 			pred:                 storage.Everything,
-			expectedAlternatives: [][]example.Pod{{}, {*preset[0]}},
+			expectedAlternatives: [][]example.Pod{{}, {*updatedPod}},
 			rv:                   initialRV,
 			rvMatch:              metav1.ResourceVersionMatchNotOlderThan,
 		},
@@ -606,23 +914,34 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			name:        "test List on existing key with resource version set to current resource version",
 			prefix:      "/pods/first/",
 			pred:        storage.Everything,
-			expectedOut: []example.Pod{*preset[0]},
+			expectedOut: []example.Pod{*updatedPod},
 			rv:          list.ResourceVersion,
 		},
 		{
 			name:        "test List on existing key with resource version set to current resource version, match=Exact",
 			prefix:      "/pods/first/",
 			pred:        storage.Everything,
-			expectedOut: []example.Pod{*preset[0]},
+			expectedOut: []example.Pod{*updatedPod},
 			rv:          list.ResourceVersion,
 			rvMatch:     metav1.ResourceVersionMatchExact,
 			expectRV:    list.ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/first/",
+						Revision: int64(continueRV),
+					},
+				}
+			},
 		},
 		{
 			name:        "test List on existing key with resource version set to current resource version, match=NotOlderThan",
 			prefix:      "/pods/first/",
 			pred:        storage.Everything,
-			expectedOut: []example.Pod{*preset[0]},
+			expectedOut: []example.Pod{*updatedPod},
 			rv:          list.ResourceVersion,
 			rvMatch:     metav1.ResourceVersionMatchNotOlderThan,
 		},
@@ -631,6 +950,9 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			prefix:      "/pods/non-existing/",
 			pred:        storage.Everything,
 			expectedOut: []example.Pod{},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
 		},
 		{
 			name:   "test List with pod name matching",
@@ -640,6 +962,9 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 				Field: fields.ParseSelectorOrDie("metadata.name!=bar"),
 			},
 			expectedOut: []example.Pod{},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
 		},
 		{
 			name:   "test List with pod name matching with resource version set to current resource version, match=NotOlderThan",
@@ -660,9 +985,31 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 				Field: fields.Everything(),
 				Limit: 1,
 			},
-			expectedOut:                []example.Pod{*preset[1]},
+			expectedOut:                []example.Pod{*createdPods[1]},
+			expectRV:                   currentRV,
 			expectContinue:             true,
-			expectedRemainingItemCount: utilpointer.Int64(1),
+			expectContinueExact:        encodeContinueOrDie(createdPods[1].Name+"\x00", int64(mustAtoi(currentRV))),
+			expectedRemainingItemCount: ptr.To[int64](1),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
+		},
+		{
+			name:   "test List with limit and prefix without trailing slash",
+			prefix: "/pods/second",
+			pred: storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+				Limit: 1,
+			},
+			expectedOut:                []example.Pod{*createdPods[1]},
+			expectRV:                   currentRV,
+			expectContinue:             true,
+			expectContinueExact:        encodeContinueOrDie(createdPods[1].Name+"\x00", int64(mustAtoi(currentRV))),
+			expectedRemainingItemCount: ptr.To[int64](1),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
 		},
 		{
 			name:   "test List with limit at current resource version",
@@ -672,11 +1019,24 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 				Field: fields.Everything(),
 				Limit: 1,
 			},
-			expectedOut:                []example.Pod{*preset[1]},
+			expectedOut:                []example.Pod{*createdPods[1]},
 			expectContinue:             true,
-			expectedRemainingItemCount: utilpointer.Int64(1),
+			expectContinueExact:        encodeContinueOrDie(createdPods[1].Name+"\x00", int64(mustAtoi(list.ResourceVersion))),
+			expectedRemainingItemCount: ptr.To[int64](1),
 			rv:                         list.ResourceVersion,
 			expectRV:                   list.ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/second/",
+						Revision: int64(continueRV),
+						Limit:    1,
+					},
+				}
+			},
 		},
 		{
 			name:   "test List with limit at current resource version and match=Exact",
@@ -686,12 +1046,25 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 				Field: fields.Everything(),
 				Limit: 1,
 			},
-			expectedOut:                []example.Pod{*preset[1]},
+			expectedOut:                []example.Pod{*createdPods[1]},
 			expectContinue:             true,
-			expectedRemainingItemCount: utilpointer.Int64(1),
+			expectContinueExact:        encodeContinueOrDie(createdPods[1].Name+"\x00", int64(mustAtoi(list.ResourceVersion))),
+			expectedRemainingItemCount: ptr.To[int64](1),
 			rv:                         list.ResourceVersion,
 			rvMatch:                    metav1.ResourceVersionMatchExact,
 			expectRV:                   list.ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/second/",
+						Revision: int64(continueRV),
+						Limit:    1,
+					},
+				}
+			},
 		},
 		{
 			name:   "test List with limit at current resource version and match=NotOlderThan",
@@ -701,9 +1074,9 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 				Field: fields.Everything(),
 				Limit: 1,
 			},
-			expectedOut:                []example.Pod{*preset[1]},
+			expectedOut:                []example.Pod{*createdPods[1]},
 			expectContinue:             true,
-			expectedRemainingItemCount: utilpointer.Int64(1),
+			expectedRemainingItemCount: ptr.To[int64](1),
 			rv:                         list.ResourceVersion,
 			rvMatch:                    metav1.ResourceVersionMatchNotOlderThan,
 			expectRVFunc:               resourceVersionNotOlderThan(list.ResourceVersion),
@@ -721,9 +1094,9 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			// While this should eventually get fixed, for now we're explicitly
 			// ignoring this testcase for watchcache.
 			ignoreForWatchCache:        true,
-			expectedOut:                []example.Pod{*preset[1]},
+			expectedOut:                []example.Pod{*createdPods[1]},
 			expectContinue:             true,
-			expectedRemainingItemCount: utilpointer.Int64(1),
+			expectedRemainingItemCount: ptr.To[int64](1),
 			rv:                         "0",
 			expectRVFunc:               resourceVersionNotOlderThan(list.ResourceVersion),
 		},
@@ -740,15 +1113,15 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			// While this should eventually get fixed, for now we're explicitly
 			// ignoring this testcase for watchcache.
 			ignoreForWatchCache:        true,
-			expectedOut:                []example.Pod{*preset[1]},
+			expectedOut:                []example.Pod{*createdPods[1]},
 			expectContinue:             true,
-			expectedRemainingItemCount: utilpointer.Int64(1),
+			expectedRemainingItemCount: ptr.To[int64](1),
 			rv:                         "0",
 			rvMatch:                    metav1.ResourceVersionMatchNotOlderThan,
 			expectRVFunc:               resourceVersionNotOlderThan(list.ResourceVersion),
 		},
 		{
-			name:   "test List with limit at resource version before first write and match=Exact",
+			name:   "test List with limit at resource version before created and match=Exact",
 			prefix: "/pods/second/",
 			pred: storage.SelectionPredicate{
 				Label: labels.Everything(),
@@ -757,9 +1130,47 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			},
 			expectedOut:    []example.Pod{},
 			expectContinue: false,
-			rv:             initialRV,
+			rv:             compactRV,
 			rvMatch:        metav1.ResourceVersionMatchExact,
-			expectRV:       initialRV,
+			expectRV:       compactRV,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/second/",
+						Revision: mustParseResourceVersion(t, compactRV),
+						Limit:    1,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with limit at resource version after created and match=Exact",
+			prefix: "/pods/second/",
+			pred: storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+				Limit: 1,
+			},
+			expectedOut:    []example.Pod{*createdPods[1]},
+			expectContinue: false,
+			rv:             createdPods[1].ResourceVersion,
+			rvMatch:        metav1.ResourceVersionMatchExact,
+			expectRV:       createdPods[1].ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/second/",
+						Revision: mustParseResourceVersion(t, createdPods[1].ResourceVersion),
+						Limit:    1,
+					},
+				}
+			},
 		},
 		{
 			name:   "test List with pregenerated continue token",
@@ -770,7 +1181,19 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 				Limit:    1,
 				Continue: secondContinuation,
 			},
-			expectedOut: []example.Pod{*preset[2]},
+			expectedOut: []example.Pod{*createdPods[2]},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/second/foo",
+						Revision: int64(continueRV),
+						Limit:    1,
+					},
+				}
+			},
 		},
 		{
 			name:   "ignores resource version 0 for List with pregenerated continue token",
@@ -782,13 +1205,28 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 				Continue: secondContinuation,
 			},
 			rv:          "0",
-			expectedOut: []example.Pod{*preset[2]},
+			expectedOut: []example.Pod{*createdPods[2]},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/second/foo",
+						Revision: int64(continueRV),
+						Limit:    1,
+					},
+				}
+			},
 		},
 		{
 			name:        "test List with multiple levels of directories and expect flattened result",
 			prefix:      "/pods/second/",
 			pred:        storage.Everything,
-			expectedOut: []example.Pod{*preset[1], *preset[2]},
+			expectedOut: []example.Pod{*createdPods[1], *createdPods[2]},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
 		},
 		{
 			name:        "test List with multiple levels of directories and expect flattened result with current resource version and match=NotOlderThan",
@@ -796,22 +1234,25 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			pred:        storage.Everything,
 			rv:          list.ResourceVersion,
 			rvMatch:     metav1.ResourceVersionMatchNotOlderThan,
-			expectedOut: []example.Pod{*preset[1], *preset[2]},
+			expectedOut: []example.Pod{*createdPods[1], *createdPods[2]},
 		},
 		{
 			name:   "test List with filter returning only one item, ensure only a single page returned",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "barfoo"),
 				Label: labels.Everything(),
 				Limit: 1,
 			},
-			expectedOut:    []example.Pod{*preset[3]},
+			expectedOut:    []example.Pod{*createdPods[3]},
 			expectContinue: true,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
 		},
 		{
 			name:   "test List with filter returning only one item, ensure only a single page returned with current resource version and match=NotOlderThan",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "barfoo"),
 				Label: labels.Everything(),
@@ -819,23 +1260,27 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			},
 			rv:             list.ResourceVersion,
 			rvMatch:        metav1.ResourceVersionMatchNotOlderThan,
-			expectedOut:    []example.Pod{*preset[3]},
+			expectedOut:    []example.Pod{*createdPods[3]},
+			expectRVFunc:   resourceVersionNotOlderThan(list.ResourceVersion),
 			expectContinue: true,
 		},
 		{
 			name:   "test List with filter returning only one item, covers the entire list",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "barfoo"),
 				Label: labels.Everything(),
 				Limit: 2,
 			},
-			expectedOut:    []example.Pod{*preset[3]},
+			expectedOut:    []example.Pod{*createdPods[3]},
 			expectContinue: false,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
 		},
 		{
 			name:   "test List with filter returning only one item, covers the entire list with current resource version and match=NotOlderThan",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "barfoo"),
 				Label: labels.Everything(),
@@ -843,35 +1288,39 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			},
 			rv:             list.ResourceVersion,
 			rvMatch:        metav1.ResourceVersionMatchNotOlderThan,
-			expectedOut:    []example.Pod{*preset[3]},
+			expectedOut:    []example.Pod{*createdPods[3]},
+			expectRVFunc:   resourceVersionNotOlderThan(list.ResourceVersion),
 			expectContinue: false,
 		},
 		{
 			name:   "test List with filter returning only one item, covers the entire list, with resource version 0",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "barfoo"),
 				Label: labels.Everything(),
 				Limit: 2,
 			},
 			rv:                   "0",
-			expectedAlternatives: [][]example.Pod{{}, {*preset[3]}},
+			expectedAlternatives: [][]example.Pod{{}, {*createdPods[3]}},
 			expectContinue:       false,
 		},
 		{
 			name:   "test List with filter returning two items, more pages possible",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "bar"),
 				Label: labels.Everything(),
 				Limit: 2,
 			},
 			expectContinue: true,
-			expectedOut:    []example.Pod{*preset[0], *preset[1]},
+			expectedOut:    []example.Pod{*updatedPod, *createdPods[1]},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
 		},
 		{
 			name:   "test List with filter returning two items, more pages possible with current resource version and match=NotOlderThan",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "bar"),
 				Label: labels.Everything(),
@@ -880,21 +1329,24 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			rv:             list.ResourceVersion,
 			rvMatch:        metav1.ResourceVersionMatchNotOlderThan,
 			expectContinue: true,
-			expectedOut:    []example.Pod{*preset[0], *preset[1]},
+			expectedOut:    []example.Pod{*updatedPod, *createdPods[1]},
 		},
 		{
 			name:   "filter returns two items split across multiple pages",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "foo"),
 				Label: labels.Everything(),
 				Limit: 2,
 			},
-			expectedOut: []example.Pod{*preset[2], *preset[4]},
+			expectedOut: []example.Pod{*createdPods[2], *createdPods[4]},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
 		},
 		{
 			name:   "filter returns two items split across multiple pages with current resource version and match=NotOlderThan",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "foo"),
 				Label: labels.Everything(),
@@ -902,54 +1354,98 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			},
 			rv:          list.ResourceVersion,
 			rvMatch:     metav1.ResourceVersionMatchNotOlderThan,
-			expectedOut: []example.Pod{*preset[2], *preset[4]},
+			expectedOut: []example.Pod{*createdPods[2], *createdPods[4]},
 		},
 		{
 			name:   "filter returns one item for last page, ends on last item, not full",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field:    fields.OneTermEqualSelector("metadata.name", "foo"),
 				Label:    labels.Everything(),
 				Limit:    2,
 				Continue: encodeContinueOrDie("third/barfoo", int64(continueRV)),
 			},
-			expectedOut: []example.Pod{*preset[4]},
+			expectedOut: []example.Pod{*createdPods[4]},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/third/barfoo",
+						Revision: int64(continueRV),
+						Limit:    2,
+					},
+				}
+			},
 		},
 		{
 			name:   "filter returns one item for last page, starts on last item, full",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field:    fields.OneTermEqualSelector("metadata.name", "foo"),
 				Label:    labels.Everything(),
 				Limit:    1,
 				Continue: encodeContinueOrDie("third/barfoo", int64(continueRV)),
 			},
-			expectedOut: []example.Pod{*preset[4]},
+			expectedOut: []example.Pod{*createdPods[4]},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/third/barfoo",
+						Revision: int64(continueRV),
+						Limit:    1,
+					},
+					{
+						Key:      "/registry/pods/third/barfoo\x00",
+						Revision: int64(continueRV),
+						Limit:    2,
+					},
+				}
+			},
 		},
 		{
 			name:   "filter returns one item for last page, starts on last item, partial page",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field:    fields.OneTermEqualSelector("metadata.name", "foo"),
 				Label:    labels.Everything(),
 				Limit:    2,
 				Continue: encodeContinueOrDie("third/barfoo", int64(continueRV)),
 			},
-			expectedOut: []example.Pod{*preset[4]},
+			expectedOut: []example.Pod{*createdPods[4]},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/third/barfoo",
+						Revision: int64(continueRV),
+						Limit:    2,
+					},
+				}
+			},
 		},
 		{
 			name:   "filter returns two items, page size equal to total list size",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "foo"),
 				Label: labels.Everything(),
 				Limit: 5,
 			},
-			expectedOut: []example.Pod{*preset[2], *preset[4]},
+			expectedOut: []example.Pod{*createdPods[2], *createdPods[4]},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
 		},
 		{
 			name:   "filter returns two items, page size equal to total list size with current resource version and match=NotOlderThan",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "foo"),
 				Label: labels.Everything(),
@@ -957,21 +1453,24 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			},
 			rv:          list.ResourceVersion,
 			rvMatch:     metav1.ResourceVersionMatchNotOlderThan,
-			expectedOut: []example.Pod{*preset[2], *preset[4]},
+			expectedOut: []example.Pod{*createdPods[2], *createdPods[4]},
 		},
 		{
 			name:   "filter returns one item, page size equal to total list size",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "barfoo"),
 				Label: labels.Everything(),
 				Limit: 5,
 			},
-			expectedOut: []example.Pod{*preset[3]},
+			expectedOut: []example.Pod{*createdPods[3]},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
 		},
 		{
 			name:   "filter returns one item, page size equal to total list size with current resource version and match=NotOlderThan",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "barfoo"),
 				Label: labels.Everything(),
@@ -979,25 +1478,28 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			},
 			rv:          list.ResourceVersion,
 			rvMatch:     metav1.ResourceVersionMatchNotOlderThan,
-			expectedOut: []example.Pod{*preset[3]},
+			expectedOut: []example.Pod{*createdPods[3]},
 		},
 		{
 			name:        "list all items",
-			prefix:      "/pods",
+			prefix:      "/pods/",
 			pred:        storage.Everything,
-			expectedOut: []example.Pod{*preset[0], *preset[1], *preset[2], *preset[3], *preset[4]},
+			expectedOut: []example.Pod{*updatedPod, *createdPods[1], *createdPods[2], *createdPods[3], *createdPods[4]},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
 		},
 		{
 			name:        "list all items with current resource version and match=NotOlderThan",
-			prefix:      "/pods",
+			prefix:      "/pods/",
 			pred:        storage.Everything,
 			rv:          list.ResourceVersion,
 			rvMatch:     metav1.ResourceVersionMatchNotOlderThan,
-			expectedOut: []example.Pod{*preset[0], *preset[1], *preset[2], *preset[3], *preset[4]},
+			expectedOut: []example.Pod{*updatedPod, *createdPods[1], *createdPods[2], *createdPods[3], *createdPods[4]},
 		},
 		{
 			name:   "verify list returns updated version of object; filter returns one item, page size equal to total list size with current resource version and match=NotOlderThan",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("spec.nodeName", "fakeNode"),
 				Label: labels.Everything(),
@@ -1005,11 +1507,124 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			},
 			rv:          list.ResourceVersion,
 			rvMatch:     metav1.ResourceVersionMatchNotOlderThan,
-			expectedOut: []example.Pod{*preset[0]},
+			expectedOut: []example.Pod{*updatedPod},
+		},
+		{
+			name:   "test List with indexed field selector returning one item, ensure only a single page returned",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Field:       fields.OneTermEqualSelector("spec.nodeName", "fakeNode"),
+				Label:       labels.Everything(),
+				IndexFields: []string{"spec.nodeName"},
+				Limit:       1,
+			},
+			expectedOut:    []example.Pod{*updatedPod},
+			expectRV:       currentRV,
+			expectContinue: !watchCacheEnabled,
+			expectContinueExact: func() string {
+				if watchCacheEnabled {
+					// TODO: index-backed cacher only scans the matching index bucket and omits the continue token when matching items equal limit.
+					return ""
+				}
+				return encodeContinueOrDie(updatedPod.Namespace+"/"+updatedPod.Name+"\x00", int64(mustAtoi(currentRV)))
+			}(),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
+		},
+		{
+			name:   "test List with indexed field selector returning one of multiple matching items, more pages in index",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Field:       fields.OneTermEqualSelector("spec.nodeName", ""),
+				Label:       labels.Everything(),
+				IndexFields: []string{"spec.nodeName"},
+				Limit:       1,
+			},
+			expectedOut:         []example.Pod{*createdPods[1]},
+			expectRV:            currentRV,
+			expectContinue:      true,
+			expectContinueExact: encodeContinueOrDie(createdPods[1].Namespace+"/"+createdPods[1].Name+"\x00", int64(mustAtoi(currentRV))),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
+		},
+		{
+			name:   "test List with indexed field selector returning all matching items at the end of list, no more pages",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Field:       fields.OneTermEqualSelector("spec.nodeName", ""),
+				Label:       labels.Everything(),
+				IndexFields: []string{"spec.nodeName"},
+				Limit:       4,
+			},
+			expectedOut:    []example.Pod{*createdPods[1], *createdPods[2], *createdPods[3], *createdPods[4]},
+			expectRV:       currentRV,
+			expectContinue: false,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
+		},
+		{
+			name:   "test List with indexed field selector and inconsistent continue returning single matching item, ensure only a single page returned",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Field:       fields.OneTermEqualSelector("spec.nodeName", "fakeNode"),
+				Label:       labels.Everything(),
+				IndexFields: []string{"spec.nodeName"},
+				Limit:       1,
+				Continue:    encodeContinueOrDie("a", -1),
+			},
+			expectedOut:    []example.Pod{*updatedPod},
+			expectRV:       currentRV,
+			expectContinue: !watchCacheEnabled || !utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot),
+			expectContinueExact: func() string {
+				if watchCacheEnabled && utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return ""
+				}
+				return encodeContinueOrDie(updatedPod.Namespace+"/"+updatedPod.Name+"\x00", int64(mustAtoi(currentRV)))
+			}(),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:   "/registry/pods/a",
+						Limit: 1,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with indexed field selector and inconsistent continue skipping first match, more pages in index",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Field:       fields.OneTermEqualSelector("spec.nodeName", ""),
+				Label:       labels.Everything(),
+				IndexFields: []string{"spec.nodeName"},
+				Limit:       1,
+				Continue:    encodeContinueOrDie(createdPods[1].Namespace+"/"+createdPods[1].Name+"\x00", -1),
+			},
+			expectedOut:         []example.Pod{*createdPods[2]},
+			expectRV:            currentRV,
+			expectContinue:      true,
+			expectContinueExact: encodeContinueOrDie(createdPods[2].Namespace+"/"+createdPods[2].Name+"\x00", int64(mustAtoi(currentRV))),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:   "/registry/pods/" + createdPods[1].Namespace + "/" + createdPods[1].Name + "\x00",
+						Limit: 1,
+					},
+				}
+			},
 		},
 		{
 			name:   "verify list does not return deleted object; filter for deleted object, page size equal to total list size with current resource version and match=NotOlderThan",
-			prefix: "/pods",
+			prefix: "/pods/",
 			pred: storage.SelectionPredicate{
 				Field: fields.OneTermEqualSelector("metadata.name", "baz"),
 				Label: labels.Everything(),
@@ -1026,11 +1641,803 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			rv:          "",
 			expectRV:    currentRV,
 			expectedOut: []example.Pod{},
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				return nil
+			},
+		},
+		{
+			name:         "test non-consistent List",
+			prefix:       "/pods/empty",
+			pred:         storage.Everything,
+			rv:           "0",
+			expectRVFunc: resourceVersionNotOlderThan(initialRV),
+			expectedOut:  []example.Pod{},
+		},
+		// match=Exact
+		{
+			name:           "test List with resource version set before first write, match=Exact",
+			prefix:         "/pods/",
+			pred:           storage.Everything,
+			rv:             initialRV,
+			rvMatch:        metav1.ResourceVersionMatchExact,
+			expectRVTooOld: true,
+		},
+		{
+			name:           "test List with compacted resource version of first write, match=Exact",
+			prefix:         "/pods/",
+			pred:           storage.Everything,
+			rv:             createdPods[0].ResourceVersion,
+			rvMatch:        metav1.ResourceVersionMatchExact,
+			expectRVTooOld: true,
+		},
+		{
+			name:        "test List with compacted resource version between first and second write, match=Exact",
+			prefix:      "/pods/",
+			pred:        storage.Everything,
+			expectedOut: []example.Pod{*createdPods[0]},
+			rv:          compactRV,
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectRV:    compactRV,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, compactRV),
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with compacted resource version between first and second write and limit, match=Exact",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+				Limit: 1,
+			},
+			expectedOut: []example.Pod{*createdPods[0]},
+			rv:          compactRV,
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectRV:    compactRV,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, compactRV),
+						Limit:    1,
+					},
+				}
+			},
+		},
+		{
+			name:        "test List with resource version of second write, match=Exact",
+			prefix:      "/pods/",
+			pred:        storage.Everything,
+			expectedOut: []example.Pod{*createdPods[0], *createdPods[1]},
+			rv:          createdPods[1].ResourceVersion,
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectRV:    createdPods[1].ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, createdPods[1].ResourceVersion),
+					},
+				}
+			},
+		},
+		{
+			name:        "test List with resource version of third write, match=Exact",
+			prefix:      "/pods/",
+			pred:        storage.Everything,
+			expectedOut: []example.Pod{*createdPods[0], *createdPods[1], *createdPods[2]},
+			rv:          createdPods[2].ResourceVersion,
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectRV:    createdPods[2].ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, createdPods[2].ResourceVersion),
+					},
+				}
+			},
+		},
+		{
+			name:        "test List with resource version of fourth write, match=Exact",
+			prefix:      "/pods/",
+			pred:        storage.Everything,
+			expectedOut: []example.Pod{*createdPods[0], *createdPods[1], *createdPods[2], *createdPods[3]},
+			rv:          createdPods[3].ResourceVersion,
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectRV:    createdPods[3].ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, createdPods[3].ResourceVersion),
+					},
+				}
+			},
+		},
+		{
+			name:        "test List with resource version of fifth write, match=Exact",
+			prefix:      "/pods/",
+			pred:        storage.Everything,
+			expectedOut: []example.Pod{*createdPods[0], *createdPods[1], *createdPods[2], *createdPods[3], *createdPods[4]},
+			rv:          createdPods[4].ResourceVersion,
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectRV:    createdPods[4].ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, createdPods[4].ResourceVersion),
+					},
+				}
+			},
+		},
+		{
+			name:        "test List with resource version of six write, match=Exact",
+			prefix:      "/pods/",
+			pred:        storage.Everything,
+			expectedOut: []example.Pod{*createdPods[0], *createdPods[1], *createdPods[2], *createdPods[3], *createdPods[4], *createdPods[5]},
+			rv:          createdPods[5].ResourceVersion,
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectRV:    createdPods[5].ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, createdPods[5].ResourceVersion),
+					},
+				}
+			},
+		},
+		{
+			name:        "test List with resource version of seventh write, match=Exact",
+			prefix:      "/pods/",
+			pred:        storage.Everything,
+			expectedOut: []example.Pod{*updatedPod, *createdPods[1], *createdPods[2], *createdPods[3], *createdPods[4], *createdPods[5]},
+			rv:          updatedPod.ResourceVersion,
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectRV:    updatedPod.ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, updatedPod.ResourceVersion),
+					},
+				}
+			},
+		},
+		{
+			name:        "test List with resource version of eight write, match=Exact",
+			prefix:      "/pods/",
+			pred:        storage.Everything,
+			expectedOut: []example.Pod{*updatedPod, *createdPods[1], *createdPods[2], *createdPods[3], *createdPods[4]},
+			rv:          fmt.Sprint(continueRV),
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectRV:    fmt.Sprint(continueRV),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: int64(continueRV),
+					},
+				}
+			},
+		},
+		{
+			name:        "test List with resource version after writes, match=Exact",
+			prefix:      "/pods/",
+			pred:        storage.Everything,
+			expectedOut: []example.Pod{*updatedPod, *createdPods[1], *createdPods[2], *createdPods[3], *createdPods[4]},
+			rv:          fmt.Sprint(continueRV + 1),
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectRV:    fmt.Sprint(continueRV + 1),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: int64(continueRV) + 1,
+					},
+				}
+			},
+		},
+		{
+			name:             "test List with future resource version, match=Exact",
+			prefix:           "/pods/",
+			pred:             storage.Everything,
+			rv:               fmt.Sprint(continueRV + 2),
+			rvMatch:          metav1.ResourceVersionMatchExact,
+			expectRVTooLarge: true,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: int64(continueRV) + 2,
+					},
+				}
+			},
+		},
+		// limit, match=Exact
+		{
+			name:   "test List with limit, resource version of second write, match=Exact",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+				Limit: 1,
+			},
+			expectedOut:                []example.Pod{*createdPods[0]},
+			rv:                         createdPods[1].ResourceVersion,
+			expectContinue:             true,
+			expectContinueExact:        encodeContinueOrDie(createdPods[0].Namespace+"/"+createdPods[0].Name+"\x00", int64(mustAtoi(createdPods[1].ResourceVersion))),
+			rvMatch:                    metav1.ResourceVersionMatchExact,
+			expectRV:                   createdPods[1].ResourceVersion,
+			expectedRemainingItemCount: ptr.To[int64](1),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, createdPods[1].ResourceVersion),
+						Limit:    1,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with limit, resource version of third write, match=Exact",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+				Limit: 2,
+			},
+			rv:                         createdPods[2].ResourceVersion,
+			rvMatch:                    metav1.ResourceVersionMatchExact,
+			expectedOut:                []example.Pod{*createdPods[0], *createdPods[1]},
+			expectContinue:             true,
+			expectContinueExact:        encodeContinueOrDie(createdPods[1].Namespace+"/"+createdPods[1].Name+"\x00", int64(mustAtoi(createdPods[2].ResourceVersion))),
+			expectRV:                   createdPods[2].ResourceVersion,
+			expectedRemainingItemCount: ptr.To[int64](1),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, createdPods[2].ResourceVersion),
+						Limit:    2,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with limit, resource version of fourth write, match=Exact",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+				Limit: 4,
+			},
+			rv:          createdPods[3].ResourceVersion,
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectedOut: []example.Pod{*createdPods[0], *createdPods[1], *createdPods[2], *createdPods[3]},
+			expectRV:    createdPods[3].ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, createdPods[3].ResourceVersion),
+						Limit:    4,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with limit, resource version of fifth write, match=Exact",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+				Limit: 1,
+			},
+			rv:                         createdPods[4].ResourceVersion,
+			rvMatch:                    metav1.ResourceVersionMatchExact,
+			expectedOut:                []example.Pod{*createdPods[0]},
+			expectRV:                   createdPods[4].ResourceVersion,
+			expectContinue:             true,
+			expectContinueExact:        encodeContinueOrDie(createdPods[0].Namespace+"/"+createdPods[0].Name+"\x00", int64(mustAtoi(createdPods[4].ResourceVersion))),
+			expectedRemainingItemCount: ptr.To[int64](4),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, createdPods[4].ResourceVersion),
+						Limit:    1,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with limit, resource version of six write, match=Exact",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+				Limit: 2,
+			},
+			rv:                         createdPods[5].ResourceVersion,
+			rvMatch:                    metav1.ResourceVersionMatchExact,
+			expectedOut:                []example.Pod{*createdPods[0], *createdPods[1]},
+			expectRV:                   createdPods[5].ResourceVersion,
+			expectContinue:             true,
+			expectContinueExact:        encodeContinueOrDie(createdPods[1].Namespace+"/"+createdPods[1].Name+"\x00", int64(mustAtoi(createdPods[5].ResourceVersion))),
+			expectedRemainingItemCount: ptr.To[int64](4),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, createdPods[5].ResourceVersion),
+						Limit:    2,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with limit, resource version of seventh write, match=Exact",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+				Limit: 4,
+			},
+			rv:                         updatedPod.ResourceVersion,
+			rvMatch:                    metav1.ResourceVersionMatchExact,
+			expectedOut:                []example.Pod{*updatedPod, *createdPods[1], *createdPods[5], *createdPods[2]},
+			expectRV:                   updatedPod.ResourceVersion,
+			expectContinue:             true,
+			expectContinueExact:        encodeContinueOrDie(createdPods[2].Namespace+"/"+createdPods[2].Name+"\x00", int64(mustAtoi(updatedPod.ResourceVersion))),
+			expectedRemainingItemCount: ptr.To[int64](2),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, updatedPod.ResourceVersion),
+						Limit:    4,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with limit, resource version of eight write, match=Exact",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+				Limit: 8,
+			},
+			expectedOut: []example.Pod{*updatedPod, *createdPods[1], *createdPods[2], *createdPods[3], *createdPods[4]},
+			rv:          fmt.Sprint(continueRV),
+			rvMatch:     metav1.ResourceVersionMatchExact,
+			expectRV:    fmt.Sprint(continueRV),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: int64(continueRV),
+						Limit:    8,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with limit, resource version after writes, match=Exact",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+				Limit: 1,
+			},
+			rv:                         fmt.Sprint(continueRV + 1),
+			rvMatch:                    metav1.ResourceVersionMatchExact,
+			expectedOut:                []example.Pod{*updatedPod},
+			expectRV:                   fmt.Sprint(continueRV + 1),
+			expectContinue:             true,
+			expectContinueExact:        encodeContinueOrDie(updatedPod.Namespace+"/"+updatedPod.Name+"\x00", int64(continueRV+1)),
+			expectedRemainingItemCount: ptr.To[int64](4),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: int64(continueRV) + 1,
+						Limit:    1,
+					},
+				}
+			},
+		},
+		// Continue
+		{
+			name:   "test List with continue, resource version before first write",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Limit:    1,
+				Continue: encodeContinueOrDie(createdPods[0].Namespace+"/"+createdPods[0].Name+"\x00", mustParseResourceVersion(t, initialRV)),
+			},
+			expectContinueTooOld: true,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, initialRV),
+						Limit:    4,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with continue, compacted resource version of first write",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Limit:    1,
+				Continue: encodeContinueOrDie(createdPods[0].Namespace+"/"+createdPods[0].Name+"\x00", mustParseResourceVersion(t, createdPods[0].ResourceVersion)),
+			},
+			expectContinueTooOld: true,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/",
+						Revision: mustParseResourceVersion(t, createdPods[0].ResourceVersion),
+						Limit:    4,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with continue, compacted resource version between first and second write",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Limit:    1,
+				Continue: encodeContinueOrDie(createdPods[0].Namespace+"/"+createdPods[0].Name+"\x00", mustParseResourceVersion(t, compactRV)),
+			},
+			expectedOut: []example.Pod{},
+			expectRV:    compactRV,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/first/bar\x00",
+						Revision: mustParseResourceVersion(t, compactRV),
+						Limit:    1,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with continue, resource version of second write",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Limit:    1,
+				Continue: encodeContinueOrDie(createdPods[0].Namespace+"/"+createdPods[0].Name+"\x00", int64(mustAtoi(createdPods[1].ResourceVersion))),
+			},
+			expectedOut: []example.Pod{*createdPods[1]},
+			expectRV:    createdPods[1].ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/first/bar\x00",
+						Revision: mustParseResourceVersion(t, createdPods[1].ResourceVersion),
+						Limit:    1,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with continue, resource version of third write",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Limit:    2,
+				Continue: encodeContinueOrDie(createdPods[1].Namespace+"/"+createdPods[1].Name+"\x00", int64(mustAtoi(createdPods[2].ResourceVersion))),
+			},
+			expectedOut: []example.Pod{*createdPods[2]},
+			expectRV:    createdPods[2].ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/second/bar\x00",
+						Revision: mustParseResourceVersion(t, createdPods[2].ResourceVersion),
+						Limit:    2,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with continue, resource version of fifth write",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Limit:    1,
+				Continue: encodeContinueOrDie(createdPods[0].Namespace+"/"+createdPods[0].Name+"\x00", int64(mustAtoi(createdPods[4].ResourceVersion))),
+			},
+			expectedOut:                []example.Pod{*createdPods[1]},
+			expectRV:                   createdPods[4].ResourceVersion,
+			expectContinue:             true,
+			expectContinueExact:        encodeContinueOrDie(createdPods[1].Namespace+"/"+createdPods[1].Name+"\x00", int64(mustAtoi(createdPods[4].ResourceVersion))),
+			expectedRemainingItemCount: ptr.To[int64](3),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/first/bar\x00",
+						Revision: mustParseResourceVersion(t, createdPods[4].ResourceVersion),
+						Limit:    1,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with continue, resource version of six write",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Limit:    2,
+				Continue: encodeContinueOrDie(createdPods[1].Namespace+"/"+createdPods[1].Name+"\x00", int64(mustAtoi(createdPods[5].ResourceVersion))),
+			},
+			expectedOut:                []example.Pod{*createdPods[5], *createdPods[2]},
+			expectRV:                   createdPods[5].ResourceVersion,
+			expectContinue:             true,
+			expectContinueExact:        encodeContinueOrDie(createdPods[2].Namespace+"/"+createdPods[2].Name+"\x00", int64(mustAtoi(createdPods[5].ResourceVersion))),
+			expectedRemainingItemCount: ptr.To[int64](2),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/second/bar\x00",
+						Revision: mustParseResourceVersion(t, createdPods[5].ResourceVersion),
+						Limit:    2,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with continue, resource version of seventh write",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Limit:    4,
+				Continue: encodeContinueOrDie(createdPods[2].Namespace+"/"+createdPods[2].Name+"\x00", int64(mustAtoi(updatedPod.ResourceVersion))),
+			},
+			expectedOut: []example.Pod{*createdPods[3], *createdPods[4]},
+			expectRV:    updatedPod.ResourceVersion,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/second/foo\x00",
+						Revision: mustParseResourceVersion(t, updatedPod.ResourceVersion),
+						Limit:    4,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with continue, resource version after writes",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Limit:    1,
+				Continue: encodeContinueOrDie(updatedPod.Namespace+"/"+updatedPod.Name+"\x00", int64(continueRV+1)),
+			},
+			expectedOut:                []example.Pod{*createdPods[1]},
+			expectRV:                   fmt.Sprint(continueRV + 1),
+			expectContinue:             true,
+			expectContinueExact:        encodeContinueOrDie(createdPods[1].Namespace+"/"+createdPods[1].Name+"\x00", int64(continueRV+1)),
+			expectedRemainingItemCount: ptr.To[int64](3),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:      "/registry/pods/first/bar\x00",
+						Revision: int64(continueRV) + 1,
+						Limit:    1,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with continue from second pod, negative resource version gives consistent read",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Continue: encodeContinueOrDie(createdPods[0].Namespace+"/"+createdPods[0].Name+"\x00", -1),
+			},
+			expectedOut: []example.Pod{*createdPods[1], *createdPods[2], *createdPods[3], *createdPods[4]},
+			expectRV:    currentRV,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key: "/registry/pods/first/bar\x00",
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with continue from second pod and limit, negative resource version gives consistent read",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Limit:    2,
+				Continue: encodeContinueOrDie(createdPods[0].Namespace+"/"+createdPods[0].Name+"\x00", -1),
+			},
+			expectedOut:                []example.Pod{*createdPods[1], *createdPods[2]},
+			expectContinue:             true,
+			expectContinueExact:        encodeContinueOrDie(createdPods[2].Namespace+"/"+createdPods[2].Name+"\x00", int64(continueRV+1)),
+			expectRV:                   currentRV,
+			expectedRemainingItemCount: ptr.To[int64](2),
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key:   "/registry/pods/first/bar\x00",
+						Limit: 2,
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with continue from third pod, negative resource version gives consistent read",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Continue: encodeContinueOrDie(createdPods[2].Namespace+"/"+createdPods[2].Name+"\x00", -1),
+			},
+			expectedOut: []example.Pod{*createdPods[3], *createdPods[4]},
+			expectRV:    currentRV,
+			expectCacherRequestsToEtcd: func() []RecordedList {
+				if utilfeature.DefaultFeatureGate.Enabled(features.ListFromCacheSnapshot) {
+					return nil
+				}
+				return []RecordedList{
+					{
+						Key: "/registry/pods/second/foo\x00",
+					},
+				}
+			},
+		},
+		{
+			name:   "test List with continue from empty fails",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Continue: encodeContinueOrDie("", int64(continueRV)),
+			},
+			expectError: true,
+		},
+		{
+			name:   "test List with continue from first pod, empty resource version fails",
+			prefix: "/pods/",
+			pred: storage.SelectionPredicate{
+				Label:    labels.Everything(),
+				Field:    fields.Everything(),
+				Continue: encodeContinueOrDie(createdPods[0].Namespace+"/"+createdPods[0].Name+"\x00", 0),
+			},
+			expectError: true,
+		},
+		{
+			name:   "test List with negative rv fails",
+			prefix: "/pods/",
+			rv:     "-1",
+			pred: storage.SelectionPredicate{
+				Label: labels.Everything(),
+				Field: fields.Everything(),
+			},
+			expectError: true,
 		},
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// For some asynchronous implementations of storage interface (in particular watchcache),
 			// certain requests may impact result of further requests. As an example, if we first
@@ -1041,7 +2448,7 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 			// doesn't automatically preclude some scenarios from happening.
 			t.Parallel()
 
-			if ignoreWatchCacheTests && tt.ignoreForWatchCache {
+			if watchCacheEnabled && tt.ignoreForWatchCache {
 				t.Skip()
 			}
 
@@ -1056,10 +2463,24 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 				Predicate:            tt.pred,
 				Recursive:            true,
 			}
-			err := store.GetList(ctx, tt.prefix, storageOpts, out)
+			recorderKey := t.Name()
+			listCtx := context.WithValue(ctx, RecorderContextKey, recorderKey)
+			err := store.GetList(listCtx, tt.prefix, storageOpts, out)
 			if tt.expectRVTooLarge {
-				if err == nil || !apierrors.IsTimeout(err) || !storage.IsTooLargeResourceVersion(err) {
-					t.Fatalf("expecting resource version too high error, but get: %s", err)
+				if !storage.IsTooLargeResourceVersion(err) {
+					t.Fatalf("expecting resource version too high error, but get: %v", err)
+				}
+				return
+			}
+			if tt.expectRVTooOld {
+				if err == nil || !strings.Contains(err.Error(), "The resourceVersion for the provided list is too old") {
+					t.Fatalf("expecting resource version too old error, but get: %v", err)
+				}
+				return
+			}
+			if tt.expectContinueTooOld {
+				if err == nil || !strings.Contains(err.Error(), "The provided continue parameter is too old to display a consistent list result") {
+					t.Fatalf("expecting continue too old error, but get: %v", err)
 				}
 				return
 			}
@@ -1077,6 +2498,10 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 				t.Errorf("unexpected continue token: %q", out.Continue)
 			}
 
+			if len(tt.expectContinueExact) > 0 {
+				ExpectContinueMatches(t, tt.expectContinueExact, out.Continue)
+			}
+
 			// If a client requests an exact resource version, it must be echoed back to them.
 			if tt.expectRV != "" {
 				if tt.expectRV != out.ResourceVersion {
@@ -1091,98 +2516,278 @@ func RunTestList(ctx context.Context, t *testing.T, store storage.Interface, com
 
 			if tt.expectedAlternatives == nil {
 				sort.Sort(sortablePodList(tt.expectedOut))
-				ExpectNoDiff(t, "incorrect list pods", tt.expectedOut, out.Items)
+				expectNoDiff(t, "incorrect list pods", tt.expectedOut, out.Items)
 			} else {
-				toInterfaceSlice := func(podLists [][]example.Pod) []interface{} {
-					result := make([]interface{}, 0, len(podLists))
-					for i := range podLists {
-						sort.Sort(sortablePodList(podLists[i]))
-						result = append(result, podLists[i])
-					}
-					return result
-				}
 				ExpectContains(t, "incorrect list pods", toInterfaceSlice(tt.expectedAlternatives), out.Items)
+			}
+			if !cmp.Equal(tt.expectedRemainingItemCount, out.RemainingItemCount) {
+				t.Fatalf("unexpected remainingItemCount, diff: %s", cmp.Diff(tt.expectedRemainingItemCount, out.RemainingItemCount))
+			}
+			if watchCacheEnabled {
+				var expectedListRequests []RecordedList
+				if tt.expectCacherRequestsToEtcd != nil {
+					expectedListRequests = tt.expectCacherRequestsToEtcd()
+				}
+				gotListRequests := recorder.ListRequestForKey(recorderKey)
+				if !cmp.Equal(expectedListRequests, gotListRequests) {
+					t.Fatalf("unexpected etcd list requests, diff: %s", cmp.Diff(expectedListRequests, gotListRequests))
+				}
 			}
 		})
 	}
 }
 
-func RunTestListWithoutPaging(ctx context.Context, t *testing.T, store storage.Interface) {
-	_, preset, err := seedMultiLevelData(ctx, store)
+func ExpectContinueMatches(t *testing.T, expect, got string) {
+	t.Helper()
+	if expect == got {
+		return
+	}
+	expectDecoded, err := base64.RawURLEncoding.DecodeString(expect)
+	if err != nil {
+		t.Errorf("expected continue token: %q, got: %q", expect, got)
+		return
+	}
+	gotDecoded, err := base64.RawURLEncoding.DecodeString(got)
+	if err != nil {
+		t.Errorf("expected continue token: %q, got: %q", expect, got)
+		return
+	}
+	t.Errorf("expected continue token: %s, got: %s", expectDecoded, gotDecoded)
+}
+
+// RunTestDeleteWithConflictAndMissingExpectedTransformOrDecodeError verifies that, when
+// ExpectTransformOrDecodeError is true, the delete will fail if a concurrent write makes it
+// possible to decode the object.
+func RunTestDeleteWithConflictAndMissingExpectedTransformOrDecodeError(ctx context.Context, t testing.TB, store storage.Interface, setFailing func(bool)) {
+	obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}}
+	key := computePodKey(obj)
+	out := &example.Pod{}
+	if err := store.Create(ctx, key, obj, out, 0); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// During validation (immediately before executing the optimistic delete transaction),
+	// simulate a concurrent update that both increases the current revision and allows the next
+	// TransformFromStorage/Decode to succeed.
+	validateCount := 0
+	injectUpdate := func(_ context.Context, _ runtime.Object) error {
+		validateCount++
+		if validateCount > 1 {
+			return nil
+		}
+
+		setFailing(false)
+
+		return store.GuaranteedUpdate(ctx, key, &example.Pod{}, false, nil,
+			storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+				pod := obj.(*example.Pod)
+				pod.Labels = map[string]string{"updated": "true"}
+				return pod, nil
+			}), nil)
+	}
+
+	// Initially, TransformFromStorage or Decode should fail.
+	setFailing(true)
+	// Watch goroutines can outlive the test; a store left failing panics them once
+	// decode errors become fatal again.
+	defer setFailing(false)
+
+	err := store.Delete(ctx, key, &example.Pod{}, nil, injectUpdate, nil,
+		storage.DeleteOptions{ExpectTransformOrDecodeError: true})
+	if !storage.IsInvalidObj(err) {
+		t.Fatalf("Expected Delete to return an 'Invalid Object' error: %v", err)
+	}
+}
+
+// RunTestDeleteExpectedTransformOrDecodeError tests that an object that cannot be transformed or
+// decoded from storage can be deleted using the ExpectTransformOrDecodeError option.
+func RunTestDeleteExpectedTransformOrDecodeError(ctx context.Context, t testing.TB, store storage.Interface, setFailing func(bool)) {
+	obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}}
+	key := computePodKey(obj)
+	out := &example.Pod{}
+	if err := store.Create(ctx, key, obj, out, 0); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	setFailing(true)
+	// Watch goroutines can outlive the test; a store left failing panics them once
+	// decode errors become fatal again.
+	defer setFailing(false)
+
+	// Simulate a conflicting update on the first attempt while ExpectTransformOrDecodeError is set,
+	// followed by a successful deletion on retry.
+	validateCount := 0
+	validateWithConflictUpdate := func(_ context.Context, _ runtime.Object) error {
+		validateCount++
+		if validateCount == 1 {
+			setFailing(false)
+			defer setFailing(true)
+			if err := store.GuaranteedUpdate(ctx, key, &example.Pod{}, false, nil,
+				storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+					pod := obj.(*example.Pod)
+					pod.ObjectMeta.Labels = map[string]string{"foo": "bar"}
+					return pod, nil
+				}), nil); err != nil {
+				t.Errorf("Unexpected failure during update: %v", err)
+			}
+		}
+		return nil
+	}
+
+	err := store.Delete(ctx, key, &example.Pod{}, nil, validateWithConflictUpdate, nil,
+		storage.DeleteOptions{ExpectTransformOrDecodeError: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	getAttrs := func(obj runtime.Object) (labels.Set, fields.Set, error) {
-		pod := obj.(*example.Pod)
-		return nil, fields.Set{"metadata.name": pod.Name}, nil
+	if validateCount != 2 {
+		t.Errorf("Expect validateCount = 2, but got %d", validateCount)
 	}
 
-	tests := []struct {
-		name                       string
-		disablePaging              bool
-		rv                         string
-		rvMatch                    metav1.ResourceVersionMatch
-		prefix                     string
-		pred                       storage.SelectionPredicate
-		expectedOut                []*example.Pod
-		expectContinue             bool
-		expectedRemainingItemCount *int64
-		expectError                bool
+	setFailing(false)
+	if err := store.Get(ctx, key, storage.GetOptions{}, &example.Pod{}); !storage.IsNotFound(err) {
+		t.Errorf("Unexpected error on reading object: %v", err)
+	}
+
+	// Simulate a conflicting background deletion while ExpectTransformOrDecodeError is set.
+	if err := store.Create(ctx, key, obj, out, 0); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	setFailing(true)
+	validateCount = 0
+	validateWithConflictDelete := func(_ context.Context, _ runtime.Object) error {
+		validateCount++
+		if validateCount == 1 {
+			if err := store.Delete(ctx, key, &example.Pod{}, nil, storage.ValidateAllObjectFunc, nil,
+				storage.DeleteOptions{ExpectTransformOrDecodeError: true}); err != nil {
+				t.Errorf("Unexpected failure during background deletion: %v", err)
+			}
+		}
+		return nil
+	}
+	err = store.Delete(ctx, key, &example.Pod{}, nil, validateWithConflictDelete, nil,
+		storage.DeleteOptions{ExpectTransformOrDecodeError: true})
+	if !storage.IsNotFound(err) {
+		t.Errorf("Expected not-found error when corrupt object is deleted concurrently, got: %v", err)
+	}
+	if validateCount != 1 {
+		t.Errorf("Expect validateCount = 1, but got %d", validateCount)
+	}
+}
+
+// RunTestDeleteWithSuggestionAndMissingExpectedTransformOrDecodeError verifies that, when
+// ExpectTransformOrDecodeError is true, passing a suggested object does not bypass transformation
+// or decoding of the serialized object in storage.
+func RunTestDeleteWithSuggestionAndMissingExpectedTransformOrDecodeError(ctx context.Context, t testing.TB, store storage.Interface) {
+	obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}}
+	key := computePodKey(obj)
+	out := &example.Pod{}
+	if err := store.Create(ctx, key, obj, out, 0); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	err := store.Delete(ctx, key, &example.Pod{}, nil, storage.ValidateAllObjectFunc, out,
+		storage.DeleteOptions{ExpectTransformOrDecodeError: true})
+	if !storage.IsInvalidObj(err) {
+		t.Fatalf("Expected Delete to return an 'Invalid Object' error: %v", err)
+	}
+}
+
+func RunTestConsistentList(ctx context.Context, t *testing.T, store storage.Interface, increaseRV IncreaseRVFunc, cacheEnabled, consistentReadsSupported, listFromCacheSnapshot bool) {
+	outPod := &example.Pod{}
+	inPod := &example.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "foo"}}
+	err := store.Create(ctx, computePodKey(inPod), inPod, outPod, 0)
+	require.NoError(t, err)
+	lastResourceWriteRV, err := strconv.Atoi(outPod.ResourceVersion)
+	require.NoError(t, err)
+
+	increaseRV(ctx, t)
+	consistentRV := lastResourceWriteRV + 1
+	cacheSyncRV := 0
+
+	tcs := []struct {
+		name               string
+		requestRV          string
+		continueToken      string
+		validateResponseRV func(*testing.T, int)
 	}{
 		{
-			name:          "test List with limit when paging disabled",
-			disablePaging: true,
-			prefix:        "/pods/second/",
-			pred: storage.SelectionPredicate{
-				Label: labels.Everything(),
-				Field: fields.Everything(),
-				Limit: 1,
+			name:      "Non-consistent list before consistent read",
+			requestRV: "0",
+			validateResponseRV: func(t *testing.T, rv int) {
+				if cacheEnabled {
+					// Cache might not yet observed write
+					assert.LessOrEqual(t, rv, lastResourceWriteRV)
+				} else {
+					// Etcd should always be up to date with consistent RV
+					assert.Equal(t, consistentRV, rv)
+				}
 			},
-			expectedOut:    []*example.Pod{preset[1], preset[2]},
-			expectContinue: false,
+		},
+		{
+			name:      "LIST without RV returns consistent RV",
+			requestRV: "",
+			validateResponseRV: func(t *testing.T, rv int) {
+				assert.Equal(t, consistentRV, rv)
+				cacheSyncRV = rv
+			},
+		},
+		{
+			name:          "List with negative continue RV returns consistent RV",
+			continueToken: encodeContinueOrDie("/pods/a", -1),
+			validateResponseRV: func(t *testing.T, rv int) {
+				assert.Equal(t, consistentRV, rv)
+				if listFromCacheSnapshot {
+					cacheSyncRV = rv
+				}
+			},
+		},
+		{
+			name:      "Non-consistent request after consistent read",
+			requestRV: "0",
+			validateResponseRV: func(t *testing.T, rv int) {
+				if cacheEnabled {
+					if consistentReadsSupported {
+						// Consistent read will sync cache
+						assert.Equal(t, cacheSyncRV, rv)
+					} else {
+						// Without consisten reads cache is not synced
+						assert.LessOrEqual(t, rv, lastResourceWriteRV)
+					}
+				} else {
+					// Etcd always points to newest RV
+					assert.Equal(t, consistentRV, rv)
+				}
+			},
 		},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.pred.GetAttrs == nil {
-				tt.pred.GetAttrs = getAttrs
-			}
-
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
 			out := &example.PodList{}
-			storageOpts := storage.ListOptions{
-				ResourceVersion:      tt.rv,
-				ResourceVersionMatch: tt.rvMatch,
-				Predicate:            tt.pred,
-				Recursive:            true,
+			opts := storage.ListOptions{
+				Recursive:       true,
+				ResourceVersion: tc.requestRV,
+				Predicate: storage.SelectionPredicate{
+					Label:    labels.Everything(),
+					Field:    fields.Everything(),
+					Continue: tc.continueToken,
+				},
 			}
+			err = store.GetList(ctx, "/pods/empty", opts, out)
+			require.NoError(t, err)
 
-			if err := store.GetList(ctx, tt.prefix, storageOpts, out); err != nil {
-				t.Fatalf("GetList failed: %v", err)
-				return
-			}
-			if (len(out.Continue) > 0) != tt.expectContinue {
-				t.Errorf("unexpected continue token: %q", out.Continue)
-			}
-
-			if len(tt.expectedOut) != len(out.Items) {
-				t.Fatalf("length of list want=%d, got=%d", len(tt.expectedOut), len(out.Items))
-			}
-			if diff := cmp.Diff(tt.expectedRemainingItemCount, out.ListMeta.GetRemainingItemCount()); diff != "" {
-				t.Errorf("incorrect remainingItemCount: %s", diff)
-			}
-			for j, wantPod := range tt.expectedOut {
-				getPod := &out.Items[j]
-				ExpectNoDiff(t, fmt.Sprintf("%s: incorrect pod", tt.name), wantPod, getPod)
-			}
+			parsedOutRV, err := strconv.Atoi(out.ResourceVersion)
+			require.NoError(t, err)
+			tc.validateResponseRV(t, parsedOutRV)
 		})
+		// Update RV on each read to test multiple reads for consistent RV.
+		increaseRV(ctx, t)
+		consistentRV++
 	}
 }
 
 // seedMultiLevelData creates a set of keys with a multi-level structure, returning a resourceVersion
 // from before any were created along with the full set of objects that were persisted
-func seedMultiLevelData(ctx context.Context, store storage.Interface) (string, []*example.Pod, error) {
+func seedMultiLevelData(ctx context.Context, t *testing.T, store storage.Interface, compact Compaction) (initialRV, compactRV string, created []*example.Pod, updated *example.Pod, err error) {
 	// Setup storage with the following structure:
 	//  /
 	//   - first/
@@ -1236,16 +2841,21 @@ func seedMultiLevelData(ctx context.Context, store storage.Interface) (string, [
 
 	// we want to figure out the resourceVersion before we create anything
 	initialList := &example.PodList{}
-	if err := store.GetList(ctx, "/pods", storage.ListOptions{Predicate: storage.Everything, Recursive: true}, initialList); err != nil {
-		return "", nil, fmt.Errorf("failed to determine starting resourceVersion: %w", err)
+	if err := store.GetList(ctx, "/pods/", storage.ListOptions{Predicate: storage.Everything, Recursive: true}, initialList); err != nil {
+		return "", "", nil, nil, fmt.Errorf("failed to determine starting resourceVersion: %w", err)
 	}
-	initialRV := initialList.ResourceVersion
+	initialRV = initialList.ResourceVersion
 
 	for i, ps := range preset {
 		preset[i].storedObj = &example.Pod{}
 		err := store.Create(ctx, ps.key, ps.obj, preset[i].storedObj, 0)
 		if err != nil {
-			return "", nil, fmt.Errorf("failed to create object: %w", err)
+			return "", "", nil, nil, fmt.Errorf("failed to create object: %w", err)
+		}
+		if i == 0 {
+			// Advance revision before creating the second object so there is a non-pod revision strictly between createdPods[0] and createdPods[1].
+			compact(ctx, t, initialRV)
+			compactRV = fmt.Sprintf("%d", mustParseResourceVersion(t, preset[0].storedObj.ResourceVersion)+1)
 		}
 	}
 
@@ -1253,33 +2863,31 @@ func seedMultiLevelData(ctx context.Context, store storage.Interface) (string, [
 	// it by changing its spec.nodeName. The point of doing this is to be able to
 	// test that if a pod with key /pods/first/bar is in fact returned, the returned
 	// pod is the updated one (i.e. with spec.nodeName changed).
-	preset[0].storedObj = &example.Pod{}
-	if err := store.GuaranteedUpdate(ctx, computePodKey(barFirst), preset[0].storedObj, true, nil,
+	updated = &example.Pod{}
+	if err := store.GuaranteedUpdate(ctx, computePodKey(barFirst), updated, true, nil,
 		func(input runtime.Object, _ storage.ResponseMeta) (output runtime.Object, ttl *uint64, err error) {
 			pod := input.(*example.Pod).DeepCopy()
 			pod.Spec.NodeName = "fakeNode"
 			return pod, nil, nil
 		}, nil); err != nil {
-		return "", nil, fmt.Errorf("failed to update object: %w", err)
+		return "", "", nil, nil, fmt.Errorf("failed to update object: %w", err)
 	}
 
 	// We now delete bazSecond provided it has been created first. We do this to enable
 	// testing cases that had an object exist initially and then was deleted and how this
 	// would be reflected in responses of different calls.
-	if err := store.Delete(ctx, computePodKey(bazSecond), preset[len(preset)-1].storedObj, nil, storage.ValidateAllObjectFunc, nil); err != nil {
-		return "", nil, fmt.Errorf("failed to delete object: %w", err)
+	storedObj := &example.Pod{}
+	if err := store.Delete(ctx, computePodKey(bazSecond), storedObj, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{}); err != nil {
+		return "", "", nil, nil, fmt.Errorf("failed to delete object: %w", err)
 	}
 
-	// Since we deleted bazSecond (last element of preset), we remove it from preset.
-	preset = preset[:len(preset)-1]
-	var created []*example.Pod
 	for _, item := range preset {
 		created = append(created, item.storedObj)
 	}
-	return initialRV, created, nil
+	return initialRV, compactRV, created, updated, nil
 }
 
-func RunTestGetListNonRecursive(ctx context.Context, t *testing.T, store storage.Interface) {
+func RunTestGetListNonRecursive(ctx context.Context, t *testing.T, increaseRV IncreaseRVFunc, store storage.Interface) {
 	key, prevStoredObj := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}})
 	prevRV, _ := strconv.Atoi(prevStoredObj.ResourceVersion)
 
@@ -1292,7 +2900,9 @@ func RunTestGetListNonRecursive(ctx context.Context, t *testing.T, store storage
 		}, nil); err != nil {
 		t.Fatalf("update failed: %v", err)
 	}
-	currentRV, _ := strconv.Atoi(storedObj.ResourceVersion)
+	objRV, _ := strconv.Atoi(storedObj.ResourceVersion)
+	// Increase RV to test consistent List.
+	increaseRV(ctx, t)
 
 	tests := []struct {
 		name                 string
@@ -1326,13 +2936,13 @@ func RunTestGetListNonRecursive(ctx context.Context, t *testing.T, store storage
 		key:         key,
 		pred:        storage.Everything,
 		expectedOut: []example.Pod{*storedObj},
-		rv:          fmt.Sprintf("%d", currentRV),
+		rv:          fmt.Sprintf("%d", objRV),
 	}, {
 		name:        "existing key, resourceVersion=current, resourceVersionMatch=notOlderThan",
 		key:         key,
 		pred:        storage.Everything,
 		expectedOut: []example.Pod{*storedObj},
-		rv:          fmt.Sprintf("%d", currentRV),
+		rv:          fmt.Sprintf("%d", objRV),
 		rvMatch:     metav1.ResourceVersionMatchNotOlderThan,
 	}, {
 		name:                 "existing key, resourceVersion=previous, resourceVersionMatch=notOlderThan",
@@ -1346,7 +2956,7 @@ func RunTestGetListNonRecursive(ctx context.Context, t *testing.T, store storage
 		key:         key,
 		pred:        storage.Everything,
 		expectedOut: []example.Pod{*storedObj},
-		rv:          fmt.Sprintf("%d", currentRV),
+		rv:          fmt.Sprintf("%d", objRV),
 		rvMatch:     metav1.ResourceVersionMatchExact,
 	}, {
 		name:        "existing key, resourceVersion=previous, resourceVersionMatch=exact",
@@ -1364,12 +2974,12 @@ func RunTestGetListNonRecursive(ctx context.Context, t *testing.T, store storage
 		expectRVTooLarge: true,
 	}, {
 		name:        "non-existing key",
-		key:         "/non-existing",
+		key:         "/pods/non-existing",
 		pred:        storage.Everything,
 		expectedOut: []example.Pod{},
 	}, {
 		name: "with matching pod name",
-		key:  "/non-existing",
+		key:  "/pods/non-existing",
 		pred: storage.SelectionPredicate{
 			Label: labels.Everything(),
 			Field: fields.ParseSelectorOrDie("metadata.name!=" + storedObj.Name),
@@ -1379,10 +2989,22 @@ func RunTestGetListNonRecursive(ctx context.Context, t *testing.T, store storage
 			},
 		},
 		expectedOut: []example.Pod{},
+	}, {
+		name: "existing key, resourceVersion=current, with not matching pod name",
+		key:  key,
+		pred: storage.SelectionPredicate{
+			Label: labels.Everything(),
+			Field: fields.ParseSelectorOrDie("metadata.name!=" + storedObj.Name),
+			GetAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
+				pod := obj.(*example.Pod)
+				return nil, fields.Set{"metadata.name": pod.Name}, nil
+			},
+		},
+		expectedOut: []example.Pod{},
+		rv:          fmt.Sprintf("%d", objRV),
 	}}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// For some asynchronous implementations of storage interface (in particular watchcache),
 			// certain requests may impact result of further requests. As an example, if we first
@@ -1417,18 +3039,547 @@ func RunTestGetListNonRecursive(ctx context.Context, t *testing.T, store storage
 			}
 
 			if tt.expectedAlternatives == nil {
-				ExpectNoDiff(t, "incorrect list pods", tt.expectedOut, out.Items)
+				expectNoDiff(t, "incorrect list pods", tt.expectedOut, out.Items)
 			} else {
-				toInterfaceSlice := func(podLists [][]example.Pod) []interface{} {
-					result := make([]interface{}, 0, len(podLists))
-					for i := range podLists {
-						result = append(result, podLists[i])
-					}
-					return result
-				}
 				ExpectContains(t, "incorrect list pods", toInterfaceSlice(tt.expectedAlternatives), out.Items)
 			}
 		})
+	}
+}
+
+// RunTestGetListRecursivePrefix tests how recursive parameter works for object keys that are prefixes of each other.
+func RunTestGetListRecursivePrefix(ctx context.Context, t *testing.T, store storage.Interface) {
+	fooKey, fooObj := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}})
+	fooBarKey, fooBarObj := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foobar", Namespace: "test-ns"}})
+	_, otherNamespaceObj := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "baz", Namespace: "test-ns2"}})
+	lastRev := otherNamespaceObj.ResourceVersion
+
+	tests := []struct {
+		name        string
+		key         string
+		recursive   bool
+		expectedOut []example.Pod
+	}{
+		{
+			name:        "NonRecursive on resource prefix doesn't return any objects",
+			key:         "/pods/",
+			recursive:   false,
+			expectedOut: []example.Pod{},
+		},
+		{
+			name:        "Recursive on resource prefix returns all objects",
+			key:         "/pods/",
+			recursive:   true,
+			expectedOut: []example.Pod{*fooObj, *fooBarObj, *otherNamespaceObj},
+		},
+		{
+			name:        "NonRecursive on namespace prefix doesn't return any objects",
+			key:         "/pods/test-ns/",
+			recursive:   false,
+			expectedOut: []example.Pod{},
+		},
+		{
+			name:        "Recursive on resource prefix returns objects in the namespace",
+			key:         "/pods/test-ns/",
+			recursive:   true,
+			expectedOut: []example.Pod{*fooObj, *fooBarObj},
+		},
+		{
+			name:        "NonRecursive on object key (prefix) returns object and no other objects with the same prefix",
+			key:         fooKey,
+			recursive:   false,
+			expectedOut: []example.Pod{*fooObj},
+		},
+		{
+			name:        "Recursive on object key (prefix) doesn't return anything",
+			key:         fooKey,
+			recursive:   true,
+			expectedOut: []example.Pod{},
+		},
+		{
+			name:        "NonRecursive on object key (no-prefix) return object",
+			key:         fooBarKey,
+			recursive:   false,
+			expectedOut: []example.Pod{*fooBarObj},
+		},
+		{
+			name:        "Recursive on object key (no-prefix) doesn't return anything",
+			key:         fooBarKey,
+			recursive:   true,
+			expectedOut: []example.Pod{},
+		},
+	}
+
+	listTypes := []struct {
+		name            string
+		ResourceVersion string
+		Match           metav1.ResourceVersionMatch
+	}{
+		{
+			name:            "Exact",
+			ResourceVersion: lastRev,
+			Match:           metav1.ResourceVersionMatchExact,
+		},
+		{
+			name:            "Consistent",
+			ResourceVersion: "",
+		},
+		{
+			name:            "NotOlderThan",
+			ResourceVersion: "0",
+			Match:           metav1.ResourceVersionMatchNotOlderThan,
+		},
+	}
+
+	for _, listType := range listTypes {
+		t.Run(listType.name, func(t *testing.T) {
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					out := &example.PodList{}
+					storageOpts := storage.ListOptions{
+						ResourceVersion:      listType.ResourceVersion,
+						ResourceVersionMatch: listType.Match,
+						Recursive:            tt.recursive,
+						Predicate:            storage.Everything,
+					}
+					err := store.GetList(ctx, tt.key, storageOpts, out)
+					if err != nil {
+						t.Fatalf("GetList failed: %v", err)
+					}
+					expectNoDiff(t, "incorrect list pods", tt.expectedOut, out.Items)
+				})
+			}
+		})
+	}
+}
+
+// errorInjector decides, per object storage key, whether transformation should
+// fail and with which error. Returning nil delegates to default behavior.
+type errorInjector func(key string) error
+
+// idOf extracts the numeric suffix from an object key like ".../foo-000002" -> 2.
+func idOf(t *testing.T, key string) int {
+	t.Helper()
+	name := key[strings.LastIndex(key, "/")+1:]
+	n, err := strconv.Atoi(strings.TrimPrefix(name, "foo-"))
+	if err != nil {
+		t.Fatalf("failed to parse the object id from key %q: %v", key, err)
+	}
+	return n
+}
+
+// errInjectingTransformer wraps an existing transformer and lets an errorInjector
+// fail transformation for selected keys on read. Writes (TransformToStorage)
+// delegate to the embedded transformer.
+type errInjectingTransformer struct {
+	value.Transformer
+	inject errorInjector
+}
+
+func (t *errInjectingTransformer) TransformFromStorage(ctx context.Context, data []byte, dataCtx value.Context) (out []byte, stale bool, err error) {
+	if injErr := t.inject(string(dataCtx.AuthenticatedData())); injErr != nil {
+		return nil, false, injErr
+	}
+	return t.Transformer.TransformFromStorage(ctx, data, dataCtx)
+}
+
+func newErrInjectingModifier(inject errorInjector) TransformerModifier {
+	return func(orig value.Transformer) value.Transformer {
+		return &errInjectingTransformer{Transformer: orig, inject: inject}
+	}
+}
+
+// RunTestGetListWithErrorAggregation tests aggregation of errors while the list operation is in progress
+func RunTestGetListWithErrorAggregation(ctx context.Context, t *testing.T, store InterfaceWithTransformerOverride, corruptErr error) {
+	// the test creates n objects and assigns each object unique id i ie. 1 <= i <= n
+	objNameFn := func(id int) string {
+		// pad with leading zeros so that for i, j where i < j, object
+		// foo-{j} follows object foo-{i} in lexicographical order
+		return fmt.Sprintf("foo-%06d", id)
+	}
+	keyFn := func(prefix string, id int) string {
+		return fmt.Sprintf("%s%s", prefix, objNameFn(id))
+	}
+
+	// errUnexpected is a non-corrupt transform error. The aggregator treats it as
+	// fatal and aborts the list, unlike corruptErr which is collected.
+	errUnexpected := errors.New("bits flipped")
+
+	tests := []struct {
+		name string
+		// number of Pod objects to be created when the test starts, the
+		// objects are named as "foo-{i}" where 1 <= i <= n
+		n int
+		// inject decides, per object key, whether transformation fails and with
+		// which error. Returning nil means the object transforms normally.
+		inject func(t *testing.T, key string) error
+		// verifies the result from GetList
+		// list: result of GetList operation is saved into list
+		// err: error returned from GetList
+		verifier func(t *testing.T, prefix string, list *example.PodList, err error)
+	}{
+		{
+			name: "first error is an unexpected error, no aggregation expected",
+			// we initially create n=7 objects with ids {1, 2, 3 ... 7}, they are put in the following disjoint sets:
+			// - good: {1, 3, 5, 7}, these objects will never become corrupt
+			// - unexpected: {2}, this object is marked to yield an unexpected error (not corruptObjErr)
+			// - corrupt: {4, 6}, these objects are marked to become corrupt
+			n: 7,
+			inject: func(t *testing.T, key string) error {
+				switch id := idOf(t, key); {
+				case id == 2:
+					return errUnexpected
+				case id%2 == 0:
+					return corruptErr
+				default:
+					return nil
+				}
+			},
+			// the following sequence of events are expected to occur in order while retrieving the n objects:
+			//
+			// -- |- 1: no error, successfully decoded
+			//    |- 2: unexpected error, GetList aborts
+			//
+			//  a) GetList encounters an unexpected (not corruptObjErr)
+			//  error while retrieving {2} and immediately aborts
+			//  b) GetList successfully decodes {1}
+			verifier: func(t *testing.T, _ string, list *example.PodList, err error) {
+				// a) the error returned from GetList should be a bare
+				// storage.InternalError, not wrapped — proves no aggregation
+				// nolint:errorlint // the aggregator should return the error as is
+				if _, ok := err.(storage.InternalError); !ok {
+					t.Fatalf("expected the error to be %T, but got: %#v", storage.InternalError{}, err)
+				}
+
+				// b) GetList should successfully decode object 1 from the good set
+				if want, got := 1, len(list.Items); want != got {
+					t.Fatalf("expected the list to have %d item(s), but got: %d", want, got)
+				}
+				if want, got := objNameFn(1), list.Items[0].Name; want != got {
+					t.Errorf("expected an object name of %q, but got: %q", want, got)
+				}
+			},
+		},
+		{
+			name: "feature enabled, should aggregate corrupt object errors",
+
+			// we initially create n=7 objects with ids {1, 2, 3 ... 7}, they are put in the following disjoint sets:
+			// - good: {1, 3, 5, 7}, these objects will never become corrupt
+			// - corrupt: {2, 4, 6}, these objects are marked to become corrupt
+			n: 7,
+			inject: func(t *testing.T, key string) error {
+				if idOf(t, key)%2 == 0 {
+					return corruptErr
+				}
+				return nil
+			},
+			// while retrieving the n objects, we expect the following from GetList:
+			//  a) GetList encounters corruptObjErr while retrieving objects in the corrupt set
+			//  b) GetList successfully decodes object(s) in the good set
+			verifier: func(t *testing.T, prefix string, list *example.PodList, listErr error) {
+				// the error returned from GetList should be an API status object
+				var statusGot apierrors.APIStatus
+				if !errors.As(listErr, &statusGot) {
+					t.Fatalf("expected an API status error object, but got: %v", listErr)
+				}
+
+				details := statusGot.Status().Details
+				corrupt := []string{keyFn(prefix, 2), keyFn(prefix, 4), keyFn(prefix, 6)}
+				// a) all the corruptObjErr errors should be aggregated
+				if details == nil || len(details.Causes) != len(corrupt) {
+					t.Fatalf("expected the API status to include the corrupt object errors, but got: %v", details)
+				}
+				for i, key := range corrupt {
+					if want, got := key, details.Causes[i].Field; want != got {
+						t.Errorf("expected an object name of %q, but got: %q", want, got)
+					}
+				}
+
+				// b) GetList should successfully decode all objects in the good set
+				good := []int{1, 3, 5, 7}
+				if want, got := len(good), len(list.Items); want != got {
+					t.Fatalf("expected the list to have %d item(s), but got: %d", want, got)
+				}
+				for i, id := range good {
+					if want, got := objNameFn(id), list.Items[i].Name; want != got {
+						t.Errorf("expected an object name of %q, but got: %q", want, got)
+					}
+				}
+			},
+		},
+		{
+			name: "feature enabled, aggregation should abort as soon as it encounters an unexpected error",
+
+			// we initially create n=7 objects with ids {1, 2, 3 ... 7}, they are put in the following disjoint sets:
+			// - good: {1, 3, 5, 7}, these objects will never become corrupt
+			// - unexpected: {4}, this object is marked to yield an unexpected error (not corruptObjErr)
+			// - corrupt: {2, 6}, these objects are marked to become corrupt
+			n: 7,
+			inject: func(t *testing.T, key string) error {
+				switch id := idOf(t, key); {
+				case id == 4:
+					return errUnexpected
+				case id%2 == 0:
+					return corruptErr
+				default:
+					return nil
+				}
+			},
+			// the following sequence of events are expected to occur in order while retrieving the n objects:
+			//
+			// --|- 1: no error, successfully decoded
+			//   |- 2: yields an expected corruptObjErr, GetList aggregates this error
+			//   |- 3: no error, successfully decoded
+			//   |- 4: unexpected error, GetList aborts
+			//
+			//  a) GetList encounters a corruptObjErr error while retrieving {2} in the corrupt set
+			//  b) GetList encounters an unexpected (not corruptObjErr) error while
+			//  retrieving {4} in the unexpected set, and immediately aborts
+			//  c) GetList successfully decodes {1,3} in the good set before it aborts
+			verifier: func(t *testing.T, prefix string, list *example.PodList, err error) {
+				// the error returned from GetList should be an API status object
+				var statusGot apierrors.APIStatus
+				if !errors.As(err, &statusGot) {
+					t.Fatalf("expected an API status error object, but got: %v", err)
+				}
+
+				details := statusGot.Status().Details
+				// a) the corrupt error from {2} plus the unexpected abort error from {4}
+				// should both be surfaced as causes
+				if details == nil || len(details.Causes) != 2 {
+					t.Fatalf("expected 2 causes (1 corrupt + 1 abort), but got: %v", details)
+				}
+				if want, got := keyFn(prefix, 2), details.Causes[0].Field; want != got {
+					t.Errorf("expected corrupt object key %q, but got: %q", want, got)
+				}
+				if want, got := metav1.CauseTypeUnexpectedServerResponse, details.Causes[1].Type; want != got {
+					t.Errorf("expected abort cause type %q, but got: %q", want, got)
+				}
+
+				// b) verify that GetList successfully decodes objects before the abort
+				ids := []int{1, 3}
+				if want, got := len(ids), len(list.Items); want != got {
+					t.Errorf("expected GetList to successfully decode %d object(s), but got: %d", want, got)
+				}
+				for i, id := range ids {
+					if want, got := objNameFn(id), list.Items[i].Name; want != got {
+						t.Errorf("expected an object name of %q, but got: %q", want, got)
+					}
+				}
+			},
+		},
+		{
+			name: "feature enabled, error aggregation should not exceed the maximum limit",
+
+			// aggregation limit is currently hard coded to 100
+			// we initially create n=210 objects with ids {1, 2, 3 ... 210}, they are put in the following disjoint sets:
+			// - good: {1, 3, 5 ... 195, 197, 199, ... 207, 209}, these 105 objects will never become corrupt
+			// - corrupt: {2, 4, 6 ... 196, 198, 200, ... 208, 210}, these 105 objects are marked to become corrupt
+			n: 210,
+			inject: func(t *testing.T, key string) error {
+				if idOf(t, key)%2 == 0 {
+					return corruptErr
+				}
+				return nil
+			},
+			// while listing the n objects, we expect the following:
+			//  a) GetList continues to aggregate the corruptObjErr errors
+			//  until it reaches the maximum limit, and then it immediately aborts
+			//  b) GetList successfully decodes the first 100 objects in the good set into list
+			verifier: func(t *testing.T, _ string, list *example.PodList, err error) {
+				// must match the aggregation limit that etcd3 configures via
+				// corruptObjErrAggregatorFactory when the feature is enabled
+				limit := 100
+				var statusGot apierrors.APIStatus
+				if !errors.As(err, &statusGot) {
+					t.Fatalf("expected an API status error object, but got: %v", err)
+				}
+				details := statusGot.Status().Details
+				// a) the returned error should contain limit+1 causes:
+				// limit corrupt errors + the sentinel "too many" entry
+				if want := limit + 1; details == nil || len(details.Causes) != want {
+					t.Fatalf("expected %d causes (limit + sentinel), but got: %d", want, len(details.Causes))
+				}
+				want := metav1.StatusCause{
+					Type:    metav1.CauseTypeTooMany,
+					Message: "too many errors, the list is truncated",
+				}
+				if got := details.Causes[limit]; !cmp.Equal(want, got) {
+					t.Errorf("expected the sentinel error, diff: %s", cmp.Diff(want, got))
+				}
+
+				// b) before the limit is hit and GetList aborts, it successfully decodes 100 objects
+				if want, got := limit, len(list.Items); want != got {
+					t.Errorf("expected GetList to successfully decode %d object(s), but got: %d", want, got)
+				}
+			},
+		},
+		{
+			name: "feature enabled, there are exactly 100 (error aggregation limit) corrupt errors",
+
+			// aggregation limit is currently hard coded to 100
+			// we initially create n=100 objects with ids {1, 2, 3 ... 100}, they are put in the following disjoint sets:
+			// - good: {}, all the objects are marked to become corrupt
+			// - corrupt: {1, 2, 3 ... 99, 100}, these objects are marked to become corrupt
+			n:      100,
+			inject: func(t *testing.T, key string) error { return corruptErr },
+			//  while listing the n objects, we expect the following:
+			//  a) GetList continues to aggregate the corruptObjErr errors
+			//  until it reaches the maximum limit, and then it immediately aborts
+			//  b) GetList successfully decodes zero objects
+			verifier: func(t *testing.T, _ string, list *example.PodList, err error) {
+				// must match the aggregation limit that etcd3 configures via
+				// corruptObjErrAggregatorFactory when the feature is enabled
+				limit := 100
+				var statusGot apierrors.APIStatus
+				if !errors.As(err, &statusGot) {
+					t.Fatalf("expected an API status error object, but got: %v", err)
+				}
+				// a) the returned error should contain limit+1 causes:
+				// limit corrupt errors + the sentinel "too many" entry
+				details := statusGot.Status().Details
+				if want := limit + 1; details == nil || len(details.Causes) != want {
+					t.Fatalf("expected %d causes (limit + sentinel), but got: %d", want, len(details.Causes))
+				}
+				want := metav1.StatusCause{
+					Type:    metav1.CauseTypeTooMany,
+					Message: "too many errors, the list is truncated",
+				}
+				if got := details.Causes[limit]; !cmp.Equal(want, got) {
+					t.Errorf("expected the sentinel error, diff: %s", cmp.Diff(want, got))
+				}
+
+				// b) all objects are corrupt, so GetList should decode 0 objects
+				if want, got := 0, len(list.Items); want != got {
+					t.Errorf("expected GetList to successfully decode %d object(s), but got: %d", want, got)
+				}
+			},
+		},
+	}
+
+	for i, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ns := fmt.Sprintf("ns-%d", i)
+			prefix := fmt.Sprintf("/pods/%s/", ns)
+
+			// Step 1: add N objects to the store foo-{1 ... n}
+			// we construct the names of the objects in a way that ensures
+			// that the order of creation is also the lexicographical
+			// order by which etcd List operation returns the objects
+			for j := 1; j <= test.n; j++ {
+				obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{
+					Name:      objNameFn(j),
+					Namespace: ns,
+				}}
+				if err := store.Create(ctx, computePodKey(obj), obj, &example.Pod{}, 0); err != nil {
+					t.Fatalf("Create failed: %v", err)
+				}
+			}
+
+			// step 2: list the N objects, we expect no error
+			out := &example.PodList{}
+			storageOpts := storage.ListOptions{
+				Predicate: storage.Everything,
+				Recursive: true,
+			}
+			err := store.GetList(ctx, prefix, storageOpts, out)
+			if err != nil {
+				t.Fatalf("GetList failed with unexpected error: %v", err)
+			}
+			if want, got := test.n, len(out.Items); want != got {
+				t.Fatalf("Expected length: %d, but got: %d", want, got)
+			}
+
+			// step 3: change the transformer so the marked objects appear corrupt
+			revertTransformer := store.UpdateTransformer(newErrInjectingModifier(func(key string) error {
+				return test.inject(t, key)
+			}))
+			defer revertTransformer()
+
+			// step 4: invoke GetList again, this time it should encounter the corrupt object(s)
+			out = &example.PodList{}
+			err = store.GetList(ctx, prefix, storageOpts, out)
+			if err == nil {
+				t.Fatalf("Expected GetList to return error")
+			}
+
+			// step 5: verify what we expect from GetList
+			test.verifier(t, prefix, out, err)
+		})
+	}
+}
+
+// RunTestGetListWithoutErrorAggregation tests that when the AllowUnsafeMalformedObjectDeletion
+// feature is disabled, GetList maintains backward compatibility by aborting on the first error.
+func RunTestGetListWithoutErrorAggregation(ctx context.Context, t *testing.T, store InterfaceWithTransformerOverride, corruptErr error) {
+	prefix := "/pods/ns/"
+	objNameFn := func(id int) string {
+		return fmt.Sprintf("foo-%06d", id)
+	}
+	keyFn := func(id int) string {
+		return fmt.Sprintf("%s%s", prefix, objNameFn(id))
+	}
+
+	// Step 1: create 7 objects, where even-numbered ones are corrupt
+	// - good: {1, 3, 5, 7}
+	// - corrupt: {2, 4, 6}
+	n := 7
+	for i := 1; i <= n; i++ {
+		obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name:      objNameFn(i),
+			Namespace: "ns",
+		}}
+		if err := store.Create(ctx, computePodKey(obj), obj, &example.Pod{}, 0); err != nil {
+			t.Fatalf("Create failed: %v", err)
+		}
+	}
+
+	// Step 2: list all objects, expect no error before corruption
+	out := &example.PodList{}
+	storageOpts := storage.ListOptions{
+		Predicate: storage.Everything,
+		Recursive: true,
+	}
+	err := store.GetList(ctx, prefix, storageOpts, out)
+	if err != nil {
+		t.Fatalf("GetList failed with unexpected error: %v", err)
+	}
+	if want, got := n, len(out.Items); want != got {
+		t.Fatalf("Expected length: %d, but got: %d", want, got)
+	}
+
+	// Step 3: corrupt the transformer so even-numbered objects fail to decode
+	revertTransformer := store.UpdateTransformer(newErrInjectingModifier(func(key string) error {
+		if idOf(t, key)%2 == 0 {
+			return corruptErr
+		}
+		return nil
+	}))
+	defer revertTransformer()
+
+	// Step 4: list again, expect GetList to abort on the first corrupt object
+	out = &example.PodList{}
+	err = store.GetList(ctx, prefix, storageOpts, out)
+	if err == nil {
+		t.Fatalf("Expected GetList to return error")
+	}
+
+	// Verify: the error should be a bare storage.InternalError (no aggregation)
+	// nolint:errorlint // the aggregator should return the error as is
+	intErr, ok := err.(storage.InternalError)
+	if !ok {
+		t.Fatalf("expected the error to be %T, but got: %#v", storage.InternalError{}, err)
+	}
+	if want, got := fmt.Sprintf(`unable to transform key "%s"`, keyFn(2)), intErr.Error(); !strings.HasPrefix(got, want) {
+		t.Errorf("expected the error to start with %q, but got: %v", want, got)
+	}
+
+	// Verify: GetList successfully decodes {1} before aborting
+	if want, got := 1, len(out.Items); want != got {
+		t.Errorf("expected the list to have %d item(s), but got: %d", want, got)
+	}
+	if want, got := objNameFn(1), out.Items[0].Name; want != got {
+		t.Errorf("expected an object name of %q, but got: %q", want, got)
 	}
 }
 
@@ -1465,12 +3616,14 @@ func RunTestListContinuation(ctx context.Context, t *testing.T, store storage.In
 		},
 	}
 
+	var currentRV string
 	for i, ps := range preset {
 		preset[i].storedObj = &example.Pod{}
 		err := store.Create(ctx, ps.key, ps.obj, preset[i].storedObj, 0)
 		if err != nil {
 			t.Fatalf("Set failed: %v", err)
 		}
+		currentRV = preset[i].storedObj.ResourceVersion
 	}
 
 	// test continuations
@@ -1488,17 +3641,22 @@ func RunTestListContinuation(ctx context.Context, t *testing.T, store storage.In
 		}
 	}
 	options := storage.ListOptions{
-		ResourceVersion: "0",
+		// Limit is ignored when ResourceVersion is set to 0.
+		// Set it to consistent read.
+		ResourceVersion: "",
 		Predicate:       pred(1, ""),
 		Recursive:       true,
 	}
-	if err := store.GetList(ctx, "/pods", options, out); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, out); err != nil {
 		t.Fatalf("Unable to get initial list: %v", err)
 	}
 	if len(out.Continue) == 0 {
 		t.Fatalf("No continuation token set")
 	}
-	ExpectNoDiff(t, "incorrect first page", []example.Pod{*preset[0].storedObj}, out.Items)
+	expectNoDiff(t, "incorrect first page", []example.Pod{*preset[0].storedObj}, out.Items)
+	if out.ResourceVersion != currentRV {
+		t.Errorf("Expect output.ResourceVersion = %s, but got %s", currentRV, out.ResourceVersion)
+	}
 	if validation != nil {
 		validation(t, 1, 1)
 	}
@@ -1508,19 +3666,23 @@ func RunTestListContinuation(ctx context.Context, t *testing.T, store storage.In
 	// no limit, should get two items
 	out = &example.PodList{}
 	options = storage.ListOptions{
-		ResourceVersion: "0",
+		// ResourceVersion should be unset when setting continuation token.
+		ResourceVersion: "",
 		Predicate:       pred(0, continueFromSecondItem),
 		Recursive:       true,
 	}
-	if err := store.GetList(ctx, "/pods", options, out); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, out); err != nil {
 		t.Fatalf("Unable to get second page: %v", err)
 	}
 	if len(out.Continue) != 0 {
 		t.Fatalf("Unexpected continuation token set")
 	}
-	key, rv, err := storage.DecodeContinue(continueFromSecondItem, "/pods")
+	key, rv, err := storage.DecodeContinue(continueFromSecondItem, "/pods/")
 	t.Logf("continue token was %d %s %v", rv, key, err)
-	ExpectNoDiff(t, "incorrect second page", []example.Pod{*preset[1].storedObj, *preset[2].storedObj}, out.Items)
+	expectNoDiff(t, "incorrect second page", []example.Pod{*preset[1].storedObj, *preset[2].storedObj}, out.Items)
+	if out.ResourceVersion != currentRV {
+		t.Errorf("Expect output.ResourceVersion = %s, but got %s", currentRV, out.ResourceVersion)
+	}
 	if validation != nil {
 		validation(t, 0, 2)
 	}
@@ -1528,17 +3690,21 @@ func RunTestListContinuation(ctx context.Context, t *testing.T, store storage.In
 	// limit, should get two more pages
 	out = &example.PodList{}
 	options = storage.ListOptions{
-		ResourceVersion: "0",
+		// ResourceVersion should be unset when setting continuation token.
+		ResourceVersion: "",
 		Predicate:       pred(1, continueFromSecondItem),
 		Recursive:       true,
 	}
-	if err := store.GetList(ctx, "/pods", options, out); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, out); err != nil {
 		t.Fatalf("Unable to get second page: %v", err)
 	}
 	if len(out.Continue) == 0 {
 		t.Fatalf("No continuation token set")
 	}
-	ExpectNoDiff(t, "incorrect second page", []example.Pod{*preset[1].storedObj}, out.Items)
+	expectNoDiff(t, "incorrect second page", []example.Pod{*preset[1].storedObj}, out.Items)
+	if out.ResourceVersion != currentRV {
+		t.Errorf("Expect output.ResourceVersion = %s, but got %s", currentRV, out.ResourceVersion)
+	}
 	if validation != nil {
 		validation(t, 1, 1)
 	}
@@ -1547,17 +3713,21 @@ func RunTestListContinuation(ctx context.Context, t *testing.T, store storage.In
 
 	out = &example.PodList{}
 	options = storage.ListOptions{
-		ResourceVersion: "0",
+		// ResourceVersion should be unset when setting continuation token.
+		ResourceVersion: "",
 		Predicate:       pred(1, continueFromThirdItem),
 		Recursive:       true,
 	}
-	if err := store.GetList(ctx, "/pods", options, out); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, out); err != nil {
 		t.Fatalf("Unable to get second page: %v", err)
 	}
 	if len(out.Continue) != 0 {
 		t.Fatalf("Unexpected continuation token set")
 	}
-	ExpectNoDiff(t, "incorrect third page", []example.Pod{*preset[2].storedObj}, out.Items)
+	expectNoDiff(t, "incorrect third page", []example.Pod{*preset[2].storedObj}, out.Items)
+	if out.ResourceVersion != currentRV {
+		t.Errorf("Expect output.ResourceVersion = %s, but got %s", currentRV, out.ResourceVersion)
+	}
 	if validation != nil {
 		validation(t, 1, 1)
 	}
@@ -1590,7 +3760,7 @@ func RunTestListPaginationRareObject(ctx context.Context, t *testing.T, store st
 		},
 		Recursive: true,
 	}
-	if err := store.GetList(ctx, "/pods", options, out); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, out); err != nil {
 		t.Fatalf("Unable to get initial list: %v", err)
 	}
 	if len(out.Continue) != 0 {
@@ -1632,12 +3802,14 @@ func RunTestListContinuationWithFilter(ctx context.Context, t *testing.T, store 
 		},
 	}
 
+	var currentRV string
 	for i, ps := range preset {
 		preset[i].storedObj = &example.Pod{}
 		err := store.Create(ctx, ps.key, ps.obj, preset[i].storedObj, 0)
 		if err != nil {
 			t.Fatalf("Set failed: %v", err)
 		}
+		currentRV = preset[i].storedObj.ResourceVersion
 	}
 
 	// the first list call should try to get 2 items from etcd (and only those items should be returned)
@@ -1658,17 +3830,22 @@ func RunTestListContinuationWithFilter(ctx context.Context, t *testing.T, store 
 		}
 	}
 	options := storage.ListOptions{
-		ResourceVersion: "0",
+		// Limit is ignored when ResourceVersion is set to 0.
+		// Set it to consistent read.
+		ResourceVersion: "",
 		Predicate:       pred(2, ""),
 		Recursive:       true,
 	}
-	if err := store.GetList(ctx, "/pods", options, out); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, out); err != nil {
 		t.Errorf("Unable to get initial list: %v", err)
 	}
 	if len(out.Continue) == 0 {
 		t.Errorf("No continuation token set")
 	}
-	ExpectNoDiff(t, "incorrect first page", []example.Pod{*preset[0].storedObj, *preset[2].storedObj}, out.Items)
+	expectNoDiff(t, "incorrect first page", []example.Pod{*preset[0].storedObj, *preset[2].storedObj}, out.Items)
+	if out.ResourceVersion != currentRV {
+		t.Errorf("Expect output.ResourceVersion = %s, but got %s", currentRV, out.ResourceVersion)
+	}
 	if validation != nil {
 		validation(t, 2, 3)
 	}
@@ -1685,29 +3862,30 @@ func RunTestListContinuationWithFilter(ctx context.Context, t *testing.T, store 
 	// both read counters should be incremented for the singular calls they make in this case
 	out = &example.PodList{}
 	options = storage.ListOptions{
-		ResourceVersion: "0",
+		// ResourceVersion should be unset when setting continuation token.
+		ResourceVersion: "",
 		Predicate:       pred(2, cont),
 		Recursive:       true,
 	}
-	if err := store.GetList(ctx, "/pods", options, out); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, out); err != nil {
 		t.Errorf("Unable to get second page: %v", err)
 	}
 	if len(out.Continue) != 0 {
 		t.Errorf("Unexpected continuation token set")
 	}
-	ExpectNoDiff(t, "incorrect second page", []example.Pod{*preset[3].storedObj}, out.Items)
+	expectNoDiff(t, "incorrect second page", []example.Pod{*preset[3].storedObj}, out.Items)
+	if out.ResourceVersion != currentRV {
+		t.Errorf("Expect output.ResourceVersion = %s, but got %s", currentRV, out.ResourceVersion)
+	}
 	if validation != nil {
 		validation(t, 2, 1)
 	}
 }
 
 type Compaction func(ctx context.Context, t *testing.T, resourceVersion string)
+type IncreaseRVFunc func(ctx context.Context, t *testing.T) (revision int64)
 
 func RunTestListInconsistentContinuation(ctx context.Context, t *testing.T, store storage.Interface, compaction Compaction) {
-	if compaction == nil {
-		t.Skipf("compaction callback not provided")
-	}
-
 	// Setup storage with the following structure:
 	//  /
 	//   - first/
@@ -1764,13 +3942,13 @@ func RunTestListInconsistentContinuation(ctx context.Context, t *testing.T, stor
 		Predicate:       pred(1, ""),
 		Recursive:       true,
 	}
-	if err := store.GetList(ctx, "/pods", options, out); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, out); err != nil {
 		t.Fatalf("Unable to get initial list: %v", err)
 	}
 	if len(out.Continue) == 0 {
 		t.Fatalf("No continuation token set")
 	}
-	ExpectNoDiff(t, "incorrect first page", []example.Pod{*preset[0].storedObj}, out.Items)
+	expectNoDiff(t, "incorrect first page", []example.Pod{*preset[0].storedObj}, out.Items)
 
 	continueFromSecondItem := out.Continue
 
@@ -1801,7 +3979,7 @@ func RunTestListInconsistentContinuation(ctx context.Context, t *testing.T, stor
 		Predicate:       pred(0, continueFromSecondItem),
 		Recursive:       true,
 	}
-	err := store.GetList(ctx, "/pods", options, out)
+	err := store.GetList(ctx, "/pods/", options, out)
 	if err == nil {
 		t.Fatalf("unexpected no error")
 	}
@@ -1823,14 +4001,14 @@ func RunTestListInconsistentContinuation(ctx context.Context, t *testing.T, stor
 		Predicate:       pred(1, inconsistentContinueFromSecondItem),
 		Recursive:       true,
 	}
-	if err := store.GetList(ctx, "/pods", options, out); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, out); err != nil {
 		t.Fatalf("Unable to get second page: %v", err)
 	}
 	if len(out.Continue) == 0 {
 		t.Fatalf("No continuation token set")
 	}
 	validateResourceVersion := resourceVersionNotOlderThan(lastRVString)
-	ExpectNoDiff(t, "incorrect second page", []example.Pod{*preset[1].storedObj}, out.Items)
+	expectNoDiff(t, "incorrect second page", []example.Pod{*preset[1].storedObj}, out.Items)
 	if err := validateResourceVersion(out.ResourceVersion); err != nil {
 		t.Fatal(err)
 	}
@@ -1842,13 +4020,13 @@ func RunTestListInconsistentContinuation(ctx context.Context, t *testing.T, stor
 		Predicate:       pred(1, continueFromThirdItem),
 		Recursive:       true,
 	}
-	if err := store.GetList(ctx, "/pods", options, out); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, out); err != nil {
 		t.Fatalf("Unable to get second page: %v", err)
 	}
 	if len(out.Continue) != 0 {
 		t.Fatalf("Unexpected continuation token set")
 	}
-	ExpectNoDiff(t, "incorrect third page", []example.Pod{*preset[2].storedObj}, out.Items)
+	expectNoDiff(t, "incorrect third page", []example.Pod{*preset[2].storedObj}, out.Items)
 	if out.ResourceVersion != resolvedResourceVersionFromThirdItem {
 		t.Fatalf("Expected list resource version to be %s, got %s", resolvedResourceVersionFromThirdItem, out.ResourceVersion)
 	}
@@ -1859,10 +4037,18 @@ type PrefixTransformerModifier func(*PrefixTransformer) value.Transformer
 type InterfaceWithPrefixTransformer interface {
 	storage.Interface
 
+	UnderlyingStorage() storage.Interface
 	UpdatePrefixTransformer(PrefixTransformerModifier) func()
 }
 
-func RunTestConsistentList(ctx context.Context, t *testing.T, store InterfaceWithPrefixTransformer) {
+type TransformerModifier func(value.Transformer) value.Transformer
+
+type InterfaceWithTransformerOverride interface {
+	storage.Interface
+	UpdateTransformer(TransformerModifier) func()
+}
+
+func RunTestListResourceVersionMatch(ctx context.Context, t *testing.T, store InterfaceWithPrefixTransformer) {
 	nextPod := func(index uint32) (string, *example.Pod) {
 		obj := &example.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1911,7 +4097,7 @@ func RunTestConsistentList(ctx context.Context, t *testing.T, store InterfaceWit
 		Predicate: predicate,
 		Recursive: true,
 	}
-	if err := store.GetList(ctx, "/pods", options, &result1); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, &result1); err != nil {
 		t.Fatalf("failed to list objects: %v", err)
 	}
 
@@ -1924,17 +4110,17 @@ func RunTestConsistentList(ctx context.Context, t *testing.T, store InterfaceWit
 	}
 
 	result2 := example.PodList{}
-	if err := store.GetList(ctx, "/pods", options, &result2); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, &result2); err != nil {
 		t.Fatalf("failed to list objects: %v", err)
 	}
 
-	ExpectNoDiff(t, "incorrect lists", result1, result2)
+	expectNoDiff(t, "incorrect lists", result1, result2)
 
 	// Now also verify the  ResourceVersionMatchNotOlderThan.
 	options.ResourceVersionMatch = metav1.ResourceVersionMatchNotOlderThan
 
 	result3 := example.PodList{}
-	if err := store.GetList(ctx, "/pods", options, &result3); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, &result3); err != nil {
 		t.Fatalf("failed to list objects: %v", err)
 	}
 
@@ -1942,16 +4128,18 @@ func RunTestConsistentList(ctx context.Context, t *testing.T, store InterfaceWit
 	options.ResourceVersionMatch = metav1.ResourceVersionMatchExact
 
 	result4 := example.PodList{}
-	if err := store.GetList(ctx, "/pods", options, &result4); err != nil {
+	if err := store.GetList(ctx, "/pods/", options, &result4); err != nil {
 		t.Fatalf("failed to list objects: %v", err)
 	}
 
-	ExpectNoDiff(t, "incorrect lists", result3, result4)
+	expectNoDiff(t, "incorrect lists", result3, result4)
 }
 
 func RunTestGuaranteedUpdate(ctx context.Context, t *testing.T, store InterfaceWithPrefixTransformer, validation KeyValidation) {
 	inputObj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns", UID: "A"}}
 	key := computePodKey(inputObj)
+	nonExistingObj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "non-existing", Namespace: "test-ns", UID: "A"}}
+	nonExistingKey := computePodKey(nonExistingObj)
 
 	tests := []struct {
 		name                string
@@ -1965,7 +4153,7 @@ func RunTestGuaranteedUpdate(ctx context.Context, t *testing.T, store InterfaceW
 		hasSelfLink         bool
 	}{{
 		name:                "non-existing key, ignoreNotFound=false",
-		key:                 "/non-existing",
+		key:                 nonExistingKey,
 		ignoreNotFound:      false,
 		precondition:        nil,
 		expectNotFoundErr:   true,
@@ -1973,7 +4161,7 @@ func RunTestGuaranteedUpdate(ctx context.Context, t *testing.T, store InterfaceW
 		expectNoUpdate:      false,
 	}, {
 		name:                "non-existing key, ignoreNotFound=true",
-		key:                 "/non-existing",
+		key:                 nonExistingKey,
 		ignoreNotFound:      true,
 		precondition:        nil,
 		expectNotFoundErr:   false,
@@ -2033,7 +4221,7 @@ func RunTestGuaranteedUpdate(ctx context.Context, t *testing.T, store InterfaceW
 
 	for i, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			key, storeObj := testPropagateStore(ctx, t, store, inputObj)
+			_, storeObj := testPropagateStore(ctx, t, store, inputObj)
 
 			out := &example.Pod{}
 			annotations := map[string]string{"version": fmt.Sprintf("%d", i)}
@@ -2059,6 +4247,9 @@ func RunTestGuaranteedUpdate(ctx context.Context, t *testing.T, store InterfaceW
 						}
 					}
 					pod := *storeObj
+					if tt.key == nonExistingKey {
+						pod = *nonExistingObj
+					}
 					if tt.hasSelfLink {
 						pod.SelfLink = "testlink"
 					}
@@ -2089,7 +4280,7 @@ func RunTestGuaranteedUpdate(ctx context.Context, t *testing.T, store InterfaceW
 			}
 
 			// verify that kv pair is not empty after set and that the underlying data matches expectations
-			validation(ctx, t, key)
+			validation(ctx, t, tt.key)
 
 			switch tt.expectNoUpdate {
 			case true:
@@ -2123,7 +4314,7 @@ func RunTestGuaranteedUpdateWithTTL(ctx context.Context, t *testing.T, store sto
 	if err != nil {
 		t.Fatalf("Watch failed: %v", err)
 	}
-	testCheckEventType(t, watch.Deleted, w)
+	testCheckEventType(t, w, watch.Deleted)
 }
 
 func RunTestGuaranteedUpdateChecksStoredData(ctx context.Context, t *testing.T, store InterfaceWithPrefixTransformer) {
@@ -2204,7 +4395,7 @@ func RunTestGuaranteedUpdateWithConflict(ctx context.Context, t *testing.T, stor
 		err := store.GuaranteedUpdate(ctx, key, &example.Pod{}, false, nil,
 			storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
 				pod := obj.(*example.Pod)
-				pod.Name = "foo-1"
+				pod.Spec.NodeName = "node-1"
 				secondToEnter.Wait()
 				return pod, nil
 			}), nil)
@@ -2221,7 +4412,7 @@ func RunTestGuaranteedUpdateWithConflict(ctx context.Context, t *testing.T, stor
 			}
 			updateCount++
 			pod := obj.(*example.Pod)
-			pod.Name = "foo-2"
+			pod.Spec.NodeName = "node-2"
 			return pod, nil
 		}), nil)
 	if err != nil {
@@ -2234,6 +4425,120 @@ func RunTestGuaranteedUpdateWithConflict(ctx context.Context, t *testing.T, stor
 	if updateCount != 2 {
 		t.Errorf("Should have conflict and called update func twice")
 	}
+
+	// Conflicting background update causes preconditions to fail on retry.
+	if err := store.GuaranteedUpdate(ctx, key, &example.Pod{}, false, nil,
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			pod := obj.(*example.Pod)
+			pod.UID = "myUID"
+			return pod, nil
+		}), nil); err != nil {
+		t.Fatalf("Setup GuaranteedUpdate failed: %v", err)
+	}
+	updateCount = 0
+	err = store.GuaranteedUpdate(ctx, key, &example.Pod{}, false, storage.NewUIDPreconditions("myUID"),
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			updateCount++
+			if updateCount == 1 {
+				if err := store.GuaranteedUpdate(ctx, key, &example.Pod{}, false, nil,
+					storage.SimpleUpdate(func(inner runtime.Object) (runtime.Object, error) {
+						innerPod := inner.(*example.Pod)
+						innerPod.UID = "otherUID"
+						return innerPod, nil
+					}), nil); err != nil {
+					t.Errorf("Background update failed: %v", err)
+				}
+			}
+			pod := obj.(*example.Pod)
+			pod.Spec.NodeName = "node-3"
+			return pod, nil
+		}), nil)
+	if !storage.IsInvalidObj(err) {
+		t.Errorf("Expected invalid object error when precondition fails after conflict, got: %v", err)
+	}
+	if updateCount != 1 {
+		t.Errorf("Expected updateCount = 1, got %d", updateCount)
+	}
+
+	// Conflicting background delete when ignoreNotFound is false returns NotFound.
+	updateCount = 0
+	err = store.GuaranteedUpdate(ctx, key, &example.Pod{}, false, nil,
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			updateCount++
+			if updateCount == 1 {
+				if err := store.Delete(ctx, key, &example.Pod{}, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{}); err != nil {
+					t.Errorf("Background delete failed: %v", err)
+				}
+			}
+			pod := obj.(*example.Pod)
+			pod.Spec.NodeName = "node-4"
+			return pod, nil
+		}), nil)
+	if !storage.IsNotFound(err) {
+		t.Errorf("Expected not-found error when object is deleted concurrently with ignoreNotFound=false, got: %v", err)
+	}
+	if updateCount != 1 {
+		t.Errorf("Expected updateCount = 1, got %d", updateCount)
+	}
+
+	// Conflicting background create when ignoreNotFound is true retries with the created object.
+	updateCount = 0
+	out := &example.Pod{}
+	err = store.GuaranteedUpdate(ctx, key, out, true, nil,
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			updateCount++
+			pod := obj.(*example.Pod)
+			if updateCount == 1 {
+				if err := store.Create(ctx, key, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns", Labels: map[string]string{"created": "bg"}}}, &example.Pod{}, 0); err != nil {
+					t.Errorf("Background create failed: %v", err)
+				}
+				pod.Name = "foo"
+				pod.Namespace = "test-ns"
+				return pod, nil
+			}
+			if pod.Labels["created"] != "bg" {
+				t.Errorf("Expected retry to observe background-created pod, got: %#v", pod)
+			}
+			pod.Labels["updated"] = "true"
+			return pod, nil
+		}), nil)
+	if err != nil {
+		t.Fatalf("Unexpected error on conflict with background create: %v", err)
+	}
+	if updateCount != 2 {
+		t.Errorf("Expected updateCount = 2, got %d", updateCount)
+	}
+
+	// Conflicting background delete when ignoreNotFound is true retries with a zero-value object and recreates it.
+	updateCount = 0
+	err = store.GuaranteedUpdate(ctx, key, out, true, nil,
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			updateCount++
+			pod := obj.(*example.Pod)
+			if updateCount == 1 {
+				if err := store.Delete(ctx, key, &example.Pod{}, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{}); err != nil {
+					t.Errorf("Background delete failed: %v", err)
+				}
+				pod.Labels = map[string]string{"attempt": "1"}
+				return pod, nil
+			}
+			if pod.ResourceVersion != "" {
+				t.Errorf("Expected zero-value pod on retry after background delete, got rv=%s", pod.ResourceVersion)
+			}
+			pod.Name = "foo"
+			pod.Namespace = "test-ns"
+			pod.Labels = map[string]string{"recreated": "true"}
+			return pod, nil
+		}), nil)
+	if err != nil {
+		t.Fatalf("Unexpected error on conflict with background delete (ignoreNotFound=true): %v", err)
+	}
+	if updateCount != 2 {
+		t.Errorf("Expected updateCount = 2, got %d", updateCount)
+	}
+	if out.Labels["recreated"] != "true" {
+		t.Errorf("Expected recreated pod label, got: %#v", out.Labels)
+	}
 }
 
 func RunTestGuaranteedUpdateWithSuggestionAndConflict(ctx context.Context, t *testing.T, store storage.Interface) {
@@ -2244,13 +4549,42 @@ func RunTestGuaranteedUpdateWithSuggestionAndConflict(ctx context.Context, t *te
 	err := store.GuaranteedUpdate(ctx, key, updatedPod, false, nil,
 		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
 			pod := obj.(*example.Pod)
-			pod.Name = "foo-2"
+			pod.Generation = 2
+			pod.UID = "myUID"
 			return pod, nil
 		}),
 		nil,
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Preconditions fail on outdated suggestion, live lookup also fails preconditions.
+	err = store.GuaranteedUpdate(ctx, key, &example.Pod{}, false, storage.NewUIDPreconditions("otherUID"),
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			t.Errorf("update function should not be called when preconditions fail")
+			return obj, nil
+		}),
+		originalPod,
+	)
+	if !storage.IsInvalidObj(err) {
+		t.Errorf("expected InvalidObj error when preconditions fail on both suggestion and live object, got: %v", err)
+	}
+
+	// Preconditions fail on outdated suggestion, live lookup passes preconditions and update succeeds.
+	updatedWithPrec := &example.Pod{}
+	err = store.GuaranteedUpdate(ctx, key, updatedWithPrec, false, storage.NewUIDPreconditions("myUID"),
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			pod := obj.(*example.Pod)
+			if pod.UID != "myUID" {
+				t.Errorf("expected live object with UID 'myUID', got %q", pod.UID)
+			}
+			return pod, nil
+		}),
+		originalPod,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error when preconditions pass on live object: %v", err)
 	}
 
 	// Second, update using the outdated originalPod as the suggestion. Return a conflict error when
@@ -2261,7 +4595,7 @@ func RunTestGuaranteedUpdateWithSuggestionAndConflict(ctx context.Context, t *te
 	err = store.GuaranteedUpdate(ctx, key, updatedPod2, false, nil,
 		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
 			pod := obj.(*example.Pod)
-			if pod.Name != "foo-2" {
+			if pod.Generation != 2 {
 				if sawConflict {
 					t.Fatalf("unexpected second conflict")
 				}
@@ -2269,7 +4603,7 @@ func RunTestGuaranteedUpdateWithSuggestionAndConflict(ctx context.Context, t *te
 				// simulated stale object - return a conflict
 				return nil, apierrors.NewConflict(example.SchemeGroupVersion.WithResource("pods").GroupResource(), "name", errors.New("foo"))
 			}
-			pod.Name = "foo-3"
+			pod.Generation = 3
 			return pod, nil
 		}),
 		originalPod,
@@ -2277,26 +4611,37 @@ func RunTestGuaranteedUpdateWithSuggestionAndConflict(ctx context.Context, t *te
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if updatedPod2.Name != "foo-3" {
-		t.Errorf("unexpected pod name: %q", updatedPod2.Name)
+	if updatedPod2.Generation != 3 {
+		t.Errorf("unexpected pod generation: %d", updatedPod2.Generation)
+	}
+
+	// Update using the outdated originalPod as suggestion where SimpleUpdate fails on both
+	// the stale suggestion and the refreshed live object.
+	attempts := 0
+	err = store.GuaranteedUpdate(ctx, key, &example.Pod{}, false, nil,
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			attempts++
+			return nil, fmt.Errorf("validation or admission error")
+		}),
+		originalPod,
+	)
+	if err == nil {
+		t.Fatalf("expected error, got none")
+	}
+	if attempts > 2 {
+		t.Errorf("update function should have been called at most twice, called %d", attempts)
 	}
 
 	// Third, update using a current version as the suggestion.
 	// Return an error and make sure that SimpleUpdate is NOT called a second time,
 	// since the live lookup shows the suggestion was already up to date.
-	attempts := 0
+	attempts = 0
 	updatedPod3 := &example.Pod{}
 	err = store.GuaranteedUpdate(ctx, key, updatedPod3, false, nil,
 		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
 			pod := obj.(*example.Pod)
-			if pod.Name != updatedPod2.Name || pod.ResourceVersion != updatedPod2.ResourceVersion {
-				t.Errorf(
-					"unexpected live object (name=%s, rv=%s), expected name=%s, rv=%s",
-					pod.Name,
-					pod.ResourceVersion,
-					updatedPod2.Name,
-					updatedPod2.ResourceVersion,
-				)
+			if pod.Generation != updatedPod2.Generation || pod.ResourceVersion != updatedPod2.ResourceVersion {
+				t.Logf("stale object (rv=%s), expected rv=%s", pod.ResourceVersion, updatedPod2.ResourceVersion)
 			}
 			attempts++
 			return nil, fmt.Errorf("validation or admission error")
@@ -2306,8 +4651,34 @@ func RunTestGuaranteedUpdateWithSuggestionAndConflict(ctx context.Context, t *te
 	if err == nil {
 		t.Fatalf("expected error, got none")
 	}
-	if attempts != 1 {
-		t.Errorf("expected 1 attempt, got %d", attempts)
+	// Implementations of the storage interface are allowed to ignore the suggestion,
+	// in which case two attempts are possible.
+	if attempts > 2 {
+		t.Errorf("update function should have been called at most twice, called %d", attempts)
+	}
+
+	// Delete the object and verify that updating with a stale suggestion and ignoreNotFound=false
+	// returns NotFound when either preconditions or tryUpdate fail on the suggestion.
+	if err := store.Delete(ctx, key, &example.Pod{}, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{}); err != nil {
+		t.Fatalf("unexpected error deleting pod: %v", err)
+	}
+	err = store.GuaranteedUpdate(ctx, key, &example.Pod{}, false, storage.NewUIDPreconditions("otherUID"),
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			return obj, nil
+		}),
+		updatedPod2,
+	)
+	if !storage.IsNotFound(err) {
+		t.Errorf("expected not-found error when preconditions fail on suggestion of deleted object, got: %v", err)
+	}
+	err = store.GuaranteedUpdate(ctx, key, &example.Pod{}, false, nil,
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			return nil, fmt.Errorf("update error on stale suggestion")
+		}),
+		updatedPod2,
+	)
+	if !storage.IsNotFound(err) {
+		t.Errorf("expected not-found error when tryUpdate fails on suggestion of deleted object, got: %v", err)
 	}
 }
 
@@ -2360,7 +4731,7 @@ func RunTestTransformationFailure(ctx context.Context, t *testing.T, store Inter
 		Predicate: storage.Everything,
 		Recursive: true,
 	}
-	if err := store.GetList(ctx, "/pods", storageOpts, &got); !storage.IsInternalError(err) {
+	if err := store.GetList(ctx, "/pods/", storageOpts, &got); !storage.IsInternalError(err) {
 		t.Errorf("Unexpected error %v", err)
 	}
 
@@ -2382,7 +4753,7 @@ func RunTestTransformationFailure(ctx context.Context, t *testing.T, store Inter
 	}
 
 	// Delete fails with internal error.
-	if err := store.Delete(ctx, preset[1].key, &example.Pod{}, nil, storage.ValidateAllObjectFunc, nil); !storage.IsInternalError(err) {
+	if err := store.Delete(ctx, preset[1].key, &example.Pod{}, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{}); !storage.IsInternalError(err) {
 		t.Errorf("Unexpected error: %v", err)
 	}
 	if err := store.Get(ctx, preset[1].key, storage.GetOptions{}, &example.Pod{}); !storage.IsInternalError(err) {
@@ -2390,41 +4761,1908 @@ func RunTestTransformationFailure(ctx context.Context, t *testing.T, store Inter
 	}
 }
 
-func RunTestCount(ctx context.Context, t *testing.T, store storage.Interface) {
-	resourceA := "/foo.bar.io/abc"
+func RunTestStats(ctx context.Context, t *testing.T, store storage.Interface, codec runtime.Codec, transformer value.Transformer, sizeEnabled bool) {
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 0, EstimatedAverageObjectSizeBytes: 0})
 
-	// resourceA is intentionally a prefix of resourceB to ensure that the count
-	// for resourceA does not include any objects from resourceB.
-	resourceB := fmt.Sprintf("%sdef", resourceA)
-
-	resourceACountExpected := 5
-	for i := 1; i <= resourceACountExpected; i++ {
-		obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("foo-%d", i)}}
-
-		key := fmt.Sprintf("%s/%d", resourceA, i)
-		if err := store.Create(ctx, key, obj, nil, 0); err != nil {
-			t.Fatalf("Create failed: %v", err)
-		}
+	foo := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo"}}
+	fooKey := computePodKey(foo)
+	if err := store.Create(ctx, fooKey, foo, nil, 0); err != nil {
+		t.Fatalf("Create failed: %v", err)
 	}
+	fooSize := objectSize(t, codec, foo, transformer)
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 1, EstimatedAverageObjectSizeBytes: fooSize})
 
-	resourceBCount := 4
-	for i := 1; i <= resourceBCount; i++ {
-		obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("foo-%d", i)}}
-
-		key := fmt.Sprintf("%s/%d", resourceB, i)
-		if err := store.Create(ctx, key, obj, nil, 0); err != nil {
-			t.Fatalf("Create failed: %v", err)
-		}
+	bar := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "bar"}}
+	barKey := computePodKey(bar)
+	if err := store.Create(ctx, barKey, bar, nil, 0); err != nil {
+		t.Fatalf("Create failed: %v", err)
 	}
+	barSize := objectSize(t, codec, bar, transformer)
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 2, EstimatedAverageObjectSizeBytes: (fooSize + barSize) / 2})
 
-	resourceACountGot, err := store.Count(resourceA)
+	if err := store.GuaranteedUpdate(ctx, barKey, bar, false, nil,
+		storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			pod := obj.(*example.Pod)
+			pod.Labels = map[string]string{"foo": "bar"}
+			return pod, nil
+		}), nil); err != nil {
+		t.Errorf("Update failed: %v", err)
+	}
+	// ResourceVerson is not stored.
+	bar.ResourceVersion = ""
+	barSize = objectSize(t, codec, bar, transformer)
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 2, EstimatedAverageObjectSizeBytes: (fooSize + barSize) / 2})
+
+	if err := store.Delete(ctx, fooKey, foo, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{}); err != nil {
+		t.Errorf("Delete failed: %v", err)
+	}
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 1, EstimatedAverageObjectSizeBytes: barSize})
+
+	if err := store.Delete(ctx, fooKey, foo, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{}); err == nil {
+		t.Errorf("Delete expected to fail")
+	}
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 1, EstimatedAverageObjectSizeBytes: barSize})
+
+	if err := store.Delete(ctx, barKey, bar, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{}); err != nil {
+		t.Errorf("Delete failed: %v", err)
+	}
+	assertStats(t, store, sizeEnabled, storage.Stats{ObjectCount: 0, EstimatedAverageObjectSizeBytes: 0})
+}
+
+func assertStats(t *testing.T, store storage.Interface, sizeEnabled bool, expectStats storage.Stats) {
+	t.Helper()
+	// Execute consistent LIST to refresh state of cache.
+	err := store.GetList(t.Context(), "/pods/", storage.ListOptions{Recursive: true, Predicate: storage.Everything}, &example.PodList{})
 	if err != nil {
-		t.Fatalf("store.Count failed: %v", err)
+		t.Fatalf("GetList failed: %v", err)
+	}
+	stats, err := store.Stats(t.Context())
+	if err != nil {
+		t.Fatalf("store.Stats failed: %v", err)
 	}
 
-	// count for resourceA should not include the objects for resourceB
-	// even though resourceA is a prefix of resourceB.
-	if int64(resourceACountExpected) != resourceACountGot {
-		t.Fatalf("store.Count for resource %s: expected %d but got %d", resourceA, resourceACountExpected, resourceACountGot)
+	if !sizeEnabled {
+		expectStats.EstimatedAverageObjectSizeBytes = 0
+	}
+	if expectStats != stats {
+		t.Errorf("store.Stats: expected %+v but got %+v", expectStats, stats)
+	}
+}
+
+func objectSize(t *testing.T, codec runtime.Codec, obj runtime.Object, transformer value.Transformer) int64 {
+	data, err := runtime.Encode(codec, obj)
+	if err != nil {
+		t.Fatalf("Encode failed: %v", err)
+	}
+	data, err = transformer.TransformToStorage(t.Context(), data, value.DefaultContext{})
+	if err != nil {
+		t.Fatalf("Transform failed: %v", err)
+	}
+	return int64(len(data))
+}
+
+func RunTestListPaging(ctx context.Context, t *testing.T, store storage.Interface) {
+	out := &example.Pod{}
+	for i := 0; i < 4; i++ {
+		name := fmt.Sprintf("test-%d", i)
+		pod := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "paging"}}
+		key := computePodKey(pod)
+		if err := store.Create(ctx, key, pod, out, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var names []string
+	opts := storage.ListOptions{
+		Recursive: true,
+		Predicate: storage.SelectionPredicate{
+			Label: labels.Everything(),
+			Field: fields.Everything(),
+			Limit: 1,
+		},
+	}
+	calls := 0
+	for {
+		calls++
+		listOut := &example.PodList{}
+		err := store.GetList(ctx, "/pods/", opts, listOut)
+		if err != nil {
+			t.Fatalf("Unexpected error %s", err)
+		}
+		for _, item := range listOut.Items {
+			names = append(names, item.Name)
+		}
+		if listOut.Continue == "" {
+			break
+		}
+		if calls == 2 {
+			name := "test-5"
+			pod := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "paging"}}
+			key := computePodKey(pod)
+			if err := store.Create(ctx, key, pod, out, 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+		opts.Predicate.Continue = listOut.Continue
+	}
+	if calls != 4 {
+		t.Errorf("unexpected list invocations: %d", calls)
+	}
+	if !reflect.DeepEqual(names, []string{"test-0", "test-1", "test-2", "test-3"}) {
+		t.Errorf("unexpected items: %#v", names)
+	}
+}
+
+func RunTestNamespaceScopedList(ctx context.Context, t *testing.T, store storage.Interface) {
+	emptyPods := func(namespace string) []example.Pod { return []example.Pod{} }
+	tests := []struct {
+		name               string
+		requestedName      string
+		requestedNamespace string
+		recursive          bool
+		indexFields        []string
+		fieldSelector      func(namespace string) fields.Selector
+		inputPods          func(namespace string) []example.Pod
+		expectPods         func(namespace string) []example.Pod
+	}{
+		{
+			name:          "request without namespace, without field selector",
+			recursive:     true,
+			fieldSelector: func(namespace string) fields.Selector { return fields.Everything() },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", "ns1"),
+					*baseNamespacedPod("foo2", "ns2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", "ns1"),
+					*baseNamespacedPod("foo2", "ns2"),
+				}
+			},
+		},
+		{
+			name:      "request without namespace, field selector with metadata.namespace",
+			recursive: true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{"metadata.namespace": namespace + "ns1"})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+				}
+			},
+		},
+		{
+			name:      "request without namespace, field selector with spec.nodename",
+			recursive: true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.ParseSelectorOrDie("spec.nodeName=bar1")
+			},
+			indexFields: []string{"spec.nodeName"},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPodAssigned("foo1", namespace+"ns1", "bar1"),
+					*baseNamespacedPodAssigned("foo2", namespace+"ns2", "bar2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPodAssigned("foo1", namespace+"ns1", "bar1"),
+				}
+			},
+		},
+		{
+			name:          "request without namespace, field selector with spec.nodename to filter out",
+			recursive:     true,
+			fieldSelector: func(namespace string) fields.Selector { return fields.ParseSelectorOrDie("spec.nodeName!=bar1") },
+			indexFields:   []string{"spec.nodeName"},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPodAssigned("foo1", namespace+"ns1", "bar1"),
+					*baseNamespacedPodAssigned("foo2", namespace+"ns2", "bar2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPodAssigned("foo2", namespace+"ns2", "bar2"),
+				}
+			},
+		},
+		{
+			name:               "request with namespace, without field selector",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector:      func(namespace string) fields.Selector { return fields.Everything() },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+				}
+			},
+		},
+		{
+			name:               "request with namespace, field selector with matched metadata.namespace",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{"metadata.namespace": namespace + "ns1"})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+				}
+			},
+		},
+		{
+			name:               "request with namespace, field selector with non-matched metadata.namespace",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{"metadata.namespace": namespace + "ns2"})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPodUpdated("foo2", namespace+"ns1"),
+					*baseNamespacedPodUpdated("foo2", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "request with namespace, field selector with spec.nodename",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector:      func(namespace string) fields.Selector { return fields.ParseSelectorOrDie("spec.nodeName=bar2") },
+			indexFields:        []string{"spec.nodeName"},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPodAssigned("foo1", namespace+"ns1", "bar1"),
+					*baseNamespacedPodAssigned("foo1", namespace+"ns2", "bar2"),
+					*baseNamespacedPodAssigned("foo2", namespace+"ns1", "bar2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPodAssigned("foo2", namespace+"ns1", "bar2"),
+				}
+			},
+		},
+		{
+			name:               "request with namespace, field selector with spec.nodename to filter out",
+			requestedNamespace: "ns2",
+			recursive:          true,
+			fieldSelector:      func(namespace string) fields.Selector { return fields.ParseSelectorOrDie("spec.nodeName!=bar1") },
+			indexFields:        []string{"spec.nodeName"},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPodAssigned("foo3", namespace+"ns2", "bar1"),
+					*baseNamespacedPodAssigned("foo2", namespace+"ns2", "bar2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPodAssigned("foo2", namespace+"ns2", "bar2"),
+				}
+			},
+		},
+		{
+			name:          "request without namespace, field selector with metadata.name",
+			recursive:     true,
+			fieldSelector: func(namespace string) fields.Selector { return fields.ParseSelectorOrDie("metadata.name=foo1") },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+		},
+		{
+			name:      "request without namespace, field selector with metadata.name and metadata.namespace",
+			recursive: true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo1",
+					"metadata.namespace": namespace + "ns1",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+				}
+			},
+		},
+		{
+			name:      "request without namespace, field selector with metadata.name and spec.nodeName",
+			recursive: true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name": "foo1",
+					"spec.nodeName": "bar1",
+				})
+			},
+			indexFields: []string{"spec.nodeName"},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPodAssigned("foo1", namespace+"ns1", "bar1"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPodAssigned("foo1", namespace+"ns1", "bar1"),
+				}
+			},
+		},
+		{
+			name:      "request without namespace, field selector with metadata.name, and with spec.nodeName to filter out watch",
+			recursive: true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.AndSelectors(
+					fields.ParseSelectorOrDie("spec.nodeName!=bar1"),
+					fields.SelectorFromSet(fields.Set{"metadata.name": "foo1"}),
+				)
+			},
+			indexFields: []string{"spec.nodeName"},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPodAssigned("foo1", namespace+"ns2", "bar1"),
+					*baseNamespacedPodAssigned("foo2", namespace+"ns2", "bar1"),
+					*baseNamespacedPodAssigned("foo1", namespace+"ns3", "bar2"),
+					*baseNamespacedPodAssigned("foo2", namespace+"ns3", "bar2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPodAssigned("foo1", namespace+"ns3", "bar2"),
+				}
+			},
+		},
+		{
+			name:               "request with namespace, with field selector metadata.name",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector:      func(namespace string) fields.Selector { return fields.ParseSelectorOrDie("metadata.name=foo1") },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPod("foo2", namespace+"ns2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+				}
+			},
+		},
+		{
+			name:               "request with namespace, with field selector metadata.name and metadata.namespace",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo1",
+					"metadata.namespace": namespace + "ns1",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPod("foo2", namespace+"ns2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+				}
+			},
+		},
+		{
+			name:               "request with namespace, with field selector metadata.name and non-matched metadata.namespace",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo1",
+					"metadata.namespace": namespace + "ns2",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPod("foo2", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "request with namespace, with field selector metadata.name, metadata.namespace and spec.nodename",
+			requestedNamespace: "ns2",
+			recursive:          true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo2",
+					"metadata.namespace": namespace + "ns2",
+					"spec.nodeName":      "bar1",
+				})
+			},
+			indexFields: []string{"spec.nodeName"},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPodAssigned("foo2", namespace+"ns2", "bar1"),
+					*baseNamespacedPodAssigned("foo1", namespace+"ns3", "bar1"),
+					*baseNamespacedPodAssigned("foo2", namespace+"ns3", "bar1"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPodAssigned("foo2", namespace+"ns2", "bar1"),
+				}
+			},
+		},
+		{
+			name:               "request with namespace, with field selector metadata.name, metadata.namespace, and with spec.nodename to filter out",
+			requestedNamespace: "ns2",
+			recursive:          true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.AndSelectors(
+					fields.ParseSelectorOrDie("spec.nodeName!=bar2"),
+					fields.SelectorFromSet(fields.Set{"metadata.name": "foo1", "metadata.namespace": namespace + "ns2"}),
+				)
+			},
+			indexFields: []string{"spec.nodeName"},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPodAssigned("foo1", namespace+"ns2", "bar1"),
+					*baseNamespacedPodAssigned("foo2", namespace+"ns2", "bar2"),
+					*baseNamespacedPodAssigned("foo1", namespace+"ns3", "bar2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPodAssigned("foo1", namespace+"ns2", "bar1"),
+				}
+			},
+		},
+		{
+			name:               "request with name, request with namespace, without field selector",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector:      func(namespace string) fields.Selector { return fields.Everything() },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+				}
+			},
+		},
+		{
+			name:               "request with name, request with namespace, field selector with matched metadata.namespace",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{"metadata.namespace": namespace + "ns1"})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+				}
+			},
+		},
+		{
+			name:               "request with name, request with namespace, field selector with non-matched metadata.namespace",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{"metadata.namespace": namespace + "ns2"})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "request with name, request with namespace, with field selector metadata.name",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector:      func(namespace string) fields.Selector { return fields.ParseSelectorOrDie("metadata.name=foo1") },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPod("foo2", namespace+"ns2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+				}
+			},
+		},
+		{
+			name:               "request with name, request with namespace, with field selector metadata.name and metadata.namespace",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo1",
+					"metadata.namespace": namespace + "ns1",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPod("foo2", namespace+"ns2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+				}
+			},
+		},
+		{
+			name:               "request with name, request with namespace, with field selector metadata.name and non-matched metadata.namespace",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo1",
+					"metadata.namespace": namespace + "ns2",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPod("foo2", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "request with name, request with namespace, with field selector non-matched metadata.name",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector:      func(namespace string) fields.Selector { return fields.ParseSelectorOrDie("metadata.name=foo2") },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPod("foo2", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "request with name, request with namespace, with field selector non-matched metadata.name and matched metadata.namespace",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo2",
+					"metadata.namespace": namespace + "ns1",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPod("foo2", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "request with name, request with namespace, with field selector non-matched metadata.name and non-matched metadata.namespace",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo2",
+					"metadata.namespace": namespace + "ns2",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPod("foo2", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "request with name, request with namespace, with field selector metadata.name, metadata.namespace and spec.nodename",
+			requestedName:      "foo2",
+			requestedNamespace: "ns2",
+			recursive:          false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo2",
+					"metadata.namespace": namespace + "ns2",
+					"spec.nodeName":      "bar1",
+				})
+			},
+			indexFields: []string{"spec.nodeName"},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPodAssigned("foo2", namespace+"ns2", "bar1"),
+					*baseNamespacedPodAssigned("foo1", namespace+"ns3", "bar1"),
+					*baseNamespacedPodAssigned("foo2", namespace+"ns3", "bar1"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPodAssigned("foo2", namespace+"ns2", "bar1"),
+				}
+			},
+		},
+		{
+			name:               "request with name, request with namespace, with field selector metadata.name, metadata.namespace, and with spec.nodename to filter out",
+			requestedName:      "foo1",
+			requestedNamespace: "ns2",
+			recursive:          false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.AndSelectors(
+					fields.ParseSelectorOrDie("spec.nodeName!=bar2"),
+					fields.SelectorFromSet(fields.Set{"metadata.name": "foo1", "metadata.namespace": namespace + "ns2"}),
+				)
+			},
+			indexFields: []string{"spec.nodeName"},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPodAssigned("foo1", namespace+"ns2", "bar1"),
+					*baseNamespacedPodAssigned("foo2", namespace+"ns2", "bar2"),
+					*baseNamespacedPodAssigned("foo1", namespace+"ns3", "bar2"),
+				}
+			},
+			expectPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPodAssigned("foo1", namespace+"ns2", "bar1"),
+				}
+			},
+		},
+		{
+			name:               "recursive, request with name, request with namespace, without field selector",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector:      func(namespace string) fields.Selector { return fields.Everything() },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "recursive, request with name, request with namespace, field selector with matched metadata.namespace",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{"metadata.namespace": namespace + "ns1"})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "recursive, request with name, request with namespace, field selector with non-matched metadata.namespace",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{"metadata.namespace": namespace + "ns2"})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "recursive, request with name, request with namespace, with field selector metadata.name",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector:      func(namespace string) fields.Selector { return fields.ParseSelectorOrDie("metadata.name=foo1") },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "recursive, request with name, request with namespace, with field selector metadata.name and matched metadata.namespace",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo1",
+					"metadata.namespace": namespace + "ns1",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "recursive, request with name, request with namespace, with field selector metadata.name and non-matched metadata.namespace",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo1",
+					"metadata.namespace": namespace + "ns2",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "recursive, request with name, request with namespace, with field selector non-matched metadata.name",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector:      func(namespace string) fields.Selector { return fields.ParseSelectorOrDie("metadata.name=foo2") },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "recursive, request with name, request with namespace, with field selector non-matched metadata.name and matched metadata.namespace",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo2",
+					"metadata.namespace": namespace + "ns1",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "recursive, request with name, request with namespace, with field selector non-matched metadata.name and non-matched metadata.namespace",
+			requestedName:      "foo1",
+			requestedNamespace: "ns1",
+			recursive:          true,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo2",
+					"metadata.namespace": namespace + "ns2",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:          "non-recursive, request without namespace, without field selector",
+			recursive:     false,
+			fieldSelector: func(namespace string) fields.Selector { return fields.Everything() },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:      "non-recursive, request without namespace, field selector with metadata.namespace",
+			recursive: false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{"metadata.namespace": namespace + "ns1"})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:          "non-recursive, request without namespace, field selector with metadata.name",
+			recursive:     false,
+			fieldSelector: func(namespace string) fields.Selector { return fields.ParseSelectorOrDie("metadata.name=foo1") },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:      "non-recursive, request without namespace, field selector with metadata.name and metadata.namespace",
+			recursive: false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo1",
+					"metadata.namespace": namespace + "ns1",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "non-recursive, request with namespace, without field selector",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector:      func(namespace string) fields.Selector { return fields.Everything() },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "non-recursive, request with namespace, field selector with matched metadata.namespace",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{"metadata.namespace": namespace + "ns1"})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "non-recursive, request with namespace, field selector with non-matched metadata.namespace",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{"metadata.namespace": namespace + "ns2"})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "non-recursive, request with namespace, with field selector metadata.name",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector:      func(namespace string) fields.Selector { return fields.ParseSelectorOrDie("metadata.name=foo1") },
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "non-recursive, request with namespace, with field selector metadata.name and matched metadata.namespace",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo1",
+					"metadata.namespace": namespace + "ns1",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+		{
+			name:               "non-recursive, request with namespace, with field selector metadata.name and non-matched metadata.namespace",
+			requestedNamespace: "ns1",
+			recursive:          false,
+			fieldSelector: func(namespace string) fields.Selector {
+				return fields.SelectorFromSet(fields.Set{
+					"metadata.name":      "foo1",
+					"metadata.namespace": namespace + "ns2",
+				})
+			},
+			inputPods: func(namespace string) []example.Pod {
+				return []example.Pod{
+					*baseNamespacedPod("foo1", namespace+"ns1"),
+					*baseNamespacedPod("foo2", namespace+"ns1"),
+					*baseNamespacedPod("foo1", namespace+"ns2"),
+				}
+			},
+			expectPods: emptyPods,
+		},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			podNames := map[string]struct{}{}
+			namespace := fmt.Sprintf("t%d-", i)
+			for _, pod := range tt.inputPods(namespace) {
+				out := &example.Pod{}
+				key := computePodKey(&pod)
+				podNames[key] = struct{}{}
+				err := store.Create(ctx, key, &pod, out, 0)
+				if err != nil {
+					t.Fatalf("GuaranteedUpdate failed: %v", err)
+				}
+			}
+			opts := storage.ListOptions{
+				ResourceVersion: "",
+				Predicate:       CreatePodPredicate(tt.fieldSelector(namespace), true, tt.indexFields),
+				Recursive:       tt.recursive,
+			}
+			listOut := &example.PodList{}
+			path := "/pods/"
+			if tt.requestedNamespace != "" {
+				path += namespace + tt.requestedNamespace
+				if tt.requestedName != "" {
+					path += "/" + tt.requestedName
+				}
+			}
+			if err := store.GetList(ctx, path, opts, listOut); err != nil {
+				t.Errorf("Unexpected error: %v", err)
+			}
+			i := 0
+			for _, pod := range listOut.Items {
+				if _, found := podNames[computePodKey(&pod)]; !found {
+					continue
+				}
+				pod.ResourceVersion = ""
+				listOut.Items[i] = pod
+				i++
+			}
+			listOut.Items = listOut.Items[:i]
+
+			expectNoDiff(t, "incorrect list pods", tt.expectPods(namespace), listOut.Items)
+		})
+	}
+}
+
+func RunTestCompactRevision(ctx context.Context, t *testing.T, store storage.Interface, increaseRV IncreaseRVFunc, compact Compaction) {
+	listOut := &example.PodList{}
+	if err := store.GetList(ctx, "/pods/", storage.ListOptions{
+		Predicate: storage.Everything,
+		Recursive: true,
+	}, listOut); err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	currentRV, err := store.Versioner().ParseResourceVersion(listOut.ResourceVersion)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	compactedRV := store.CompactRevision()
+	if compactedRV >= int64(currentRV) {
+		t.Fatalf("Expected current RV not be compacted, current: %d, compacted: %d", currentRV, compactedRV)
+	}
+	if err := store.GetList(ctx, "/pods/", storage.ListOptions{
+		Predicate:            storage.Everything,
+		Recursive:            true,
+		ResourceVersion:      listOut.ResourceVersion,
+		ResourceVersionMatch: metav1.ResourceVersionMatchExact,
+	}, listOut); err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	increaseRV(ctx, t)
+	increaseRV(ctx, t)
+	compactedFutureRV := currentRV + 1
+	expectCompactedRV := currentRV + 2
+	compact(ctx, t, fmt.Sprintf("%d", expectCompactedRV))
+	if err := store.GetList(ctx, "/pods/", storage.ListOptions{
+		Predicate:            storage.Everything,
+		Recursive:            true,
+		ResourceVersion:      listOut.ResourceVersion,
+		ResourceVersionMatch: metav1.ResourceVersionMatchExact,
+	}, listOut); err == nil || !strings.Contains(err.Error(), "The resourceVersion for the provided list is too old") {
+		t.Errorf(`Expected "The resourceVersion for the provided list is too old", but got error: %v`, err)
+	}
+	// Call twice: the first syncs watchCache to compactedFutureRV via bookmark (falling back after waiting),
+	// and the second exercises upfront delegation once watchCache is already fresh.
+	for range 2 {
+		if err := store.GetList(ctx, "/pods/", storage.ListOptions{
+			Predicate:            storage.Everything,
+			Recursive:            true,
+			ResourceVersion:      fmt.Sprintf("%d", compactedFutureRV),
+			ResourceVersionMatch: metav1.ResourceVersionMatchExact,
+		}, listOut); err == nil || !strings.Contains(err.Error(), "The resourceVersion for the provided list is too old") {
+			t.Errorf(`Expected "The resourceVersion for the provided list is too old", but got error: %v`, err)
+		}
+	}
+	if err := store.GetList(ctx, "/pods/", storage.ListOptions{
+		Predicate:            storage.Everything,
+		Recursive:            true,
+		ResourceVersion:      fmt.Sprintf("%d", expectCompactedRV),
+		ResourceVersionMatch: metav1.ResourceVersionMatchExact,
+	}, listOut); err != nil {
+		t.Errorf("Unexpected error listing at compacted RV %d: %v", expectCompactedRV, err)
+	}
+	compactedRV = store.CompactRevision()
+	if compactedRV != int64(expectCompactedRV) {
+		t.Errorf("CompactRevision()=%d, expected: %d", store.CompactRevision(), expectCompactedRV)
+	}
+}
+
+func RunTestKeySchema(ctx context.Context, t *testing.T, store storage.Interface) {
+	createObj := &example.Pod{}
+	createOut := &example.Pod{}
+	require.ErrorContains(t, store.Create(ctx, "", createObj, createOut, 0), "empty key")
+	require.ErrorContains(t, store.Create(ctx, "/", createObj, createOut, 0), "empty key")
+	require.ErrorContains(t, store.Create(ctx, ".", createObj, createOut, 0), "invalid key")
+	require.ErrorContains(t, store.Create(ctx, "..", createObj, createOut, 0), "invalid key")
+	require.ErrorContains(t, store.Create(ctx, "pods", createObj, createOut, 0), "lacks resource prefix")
+	require.ErrorContains(t, store.Create(ctx, "/pods", createObj, createOut, 0), "lacks resource prefix")
+	require.ErrorContains(t, store.Create(ctx, "/pods.apps", createObj, createOut, 0), "lacks resource prefix")
+	require.ErrorContains(t, store.Create(ctx, "/foo/", createObj, createOut, 0), "lacks resource prefix")
+	require.NoError(t, store.Create(ctx, "/pods/", createObj, createOut, 0))
+	require.NoError(t, store.Create(ctx, "/pods/name", &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "name"}}, createOut, 0))
+	require.NoError(t, store.Create(ctx, "/pods/namespace", &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "namespace"}}, createOut, 0))
+	require.NoError(t, store.Create(ctx, "/pods/namespace/name", &example.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace", Name: "name"}}, createOut, 0))
+
+	listOut := &example.PodList{}
+	recursiveListOpts := storage.ListOptions{Predicate: storage.Everything, Recursive: true}
+	nonRecursiveListOpts := storage.ListOptions{Predicate: storage.Everything, Recursive: false}
+	require.ErrorContains(t, store.GetList(ctx, "", recursiveListOpts, listOut), "empty key")
+	require.ErrorContains(t, store.GetList(ctx, "/", recursiveListOpts, listOut), "empty key")
+	require.ErrorContains(t, store.GetList(ctx, ".", recursiveListOpts, listOut), "invalid key")
+	require.ErrorContains(t, store.GetList(ctx, "..", recursiveListOpts, listOut), "invalid key")
+	require.ErrorContains(t, store.GetList(ctx, "pods", recursiveListOpts, listOut), "lacks resource prefix")
+	require.ErrorContains(t, store.GetList(ctx, "/pods.apps", recursiveListOpts, listOut), "lacks resource prefix")
+	require.ErrorContains(t, store.GetList(ctx, "/foo/", recursiveListOpts, listOut), "lacks resource prefix")
+	require.ErrorContains(t, store.GetList(ctx, "/pods", nonRecursiveListOpts, listOut), "lacks resource prefix")
+	require.NoError(t, store.GetList(ctx, "/pods", recursiveListOpts, listOut))
+	require.NoError(t, store.GetList(ctx, "/pods/", recursiveListOpts, listOut))
+	require.NoError(t, store.GetList(ctx, "/pods/namespace", recursiveListOpts, listOut))
+	require.NoError(t, store.GetList(ctx, "/pods/namespace/name", recursiveListOpts, listOut))
+
+	getOut := &example.Pod{}
+	getOpts := storage.GetOptions{}
+	require.ErrorContains(t, store.Get(ctx, "", getOpts, getOut), "empty key")
+	require.ErrorContains(t, store.Get(ctx, "/", getOpts, getOut), "empty key")
+	require.ErrorContains(t, store.Get(ctx, ".", getOpts, getOut), "invalid key")
+	require.ErrorContains(t, store.Get(ctx, "..", getOpts, getOut), "invalid key")
+	require.ErrorContains(t, store.Get(ctx, "pods", getOpts, getOut), "lacks resource prefix")
+	require.ErrorContains(t, store.Get(ctx, "/pods", getOpts, getOut), "lacks resource prefix")
+	require.ErrorContains(t, store.Get(ctx, "/pods.apps", getOpts, getOut), "lacks resource prefix")
+	require.ErrorContains(t, store.Get(ctx, "/foo/", getOpts, getOut), "lacks resource prefix")
+	require.NoError(t, store.Get(ctx, "/pods/", getOpts, getOut))
+	require.NoError(t, store.Get(ctx, "/pods/namespace", getOpts, getOut))
+	require.NoError(t, store.Get(ctx, "/pods/namespace/name", getOpts, getOut))
+
+	_, err := store.Watch(ctx, "", recursiveListOpts)
+	require.ErrorContains(t, err, "empty key")
+	_, err = store.Watch(ctx, "/", recursiveListOpts)
+	require.ErrorContains(t, err, "empty key")
+	_, err = store.Watch(ctx, ".", recursiveListOpts)
+	require.ErrorContains(t, err, "invalid key")
+	_, err = store.Watch(ctx, "..", recursiveListOpts)
+	require.ErrorContains(t, err, "invalid key")
+	_, err = store.Watch(ctx, "pods", recursiveListOpts)
+	require.ErrorContains(t, err, "lacks resource prefix")
+	_, err = store.Watch(ctx, "/pods.apps", recursiveListOpts)
+	require.ErrorContains(t, err, "lacks resource prefix")
+	_, err = store.Watch(ctx, "/foo/", recursiveListOpts)
+	require.ErrorContains(t, err, "lacks resource prefix")
+	_, err = store.Watch(ctx, "/pods", nonRecursiveListOpts)
+	require.ErrorContains(t, err, "lacks resource prefix")
+	w, err := store.Watch(ctx, "/pods", recursiveListOpts)
+	require.NoError(t, err)
+	w.Stop()
+	require.NoError(t, err)
+	w.Stop()
+	w, err = store.Watch(ctx, "/pods/namespace", recursiveListOpts)
+	require.NoError(t, err)
+	w.Stop()
+	w, err = store.Watch(ctx, "/pods/namespace/name", recursiveListOpts)
+	require.NoError(t, err)
+	w.Stop()
+
+	updateOut := &example.Pod{}
+	updateFunc := func(input runtime.Object, res storage.ResponseMeta) (output runtime.Object, ttl *uint64, err error) {
+		return input, nil, nil
+	}
+	require.ErrorContains(t, store.GuaranteedUpdate(ctx, "", updateOut, false, nil, updateFunc, nil), "empty key")
+	require.ErrorContains(t, store.GuaranteedUpdate(ctx, "/", updateOut, false, nil, updateFunc, nil), "empty key")
+	require.ErrorContains(t, store.GuaranteedUpdate(ctx, ".", updateOut, false, nil, updateFunc, nil), "invalid key")
+	require.ErrorContains(t, store.GuaranteedUpdate(ctx, "..", updateOut, false, nil, updateFunc, nil), "invalid key")
+	require.ErrorContains(t, store.GuaranteedUpdate(ctx, "pods", updateOut, false, nil, updateFunc, nil), "lacks resource prefix")
+	require.ErrorContains(t, store.GuaranteedUpdate(ctx, "/pods", updateOut, false, nil, updateFunc, nil), "lacks resource prefix")
+	require.ErrorContains(t, store.GuaranteedUpdate(ctx, "/pods.apps", updateOut, false, nil, updateFunc, nil), "lacks resource prefix")
+	require.ErrorContains(t, store.GuaranteedUpdate(ctx, "/foo/", updateOut, false, nil, updateFunc, nil), "lacks resource prefix")
+	require.NoError(t, store.GuaranteedUpdate(ctx, "/pods/", updateOut, false, nil, updateFunc, nil))
+	require.NoError(t, store.GuaranteedUpdate(ctx, "/pods/namespace", updateOut, false, nil, updateFunc, nil))
+	require.NoError(t, store.GuaranteedUpdate(ctx, "/pods/namespace/name", updateOut, false, nil, updateFunc, nil))
+
+	deleteOut := &example.Pod{}
+	deleteFunc := func(ctx context.Context, obj runtime.Object) error {
+		return nil
+	}
+	deleteOpts := storage.DeleteOptions{}
+	require.ErrorContains(t, store.Delete(ctx, "", deleteOut, nil, deleteFunc, nil, deleteOpts), "empty key")
+	require.ErrorContains(t, store.Delete(ctx, "/", deleteOut, nil, deleteFunc, nil, deleteOpts), "empty key")
+	require.ErrorContains(t, store.Delete(ctx, ".", deleteOut, nil, deleteFunc, nil, deleteOpts), "invalid key")
+	require.ErrorContains(t, store.Delete(ctx, "..", deleteOut, nil, deleteFunc, nil, deleteOpts), "invalid key")
+	require.ErrorContains(t, store.Delete(ctx, "pods", deleteOut, nil, deleteFunc, nil, deleteOpts), "lacks resource prefix")
+	require.ErrorContains(t, store.Delete(ctx, "/pods", deleteOut, nil, deleteFunc, nil, deleteOpts), "lacks resource prefix")
+	require.ErrorContains(t, store.Delete(ctx, "/pods.apps", deleteOut, nil, deleteFunc, nil, deleteOpts), "lacks resource prefix")
+	require.ErrorContains(t, store.Delete(ctx, "/foo", deleteOut, nil, deleteFunc, nil, deleteOpts), "lacks resource prefix")
+	require.NoError(t, store.Delete(ctx, "/pods/", deleteOut, nil, deleteFunc, nil, deleteOpts))
+	require.NoError(t, store.Delete(ctx, "/pods/namespace", deleteOut, nil, deleteFunc, nil, deleteOpts))
+	require.NoError(t, store.Delete(ctx, "/pods/namespace/name", deleteOut, nil, deleteFunc, nil, deleteOpts))
+}
+
+func mustParseResourceVersion(t *testing.T, resourceVersion string) int64 {
+	t.Helper()
+	versioner := storage.APIObjectVersioner{}
+	rv, err := versioner.ParseResourceVersion(resourceVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return int64(rv)
+}
+
+type optimisticCallbackAction int
+
+const (
+	actionMutate optimisticCallbackAction = iota
+	actionNoop
+	actionReject
+	actionConflictUpdate
+	actionConflictReject
+	actionConflictDelete
+)
+
+type optimisticConcurrencyTestCase struct {
+	name              string
+	missingKey        bool
+	ignoreNotFound    bool
+	action            optimisticCallbackAction
+	preconditions     func(current *example.Pod) *storage.Preconditions
+	transformer       PrefixTransformerModifier
+	expectStatsCacher KubernetesRequestStats
+	expectStatsEtcd   KubernetesRequestStats
+	expectErr         func(error) bool
+}
+
+func RunTestOptimisticConcurrency(ctx context.Context, t *testing.T, store InterfaceWithPrefixTransformer, watchCacheEnabled bool, recorder *KubernetesRecorder) {
+	matchCurrent := func(cur *example.Pod) *storage.Preconditions {
+		return &storage.Preconditions{UID: &cur.UID, ResourceVersion: &cur.ResourceVersion}
+	}
+	wrongUID := func(_ *example.Pod) *storage.Preconditions {
+		return storage.NewUIDPreconditions("wrong-uid")
+	}
+	wrongRV := func(_ *example.Pod) *storage.Preconditions {
+		return &storage.Preconditions{ResourceVersion: ptr.To("999999999")}
+	}
+	rotatedTransformer := func(previous *PrefixTransformer) value.Transformer {
+		prevCopy := *previous
+		return value.NewPrefixTransformers(nil,
+			value.PrefixTransformer{Prefix: []byte("rotated!"), Transformer: NewPrefixTransformer([]byte{}, false)},
+			value.PrefixTransformer{Prefix: []byte{}, Transformer: &prevCopy},
+		)
+	}
+	incompatibleTransformer := func(_ *PrefixTransformer) value.Transformer {
+		return NewPrefixTransformer([]byte("otherprefix!"), false)
+	}
+
+	testCases := []optimisticConcurrencyTestCase{
+		{
+			name:              "existing object commits in single transaction",
+			expectStatsCacher: KubernetesRequestStats{Writes: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1, Writes: 1},
+		},
+		{
+			name:              "existing object with rotated transformer commits in single transaction",
+			transformer:       rotatedTransformer,
+			expectStatsCacher: KubernetesRequestStats{Writes: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1, Writes: 1},
+		},
+		{
+			name:              "noop update short-circuits without writing",
+			action:            actionNoop,
+			expectStatsCacher: KubernetesRequestStats{Gets: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1},
+		},
+		{
+			name:              "noop update with rotated transformer rewrites object",
+			action:            actionNoop,
+			transformer:       rotatedTransformer,
+			expectStatsCacher: KubernetesRequestStats{Gets: 1, Writes: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1, Writes: 1},
+		},
+		{
+			name:              "noop update with incompatible transformer fails",
+			action:            actionNoop,
+			transformer:       incompatibleTransformer,
+			expectStatsCacher: KubernetesRequestStats{Gets: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1},
+			expectErr:         storage.IsInternalError,
+		},
+		{
+			name:              "missing key returns NotFound",
+			missingKey:        true,
+			expectStatsCacher: KubernetesRequestStats{Gets: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1},
+			expectErr:         storage.IsNotFound,
+		},
+		{
+			name:              "missing key with preconditions returns NotFound",
+			missingKey:        true,
+			preconditions:     wrongUID,
+			expectStatsCacher: KubernetesRequestStats{Gets: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1},
+			expectErr:         storage.IsNotFound,
+		},
+		{
+			name:              "missing key with ignoreNotFound creates object",
+			missingKey:        true,
+			ignoreNotFound:    true,
+			expectStatsCacher: KubernetesRequestStats{Gets: 1, Writes: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1, Writes: 1},
+		},
+		{
+			name:              "missing key with ignoreNotFound fails preconditions without retry",
+			missingKey:        true,
+			ignoreNotFound:    true,
+			preconditions:     wrongUID,
+			expectStatsCacher: KubernetesRequestStats{Gets: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1},
+			expectErr:         storage.IsInvalidObj,
+		},
+		{
+			name:              "matching preconditions commit in single transaction",
+			preconditions:     matchCurrent,
+			expectStatsCacher: KubernetesRequestStats{Writes: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1, Writes: 1},
+		},
+		{
+			name:              "UID precondition mismatch fails without retry",
+			preconditions:     wrongUID,
+			expectStatsCacher: KubernetesRequestStats{Gets: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1},
+			expectErr:         storage.IsInvalidObj,
+		},
+		{
+			name:              "ResourceVersion precondition mismatch fails without retry",
+			preconditions:     wrongRV,
+			expectStatsCacher: KubernetesRequestStats{Gets: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1},
+			expectErr:         storage.IsInvalidObj,
+		},
+		{
+			name:              "callback error fails without retry",
+			action:            actionReject,
+			expectStatsCacher: KubernetesRequestStats{Gets: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1},
+			expectErr:         apierrors.IsConflict,
+		},
+		{
+			name:              "concurrent update conflict refreshes and retries",
+			action:            actionConflictUpdate,
+			expectStatsCacher: KubernetesRequestStats{Writes: 2, Conflicts: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1, Writes: 2, Conflicts: 1},
+		},
+		{
+			name:              "concurrent update conflict fails preconditions on retry",
+			preconditions:     matchCurrent,
+			action:            actionConflictUpdate,
+			expectStatsCacher: KubernetesRequestStats{Writes: 1, Conflicts: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1, Writes: 1, Conflicts: 1},
+			expectErr:         storage.IsInvalidObj,
+		},
+		{
+			name:              "concurrent update conflict fails callback on retry",
+			action:            actionConflictReject,
+			expectStatsCacher: KubernetesRequestStats{Writes: 1, Conflicts: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1, Writes: 1, Conflicts: 1},
+			expectErr:         apierrors.IsConflict,
+		},
+		{
+			name:              "concurrent delete conflict returns NotFound",
+			action:            actionConflictDelete,
+			expectStatsCacher: KubernetesRequestStats{Writes: 1, Conflicts: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1, Writes: 1, Conflicts: 1},
+			expectErr:         storage.IsNotFound,
+		},
+		{
+			name:              "concurrent delete conflict with ignoreNotFound recreates object",
+			ignoreNotFound:    true,
+			action:            actionConflictDelete,
+			expectStatsCacher: KubernetesRequestStats{Writes: 2, Conflicts: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1, Writes: 2, Conflicts: 1},
+		},
+		{
+			name:              "missing key with ignoreNotFound and concurrent create refreshes and retries",
+			missingKey:        true,
+			ignoreNotFound:    true,
+			action:            actionConflictUpdate,
+			expectStatsCacher: KubernetesRequestStats{Gets: 1, Writes: 2, Conflicts: 1},
+			expectStatsEtcd:   KubernetesRequestStats{Gets: 1, Writes: 2, Conflicts: 1},
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !tc.ignoreNotFound && tc.action != actionNoop {
+				t.Run("Delete", func(t *testing.T) {
+					runOptimisticConcurrencyOp(ctx, t, store, watchCacheEnabled, recorder, fmt.Sprintf("pod-%d-delete", i), tc, true)
+				})
+			}
+			t.Run("GuaranteedUpdate", func(t *testing.T) {
+				runOptimisticConcurrencyOp(ctx, t, store, watchCacheEnabled, recorder, fmt.Sprintf("pod-%d-update", i), tc, false)
+			})
+		})
+	}
+}
+
+func runOptimisticConcurrencyOp(ctx context.Context, t *testing.T, store InterfaceWithPrefixTransformer, watchCacheEnabled bool, recorder *KubernetesRecorder, podName string, tc optimisticConcurrencyTestCase, isDelete bool) {
+	key := "/pods/test-ns/" + podName
+	out := &example.Pod{}
+
+	var current *example.Pod
+	if !tc.missingKey {
+		seed := &example.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "test-ns",
+				Name:      podName,
+				UID:       "uid-1",
+				Labels:    map[string]string{"rev": "initial"},
+			},
+		}
+		current = &example.Pod{}
+		require.NoError(t, store.Create(ctx, key, seed, current, 0))
+		if watchCacheEnabled {
+			require.NoError(t, store.Get(ctx, key, storage.GetOptions{ResourceVersion: current.ResourceVersion}, &example.Pod{}))
+		}
+	}
+
+	var revertTransformer func()
+	if tc.transformer != nil {
+		revertFn := store.UpdatePrefixTransformer(tc.transformer)
+		var reverted bool
+		revertTransformer = func() {
+			if reverted {
+				return
+			}
+			if watchCacheEnabled && out.ResourceVersion != "" {
+				// Ensure the background watch transforms the event at out.ResourceVersion before restoring the old prefix.
+				_ = store.Get(ctx, key, storage.GetOptions{IgnoreNotFound: true, ResourceVersion: out.ResourceVersion}, &example.Pod{})
+			}
+			revertFn()
+			reverted = true
+		}
+		defer revertTransformer()
+	}
+
+	var precond *storage.Preconditions
+	if tc.preconditions != nil {
+		precond = tc.preconditions(current)
+	}
+
+	rejectWithDirtyMutation := func(obj runtime.Object) error {
+		// Mutate input in place before failing so missing DeepCopy on cached objects is caught.
+		if p, ok := obj.(*example.Pod); ok && p != nil {
+			if p.Labels == nil {
+				p.Labels = map[string]string{}
+			}
+			p.Labels["rejected"] = "dirty"
+		}
+		return apierrors.NewConflict(example.Resource("pods"), podName, errors.New("rejected"))
+	}
+
+	var conflictInjected bool
+	onCallback := func(obj runtime.Object) error {
+		switch tc.action {
+		case actionReject:
+			return rejectWithDirtyMutation(obj)
+		case actionConflictUpdate, actionConflictReject:
+			if !conflictInjected {
+				conflictInjected = true
+				updated := &example.Pod{}
+				require.NoError(t, store.GuaranteedUpdate(ctx, key, updated, true, nil, storage.SimpleUpdate(func(in runtime.Object) (runtime.Object, error) {
+					p := in.(*example.Pod)
+					if p.Name == "" {
+						p.Namespace = "test-ns"
+						p.Name = podName
+						p.Labels = map[string]string{}
+					}
+					p.Labels["rev"] = "conflict"
+					return p, nil
+				}), nil))
+				current = updated
+				return nil
+			}
+			if tc.action == actionConflictReject {
+				return rejectWithDirtyMutation(obj)
+			}
+		case actionConflictDelete:
+			if !conflictInjected {
+				conflictInjected = true
+				require.NoError(t, store.Delete(ctx, key, &example.Pod{}, nil, storage.ValidateAllObjectFunc, nil, storage.DeleteOptions{}))
+				current = nil
+			}
+		}
+		return nil
+	}
+
+	recorderKey := t.Name()
+	opCtx := context.WithValue(ctx, RecorderContextKey, recorderKey)
+	var err error
+	if isDelete {
+		err = store.Delete(opCtx, key, out, precond, func(_ context.Context, obj runtime.Object) error {
+			return onCallback(obj)
+		}, nil, storage.DeleteOptions{})
+	} else {
+		err = store.GuaranteedUpdate(opCtx, key, out, tc.ignoreNotFound, precond, storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+			if err := onCallback(obj); err != nil {
+				return nil, err
+			}
+			pod := obj.(*example.Pod)
+			if pod.Name == "" {
+				require.Equal(t, &example.Pod{}, pod)
+				pod.Namespace = "test-ns"
+				pod.Name = podName
+			}
+			if tc.action != actionNoop {
+				if pod.Annotations == nil {
+					pod.Annotations = make(map[string]string)
+				}
+				pod.Annotations["mutated"] = "updated"
+			}
+			return pod, nil
+		}), nil)
+	}
+
+	if tc.expectErr != nil {
+		require.True(t, tc.expectErr(err), "unexpected error: %v", err)
+	} else {
+		require.NoError(t, err)
+	}
+
+	wantStats := tc.expectStatsEtcd
+	if watchCacheEnabled {
+		wantStats = tc.expectStatsCacher
+	}
+	require.Equal(t, wantStats, recorder.StatsForKey(recorderKey))
+
+	if tc.expectErr != nil {
+		if current != nil && (tc.action == actionReject || tc.action == actionConflictReject) {
+			cached := &example.Pod{}
+			require.NoError(t, store.Get(ctx, key, storage.GetOptions{ResourceVersion: current.ResourceVersion}, cached))
+			require.Equal(t, current, cached)
+		}
+		return
+	}
+
+	expectOut := &example.Pod{}
+	if isDelete {
+		expectOut = current.DeepCopy()
+		expectOut.ResourceVersion = out.ResourceVersion
+		require.True(t, storage.IsNotFound(store.Get(ctx, key, storage.GetOptions{}, &example.Pod{})))
+	} else {
+		if tc.action == actionNoop {
+			if tc.transformer != nil {
+				require.NotEqual(t, current.ResourceVersion, out.ResourceVersion)
+			} else {
+				require.Equal(t, current.ResourceVersion, out.ResourceVersion)
+			}
+		} else {
+			require.Equal(t, "updated", out.Annotations["mutated"])
+		}
+		require.NoError(t, store.Get(ctx, key, storage.GetOptions{}, expectOut))
+	}
+
+	require.Equal(t, expectOut, out)
+
+	if revertTransformer != nil {
+		revertTransformer()
+		if !isDelete {
+			// Stored bytes now carry the rotated prefix and cannot be read from underlying storage with the original prefix alone.
+			require.True(t, storage.IsInternalError(store.UnderlyingStorage().Get(ctx, key, storage.GetOptions{}, &example.Pod{})))
+		}
+	}
+}
+
+func RunTestDeleteOnce(ctx context.Context, t *testing.T, store storage.Interface, prefix string, codec runtime.Codec) {
+	mustState := func(obj runtime.Object) *storage.ObjState {
+		state, err := storage.GetStateFromObject(store.Versioner(), codec, obj, true)
+		require.NoError(t, err)
+		return state
+	}
+
+	key, existing := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}})
+	existingRev, err := strconv.ParseInt(existing.ResourceVersion, 10, 64)
+	require.NoError(t, err)
+	_, emptyKeyErr := storage.PrepareKey("/pods/", "", false)
+
+	stale := existing.DeepCopy()
+	stale.ResourceVersion = "999999"
+
+	tests := []struct {
+		name         string
+		key          string
+		origState    *storage.ObjState
+		expectError  error
+		expectOut    *example.Pod
+		expectStored *example.Pod
+	}{
+		{
+			name:         "conflicts on stale revision",
+			key:          key,
+			origState:    mustState(stale),
+			expectError:  storage.NewResourceVersionConflictsError(prefix+key, existingRev),
+			expectOut:    &example.Pod{},
+			expectStored: existing,
+		},
+		{
+			name:         "conflicts when key does not exist",
+			key:          "/pods/test-ns/missing",
+			origState:    mustState(existing.DeepCopy()),
+			expectError:  storage.NewResourceVersionConflictsError(prefix+"/pods/test-ns/missing", existingRev),
+			expectOut:    &example.Pod{},
+			expectStored: nil,
+		},
+		{
+			name:        "rejects empty key",
+			key:         "",
+			origState:   mustState(existing.DeepCopy()),
+			expectError: emptyKeyErr,
+			expectOut:   &example.Pod{},
+		},
+		// Placed last because it deletes key from storage.
+		{
+			name:         "deletes object at matching revision",
+			key:          key,
+			origState:    mustState(existing.DeepCopy()),
+			expectOut:    existing,
+			expectStored: nil,
+		},
+	}
+
+	for i := range tests {
+		tt := &tests[i]
+		t.Run(tt.name, func(t *testing.T) {
+			out := &example.Pod{}
+			err := store.DeleteOnce(ctx, tt.key, tt.origState, out)
+			require.Equal(t, tt.expectError, err)
+
+			wantOut := tt.expectOut.DeepCopy()
+			if tt.expectError == nil {
+				require.NotEmpty(t, out.ResourceVersion)
+				require.NotEqual(t, tt.expectOut.ResourceVersion, out.ResourceVersion)
+				wantOut.ResourceVersion = out.ResourceVersion
+			}
+			require.Equal(t, wantOut, out)
+
+			if tt.key == "" {
+				return
+			}
+			got := &example.Pod{}
+			err = store.Get(ctx, tt.key, storage.GetOptions{}, got)
+			if tt.expectStored == nil {
+				require.True(t, storage.IsNotFound(err), "expected NotFound, got: %v", err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tt.expectStored, got)
+			}
+		})
+	}
+}
+
+func RunTestUpdateOnce(ctx context.Context, t *testing.T, store storage.Interface, prefix string, codec runtime.Codec) {
+	mustState := func(obj runtime.Object) *storage.ObjState {
+		state, err := storage.GetStateFromObject(store.Versioner(), codec, obj, true)
+		require.NoError(t, err)
+		return state
+	}
+	mustStorageState := func(obj runtime.Object) *storage.ObjState {
+		state := mustState(obj)
+		state.FromStorage = true
+		return state
+	}
+
+	key, existing := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}})
+	existingRev, err := strconv.ParseInt(existing.ResourceVersion, 10, 64)
+	require.NoError(t, err)
+	_, emptyKeyErr := storage.PrepareKey("/pods/", "", false)
+
+	stale := existing.DeepCopy()
+	stale.ResourceVersion = "999999"
+
+	updated := existing.DeepCopy()
+	updated.Labels = map[string]string{"mutated": "updated"}
+
+	created := existing.DeepCopy()
+	created.Name = "bar"
+	created.ResourceVersion = ""
+	created.Labels = map[string]string{"mutated": "created"}
+
+	tests := []struct {
+		name           string
+		key            string
+		origState      *storage.ObjState
+		obj            *example.Pod
+		ignoreNotFound bool
+		expectState    *storage.ObjState
+		expectError    error
+		expectOut      *example.Pod
+		expectRV       string
+		expectStored   *example.Pod
+	}{
+		{
+			name:         "noop update returns existing object without changing revision",
+			key:          key,
+			origState:    mustState(existing.DeepCopy()),
+			obj:          existing,
+			expectState:  mustStorageState(existing.DeepCopy()),
+			expectOut:    existing,
+			expectRV:     existing.ResourceVersion,
+			expectStored: existing,
+		},
+		{
+			name:         "noop update conflicts and returns refreshed state when stored object differs",
+			key:          key,
+			origState:    mustState(updated.DeepCopy()),
+			obj:          updated,
+			expectState:  mustStorageState(existing.DeepCopy()),
+			expectError:  storage.NewResourceVersionConflictsError(prefix+key, existingRev),
+			expectOut:    &example.Pod{},
+			expectStored: existing,
+		},
+		{
+			name:         "conflicts on stale revision",
+			key:          key,
+			origState:    mustState(stale),
+			obj:          updated,
+			expectError:  storage.NewResourceVersionConflictsError(prefix+key, existingRev),
+			expectOut:    &example.Pod{},
+			expectStored: existing,
+		},
+		{
+			name:           "conflicts when creating with zero revision on existing key",
+			key:            key,
+			origState:      mustState(&example.Pod{}),
+			obj:            updated,
+			ignoreNotFound: true,
+			expectError:    storage.NewResourceVersionConflictsError(prefix+key, existingRev),
+			expectOut:      &example.Pod{},
+			expectStored:   existing,
+		},
+		{
+			name:         "conflicts when key does not exist",
+			key:          "/pods/test-ns/missing",
+			origState:    mustState(existing.DeepCopy()),
+			obj:          updated,
+			expectError:  storage.NewResourceVersionConflictsError(prefix+"/pods/test-ns/missing", existingRev),
+			expectOut:    &example.Pod{},
+			expectStored: nil,
+		},
+		{
+			name:         "noop update fails when key is missing and ignoreNotFound is false",
+			key:          "/pods/test-ns/missing",
+			origState:    mustState(existing.DeepCopy()),
+			obj:          existing,
+			expectError:  storage.NewKeyNotFoundError(prefix+"/pods/test-ns/missing", existingRev),
+			expectOut:    &example.Pod{},
+			expectStored: nil,
+		},
+		{
+			name:        "rejects empty key",
+			key:         "",
+			origState:   mustState(existing.DeepCopy()),
+			obj:         updated,
+			expectError: emptyKeyErr,
+			expectOut:   &example.Pod{},
+		},
+		{
+			name:           "creates object when origState has zero revision",
+			key:            computePodKey(created),
+			origState:      mustState(&example.Pod{}),
+			obj:            created,
+			ignoreNotFound: true,
+			expectState:    mustState(&example.Pod{}),
+			expectOut:      created,
+			expectStored:   created,
+		},
+		// Placed last because it mutates key in storage.
+		{
+			name:         "updates object at matching revision",
+			key:          key,
+			origState:    mustState(existing.DeepCopy()),
+			obj:          updated,
+			expectState:  mustState(existing.DeepCopy()),
+			expectOut:    updated,
+			expectStored: updated,
+		},
+	}
+
+	for i := range tests {
+		tt := &tests[i]
+		t.Run(tt.name, func(t *testing.T) {
+			out := &example.Pod{}
+			state, err := store.UpdateOnce(ctx, tt.key, tt.origState, tt.obj.DeepCopy(), 0, out, tt.ignoreNotFound)
+			require.Equal(t, tt.expectError, err)
+			require.Equal(t, tt.expectState, state)
+
+			if tt.expectRV != "" {
+				require.Equal(t, tt.expectRV, out.ResourceVersion)
+			} else if tt.expectError == nil {
+				require.NotEmpty(t, out.ResourceVersion)
+				require.NotEqual(t, tt.expectOut.ResourceVersion, out.ResourceVersion)
+			}
+
+			wantOut := tt.expectOut.DeepCopy()
+			if tt.expectError == nil {
+				wantOut.ResourceVersion = out.ResourceVersion
+			}
+			require.Equal(t, wantOut, out)
+
+			if tt.key == "" {
+				return
+			}
+			got := &example.Pod{}
+			err = store.Get(ctx, tt.key, storage.GetOptions{}, got)
+			if tt.expectStored == nil {
+				require.True(t, storage.IsNotFound(err), "expected NotFound, got: %v", err)
+			} else {
+				require.NoError(t, err)
+				wantStored := tt.expectStored.DeepCopy()
+				if tt.expectError == nil {
+					wantStored.ResourceVersion = out.ResourceVersion
+				}
+				require.Equal(t, wantStored, got)
+			}
+		})
 	}
 }

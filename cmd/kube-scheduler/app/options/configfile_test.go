@@ -17,22 +17,29 @@ limitations under the License.
 package options
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/ktesting"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+	configv1 "k8s.io/kubernetes/pkg/scheduler/apis/config/v1"
 )
 
 const (
 	apiVersionMissing = "'apiVersion' is missing"
 	apiVersionTooOld  = "no kind \"KubeSchedulerConfiguration\" is registered for" +
 		" version \"kubescheduler.config.k8s.io/v1alpha1\""
-	fileNotFound = "no such file or directory"
 
 	// schedulerConfigMinimalCorrect is the minimal
 	// correct scheduler config
@@ -91,7 +98,7 @@ func TestLoadConfigFromFile(t *testing.T) {
 		{
 			name:           "Empty scheduler config file path",
 			path:           "",
-			expectedErr:    fmt.Errorf(fileNotFound),
+			expectedErr:    syscall.Errno(syscall.ENOENT),
 			expectedConfig: nil,
 		},
 		{
@@ -103,13 +110,13 @@ func TestLoadConfigFromFile(t *testing.T) {
 		{
 			name:           "Scheduler config with decode error",
 			path:           decodeErrConfigFile,
-			expectedErr:    fmt.Errorf(apiVersionMissing),
+			expectedErr:    errors.New(apiVersionMissing),
 			expectedConfig: nil,
 		},
 		{
 			name:           "Scheduler config version too old",
 			path:           versionTooOldConfigFile,
-			expectedErr:    fmt.Errorf(apiVersionTooOld),
+			expectedErr:    errors.New(apiVersionTooOld),
 			expectedConfig: nil,
 		},
 	}
@@ -132,5 +139,33 @@ func TestLoadConfigFromFile(t *testing.T) {
 			}
 		})
 
+	}
+}
+
+func TestLogOrWriteConfigRedactsExtenderKeyData(t *testing.T) {
+	logger := ktesting.NewLogger(t, ktesting.NewConfig(ktesting.Verbosity(2), ktesting.BufferLogs(true)))
+	keyData := []byte("-----BEGIN PRIVATE KEY-----\nsecret-bytes\n-----END PRIVATE KEY-----")
+	cfg := &config.KubeSchedulerConfiguration{
+		TypeMeta: metav1.TypeMeta{APIVersion: configv1.SchemeGroupVersion.String()},
+		Extenders: []config.Extender{{
+			URLPrefix:   "https://extender.example.com",
+			EnableHTTPS: true,
+			TLSConfig:   &config.ExtenderTLSConfig{KeyData: keyData},
+		}},
+	}
+
+	if err := LogOrWriteConfig(logger, "", cfg, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	output := logger.GetSink().(ktesting.Underlier).GetBuffer().String()
+	if strings.Contains(output, base64.StdEncoding.EncodeToString(keyData)) {
+		t.Error("extender TLS key data leaked into the logged config")
+	}
+	if !strings.Contains(output, "keyData: REDACTED") {
+		t.Errorf("expected redacted keyData in the logged config, got:\n%s", output)
+	}
+	if !bytes.Equal(cfg.Extenders[0].TLSConfig.KeyData, keyData) {
+		t.Error("LogOrWriteConfig mutated the caller's config")
 	}
 }

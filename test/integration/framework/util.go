@@ -21,28 +21,21 @@ package framework
 import (
 	"context"
 	"fmt"
+	"os"
+	"slices"
 	"testing"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	nodectlr "k8s.io/kubernetes/pkg/controller/nodelifecycle"
-)
-
-const (
-	// poll is how often to Poll pods, nodes and claims.
-	poll = 2 * time.Second
-
-	// singleCallTimeout is how long to try single API calls (like 'get' or 'list'). Used to prevent
-	// transient failures from failing tests.
-	singleCallTimeout = 5 * time.Minute
+	testutils "k8s.io/kubernetes/test/utils"
 )
 
 // CreateNamespaceOrDie creates a namespace.
-func CreateNamespaceOrDie(c clientset.Interface, baseName string, t testing.TB) *v1.Namespace {
+func CreateNamespaceOrDie(c clientset.Interface, baseName string, t testutils.TB) *v1.Namespace {
 	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: baseName}}
 	result, err := c.CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{})
 	if err != nil {
@@ -52,27 +45,11 @@ func CreateNamespaceOrDie(c clientset.Interface, baseName string, t testing.TB) 
 }
 
 // DeleteNamespaceOrDie deletes a namespace.
-func DeleteNamespaceOrDie(c clientset.Interface, ns *v1.Namespace, t testing.TB) {
+func DeleteNamespaceOrDie(c clientset.Interface, ns *v1.Namespace, t testutils.TB) {
 	err := c.CoreV1().Namespaces().Delete(context.TODO(), ns.Name, metav1.DeleteOptions{})
 	if err != nil {
 		t.Fatalf("Failed to delete namespace: %v", err)
 	}
-}
-
-// waitListAllNodes is a wrapper around listing nodes supporting retries.
-func waitListAllNodes(c clientset.Interface) (*v1.NodeList, error) {
-	var nodes *v1.NodeList
-	var err error
-	if wait.PollImmediate(poll, singleCallTimeout, func() (bool, error) {
-		nodes, err = c.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
-		if err != nil {
-			return false, err
-		}
-		return true, nil
-	}) != nil {
-		return nodes, err
-	}
-	return nodes, nil
 }
 
 // Filter filters nodes in NodeList in place, removing nodes that do not
@@ -158,7 +135,7 @@ func isNodeConditionSetAsExpected(node *v1.Node, conditionType v1.NodeConditionT
 							conditionType, node.Name, cond.Status == v1.ConditionTrue, taints)
 					}
 					if !silent {
-						klog.Infof(msg)
+						klog.Info(msg)
 					}
 					return false
 				}
@@ -187,4 +164,28 @@ func isNodeConditionSetAsExpected(node *v1.Node, conditionType v1.NodeConditionT
 		klog.Infof("Couldn't find condition %v on node %v", conditionType, node.Name)
 	}
 	return false
+}
+
+// FixBenchmarkJSONOutput works around Go not emitting a "pass" action for
+// sub-benchmarks
+// (https://github.com/golang/go/issues/66825#issuecomment-2343229005), which
+// causes gotestsum to report a successful benchmark run as failed
+// (https://github.com/gotestyourself/gotestsum/issues/413#issuecomment-2343206787).
+//
+// It does this by printing the missing "PASS" output line that test2json
+// then converts into the "pass" action.
+func FixBenchmarkJSONOutput(b *testing.B) {
+	if !slices.Contains(os.Args, "-test.v=test2json") {
+		return
+	}
+
+	start := time.Now()
+	b.Cleanup(func() {
+		if b.Failed() {
+			return
+		}
+		// SYN gets injected when using -test.v=test2json, see
+		// https://cs.opensource.google/go/go/+/refs/tags/go1.23.3:src/testing/testing.go;drc=87ec2c959c73e62bfae230ef7efca11ec2a90804;l=527
+		fmt.Fprintf(os.Stderr, "%c--- PASS: %s (%.2fs)\n", 22 /* SYN */, b.Name(), time.Since(start).Seconds())
+	})
 }

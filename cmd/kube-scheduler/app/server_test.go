@@ -29,19 +29,21 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/spf13/pflag"
+
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apiserver/pkg/util/feature"
+	basecompatibility "k8s.io/component-base/compatibility"
 	componentbaseconfig "k8s.io/component-base/config"
 	"k8s.io/component-base/featuregate"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	configv1 "k8s.io/kube-scheduler/config/v1"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/cmd/kube-scheduler/app/options"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/testing/defaults"
-	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 func TestSetup(t *testing.T) {
@@ -102,6 +104,7 @@ profiles:
       - name: NodePorts
       - name: InterPodAffinity
       - name: TaintToleration
+      - name: DynamicResources
       disabled:
       - name: "*"
     preFilter:
@@ -117,6 +120,19 @@ profiles:
       disabled:
       - name: VolumeBinding
       - name: NodeResourcesFit
+`, configKubeconfig)), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
+	// plugin config
+	simplifiedPluginConfigFilev1 := filepath.Join(tmpDir, "simplifiedPluginv1.yaml")
+	if err := os.WriteFile(simplifiedPluginConfigFilev1, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: '%s'
+profiles:
+- schedulerName: simplified-scheduler
 `, configKubeconfig)), os.FileMode(0600)); err != nil {
 		t.Fatal(err)
 	}
@@ -198,39 +214,40 @@ leaderElection:
 		name                 string
 		flags                []string
 		registryOptions      []Option
-		restoreFeatures      map[featuregate.Feature]bool
 		wantPlugins          map[string]*config.Plugins
 		wantLeaderElection   *componentbaseconfig.LeaderElectionConfiguration
 		wantClientConnection *componentbaseconfig.ClientConnectionConfiguration
+		wantErr              bool
+		wantFeaturesGates    map[string]bool
 	}{
 		{
-			name: "default config with an alpha feature enabled",
+			name: "default config with beta feature explicitly enabled",
 			flags: []string{
 				"--kubeconfig", configKubeconfig,
-				"--feature-gates=VolumeCapacityPriority=true",
+				"--feature-gates=StorageCapacityScoring=true",
 			},
 			wantPlugins: map[string]*config.Plugins{
 				"default-scheduler": defaults.ExpandedPluginsV1,
 			},
-			restoreFeatures: map[featuregate.Feature]bool{
-				features.VolumeCapacityPriority: false,
+		},
+		{
+			name: "default config with beta feature explicitly disabled",
+			flags: []string{
+				"--kubeconfig", configKubeconfig,
+				"--feature-gates=StorageCapacityScoring=false",
+			},
+			wantPlugins: map[string]*config.Plugins{
+				"default-scheduler": defaults.ExpandedPluginsV1,
 			},
 		},
 		{
-			name: "default config with a beta feature disabled",
+			name: "component configuration v1 with only scheduler name configured",
 			flags: []string{
+				"--config", simplifiedPluginConfigFilev1,
 				"--kubeconfig", configKubeconfig,
-				"--feature-gates=PodSchedulingReadiness=false",
 			},
 			wantPlugins: map[string]*config.Plugins{
-				"default-scheduler": func() *config.Plugins {
-					plugins := defaults.ExpandedPluginsV1.DeepCopy()
-					plugins.PreEnqueue = config.PluginSet{}
-					return plugins
-				}(),
-			},
-			restoreFeatures: map[featuregate.Feature]bool{
-				features.PodSchedulingReadiness: true,
+				"simplified-scheduler": defaults.ExpandedPluginsV1,
 			},
 		},
 		{
@@ -251,15 +268,22 @@ leaderElection:
 			wantPlugins: map[string]*config.Plugins{
 				"default-scheduler": func() *config.Plugins {
 					plugins := defaults.ExpandedPluginsV1.DeepCopy()
+					// With this (and only this?!) config comes DynamicResources after DefaultPreemption.
+					plugins.PreEnqueue.Enabled[1], plugins.PreEnqueue.Enabled[2] = plugins.PreEnqueue.Enabled[2], plugins.PreEnqueue.Enabled[1]
+					plugins.PostFilter.Enabled[0], plugins.PostFilter.Enabled[1] = plugins.PostFilter.Enabled[1], plugins.PostFilter.Enabled[0]
+					plugins.PodGroupPostFilter.Enabled[0], plugins.PodGroupPostFilter.Enabled[1] = plugins.PodGroupPostFilter.Enabled[1], plugins.PodGroupPostFilter.Enabled[0]
 					plugins.Filter.Enabled = []config.Plugin{
 						{Name: "NodeResourcesFit"},
 						{Name: "NodePorts"},
+						{Name: "DynamicResources"},
 					}
 					plugins.PreFilter.Enabled = []config.Plugin{
 						{Name: "NodeResourcesFit"},
 						{Name: "NodePorts"},
+						{Name: "DynamicResources"},
 					}
 					plugins.PreScore.Enabled = []config.Plugin{
+						{Name: "VolumeBinding"},
 						{Name: "NodeResourcesFit"},
 						{Name: "InterPodAffinity"},
 						{Name: "TaintToleration"},
@@ -267,6 +291,10 @@ leaderElection:
 					plugins.Score.Enabled = []config.Plugin{
 						{Name: "InterPodAffinity", Weight: 1},
 						{Name: "TaintToleration", Weight: 1},
+						{Name: "DynamicResources", Weight: 1},
+					}
+					plugins.Bind.Enabled = []config.Plugin{
+						{Name: "DefaultBinder"},
 					}
 					return plugins
 				}(),
@@ -369,6 +397,46 @@ leaderElection:
 				ResourceNamespace: configv1.SchedulerDefaultLockObjectNamespace,
 			},
 		},
+		{
+			name: "emulated version out of range",
+			flags: []string{
+				"--kubeconfig", configKubeconfig,
+				"--emulated-version=1.28",
+			},
+			wantErr: true,
+		},
+		{
+			name: "default feature gates at binary version",
+			flags: []string{
+				"--kubeconfig", configKubeconfig,
+			},
+			wantFeaturesGates: map[string]bool{"kubeA": true, "kubeB": false},
+		},
+		{
+			name: "default feature gates at emulated version",
+			flags: []string{
+				"--kubeconfig", configKubeconfig,
+				"--emulated-version=1.31",
+			},
+			wantFeaturesGates: map[string]bool{"kubeA": false, "kubeB": false},
+		},
+		{
+			name: "set feature gates at emulated version",
+			flags: []string{
+				"--kubeconfig", configKubeconfig,
+				"--emulated-version=1.31",
+				"--feature-gates=kubeA=false,kubeB=true",
+			},
+			wantFeaturesGates: map[string]bool{"kubeA": false, "kubeB": true},
+		},
+		{
+			name: "cannot set locked feature gate",
+			flags: []string{
+				"--kubeconfig", configKubeconfig,
+				"--feature-gates=kubeA=false,kubeB=true",
+			},
+			wantErr: true,
+		},
 	}
 
 	makeListener := func(t *testing.T) net.Listener {
@@ -382,12 +450,23 @@ leaderElection:
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			for k, v := range tc.restoreFeatures {
-				defer featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, k, v)()
-			}
+			componentGlobalsRegistry := basecompatibility.NewComponentGlobalsRegistry()
+			// set binary version to v1.37+ since StorageCapacityScoring (Beta in v1.37) is enabled by default
+			verKube := basecompatibility.NewEffectiveVersionFromString("1.37", "1.31", "1.31")
+			fg := feature.DefaultFeatureGate.DeepCopy()
+			utilruntime.Must(fg.AddVersioned(map[featuregate.Feature]featuregate.VersionedSpecs{
+				"kubeA": {
+					{Version: version.MustParse("1.30"), Default: false, PreRelease: featuregate.Beta},
+					{Version: version.MustParse("1.32"), Default: true, LockToDefault: true, PreRelease: featuregate.GA},
+				},
+				"kubeB": {
+					{Version: version.MustParse("1.31"), Default: false, PreRelease: featuregate.Alpha},
+				},
+			}))
+			utilruntime.Must(componentGlobalsRegistry.Register(basecompatibility.DefaultKubeComponent, verKube, fg))
 
 			fs := pflag.NewFlagSet("test", pflag.PanicOnError)
-			opts := options.NewOptions()
+			opts := options.NewOptionsWithComponentGlobalsRegistry(componentGlobalsRegistry)
 
 			// use listeners instead of static ports so parallel test runs don't conflict
 			opts.SecureServing.Listener = makeListener(t)
@@ -408,6 +487,12 @@ leaderElection:
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			_, sched, err := Setup(ctx, opts, tc.registryOptions...)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected Setup error, got nil")
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -436,6 +521,12 @@ leaderElection:
 					t.Errorf("Unexpected clientConnection diff (-want, +got): %s", diff)
 				}
 			}
+			for f, v := range tc.wantFeaturesGates {
+				enabled := fg.Enabled(featuregate.Feature(f))
+				if enabled != v {
+					t.Errorf("expected featuregate.Enabled(%s)=%v, got %v", f, v, enabled)
+				}
+			}
 		})
 	}
 }
@@ -443,25 +534,25 @@ leaderElection:
 // Simulates an out-of-tree plugin.
 type foo struct{}
 
-var _ framework.PreFilterPlugin = &foo{}
-var _ framework.FilterPlugin = &foo{}
+var _ fwk.PreFilterPlugin = &foo{}
+var _ fwk.FilterPlugin = &foo{}
 
 func (*foo) Name() string {
 	return "Foo"
 }
 
-func newFoo(_ runtime.Object, _ framework.Handle) (framework.Plugin, error) {
+func newFoo(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
 	return &foo{}, nil
 }
 
-func (*foo) PreFilter(_ context.Context, _ *framework.CycleState, _ *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
+func (*foo) PreFilter(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ []fwk.NodeInfo) (*fwk.PreFilterResult, *fwk.Status) {
 	return nil, nil
 }
 
-func (*foo) PreFilterExtensions() framework.PreFilterExtensions {
+func (*foo) PreFilterExtensions() fwk.PreFilterExtensions {
 	return nil
 }
 
-func (*foo) Filter(_ context.Context, _ *framework.CycleState, _ *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+func (*foo) Filter(_ context.Context, _ fwk.CycleState, _ *v1.Pod, nodeInfo fwk.NodeInfo) *fwk.Status {
 	return nil
 }

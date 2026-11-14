@@ -17,6 +17,7 @@ limitations under the License.
 package portforward
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -31,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/rest/fake"
+	"k8s.io/client-go/tools/portforward"
 	cmdtesting "k8s.io/kubectl/pkg/cmd/testing"
 	"k8s.io/kubectl/pkg/scheme"
 )
@@ -101,6 +103,8 @@ func testPortForward(t *testing.T, flags map[string]string, args []string) {
 			}
 
 			opts := &PortForwardOptions{}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			cmd := NewCmdPortForward(tf, genericiooptions.NewTestIOStreamsDiscard())
 			cmd.Run = func(cmd *cobra.Command, args []string) {
 				if err = opts.Complete(tf, cmd, args); err != nil {
@@ -110,7 +114,7 @@ func testPortForward(t *testing.T, flags map[string]string, args []string) {
 				if err = opts.Validate(); err != nil {
 					return
 				}
-				err = opts.RunPortForward()
+				err = opts.RunPortForwardContext(ctx)
 			}
 
 			for name, value := range flags {
@@ -815,6 +819,24 @@ func TestConvertPodNamedPortToNumber(t *testing.T) {
 			ports: []string{"https", "http"},
 			err:   true,
 		},
+		{
+			name: "empty port name",
+			pod: corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Ports: []corev1.ContainerPort{
+								{
+									ContainerPort: int32(27017)},
+							},
+						},
+					},
+				},
+			},
+			ports:     []string{"28015:"},
+			converted: nil,
+			err:       true,
+		},
 	}
 
 	for _, tc := range cases {
@@ -979,4 +1001,22 @@ func TestCheckUDPPort(t *testing.T) {
 			t.Errorf("%v: unexpected success", tc.name)
 		}
 	}
+}
+
+func TestCreateDialer(t *testing.T) {
+	url, err := url.Parse("http://localhost:8080/index.html")
+	if err != nil {
+		t.Fatalf("unable to parse test url: %v", err)
+	}
+	config := cmdtesting.DefaultClientConfig()
+	opts := PortForwardOptions{Config: config}
+	// WebSockets with SPDY fallback is always used.
+	dialer, err := createDialer("GET", url, opts)
+	if err != nil {
+		t.Fatalf("unable to create dialer: %v", err)
+	}
+	if _, isFallback := dialer.(*portforward.StreamingFallbackDialer); !isFallback {
+		t.Errorf("expected fallback dialer, got %#v", dialer)
+	}
+
 }

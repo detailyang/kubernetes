@@ -265,3 +265,57 @@
 - endpoint: createAuthenticationV1SelfSubjectReview
   reason: Cluster providers are allowed to choose to not serve this API, and the whoami command handles unavailability gracefully.
   link: https://github.com/kubernetes/enhancements/blob/master/keps/sig-auth/3325-self-subject-attributes-review-api/README.md#ga
+- endpoint: getInternalApiserverAPIGroup
+  reason: The endpoint is part of a group that has no stable endpoints yet, reporting as a stable endpoint in apisnoop.
+  link: https://github.com/kubernetes/issues/124248
+- endpoint: getResourceAPIGroup
+  reason: The endpoint is part of a group that has no stable endpoints yet, reporting as a stable endpoint in apisnoop.
+  link: https://github.com/kubernetes/issues/124248
+- endpoint: getStoragemigrationAPIGroup
+  reason: The endpoint is part of a group that has no stable endpoints yet, reporting as a stable endpoint in apisnoop.
+  link: https://github.com/kubernetes/issues/124248
+- endpoint: createNetworkingV1ServiceCIDR
+  reason: Kubernetes distribution would reasonably not allow this action via the API
+  link: https://github.com/kubernetes/enhancements/pull/4983#issuecomment-2541699445
+- endpoint: deleteNetworkingV1CollectionServiceCIDR
+  reason: Kubernetes distribution would reasonably not allow this action via the API
+  link: https://github.com/kubernetes/enhancements/pull/4983#issuecomment-2541699445
+- endpoint: deleteNetworkingV1ServiceCIDR
+  reason: Kubernetes distribution would reasonably not allow this action via the API
+  link: https://github.com/kubernetes/enhancements/pull/4983#issuecomment-2541699445
+- endpoint: patchNetworkingV1ServiceCIDR
+  reason: Kubernetes distribution would reasonably not allow this action via the API
+  link: https://github.com/kubernetes/enhancements/pull/4983#issuecomment-2541699445
+- endpoint: patchNetworkingV1ServiceCIDRStatus
+  reason: Kubernetes distribution would reasonably not allow this action via the API
+  link: https://github.com/kubernetes/enhancements/pull/4983#issuecomment-2541699445
+- endpoint: replaceNetworkingV1ServiceCIDR
+  reason: Kubernetes distribution would reasonably not allow this action via the API
+  link: https://github.com/kubernetes/enhancements/pull/4983#issuecomment-2541699445
+- endpoint: replaceNetworkingV1ServiceCIDRStatus
+  reason: Kubernetes distribution would reasonably not allow this action via the API
+  link: https://github.com/kubernetes/enhancements/pull/4983#issuecomment-2541699445
+- endpoint: connectCoreV1PostNamespacedPodExec
+  reason: Deprecated and uses a sometime unreliable SPDY protocol
+  link: https://github.com/kubernetes/kubernetes/issues/133689#issuecomment-3233952615
+- endpoint: connectCoreV1PostNamespacedPodPortforward
+  reason: Deprecated and uses a sometime unreliable SPDY protocol
+  link: https://github.com/kubernetes/kubernetes/issues/133689#issuecomment-3233952615
+- endpoint: readStorageV1CSINodeStatus
+  reason: CSINode status subresource is behind the alpha CSIVolumeHealth feature gate
+  link: https://github.com/kubernetes/enhancements/issues/1432
+- endpoint: patchStorageV1CSINodeStatus
+  reason: CSINode status subresource is behind the alpha CSIVolumeHealth feature gate
+  link: https://github.com/kubernetes/enhancements/issues/1432
+- endpoint: replaceStorageV1CSINodeStatus
+  reason: CSINode status subresource is behind the alpha CSIVolumeHealth feature gate
+  link: https://github.com/kubernetes/enhancements/issues/1432
+- endpoint: readCoreV1NamespacedPodDynamic
+  reason: Pod dynamic subresource is behind the alpha DynamicContainers feature gate
+  link: https://github.com/kubernetes/enhancements/issues/5972
+- endpoint: patchCoreV1NamespacedPodDynamic
+  reason: Pod dynamic subresource is behind the alpha DynamicContainers feature gate
+  link: https://github.com/kubernetes/enhancements/issues/5972
+- endpoint: replaceCoreV1NamespacedPodDynamic
+  reason: Pod dynamic subresource is behind the alpha DynamicContainers feature gate
+  link: https://github.com/kubernetes/enhancements/issues/5972

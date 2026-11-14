@@ -24,69 +24,29 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
+
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/client-go/tools/record"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/metrics/testutil"
-	"k8s.io/kubernetes/pkg/features"
+	ndf "k8s.io/component-helpers/nodedeclaredfeatures"
+	ndftesting "k8s.io/component-helpers/nodedeclaredfeatures/testing"
+	"k8s.io/ktesting"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
 	"k8s.io/kubernetes/pkg/kubelet/util/format"
 )
-
-func TestResolvePortInt(t *testing.T) {
-	expected := 80
-	port, err := resolvePort(intstr.FromInt32(int32(expected)), &v1.Container{})
-	if port != expected {
-		t.Errorf("expected: %d, saw: %d", expected, port)
-	}
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestResolvePortString(t *testing.T) {
-	expected := 80
-	name := "foo"
-	container := &v1.Container{
-		Ports: []v1.ContainerPort{
-			{Name: name, ContainerPort: int32(expected)},
-		},
-	}
-	port, err := resolvePort(intstr.FromString(name), container)
-	if port != expected {
-		t.Errorf("expected: %d, saw: %d", expected, port)
-	}
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestResolvePortStringUnknown(t *testing.T) {
-	expected := int32(80)
-	name := "foo"
-	container := &v1.Container{
-		Ports: []v1.ContainerPort{
-			{Name: "bar", ContainerPort: expected},
-		},
-	}
-	port, err := resolvePort(intstr.FromString(name), container)
-	if port != -1 {
-		t.Errorf("expected: -1, saw: %d", port)
-	}
-	if err == nil {
-		t.Error("unexpected non-error")
-	}
-}
 
 type fakeContainerCommandRunner struct {
 	Cmd []string
@@ -102,24 +62,26 @@ func (f *fakeContainerCommandRunner) RunInContainer(_ context.Context, id kubeco
 }
 
 func stubPodStatusProvider(podIP string) podStatusProvider {
-	return podStatusProviderFunc(func(uid types.UID, name, namespace string) (*kubecontainer.PodStatus, error) {
-		return &kubecontainer.PodStatus{
-			ID:        uid,
-			Name:      name,
-			Namespace: namespace,
-			IPs:       []string{podIP},
-		}, nil
-	})
+	return &fakePodStatusProvider{podIP: podIP}
 }
 
-type podStatusProviderFunc func(uid types.UID, name, namespace string) (*kubecontainer.PodStatus, error)
+type fakePodStatusProvider struct {
+	podIP string
+}
 
-func (f podStatusProviderFunc) GetPodStatus(_ context.Context, uid types.UID, name, namespace string) (*kubecontainer.PodStatus, error) {
-	return f(uid, name, namespace)
+func (f *fakePodStatusProvider) GetPod(_ context.Context, uid types.UID) (*kubecontainer.Pod, error) {
+	return &kubecontainer.Pod{ID: uid}, nil
+}
+
+func (f *fakePodStatusProvider) GetPodStatus(_ context.Context, pod *kubecontainer.Pod) (*kubecontainer.PodStatus, error) {
+	return &kubecontainer.PodStatus{
+		ID:  pod.ID,
+		IPs: []string{f.podIP},
+	}, nil
 }
 
 func TestRunHandlerExec(t *testing.T) {
-	ctx := context.Background()
+	_, tCtx := ktesting.NewTestContext(t)
 	fakeCommandRunner := fakeContainerCommandRunner{}
 	handlerRunner := NewHandlerRunner(&fakeHTTP{}, &fakeCommandRunner, nil, nil)
 
@@ -141,7 +103,7 @@ func TestRunHandlerExec(t *testing.T) {
 	pod.ObjectMeta.Name = "podFoo"
 	pod.ObjectMeta.Namespace = "nsFoo"
 	pod.Spec.Containers = []v1.Container{container}
-	_, err := handlerRunner.Run(ctx, containerID, &pod, &container, container.Lifecycle.PostStart)
+	_, err := handlerRunner.Run(tCtx, containerID, &pod, &container, container.Lifecycle.PostStart)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -165,7 +127,7 @@ func (f *fakeHTTP) Do(req *http.Request) (*http.Response, error) {
 }
 
 func TestRunHandlerHttp(t *testing.T) {
-	ctx := context.Background()
+	_, tCtx := ktesting.NewTestContext(t)
 	fakeHTTPGetter := fakeHTTP{}
 	fakePodStatusProvider := stubPodStatusProvider("127.0.0.1")
 	handlerRunner := NewHandlerRunner(&fakeHTTPGetter, &fakeContainerCommandRunner{}, fakePodStatusProvider, nil)
@@ -190,7 +152,7 @@ func TestRunHandlerHttp(t *testing.T) {
 	pod.ObjectMeta.Namespace = "nsFoo"
 	pod.ObjectMeta.UID = "foo-bar-quux"
 	pod.Spec.Containers = []v1.Container{container}
-	_, err := handlerRunner.Run(ctx, containerID, &pod, &container, container.Lifecycle.PostStart)
+	_, err := handlerRunner.Run(tCtx, containerID, &pod, &container, container.Lifecycle.PostStart)
 
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
@@ -201,7 +163,7 @@ func TestRunHandlerHttp(t *testing.T) {
 }
 
 func TestRunHandlerHttpWithHeaders(t *testing.T) {
-	ctx := context.Background()
+	_, tCtx := ktesting.NewTestContext(t)
 	fakeHTTPDoer := fakeHTTP{}
 	fakePodStatusProvider := stubPodStatusProvider("127.0.0.1")
 
@@ -229,7 +191,7 @@ func TestRunHandlerHttpWithHeaders(t *testing.T) {
 	pod.ObjectMeta.Name = "podFoo"
 	pod.ObjectMeta.Namespace = "nsFoo"
 	pod.Spec.Containers = []v1.Container{container}
-	_, err := handlerRunner.Run(ctx, containerID, &pod, &container, container.Lifecycle.PostStart)
+	_, err := handlerRunner.Run(tCtx, containerID, &pod, &container, container.Lifecycle.PostStart)
 
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
@@ -243,7 +205,7 @@ func TestRunHandlerHttpWithHeaders(t *testing.T) {
 }
 
 func TestRunHandlerHttps(t *testing.T) {
-	ctx := context.Background()
+	_, tCtx := ktesting.NewTestContext(t)
 	fakeHTTPDoer := fakeHTTP{}
 	fakePodStatusProvider := stubPodStatusProvider("127.0.0.1")
 	handlerRunner := NewHandlerRunner(&fakeHTTPDoer, &fakeContainerCommandRunner{}, fakePodStatusProvider, nil)
@@ -269,9 +231,9 @@ func TestRunHandlerHttps(t *testing.T) {
 	pod.Spec.Containers = []v1.Container{container}
 
 	t.Run("consistent", func(t *testing.T) {
-		container.Lifecycle.PostStart.HTTPGet.Port = intstr.FromString("70")
+		container.Lifecycle.PostStart.HTTPGet.Port = intstr.FromInt32(70)
 		pod.Spec.Containers = []v1.Container{container}
-		_, err := handlerRunner.Run(ctx, containerID, &pod, &container, container.Lifecycle.PostStart)
+		_, err := handlerRunner.Run(tCtx, containerID, &pod, &container, container.Lifecycle.PostStart)
 
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
@@ -280,50 +242,23 @@ func TestRunHandlerHttps(t *testing.T) {
 			t.Errorf("unexpected url: %s", fakeHTTPDoer.url)
 		}
 	})
-
-	t.Run("inconsistent", func(t *testing.T) {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentHTTPGetHandlers, false)()
-		container.Lifecycle.PostStart.HTTPGet.Port = intstr.FromString("70")
-		pod.Spec.Containers = []v1.Container{container}
-		_, err := handlerRunner.Run(ctx, containerID, &pod, &container, container.Lifecycle.PostStart)
-
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
-		if fakeHTTPDoer.url != "http://foo:70/bar" {
-			t.Errorf("unexpected url: %q", fakeHTTPDoer.url)
-		}
-	})
 }
 
 func TestRunHandlerHTTPPort(t *testing.T) {
 	tests := []struct {
-		Name               string
-		FeatureGateEnabled bool
-		Port               intstr.IntOrString
-		ExpectError        bool
-		Expected           string
+		Name        string
+		Port        intstr.IntOrString
+		ExpectError bool
+		Expected    string
 	}{
 		{
-			Name:               "consistent/with port",
-			FeatureGateEnabled: true,
-			Port:               intstr.FromString("70"),
-			Expected:           "https://foo:70/bar",
+			Name:     "consistent/with port",
+			Port:     intstr.FromInt32(70),
+			Expected: "https://foo:70/bar",
 		}, {
-			Name:               "consistent/without port",
-			FeatureGateEnabled: true,
-			Port:               intstr.FromString(""),
-			ExpectError:        true,
-		}, {
-			Name:               "inconsistent/with port",
-			FeatureGateEnabled: false,
-			Port:               intstr.FromString("70"),
-			Expected:           "http://foo:70/bar",
-		}, {
-			Name:               "inconsistent/without port",
-			Port:               intstr.FromString(""),
-			FeatureGateEnabled: false,
-			Expected:           "http://foo:80/bar",
+			Name:        "consistent/without port",
+			Port:        intstr.FromString(""),
+			ExpectError: true,
 		},
 	}
 
@@ -352,14 +287,13 @@ func TestRunHandlerHTTPPort(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.Name, func(t *testing.T) {
-			ctx := context.Background()
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentHTTPGetHandlers, tt.FeatureGateEnabled)()
+			_, tCtx := ktesting.NewTestContext(t)
 			fakeHTTPDoer := fakeHTTP{}
 			handlerRunner := NewHandlerRunner(&fakeHTTPDoer, &fakeContainerCommandRunner{}, fakePodStatusProvider, nil)
 
 			container.Lifecycle.PostStart.HTTPGet.Port = tt.Port
 			pod.Spec.Containers = []v1.Container{container}
-			_, err := handlerRunner.Run(ctx, containerID, &pod, &container, container.Lifecycle.PostStart)
+			_, err := handlerRunner.Run(tCtx, containerID, &pod, &container, container.Lifecycle.PostStart)
 
 			if hasError := (err != nil); hasError != tt.ExpectError {
 				t.Errorf("unexpected error: %v", err)
@@ -391,7 +325,7 @@ func TestRunHTTPHandler(t *testing.T) {
 			PodIP: "",
 			HTTPGet: &v1.HTTPGetAction{
 				Path:        "foo",
-				Port:        intstr.FromString("42"),
+				Port:        intstr.FromInt32(42),
 				Host:        "example.test",
 				Scheme:      "http",
 				HTTPHeaders: []v1.HTTPHeader{},
@@ -410,7 +344,7 @@ func TestRunHTTPHandler(t *testing.T) {
 			PodIP: "233.252.0.1",
 			HTTPGet: &v1.HTTPGetAction{
 				Path:        "foo",
-				Port:        intstr.FromString("42"),
+				Port:        intstr.FromInt32(42),
 				Scheme:      "http",
 				HTTPHeaders: []v1.HTTPHeader{},
 			},
@@ -428,7 +362,7 @@ func TestRunHTTPHandler(t *testing.T) {
 			PodIP: "233.252.0.1",
 			HTTPGet: &v1.HTTPGetAction{
 				Path:        "/foo",
-				Port:        intstr.FromString("42"),
+				Port:        intstr.FromInt32(42),
 				Scheme:      "http",
 				HTTPHeaders: []v1.HTTPHeader{},
 			},
@@ -446,7 +380,7 @@ func TestRunHTTPHandler(t *testing.T) {
 			PodIP: "233.252.0.1",
 			HTTPGet: &v1.HTTPGetAction{
 				Path:        "foo",
-				Port:        intstr.FromString("42"),
+				Port:        intstr.FromInt32(42),
 				Scheme:      "http",
 				HTTPHeaders: []v1.HTTPHeader{},
 			},
@@ -482,7 +416,7 @@ func TestRunHTTPHandler(t *testing.T) {
 			PodIP: "233.252.0.1",
 			HTTPGet: &v1.HTTPGetAction{
 				Path:        "foo",
-				Port:        intstr.FromString("4430"),
+				Port:        intstr.FromInt32(4430),
 				Scheme:      "https",
 				HTTPHeaders: []v1.HTTPHeader{},
 			},
@@ -500,7 +434,7 @@ func TestRunHTTPHandler(t *testing.T) {
 			PodIP: "233.252.0.1",
 			HTTPGet: &v1.HTTPGetAction{
 				Path:        "foo",
-				Port:        intstr.FromString("80"),
+				Port:        intstr.FromInt32(80),
 				Scheme:      "baz",
 				HTTPHeaders: []v1.HTTPHeader{},
 			},
@@ -518,7 +452,7 @@ func TestRunHTTPHandler(t *testing.T) {
 			PodIP: "233.252.0.1",
 			HTTPGet: &v1.HTTPGetAction{
 				Path:        "foo?k=v",
-				Port:        intstr.FromString("80"),
+				Port:        intstr.FromInt32(80),
 				Scheme:      "http",
 				HTTPHeaders: []v1.HTTPHeader{},
 			},
@@ -536,7 +470,7 @@ func TestRunHTTPHandler(t *testing.T) {
 			PodIP: "233.252.0.1",
 			HTTPGet: &v1.HTTPGetAction{
 				Path:        "foo#frag",
-				Port:        intstr.FromString("80"),
+				Port:        intstr.FromInt32(80),
 				Scheme:      "http",
 				HTTPHeaders: []v1.HTTPHeader{},
 			},
@@ -554,7 +488,7 @@ func TestRunHTTPHandler(t *testing.T) {
 			PodIP: "233.252.0.1",
 			HTTPGet: &v1.HTTPGetAction{
 				Path:   "foo",
-				Port:   intstr.FromString("80"),
+				Port:   intstr.FromInt32(80),
 				Scheme: "http",
 				HTTPHeaders: []v1.HTTPHeader{
 					{
@@ -579,7 +513,7 @@ func TestRunHTTPHandler(t *testing.T) {
 			HTTPGet: &v1.HTTPGetAction{
 				Host:   "example.test",
 				Path:   "foo",
-				Port:   intstr.FromString("80"),
+				Port:   intstr.FromInt32(80),
 				Scheme: "http",
 				HTTPHeaders: []v1.HTTPHeader{
 					{
@@ -624,7 +558,7 @@ func TestRunHTTPHandler(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.Name, func(t *testing.T) {
-			ctx := context.Background()
+			_, tCtx := ktesting.NewTestContext(t)
 			fakePodStatusProvider := stubPodStatusProvider(tt.PodIP)
 
 			container.Lifecycle.PostStart.HTTPGet = tt.HTTPGet
@@ -634,7 +568,7 @@ func TestRunHTTPHandler(t *testing.T) {
 				fakeHTTPDoer := fakeHTTP{}
 				handlerRunner := NewHandlerRunner(&fakeHTTPDoer, &fakeContainerCommandRunner{}, fakePodStatusProvider, nil)
 
-				_, err := handlerRunner.Run(ctx, containerID, &pod, &container, container.Lifecycle.PostStart)
+				_, err := handlerRunner.Run(tCtx, containerID, &pod, &container, container.Lifecycle.PostStart)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -648,20 +582,14 @@ func TestRunHTTPHandler(t *testing.T) {
 			}
 
 			t.Run("consistent", func(t *testing.T) {
-				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentHTTPGetHandlers, true)()
 				verify(t, tt.Expected.NewHeader, tt.Expected.NewURL)
-			})
-
-			t.Run("inconsistent", func(t *testing.T) {
-				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentHTTPGetHandlers, false)()
-				verify(t, tt.Expected.OldHeader, tt.Expected.OldURL)
 			})
 		})
 	}
 }
 
 func TestRunHandlerNil(t *testing.T) {
-	ctx := context.Background()
+	_, tCtx := ktesting.NewTestContext(t)
 	handlerRunner := NewHandlerRunner(&fakeHTTP{}, &fakeContainerCommandRunner{}, nil, nil)
 	containerID := kubecontainer.ContainerID{Type: "test", ID: "abc1234"}
 	podName := "podFoo"
@@ -678,14 +606,14 @@ func TestRunHandlerNil(t *testing.T) {
 	pod.ObjectMeta.Name = podName
 	pod.ObjectMeta.Namespace = podNamespace
 	pod.Spec.Containers = []v1.Container{container}
-	_, err := handlerRunner.Run(ctx, containerID, &pod, &container, container.Lifecycle.PostStart)
+	_, err := handlerRunner.Run(tCtx, containerID, &pod, &container, container.Lifecycle.PostStart)
 	if err == nil {
 		t.Errorf("expect error, but got nil")
 	}
 }
 
 func TestRunHandlerExecFailure(t *testing.T) {
-	ctx := context.Background()
+	_, tCtx := ktesting.NewTestContext(t)
 	expectedErr := fmt.Errorf("invalid command")
 	fakeCommandRunner := fakeContainerCommandRunner{Err: expectedErr, Msg: expectedErr.Error()}
 	handlerRunner := NewHandlerRunner(&fakeHTTP{}, &fakeCommandRunner, nil, nil)
@@ -710,7 +638,7 @@ func TestRunHandlerExecFailure(t *testing.T) {
 	pod.ObjectMeta.Namespace = "nsFoo"
 	pod.Spec.Containers = []v1.Container{container}
 	expectedErrMsg := fmt.Sprintf("Exec lifecycle hook (%s) for Container %q in Pod %q failed - error: %v, message: %q", command, containerName, format.Pod(&pod), expectedErr, expectedErr.Error())
-	msg, err := handlerRunner.Run(ctx, containerID, &pod, &container, container.Lifecycle.PostStart)
+	msg, err := handlerRunner.Run(tCtx, containerID, &pod, &container, container.Lifecycle.PostStart)
 	if err == nil {
 		t.Errorf("expected error: %v", expectedErr)
 	}
@@ -720,7 +648,7 @@ func TestRunHandlerExecFailure(t *testing.T) {
 }
 
 func TestRunHandlerHttpFailure(t *testing.T) {
-	ctx := context.Background()
+	_, tCtx := ktesting.NewTestContext(t)
 	expectedErr := fmt.Errorf("fake http error")
 	expectedResp := http.Response{
 		Body: io.NopCloser(strings.NewReader(expectedErr.Error())),
@@ -750,7 +678,7 @@ func TestRunHandlerHttpFailure(t *testing.T) {
 	pod.ObjectMeta.Namespace = "nsFoo"
 	pod.Spec.Containers = []v1.Container{container}
 	expectedErrMsg := fmt.Sprintf("HTTP lifecycle hook (%s) for Container %q in Pod %q failed - error: %v", "bar", containerName, format.Pod(&pod), expectedErr)
-	msg, err := handlerRunner.Run(ctx, containerID, &pod, &container, container.Lifecycle.PostStart)
+	msg, err := handlerRunner.Run(tCtx, containerID, &pod, &container, container.Lifecycle.PostStart)
 	if err == nil {
 		t.Errorf("expected error: %v", expectedErr)
 	}
@@ -763,8 +691,7 @@ func TestRunHandlerHttpFailure(t *testing.T) {
 }
 
 func TestRunHandlerHttpsFailureFallback(t *testing.T) {
-	ctx := context.Background()
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsistentHTTPGetHandlers, true)()
+	_, tCtx := ktesting.NewTestContext(t)
 
 	// Since prometheus' gatherer is global, other tests may have updated metrics already, so
 	// we need to reset them prior running this test.
@@ -778,6 +705,10 @@ func TestRunHandlerHttpsFailureFallback(t *testing.T) {
 	}))
 	defer srv.Close()
 	_, port, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	portNumber, err := strconv.Atoi(port)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -798,7 +729,7 @@ func TestRunHandlerHttpsFailureFallback(t *testing.T) {
 					// set the scheme to https to ensure it falls back to HTTP.
 					Scheme: "https",
 					Host:   "127.0.0.1",
-					Port:   intstr.FromString(port),
+					Port:   intstr.FromInt32(int32(portNumber)),
 					Path:   "bar",
 					HTTPHeaders: []v1.HTTPHeader{
 						{
@@ -814,7 +745,7 @@ func TestRunHandlerHttpsFailureFallback(t *testing.T) {
 	pod.ObjectMeta.Name = "podFoo"
 	pod.ObjectMeta.Namespace = "nsFoo"
 	pod.Spec.Containers = []v1.Container{container}
-	msg, err := handlerRunner.Run(ctx, containerID, &pod, &container, container.Lifecycle.PostStart)
+	msg, err := handlerRunner.Run(tCtx, containerID, &pod, &container, container.Lifecycle.PostStart)
 
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
@@ -857,5 +788,274 @@ func TestIsHTTPResponseError(t *testing.T) {
 	_, err = http.DefaultClient.Do(req)
 	if !isHTTPResponseError(err) {
 		t.Errorf("unexpected http response error: %v", err)
+	}
+}
+
+func TestRunSleepHandler(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	handlerRunner := NewHandlerRunner(&fakeHTTP{}, &fakeContainerCommandRunner{}, nil, nil)
+	containerID := kubecontainer.ContainerID{Type: "test", ID: "abc1234"}
+	containerName := "containerFoo"
+	container := v1.Container{
+		Name: containerName,
+		Lifecycle: &v1.Lifecycle{
+			PreStop: &v1.LifecycleHandler{},
+		},
+	}
+	pod := v1.Pod{}
+	pod.ObjectMeta.Name = "podFoo"
+	pod.ObjectMeta.Namespace = "nsFoo"
+	pod.Spec.Containers = []v1.Container{container}
+
+	tests := []struct {
+		name                          string
+		sleepSeconds                  int64
+		terminationGracePeriodSeconds int64
+		expectErr                     bool
+		expectedErr                   string
+	}{
+		{
+			name:                          "valid seconds",
+			sleepSeconds:                  5,
+			terminationGracePeriodSeconds: 30,
+		},
+		{
+			name:                          "longer than TerminationGracePeriodSeconds",
+			sleepSeconds:                  3,
+			terminationGracePeriodSeconds: 2,
+			expectErr:                     true,
+			expectedErr:                   "container terminated before sleep hook finished",
+		},
+	}
+
+	for _, tt := range tests {
+		tCtx.SyncTest(tt.name, func(tCtx ktesting.TContext) {
+			t := tCtx.TB()
+			pod.Spec.Containers[0].Lifecycle.PreStop.Sleep = &v1.SleepAction{Seconds: tt.sleepSeconds}
+			ctx, cancel := context.WithTimeout(tCtx, time.Duration(tt.terminationGracePeriodSeconds)*time.Second)
+			defer cancel()
+
+			_, err := handlerRunner.Run(ctx, containerID, &pod, &container, container.Lifecycle.PreStop)
+
+			if !tt.expectErr && err != nil {
+				t.Errorf("unexpected success")
+			}
+			if tt.expectErr && err.Error() != tt.expectedErr {
+				t.Errorf("%s: expected error want %s, got %s", tt.name, tt.expectedErr, err.Error())
+			}
+		})
+	}
+}
+
+func TestDeclaredFeaturesAdmitHandler(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	basePod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pod",
+		},
+	}
+	createMockFeature := func(t *testing.T, name string, inferForSched bool, maxVersionStr string) *ndftesting.MockFeature {
+		m := ndftesting.NewMockFeature(t)
+		m.SetName(name)
+		m.SetInferForScheduling(func(podInfo *ndf.PodInfo) bool { return inferForSched })
+		if maxVersionStr != "" {
+			m.SetMaxVersion(version.MustParseSemantic(maxVersionStr))
+		} else {
+			m.SetMaxVersion(nil)
+		}
+		return m
+	}
+	createPodContainerFeature := func(t *testing.T, name string, maxVersionStr string) *ndftesting.MockFeature {
+		m := ndftesting.NewMockFeature(t)
+		m.SetName(name)
+		m.SetInferForScheduling(func(podInfo *ndf.PodInfo) bool {
+			return podInfo.Spec != nil && len(podInfo.Spec.Containers) > 0
+		})
+		if maxVersionStr != "" {
+			m.SetMaxVersion(version.MustParseSemantic(maxVersionStr))
+		} else {
+			m.SetMaxVersion(nil)
+		}
+		return m
+	}
+	createUpdateOnlyFeature := func(t *testing.T, name string, inferForUpdate bool) *ndftesting.MockFeature {
+		m := ndftesting.NewMockFeature(t)
+		m.SetName(name)
+		m.SetInferForScheduling(func(podInfo *ndf.PodInfo) bool { return false })
+		m.SetInferForUpdate(func(oldPodInfo, newPodInfo *ndf.PodInfo) bool { return inferForUpdate })
+		m.SetMaxVersion(nil)
+		return m
+	}
+	podWithContainer := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pod",
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{Name: "c1"}},
+		},
+	}
+
+	testCases := []struct {
+		name                 string
+		attrs                *PodAdmitAttributes
+		nodeDeclaredFeatures []string
+		version              *version.Version
+		registeredFeatures   []ndf.Feature
+		expectedAdmit        bool
+		expectedReason       string
+		expectedMessage      string
+	}{
+		{
+			name:                 "AddOperation: Admit when no requirements",
+			attrs:                &PodAdmitAttributes{Pod: basePod, Operation: AddOperation},
+			nodeDeclaredFeatures: []string{"FeatureA"},
+			version:              version.MustParseSemantic("1.30.0"),
+			registeredFeatures: []ndf.Feature{
+				createMockFeature(t, "FeatureA", false, ""),
+			},
+			expectedAdmit: true,
+		},
+		{
+			name:                 "AddOperation: Admit when requirements met",
+			attrs:                &PodAdmitAttributes{Pod: basePod, Operation: AddOperation},
+			nodeDeclaredFeatures: []string{"FeatureA"},
+			version:              version.MustParseSemantic("1.30.0"),
+			registeredFeatures: []ndf.Feature{
+				createMockFeature(t, "FeatureA", true, ""),
+			},
+			expectedAdmit: true,
+		},
+		{
+			name:                 "AddOperation: Reject when requirements not met",
+			attrs:                &PodAdmitAttributes{Pod: basePod, Operation: AddOperation},
+			nodeDeclaredFeatures: []string{},
+			version:              version.MustParseSemantic("1.30.0"),
+			registeredFeatures: []ndf.Feature{
+				createMockFeature(t, "FeatureA", true, ""),
+			},
+			expectedAdmit:   false,
+			expectedReason:  PodFeatureUnsupported,
+			expectedMessage: "Pod requires node features that are not available: FeatureA",
+		},
+		{
+			name:                 "AddOperation: Admit without feature declared when feature generally available",
+			attrs:                &PodAdmitAttributes{Pod: basePod, Operation: AddOperation},
+			nodeDeclaredFeatures: []string{},
+			version:              version.MustParseSemantic("1.35.0"),
+			registeredFeatures: []ndf.Feature{
+				createMockFeature(t, "FeatureA", true, "1.34.0"),
+			},
+			expectedAdmit: true,
+		},
+		{
+			name: "UpdateOperation: Admit when feature was already required by AllocatedPod even if node lacks feature",
+			attrs: &PodAdmitAttributes{
+				Pod:       podWithContainer,
+				Operation: UpdateOperation,
+				Update:    &PodUpdate{AllocatedPod: podWithContainer},
+			},
+			nodeDeclaredFeatures: []string{},
+			version:              version.MustParseSemantic("1.30.0"),
+			registeredFeatures: []ndf.Feature{
+				createPodContainerFeature(t, "FeatureA", ""),
+			},
+			expectedAdmit: true,
+		},
+		{
+			name: "UpdateOperation: Reject when update newly requires scheduling feature not on node",
+			attrs: &PodAdmitAttributes{
+				Pod:       podWithContainer,
+				Operation: UpdateOperation,
+				Update:    &PodUpdate{AllocatedPod: basePod},
+			},
+			nodeDeclaredFeatures: []string{},
+			version:              version.MustParseSemantic("1.30.0"),
+			registeredFeatures: []ndf.Feature{
+				createPodContainerFeature(t, "FeatureA", ""),
+			},
+			expectedAdmit:   false,
+			expectedReason:  PodFeatureUnsupported,
+			expectedMessage: "Pod requires node features that are not available: FeatureA",
+		},
+		{
+			name: "UpdateOperation: Admit when update newly requires scheduling feature that is declared on node",
+			attrs: &PodAdmitAttributes{
+				Pod:       podWithContainer,
+				Operation: UpdateOperation,
+				Update:    &PodUpdate{AllocatedPod: basePod},
+			},
+			nodeDeclaredFeatures: []string{"FeatureA"},
+			version:              version.MustParseSemantic("1.30.0"),
+			registeredFeatures: []ndf.Feature{
+				createPodContainerFeature(t, "FeatureA", ""),
+			},
+			expectedAdmit: true,
+		},
+		{
+			name: "UpdateOperation: Reject when update-specific InferForUpdate requirement not met on node",
+			attrs: &PodAdmitAttributes{
+				Pod:       basePod,
+				Operation: UpdateOperation,
+				Update:    &PodUpdate{AllocatedPod: basePod},
+			},
+			nodeDeclaredFeatures: []string{},
+			version:              version.MustParseSemantic("1.30.0"),
+			registeredFeatures: []ndf.Feature{
+				createUpdateOnlyFeature(t, "FeatureUpdateOnly", true),
+			},
+			expectedAdmit:   false,
+			expectedReason:  PodFeatureUnsupported,
+			expectedMessage: "Pod requires node features that are not available: FeatureUpdateOnly",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			framework := ndf.New(tc.registeredFeatures)
+			fs := framework.MustMapSorted(tc.nodeDeclaredFeatures)
+			handler := NewDeclaredFeaturesAdmitHandler(framework, fs, tc.version)
+
+			result := handler.Admit(tCtx, tc.attrs)
+
+			require.Equal(t, tc.expectedAdmit, result.Admit)
+			if !result.Admit {
+				require.Equal(t, tc.expectedReason, result.Reason)
+				require.Contains(t, result.Message, tc.expectedMessage, "Expected message '%s' to contain '%s'", result.Message, tc.expectedMessage)
+				require.Equal(t, RejectionInfeasible, result.RejectionType)
+			}
+		})
+	}
+}
+
+func TestSecurityProfileOCIAdmitHandler(t *testing.T) {
+	ociPod := &v1.Pod{Spec: v1.PodSpec{
+		Containers: []v1.Container{{Name: "c", SecurityContext: &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{
+			Type: v1.SeccompProfileTypeOCI,
+			OCI:  &v1.SecurityProfileOCI{Ref: "registry.example.com/profile@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+		}}}},
+	}}
+	plainPod := &v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{{Name: "c"}}}}
+
+	for _, tc := range []struct {
+		name     string
+		pod      *v1.Pod
+		features *kubecontainer.RuntimeFeatures
+		admit    bool
+	}{
+		{name: "pod without OCI profile", pod: plainPod, admit: true},
+		{name: "runtime supports OCI profiles", pod: ociPod, features: &kubecontainer.RuntimeFeatures{SeccompProfileOCI: true}, admit: true},
+		{name: "runtime without support", pod: ociPod, features: &kubecontainer.RuntimeFeatures{}},
+		{name: "runtime features unknown", pod: ociPod},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := NewSecurityProfileOCIAdmitHandler(func() *kubecontainer.RuntimeFeatures { return tc.features })
+			result := handler.Admit(context.Background(), &PodAdmitAttributes{Pod: tc.pod})
+			if result.Admit != tc.admit {
+				t.Fatalf("Admit() = %v, want %v", result.Admit, tc.admit)
+			}
+			if !tc.admit && result.Reason != SecurityProfileOCIUnsupportedReason {
+				t.Errorf("unexpected reason %q", result.Reason)
+			}
+		})
 	}
 }

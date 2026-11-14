@@ -19,6 +19,7 @@ package apps
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -26,12 +27,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/pkg/util/slice"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2ejob "k8s.io/kubernetes/test/e2e/framework/job"
 	admissionapi "k8s.io/pod-security-admission/api"
 
 	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
 const (
@@ -56,14 +57,14 @@ func cleanupJob(ctx context.Context, f *framework.Framework, job *batchv1.Job) {
 
 	framework.Logf("Remove the Job's dummy finalizer; the Job should be deleted cascadingly")
 	removeFinalizerFunc := func(j *batchv1.Job) {
-		j.ObjectMeta.Finalizers = slice.RemoveString(j.ObjectMeta.Finalizers, dummyFinalizer, nil)
+		j.ObjectMeta.Finalizers = slices.DeleteFunc(j.ObjectMeta.Finalizers, func(actual string) bool { return actual == dummyFinalizer })
 	}
 	_, err := updateJobWithRetries(ctx, c, ns, job.Name, removeFinalizerFunc)
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "update Job %q in namespace %q", job.Name, ns)
 	e2ejob.WaitForJobGone(ctx, c, ns, job.Name, wait.ForeverTestTimeout)
 
 	err = e2ejob.WaitForAllJobPodsGone(ctx, c, ns, job.Name)
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "wait for all pods to be deleted for Job %q in namespace %q", job.Name, ns)
 }
 
 func testFinishedJob(ctx context.Context, f *framework.Framework) {
@@ -82,19 +83,19 @@ func testFinishedJob(ctx context.Context, f *framework.Framework) {
 
 	framework.Logf("Create a Job %s/%s with TTL", ns, job.Name)
 	job, err := e2ejob.CreateJob(ctx, c, ns, job)
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "create Job in namespace %q", ns)
 
 	framework.Logf("Wait for the Job to finish")
 	err = e2ejob.WaitForJobFinish(ctx, c, ns, job.Name)
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "wait for completion of Job %q in namespace %q", job.Name, ns)
 
 	framework.Logf("Wait for TTL after finished controller to delete the Job")
 	err = waitForJobDeleting(ctx, c, ns, job.Name)
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "wait for Job %q in namespace %q to be marked for deletion", job.Name, ns)
 
 	framework.Logf("Check Job's deletionTimestamp and compare with the time when the Job finished")
 	job, err = e2ejob.GetJob(ctx, c, ns, job.Name)
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "get Job in namespace %q", ns)
 	jobFinishTime := finishTime(job)
 	finishTimeUTC := jobFinishTime.UTC()
 	if jobFinishTime.IsZero() {
@@ -102,7 +103,7 @@ func testFinishedJob(ctx context.Context, f *framework.Framework) {
 	}
 
 	deleteAtUTC := job.ObjectMeta.DeletionTimestamp.UTC()
-	framework.ExpectNotEqual(deleteAtUTC, nil)
+	gomega.Expect(deleteAtUTC).NotTo(gomega.BeNil())
 
 	expireAtUTC := finishTimeUTC.Add(time.Duration(ttl) * time.Second)
 	if deleteAtUTC.Before(expireAtUTC) {
@@ -125,7 +126,7 @@ func finishTime(finishedJob *batchv1.Job) metav1.Time {
 func updateJobWithRetries(ctx context.Context, c clientset.Interface, namespace, name string, applyUpdate func(*batchv1.Job)) (job *batchv1.Job, err error) {
 	jobs := c.BatchV1().Jobs(namespace)
 	var updateErr error
-	pollErr := wait.PollImmediateWithContext(ctx, framework.Poll, JobTimeout, func(ctx context.Context) (bool, error) {
+	pollErr := wait.PollUntilContextTimeout(ctx, framework.Poll, JobTimeout, true, func(ctx context.Context) (bool, error) {
 		if job, err = jobs.Get(ctx, name, metav1.GetOptions{}); err != nil {
 			return false, err
 		}
@@ -138,7 +139,7 @@ func updateJobWithRetries(ctx context.Context, c clientset.Interface, namespace,
 		updateErr = err
 		return false, nil
 	})
-	if pollErr == wait.ErrWaitTimeout {
+	if wait.Interrupted(pollErr) {
 		pollErr = fmt.Errorf("couldn't apply the provided updated to job %q: %v", name, updateErr)
 	}
 	return job, pollErr
@@ -147,7 +148,7 @@ func updateJobWithRetries(ctx context.Context, c clientset.Interface, namespace,
 // waitForJobDeleting uses c to wait for the Job jobName in namespace ns to have
 // a non-nil deletionTimestamp (i.e. being deleted).
 func waitForJobDeleting(ctx context.Context, c clientset.Interface, ns, jobName string) error {
-	return wait.PollImmediateWithContext(ctx, framework.Poll, JobTimeout, func(ctx context.Context) (bool, error) {
+	return wait.PollUntilContextTimeout(ctx, framework.Poll, JobTimeout, true, func(ctx context.Context) (bool, error) {
 		curr, err := c.BatchV1().Jobs(ns).Get(ctx, jobName, metav1.GetOptions{})
 		if err != nil {
 			return false, err

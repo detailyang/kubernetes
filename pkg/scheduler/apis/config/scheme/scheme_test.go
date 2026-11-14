@@ -19,15 +19,17 @@ package scheme
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	v1 "k8s.io/kube-scheduler/config/v1"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/testing/defaults"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/yaml"
 )
 
@@ -52,6 +54,10 @@ profiles:
     args:
       minCandidateNodesPercentage: 50
       minCandidateNodesAbsolute: 500
+  - name: DynamicResources
+    args:
+      filterTimeout: 10s
+      bindingTimeout: 30s
   - name: InterPodAffinity
     args:
       hardPodAffinityWeight: 5
@@ -101,6 +107,13 @@ profiles:
 							Args: &config.DefaultPreemptionArgs{MinCandidateNodesPercentage: 50, MinCandidateNodesAbsolute: 500},
 						},
 						{
+							Name: "DynamicResources",
+							Args: &config.DynamicResourcesArgs{
+								FilterTimeout:  &metav1.Duration{Duration: 10 * time.Second},
+								BindingTimeout: &metav1.Duration{Duration: 30 * time.Second},
+							},
+						},
+						{
 							Name: "InterPodAffinity",
 							Args: &config.InterPodAffinityArgs{HardPodAffinityWeight: 5},
 						},
@@ -130,6 +143,10 @@ profiles:
 							Name: "VolumeBinding",
 							Args: &config.VolumeBindingArgs{
 								BindTimeoutSeconds: 300,
+								Shape: []config.UtilizationShapePoint{
+									{Utilization: 0, Score: 10},
+									{Utilization: 100, Score: 0},
+								},
 							},
 						},
 						{
@@ -196,9 +213,43 @@ profiles:
 			wantProfiles: []config.KubeSchedulerProfile{
 				{
 					SchedulerName:            "default-scheduler",
-					PercentageOfNodesToScore: pointer.Int32(20),
+					PercentageOfNodesToScore: ptr.To[int32](20),
 					Plugins:                  defaults.PluginsV1,
 					PluginConfig:             defaults.PluginConfigsV1,
+				},
+			},
+		},
+		{
+			name: "v1 with non-default global percentageOfPlacementsToScore",
+			data: []byte(`
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+percentageOfPlacementsToScore: 10
+`),
+			wantProfiles: []config.KubeSchedulerProfile{
+				{
+					SchedulerName:                 "default-scheduler",
+					PercentageOfPlacementsToScore: nil,
+					Plugins:                       defaults.PluginsV1,
+					PluginConfig:                  defaults.PluginConfigsV1,
+				},
+			},
+		},
+		{
+			name: "v1 with non-default global and profile percentageOfPlacementsToScore",
+			data: []byte(`
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+percentageOfPlacementsToScore: 10
+profiles:
+- percentageOfPlacementsToScore: 20
+`),
+			wantProfiles: []config.KubeSchedulerProfile{
+				{
+					SchedulerName:                 "default-scheduler",
+					PercentageOfPlacementsToScore: ptr.To[int32](20),
+					Plugins:                       defaults.PluginsV1,
+					PluginConfig:                  defaults.PluginConfigsV1,
 				},
 			},
 		},
@@ -223,6 +274,13 @@ profiles:
 						{
 							Name: "DefaultPreemption",
 							Args: &config.DefaultPreemptionArgs{MinCandidateNodesPercentage: 50, MinCandidateNodesAbsolute: 100},
+						},
+						{
+							Name: "DynamicResources",
+							Args: &config.DynamicResourcesArgs{
+								FilterTimeout:  &metav1.Duration{Duration: 10 * time.Second},
+								BindingTimeout: &metav1.Duration{Duration: 10 * time.Minute},
+							},
 						},
 						{
 							Name: "InterPodAffinity",
@@ -262,6 +320,10 @@ profiles:
 							Name: "VolumeBinding",
 							Args: &config.VolumeBindingArgs{
 								BindTimeoutSeconds: 600,
+								Shape: []config.UtilizationShapePoint{
+									{Utilization: 0, Score: 10},
+									{Utilization: 100, Score: 0},
+								},
 							},
 						},
 					},
@@ -351,6 +413,8 @@ profiles:
 - pluginConfig:
   - name: DefaultPreemption
     args:
+  - name: DynamicResources
+    args:
   - name: InterPodAffinity
     args:
   - name: NodeResourcesFit
@@ -370,6 +434,13 @@ profiles:
 						{
 							Name: "DefaultPreemption",
 							Args: &config.DefaultPreemptionArgs{MinCandidateNodesPercentage: 10, MinCandidateNodesAbsolute: 100},
+						},
+						{
+							Name: "DynamicResources",
+							Args: &config.DynamicResourcesArgs{
+								FilterTimeout:  &metav1.Duration{Duration: 10 * time.Second},
+								BindingTimeout: &metav1.Duration{Duration: 10 * time.Minute},
+							},
 						},
 						{
 							Name: "InterPodAffinity",
@@ -394,6 +465,10 @@ profiles:
 							Name: "VolumeBinding",
 							Args: &config.VolumeBindingArgs{
 								BindTimeoutSeconds: 600,
+								Shape: []config.UtilizationShapePoint{
+									{Utilization: 0, Score: 10},
+									{Utilization: 100, Score: 0},
+								},
 							},
 						},
 						{
@@ -444,6 +519,13 @@ profiles:
 							Args: &config.DefaultPreemptionArgs{MinCandidateNodesPercentage: 10, MinCandidateNodesAbsolute: 100},
 						},
 						{
+							Name: "DynamicResources",
+							Args: &config.DynamicResourcesArgs{
+								FilterTimeout:  &metav1.Duration{Duration: 10 * time.Second},
+								BindingTimeout: &metav1.Duration{Duration: 10 * time.Minute},
+							},
+						},
+						{
 							Name: "NodeAffinity",
 							Args: &config.NodeAffinityArgs{},
 						},
@@ -475,6 +557,10 @@ profiles:
 							Name: "VolumeBinding",
 							Args: &config.VolumeBindingArgs{
 								BindTimeoutSeconds: 600,
+								Shape: []config.UtilizationShapePoint{
+									{Utilization: 0, Score: 10},
+									{Utilization: 100, Score: 0},
+								},
 							},
 						},
 					},
@@ -525,7 +611,7 @@ func TestCodecsEncodePluginConfig(t *testing.T) {
 								Name: "InterPodAffinity",
 								Args: runtime.RawExtension{
 									Object: &v1.InterPodAffinityArgs{
-										HardPodAffinityWeight: pointer.Int32(5),
+										HardPodAffinityWeight: ptr.To[int32](5),
 									},
 								},
 							},
@@ -533,7 +619,7 @@ func TestCodecsEncodePluginConfig(t *testing.T) {
 								Name: "VolumeBinding",
 								Args: runtime.RawExtension{
 									Object: &v1.VolumeBindingArgs{
-										BindTimeoutSeconds: pointer.Int64(300),
+										BindTimeoutSeconds: ptr.To[int64](300),
 										Shape: []v1.UtilizationShapePoint{
 											{
 												Utilization: 0,

@@ -17,6 +17,7 @@ limitations under the License.
 package conversion
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -24,8 +25,8 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 
-	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	v1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	"k8s.io/apiextensions-api/pkg/apis/apiextensions/v1beta1"
 	apivalidation "k8s.io/apimachinery/pkg/api/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -76,9 +77,14 @@ type webhookConverter struct {
 
 func webhookClientConfigForCRD(crd *v1.CustomResourceDefinition) *webhook.ClientConfig {
 	apiConfig := crd.Spec.Conversion.Webhook.ClientConfig
+	caBundle := apiConfig.CABundle
+	if len(caBundle) > 0 && len(bytes.TrimSpace(caBundle)) == 0 {
+		// treat whitespace-only caBundle as empty
+		caBundle = nil
+	}
 	ret := webhook.ClientConfig{
 		Name:     fmt.Sprintf("conversion_webhook_for_%s", crd.Name),
-		CABundle: apiConfig.CABundle,
+		CABundle: caBundle,
 	}
 	if apiConfig.URL != nil {
 		ret.URL = *apiConfig.URL

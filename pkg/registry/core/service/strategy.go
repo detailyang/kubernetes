@@ -18,31 +18,36 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/registry/rest"
+	pkgstorage "k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	serviceapi "k8s.io/kubernetes/pkg/api/service"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
-	"k8s.io/kubernetes/pkg/features"
 
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
 )
 
 // svcStrategy implements behavior for Services
 type svcStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating Services
 // objects via the REST API.
-var Strategy = svcStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = svcStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 // NamespaceScoped is true for services.
 func (svcStrategy) NamespaceScoped() bool {
@@ -95,7 +100,7 @@ func (svcStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []s
 func (svcStrategy) Canonicalize(obj runtime.Object) {
 }
 
-func (svcStrategy) AllowCreateOnUpdate() bool {
+func (svcStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return true
 }
 
@@ -109,7 +114,7 @@ func (svcStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object
 	return serviceapi.GetWarningsForService(obj.(*api.Service), old.(*api.Service))
 }
 
-func (svcStrategy) AllowUnconditionalUpdate() bool {
+func (svcStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }
 
@@ -119,9 +124,7 @@ func (svcStrategy) AllowUnconditionalUpdate() bool {
 //	if !utilfeature.DefaultFeatureGate.Enabled(features.MyFeature) && !myFeatureInUse(oldSvc) {
 //	    newSvc.Spec.MyFeature = nil
 //	}
-func dropServiceDisabledFields(newSvc *api.Service, oldSvc *api.Service) {
-
-}
+func dropServiceDisabledFields(newSvc *api.Service, oldSvc *api.Service) {}
 
 type serviceStatusStrategy struct {
 	svcStrategy
@@ -159,7 +162,47 @@ func (serviceStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtim
 
 // WarningsOnUpdate returns warnings for the given update.
 func (serviceStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
-	return nil
+	svc := obj.(*api.Service)
+	var warnings []string
+
+	if len(svc.Status.LoadBalancer.Ingress) > 0 {
+		fieldPath := field.NewPath("status", "loadBalancer", "ingress")
+		for i, ingress := range svc.Status.LoadBalancer.Ingress {
+			if len(ingress.IP) > 0 {
+				warnings = append(warnings, utilvalidation.GetWarningsForIP(fieldPath.Index(i), ingress.IP)...)
+			}
+		}
+	}
+
+	return warnings
+}
+
+// GetAttrs returns labels and fields of a given object for filtering purposes.
+func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
+	service, ok := obj.(*api.Service)
+	if !ok {
+		return nil, nil, fmt.Errorf("not a service")
+	}
+	return service.Labels, SelectableFields(service), nil
+}
+
+// Matcher returns a selection predicate for a given label and field selector.
+func Matcher(label labels.Selector, field fields.Selector) pkgstorage.SelectionPredicate {
+	return pkgstorage.SelectionPredicate{
+		Label:    label,
+		Field:    field,
+		GetAttrs: GetAttrs,
+	}
+}
+
+// SelectableFields returns a field set that can be used for filter selection
+func SelectableFields(service *api.Service) fields.Set {
+	objectMetaFieldsSet := generic.ObjectMetaFieldsSet(&service.ObjectMeta, true)
+	serviceSpecificFieldsSet := fields.Set{
+		"spec.clusterIP": service.Spec.ClusterIP,
+		"spec.type":      string(service.Spec.Type),
+	}
+	return generic.MergeFieldsSets(objectMetaFieldsSet, serviceSpecificFieldsSet)
 }
 
 // dropServiceStatusDisabledFields drops fields that are not used if their associated feature gates
@@ -168,26 +211,7 @@ func (serviceStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runt
 //	if !utilfeature.DefaultFeatureGate.Enabled(features.MyFeature) && !myFeatureInUse(oldSvc) {
 //	    newSvc.Status.MyFeature = nil
 //	}
-func dropServiceStatusDisabledFields(newSvc *api.Service, oldSvc *api.Service) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.LoadBalancerIPMode) && !loadbalancerIPModeInUse(oldSvc) {
-		for i := range newSvc.Status.LoadBalancer.Ingress {
-			newSvc.Status.LoadBalancer.Ingress[i].IPMode = nil
-		}
-	}
-}
-
-// returns true when the LoadBalancer Ingress IPMode fields are in use.
-func loadbalancerIPModeInUse(svc *api.Service) bool {
-	if svc == nil {
-		return false
-	}
-	for _, ing := range svc.Status.LoadBalancer.Ingress {
-		if ing.IPMode != nil {
-			return true
-		}
-	}
-	return false
-}
+func dropServiceStatusDisabledFields(newSvc *api.Service, oldSvc *api.Service) {}
 
 func sameStringSlice(a []string, b []string) bool {
 	if len(a) != len(b) {
@@ -277,7 +301,7 @@ func dropTypeDependentFields(newSvc *api.Service, oldSvc *api.Service) {
 
 	// If a user is switching to a type that doesn't need ExternalTrafficPolicy
 	// AND they did not change this field, it is safe to drop it.
-	if needsExternalTrafficPolicy(oldSvc) && !needsExternalTrafficPolicy(newSvc) && sameExternalTrafficPolicy(oldSvc, newSvc) {
+	if serviceapi.ExternallyAccessible(oldSvc) && !serviceapi.ExternallyAccessible(newSvc) && sameExternalTrafficPolicy(oldSvc, newSvc) {
 		newSvc.Spec.ExternalTrafficPolicy = api.ServiceExternalTrafficPolicy("")
 	}
 
@@ -374,10 +398,6 @@ func sameLoadBalancerClass(oldSvc, newSvc *api.Service) bool {
 		return true // both are nil
 	}
 	return *oldSvc.Spec.LoadBalancerClass == *newSvc.Spec.LoadBalancerClass
-}
-
-func needsExternalTrafficPolicy(svc *api.Service) bool {
-	return svc.Spec.Type == api.ServiceTypeNodePort || svc.Spec.Type == api.ServiceTypeLoadBalancer
 }
 
 func sameExternalTrafficPolicy(oldSvc, newSvc *api.Service) bool {

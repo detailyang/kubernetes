@@ -27,8 +27,10 @@ import (
 	"k8s.io/component-base/featuregate"
 	"k8s.io/klog/v2"
 	api "k8s.io/kubernetes/pkg/apis/certificates"
+	kapihelper "k8s.io/kubernetes/pkg/apis/core/helper"
+	"k8s.io/kubernetes/pkg/certauthorization"
 	"k8s.io/kubernetes/pkg/features"
-	"k8s.io/kubernetes/plugin/pkg/admission/certificates"
+	"k8s.io/kubernetes/pkg/registry/rbac"
 )
 
 const PluginName = "ClusterTrustBundleAttest"
@@ -46,7 +48,7 @@ func Register(plugins *admission.Plugins) {
 // resource=signers resourceName=<the signer name> verb=attest.
 type Plugin struct {
 	*admission.Handler
-	authz authorizer.Authorizer
+	authz authorizer.UnconditionalAuthorizer
 
 	inspectedFeatureGates bool
 	enabled               bool
@@ -54,7 +56,7 @@ type Plugin struct {
 
 var _ admission.ValidationInterface = &Plugin{}
 var _ admission.InitializationValidator = &Plugin{}
-var _ genericadmissioninit.WantsAuthorizer = &Plugin{}
+var _ genericadmissioninit.WantsUnconditionalAuthorizer = &Plugin{}
 var _ genericadmissioninit.WantsFeatures = &Plugin{}
 
 func NewPlugin() *Plugin {
@@ -63,8 +65,8 @@ func NewPlugin() *Plugin {
 	}
 }
 
-// SetAuthorizer sets the plugin's authorizer.
-func (p *Plugin) SetAuthorizer(authz authorizer.Authorizer) {
+// SetUnconditionalAuthorizer sets the plugin's authorizer.
+func (p *Plugin) SetUnconditionalAuthorizer(authz authorizer.UnconditionalAuthorizer) {
 	p.authz = authz
 }
 
@@ -109,7 +111,12 @@ func (p *Plugin) Validate(ctx context.Context, a admission.Attributes, _ admissi
 		return nil
 	}
 
-	if !certificates.IsAuthorizedForSignerName(ctx, p.authz, a.GetUserInfo(), "attest", newBundle.Spec.SignerName) {
+	// Skip the attest check when the semantics of the bundle are unchanged to support storage migration and GC workflows
+	if a.GetOperation() == admission.Update && rbac.IsOnlyMutatingGCFields(a.GetObject(), a.GetOldObject(), kapihelper.Semantic) {
+		return nil
+	}
+
+	if !certauthorization.IsAuthorizedForSignerName(ctx, p.authz, a.GetUserInfo(), "attest", newBundle.Spec.SignerName) {
 		klog.V(4).Infof("user not permitted to attest ClusterTrustBundle %q with signerName %q", newBundle.Name, newBundle.Spec.SignerName)
 		return admission.NewForbidden(a, fmt.Errorf("user not permitted to attest for signerName %q", newBundle.Spec.SignerName))
 	}

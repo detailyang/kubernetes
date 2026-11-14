@@ -24,6 +24,8 @@ import (
 	"strconv"
 	"strings"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/fields"
@@ -42,17 +44,16 @@ import (
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/core/helper"
 	corevalidation "k8s.io/kubernetes/pkg/apis/core/validation"
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 // rcStrategy implements verification logic for Replication Controllers.
 type rcStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating Replication Controller objects.
-var Strategy = rcStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = rcStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 // DefaultGarbageCollectionPolicy returns OrphanDependents for v1 for backwards compatibility,
 // and DeleteDependents for all other versions.
@@ -122,7 +123,9 @@ func (rcStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object)
 // Validate validates a new replication controller.
 func (rcStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	controller := obj.(*api.ReplicationController)
-	opts := pod.GetValidationOptionsFromPodTemplate(controller.Spec.Template, nil)
+	opts := corevalidation.GetValidationOptionsFromPodTemplate(controller.Spec.Template, nil)
+
+	// Run imperative validation
 	return corevalidation.ValidateReplicationController(controller, opts)
 }
 
@@ -143,7 +146,7 @@ func (rcStrategy) Canonicalize(obj runtime.Object) {
 
 // AllowCreateOnUpdate is false for replication controllers; this means a POST is
 // needed to create one.
-func (rcStrategy) AllowCreateOnUpdate() bool {
+func (rcStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -152,10 +155,8 @@ func (rcStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) f
 	oldRc := old.(*api.ReplicationController)
 	newRc := obj.(*api.ReplicationController)
 
-	opts := pod.GetValidationOptionsFromPodTemplate(newRc.Spec.Template, oldRc.Spec.Template)
-	validationErrorList := corevalidation.ValidateReplicationController(newRc, opts)
-	updateErrorList := corevalidation.ValidateReplicationControllerUpdate(newRc, oldRc, opts)
-	errs := append(validationErrorList, updateErrorList...)
+	opts := corevalidation.GetValidationOptionsFromPodTemplate(newRc.Spec.Template, oldRc.Spec.Template)
+	errs := corevalidation.ValidateReplicationControllerUpdate(newRc, oldRc, opts)
 
 	for key, value := range helper.NonConvertibleFields(oldRc.Annotations) {
 		parts := strings.Split(key, "/")
@@ -183,12 +184,12 @@ func (rcStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object)
 	oldRc := old.(*api.ReplicationController)
 	newRc := obj.(*api.ReplicationController)
 	if oldRc.Generation != newRc.Generation {
-		warnings = pod.GetWarningsForPodTemplate(ctx, field.NewPath("spec", "template"), oldRc.Spec.Template, newRc.Spec.Template)
+		warnings = pod.GetWarningsForPodTemplate(ctx, field.NewPath("spec", "template"), newRc.Spec.Template, oldRc.Spec.Template)
 	}
 	return warnings
 }
 
-func (rcStrategy) AllowUnconditionalUpdate() bool {
+func (rcStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }
 

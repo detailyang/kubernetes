@@ -20,14 +20,25 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/prometheus/common/model"
+	certificatesv1beta1 "k8s.io/api/certificates/v1beta1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/endpoints/metrics"
+	"k8s.io/apiserver/pkg/features"
+	"k8s.io/apiserver/pkg/storage/cacher/consistency"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	compbasemetrics "k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/testutil"
 	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration/framework"
@@ -61,7 +72,7 @@ func TestAPIServerProcessMetrics(t *testing.T) {
 		t.Skipf("not supported on GOOS=%s", runtime.GOOS)
 	}
 
-	s := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer s.TearDownFn()
 
 	metrics, err := scrapeMetrics(s)
@@ -79,7 +90,7 @@ func TestAPIServerProcessMetrics(t *testing.T) {
 func TestAPIServerStorageMetrics(t *testing.T) {
 	config := framework.SharedEtcd()
 	config.Transport.ServerList = []string{config.Transport.ServerList[0], config.Transport.ServerList[0]}
-	s := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, config)
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), config)
 	defer s.TearDownFn()
 
 	metrics, err := scrapeMetrics(s)
@@ -101,7 +112,12 @@ func TestAPIServerStorageMetrics(t *testing.T) {
 }
 
 func TestAPIServerMetrics(t *testing.T) {
-	s := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	// KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE allows for APIs pending removal to not block tests
+	t.Setenv("KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE", "true")
+
+	flags := framework.DefaultTestServerFlags()
+	flags = append(flags, fmt.Sprintf("--runtime-config=%s=true", certificatesv1beta1.SchemeGroupVersion))
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, flags, framework.SharedEtcd())
 	defer s.TearDownFn()
 
 	// Make a request to the apiserver to ensure there's at least one data point
@@ -112,8 +128,8 @@ func TestAPIServerMetrics(t *testing.T) {
 	}
 
 	// Make a request to a deprecated API to ensure there's at least one data point
-	if _, err := client.StorageV1beta1().CSIStorageCapacities("default").List(context.TODO(), metav1.ListOptions{}); err != nil {
-		t.Fatalf("unexpected error getting rbac roles: %v", err)
+	if _, err := client.CertificatesV1beta1().ClusterTrustBundles().List(context.TODO(), metav1.ListOptions{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	metrics, err := scrapeMetrics(s)
@@ -130,7 +146,7 @@ func TestAPIServerMetrics(t *testing.T) {
 
 func TestAPIServerMetricsLabels(t *testing.T) {
 	// Disable ServiceAccount admission plugin as we don't have service account controller running.
-	s := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins=ServiceAccount"}, framework.SharedEtcd())
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer s.TearDownFn()
 
 	clientConfig := restclient.CopyConfig(s.ClientConfig)
@@ -140,16 +156,16 @@ func TestAPIServerMetricsLabels(t *testing.T) {
 		t.Fatalf("Error in create clientset: %v", err)
 	}
 
-	expectedMetrics := []model.Metric{}
+	expectedMetrics := []testutil.Metric{}
 
-	metricLabels := func(group, version, resource, subresource, scope, verb string) model.Metric {
-		return map[model.LabelName]model.LabelValue{
-			model.LabelName("group"):       model.LabelValue(group),
-			model.LabelName("version"):     model.LabelValue(version),
-			model.LabelName("resource"):    model.LabelValue(resource),
-			model.LabelName("subresource"): model.LabelValue(subresource),
-			model.LabelName("scope"):       model.LabelValue(scope),
-			model.LabelName("verb"):        model.LabelValue(verb),
+	metricLabels := func(group, version, resource, subresource, scope, verb string) testutil.Metric {
+		return map[testutil.LabelName]testutil.LabelValue{
+			testutil.LabelName("group"):       testutil.LabelValue(group),
+			testutil.LabelName("version"):     testutil.LabelValue(version),
+			testutil.LabelName("resource"):    testutil.LabelValue(resource),
+			testutil.LabelName("subresource"): testutil.LabelValue(subresource),
+			testutil.LabelName("scope"):       testutil.LabelValue(scope),
+			testutil.LabelName("verb"):        testutil.LabelValue(verb),
 		}
 	}
 
@@ -159,7 +175,7 @@ func TestAPIServerMetricsLabels(t *testing.T) {
 		}
 	}
 
-	appendExpectedMetric := func(metric model.Metric) {
+	appendExpectedMetric := func(metric testutil.Metric) {
 		expectedMetrics = append(expectedMetrics, metric)
 	}
 
@@ -235,7 +251,7 @@ func TestAPIServerMetricsLabels(t *testing.T) {
 		t.Fatalf("apiserver_request_total metric not exposed")
 	}
 
-	hasLabels := func(current, expected model.Metric) bool {
+	hasLabels := func(current, expected testutil.Metric) bool {
 		for key, value := range expected {
 			if current[key] != value {
 				return false
@@ -256,6 +272,101 @@ func TestAPIServerMetricsLabels(t *testing.T) {
 			t.Errorf("No sample found for %#v", expectedMetric)
 		}
 	}
+}
+
+func TestAPIServerMetricsLabelsWithAllowList(t *testing.T) {
+	testCases := []struct {
+		name        string
+		metricName  string
+		labelName   testutil.LabelName
+		allowValues testutil.LabelValues
+		isHistogram bool
+	}{
+		{
+			name:        "check CounterVec metric",
+			metricName:  "apiserver_request_total",
+			labelName:   "code",
+			allowValues: testutil.LabelValues{"201", "500"},
+		},
+		{
+			name:        "check GaugeVec metric",
+			metricName:  "apiserver_current_inflight_requests",
+			labelName:   "request_kind",
+			allowValues: testutil.LabelValues{"mutating"},
+		},
+		{
+			name:        "check Histogram metric",
+			metricName:  "apiserver_request_duration_seconds",
+			labelName:   "verb",
+			allowValues: testutil.LabelValues{"POST", "LIST"},
+			isHistogram: true,
+		},
+	}
+
+	// Assemble the allow-metric-labels flag.
+	var allowMetricLabelFlagStrs []string
+	for _, tc := range testCases {
+		var allowValuesStr []string
+		for _, allowValue := range tc.allowValues {
+			allowValuesStr = append(allowValuesStr, string(allowValue))
+		}
+		allowMetricLabelFlagStrs = append(allowMetricLabelFlagStrs, fmt.Sprintf("\"%s,%s=%s\"", tc.metricName, tc.labelName, strings.Join(allowValuesStr, ",")))
+	}
+	allowMetricLabelsFlag := "--allow-metric-labels=" + strings.Join(allowMetricLabelFlagStrs, ",")
+
+	testServerFlags := framework.DefaultTestServerFlags()
+	testServerFlags = append(testServerFlags, allowMetricLabelsFlag)
+
+	// TODO: have a better way to setup and teardown for all the other tests.
+	metrics.Reset()
+	defer metrics.Reset()
+	metrics.ResetLabelAllowLists()
+	defer metrics.ResetLabelAllowLists()
+	defer compbasemetrics.ResetLabelValueAllowLists()
+
+	// KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE allows for APIs pending removal to not block tests
+	t.Setenv("KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE", "true")
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, testServerFlags, framework.SharedEtcd())
+	defer s.TearDownFn()
+
+	metrics, err := scrapeMetrics(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			metricName := tc.metricName
+			if tc.isHistogram {
+				metricName += "_sum"
+			}
+			samples, found := metrics[metricName]
+			if !found {
+				t.Fatalf("metric %q not found", metricName)
+			}
+			for _, sample := range samples {
+				if value, ok := sample.Metric[tc.labelName]; ok {
+					if !slices.Contains(tc.allowValues, value) && value != "unexpected" {
+						t.Fatalf("value %q is not allowed for label %q", value, tc.labelName)
+					}
+				}
+			}
+		})
+
+	}
+
+	t.Run("check cardinality_enforcement_unexpected_categorizations_total", func(t *testing.T) {
+		samples, found := metrics["cardinality_enforcement_unexpected_categorizations_total"]
+		if !found {
+			t.Fatal("metric cardinality_enforcement_unexpected_categorizations_total not found")
+		}
+		if len(samples) != 1 {
+			t.Fatalf("Unexpected number of samples in cardinality_enforcement_unexpected_categorizations_total")
+		}
+		if samples[0].Value <= 0 {
+			t.Fatalf("Unexpected non-positive cardinality_enforcement_unexpected_categorizations_total, got: %s", samples[0].Value)
+		}
+
+	})
 }
 
 func TestAPIServerMetricsPods(t *testing.T) {
@@ -283,7 +394,7 @@ func TestAPIServerMetricsPods(t *testing.T) {
 	}
 
 	// Disable ServiceAccount admission plugin as we don't have service account controller running.
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins=ServiceAccount"}, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	clientConfig := restclient.CopyConfig(server.ClientConfig)
@@ -391,7 +502,7 @@ func TestAPIServerMetricsNamespaces(t *testing.T) {
 		}
 	}
 
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer server.TearDownFn()
 
 	clientConfig := restclient.CopyConfig(server.ClientConfig)
@@ -483,7 +594,7 @@ func TestAPIServerMetricsNamespaces(t *testing.T) {
 	}
 }
 
-func getSamples(s *kubeapiservertesting.TestServer) (model.Samples, error) {
+func getSamples(s *kubeapiservertesting.TestServer) (testutil.Samples, error) {
 	metrics, err := scrapeMetrics(s)
 	if err != nil {
 		return nil, err
@@ -496,8 +607,8 @@ func getSamples(s *kubeapiservertesting.TestServer) (model.Samples, error) {
 	return samples, nil
 }
 
-func diffMetrics(newSamples model.Samples, oldSamples model.Samples) model.Samples {
-	samplesDiff := model.Samples{}
+func diffMetrics(newSamples testutil.Samples, oldSamples testutil.Samples) testutil.Samples {
+	samplesDiff := testutil.Samples{}
 	for _, sample := range newSamples {
 		if !sampleExistsInSamples(sample, oldSamples) {
 			samplesDiff = append(samplesDiff, sample)
@@ -506,11 +617,116 @@ func diffMetrics(newSamples model.Samples, oldSamples model.Samples) model.Sampl
 	return samplesDiff
 }
 
-func sampleExistsInSamples(s *model.Sample, samples model.Samples) bool {
+func sampleExistsInSamples(s *testutil.Sample, samples testutil.Samples) bool {
 	for _, sample := range samples {
 		if sample.Equal(s) {
 			return true
 		}
 	}
 	return false
+}
+
+func TestWatchCacheConsistencyCheckMetrics(t *testing.T) {
+	period := time.Second
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.DetectCacheInconsistency, true)
+	clean := overrideConsistencyCheckerTimings(period)
+	defer clean()
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
+	defer server.TearDownFn()
+
+	rt, err := restclient.TransportFor(server.ClientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodGet, server.ClientConfig.Host+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// wait 3 periods to for 2 scrape cycles (takes 1-1.5 period) and require 2 successes
+	delay := 3 * period
+	time.Sleep(delay)
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err := resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+	statuses, err := parseConsistencyCheckMetric(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceSuccesses := 0
+	for status, count := range statuses {
+		switch status.status {
+		case "success":
+			if count >= 2 {
+				resourceSuccesses++
+			}
+		case "failure":
+			t.Errorf("Failure checking consistency of resource %q", status.resource)
+		case "error":
+			t.Errorf("Error when checking consistency of resource %q", status.resource)
+		default:
+			t.Errorf("Unknown status of resource %q, status: %q", status.resource, status.status)
+		}
+	}
+	if resourceSuccesses <= 10 {
+		t.Errorf("Expected at least 10 resources with success, got: %d", resourceSuccesses)
+	}
+}
+
+func overrideConsistencyCheckerTimings(period time.Duration) func() {
+	tmpPeriod := consistency.CheckPeriod
+	consistency.CheckPeriod = period
+	return func() {
+		consistency.CheckPeriod = tmpPeriod
+	}
+}
+
+func parseConsistencyCheckMetric(r io.Reader) (map[consistencyCheckStatus]float64, error) {
+	statuses := map[consistencyCheckStatus]float64{}
+	metric, err := parseMetric(r, "apiserver_storage_consistency_checks_total")
+	if err != nil {
+		return statuses, err
+	}
+	for _, m := range metric.GetMetric() {
+		status := consistencyCheckStatus{}
+		for _, label := range m.GetLabel() {
+			switch label.GetName() {
+			case "resource":
+				status.resource = label.GetValue()
+			case "group":
+				status.group = label.GetValue()
+			case "status":
+				status.status = label.GetValue()
+			default:
+				return statuses, fmt.Errorf("Unknown label: %v", label.GetName())
+			}
+		}
+		statuses[status] = m.GetCounter().GetValue()
+	}
+	return statuses, nil
+}
+
+type consistencyCheckStatus struct {
+	group    string
+	resource string
+	status   string
+}
+
+func parseMetric(r io.Reader, name string) (*testutil.MetricFamily, error) {
+	mfs, err := testutil.TextToMetricFamilies(r)
+	if err != nil {
+		return nil, err
+	}
+	for metricName, metric := range mfs {
+		if metricName == name {
+			return metric, nil
+		}
+	}
+	return nil, fmt.Errorf("Metric not found %q", name)
 }

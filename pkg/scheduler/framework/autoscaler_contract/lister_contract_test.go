@@ -21,28 +21,50 @@ limitations under the License.
 package contract
 
 import (
-	"k8s.io/kubernetes/pkg/scheduler/framework"
+	v1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	draapi "k8s.io/dynamic-resource-allocation/api"
+	"k8s.io/dynamic-resource-allocation/structured/schedulerapi"
+	fwk "k8s.io/kube-scheduler/framework"
 )
 
-var _ framework.NodeInfoLister = &nodeInfoListerContract{}
-var _ framework.StorageInfoLister = &storageInfoListerContract{}
-var _ framework.SharedLister = &shareListerContract{}
+var _ fwk.NodeInfoLister = &nodeInfoListerContract{}
+var _ fwk.StorageInfoLister = &storageInfoListerContract{}
+var _ fwk.SharedLister = &shareListerContract{}
+var _ fwk.ResourceSliceLister = &resourceSliceListerContract{}
+var _ fwk.PodGroupStateLister = &podGroupStateListerContract{}
+var _ fwk.PodGroupLister = &podGroupListerContract{}
+var _ fwk.PodGroupState = &podGroupStateContract{}
+var _ fwk.CompositePodGroupStateLister = &compositePodGroupStateListerContract{}
+var _ fwk.CompositePodGroupLister = &compositePodGroupListerContract{}
+var _ fwk.CompositePodGroupState = &compositePodGroupStateContract{}
+var _ fwk.DeviceClassLister = &deviceClassListerContract{}
+var _ fwk.ResourceClaimTracker = &resourceClaimTrackerContract{}
+var _ fwk.DeviceClassResolver = &deviceClassResolverContract{}
+var _ fwk.SharedDRAManager = &sharedDRAManagerContract{}
 
 type nodeInfoListerContract struct{}
 
-func (c *nodeInfoListerContract) List() ([]*framework.NodeInfo, error) {
+func (c *nodeInfoListerContract) List() ([]fwk.NodeInfo, error) {
 	return nil, nil
 }
 
-func (c *nodeInfoListerContract) HavePodsWithAffinityList() ([]*framework.NodeInfo, error) {
+func (c *nodeInfoListerContract) HavePodsWithAffinityList() ([]fwk.NodeInfo, error) {
 	return nil, nil
 }
 
-func (c *nodeInfoListerContract) HavePodsWithRequiredAntiAffinityList() ([]*framework.NodeInfo, error) {
+func (c *nodeInfoListerContract) HavePodsWithRequiredAntiAffinityList() ([]fwk.NodeInfo, error) {
 	return nil, nil
 }
 
-func (c *nodeInfoListerContract) Get(_ string) (*framework.NodeInfo, error) {
+func (c *nodeInfoListerContract) HavePodsWithRequiredNonHostScopedAntiAffinityList() ([]fwk.NodeInfo, error) {
+	return nil, nil
+}
+
+func (c *nodeInfoListerContract) Get(_ string) (fwk.NodeInfo, error) {
 	return nil, nil
 }
 
@@ -54,10 +76,163 @@ func (c *storageInfoListerContract) IsPVCUsedByPods(_ string) bool {
 
 type shareListerContract struct{}
 
-func (c *shareListerContract) NodeInfos() framework.NodeInfoLister {
+func (c *shareListerContract) NodeInfos() fwk.NodeInfoLister {
 	return nil
 }
 
-func (c *shareListerContract) StorageInfos() framework.StorageInfoLister {
+func (c *shareListerContract) StorageInfos() fwk.StorageInfoLister {
+	return nil
+}
+
+func (c *shareListerContract) PodGroupStates() fwk.PodGroupStateLister {
+	return nil
+}
+
+func (c *shareListerContract) PodGroups() fwk.PodGroupLister {
+	return nil
+}
+
+func (c *shareListerContract) CompositePodGroupStates() fwk.CompositePodGroupStateLister {
+	return nil
+}
+
+func (c *shareListerContract) CompositePodGroups() fwk.CompositePodGroupLister {
+	return nil
+}
+
+type podGroupListerContract struct{}
+
+func (c *podGroupListerContract) Get(_ string, _ string) (*schedulingv1beta1.PodGroup, error) {
+	return nil, nil
+}
+
+type podGroupStateListerContract struct{}
+
+func (c *podGroupStateListerContract) Get(_ string, _ string) (fwk.PodGroupState, error) {
+	return nil, nil
+}
+
+type podGroupStateContract struct{}
+
+func (c *podGroupStateContract) AllPods() sets.Set[types.UID] {
+	return nil
+}
+
+func (c *podGroupStateContract) UnscheduledPods() map[string]*v1.Pod {
+	return nil
+}
+
+func (c *podGroupStateContract) AssumedPods() sets.Set[types.UID] {
+	return nil
+}
+
+func (c *podGroupStateContract) AssignedPods() sets.Set[types.UID] {
+	return nil
+}
+
+func (c *podGroupStateContract) AllPodsCount() int {
+	return 0
+}
+
+func (c *podGroupStateContract) ScheduledPodsCount() int {
+	return 0
+}
+
+func (c *podGroupStateContract) ScheduledPods() []*v1.Pod {
+	return nil
+}
+
+type compositePodGroupListerContract struct{}
+
+func (c *compositePodGroupListerContract) Get(_ string, _ string) (*schedulingv1beta1.CompositePodGroup, error) {
+	return nil, nil
+}
+
+type compositePodGroupStateListerContract struct{}
+
+func (c *compositePodGroupStateListerContract) Get(_ string, _ string) (fwk.CompositePodGroupState, error) {
+	return nil, nil
+}
+
+type compositePodGroupStateContract struct{}
+
+func (c *compositePodGroupStateContract) GetChildren() []fwk.EntityKey {
+	return nil
+}
+
+type resourceSliceListerContract struct{}
+
+func (c *resourceSliceListerContract) ListWithDeviceTaintRules() ([]*draapi.ResourceSlice, error) {
+	return nil, nil
+}
+
+type deviceClassListerContract struct{}
+
+func (c *deviceClassListerContract) List() ([]*resourceapi.DeviceClass, error) {
+	return nil, nil
+}
+
+func (c *deviceClassListerContract) Get(_ string) (*resourceapi.DeviceClass, error) {
+	return nil, nil
+}
+
+type resourceClaimTrackerContract struct{}
+
+func (r *resourceClaimTrackerContract) List() ([]*resourceapi.ResourceClaim, error) {
+	return nil, nil
+}
+
+func (r *resourceClaimTrackerContract) Get(_, _ string) (*resourceapi.ResourceClaim, error) {
+	return nil, nil
+}
+
+func (r *resourceClaimTrackerContract) ListAllAllocatedDevices() (sets.Set[schedulerapi.DeviceID], error) {
+	return nil, nil
+}
+
+func (r *resourceClaimTrackerContract) GatherAllocatedState() (*schedulerapi.AllocatedState, error) {
+	return nil, nil
+}
+
+func (r *resourceClaimTrackerContract) GetPendingAllocation(_ types.UID) *resourceapi.AllocationResult {
+	return nil
+}
+
+func (r *resourceClaimTrackerContract) SignalClaimPendingAllocation(_ types.UID, _ *resourceapi.ResourceClaim) error {
+	return nil
+}
+
+func (r *resourceClaimTrackerContract) MaybeRemoveClaimPendingAllocation(_ types.UID, _ bool) (deleted bool) {
+	return false
+}
+
+func (r *resourceClaimTrackerContract) AssumeClaimAfterAPICall(_ *resourceapi.ResourceClaim) error {
+	return nil
+}
+
+func (r *resourceClaimTrackerContract) AssumedClaimRestore(_, _ string) {
+}
+
+type sharedDRAManagerContract struct{}
+
+func (s *sharedDRAManagerContract) ResourceClaims() fwk.ResourceClaimTracker {
+	return nil
+}
+
+func (s *sharedDRAManagerContract) ResourceSlices() fwk.ResourceSliceLister {
+	return nil
+}
+
+func (s *sharedDRAManagerContract) DeviceClasses() fwk.DeviceClassLister {
+	return nil
+}
+
+func (s *sharedDRAManagerContract) DeviceClassResolver() fwk.DeviceClassResolver {
+	return nil
+}
+
+type deviceClassResolverContract struct{}
+
+func (d *deviceClassResolverContract) GetDeviceClass(_ v1.ResourceName) *resourceapi.DeviceClass {
 	return nil
 }

@@ -19,25 +19,30 @@ package volumeattachment
 import (
 	"context"
 
+	"k8s.io/apiserver/pkg/registry/rest"
+
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/storage/names"
+	"k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/apis/storage"
 	"k8s.io/kubernetes/pkg/apis/storage/validation"
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 // volumeAttachmentStrategy implements behavior for VolumeAttachment objects
 type volumeAttachmentStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating
 // VolumeAttachment objects via the REST API.
-var Strategy = volumeAttachmentStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = volumeAttachmentStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 func (volumeAttachmentStrategy) NamespaceScoped() bool {
 	return false
@@ -63,12 +68,7 @@ func (volumeAttachmentStrategy) PrepareForCreate(ctx context.Context, obj runtim
 
 func (volumeAttachmentStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	volumeAttachment := obj.(*storage.VolumeAttachment)
-
-	errs := validation.ValidateVolumeAttachment(volumeAttachment)
-
-	// tighten up validation of newly created v1 attachments
-	errs = append(errs, validation.ValidateVolumeAttachmentV1(volumeAttachment)...)
-	return errs
+	return validation.ValidateVolumeAttachment(volumeAttachment)
 }
 
 // WarningsOnCreate returns warnings for the creation of the given object.
@@ -80,7 +80,7 @@ func (volumeAttachmentStrategy) WarningsOnCreate(ctx context.Context, obj runtim
 func (volumeAttachmentStrategy) Canonicalize(obj runtime.Object) {
 }
 
-func (volumeAttachmentStrategy) AllowCreateOnUpdate() bool {
+func (volumeAttachmentStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -97,8 +97,7 @@ func (volumeAttachmentStrategy) PrepareForUpdate(ctx context.Context, obj, old r
 func (volumeAttachmentStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newVolumeAttachmentObj := obj.(*storage.VolumeAttachment)
 	oldVolumeAttachmentObj := old.(*storage.VolumeAttachment)
-	errorList := validation.ValidateVolumeAttachment(newVolumeAttachmentObj)
-	return append(errorList, validation.ValidateVolumeAttachmentUpdate(newVolumeAttachmentObj, oldVolumeAttachmentObj)...)
+	return validation.ValidateVolumeAttachmentUpdate(newVolumeAttachmentObj, oldVolumeAttachmentObj)
 }
 
 // WarningsOnUpdate returns warnings for the given update.
@@ -106,7 +105,7 @@ func (volumeAttachmentStrategy) WarningsOnUpdate(ctx context.Context, obj, old r
 	return nil
 }
 
-func (volumeAttachmentStrategy) AllowUnconditionalUpdate() bool {
+func (volumeAttachmentStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -139,4 +138,18 @@ func (volumeAttachmentStatusStrategy) PrepareForUpdate(ctx context.Context, obj,
 
 	newVolumeAttachment.Spec = oldVolumeAttachment.Spec
 	metav1.ResetObjectMetaForStatus(&newVolumeAttachment.ObjectMeta, &oldVolumeAttachment.ObjectMeta)
+
+	if !feature.DefaultFeatureGate.Enabled(features.MutableCSINodeAllocatableCount) {
+		// Only clear ErrorCode field if it isn't set in the old object
+		if newVolumeAttachment.Status.AttachError != nil {
+			if oldVolumeAttachment.Status.AttachError == nil || oldVolumeAttachment.Status.AttachError.ErrorCode == nil {
+				newVolumeAttachment.Status.AttachError.ErrorCode = nil
+			}
+		}
+		if newVolumeAttachment.Status.DetachError != nil {
+			if oldVolumeAttachment.Status.DetachError == nil || oldVolumeAttachment.Status.DetachError.ErrorCode == nil {
+				newVolumeAttachment.Status.DetachError.ErrorCode = nil
+			}
+		}
+	}
 }

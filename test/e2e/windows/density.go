@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2emetrics "k8s.io/kubernetes/test/e2e/framework/metrics"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
@@ -40,7 +41,7 @@ import (
 	"github.com/onsi/gomega"
 )
 
-var _ = SIGDescribe("[Feature:Windows] Density [Serial] [Slow]", func() {
+var _ = sigDescribe(feature.Windows, "Density", framework.WithSerial(), framework.WithSlow(), skipUnlessWindows(func() {
 	f := framework.NewDefaultFramework("density-test-windows")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
@@ -63,16 +64,15 @@ var _ = SIGDescribe("[Feature:Windows] Density [Serial] [Slow]", func() {
 		}
 
 		for _, testArg := range dTests {
-			itArg := testArg
-			desc := fmt.Sprintf("latency/resource should be within limit when create %d pods with %v interval", itArg.podsNr, itArg.interval)
+			desc := fmt.Sprintf("latency/resource should be within limit when create %d pods with %v interval", testArg.podsNr, testArg.interval)
 			ginkgo.It(desc, func(ctx context.Context) {
-				itArg.createMethod = "batch"
-				runDensityBatchTest(ctx, f, itArg)
+				testArg.createMethod = "batch"
+				runDensityBatchTest(ctx, f, testArg)
 			})
 		}
 	})
 
-})
+}))
 
 type densityTest struct {
 	// number of pods
@@ -115,7 +115,7 @@ func runDensityBatchTest(ctx context.Context, f *framework.Framework, testArg de
 
 	gomega.Eventually(ctx, func() bool {
 		return len(watchTimes) == testArg.podsNr
-	}, 10*time.Minute, 10*time.Second).Should(gomega.BeTrue())
+	}, 10*time.Minute, 10*time.Second).Should(gomega.BeTrueBecause("All pods should be observed by the watch."))
 
 	if len(watchTimes) < testArg.podsNr {
 		framework.Failf("Timeout reached waiting for all Pods to be observed by the watch.")
@@ -224,7 +224,7 @@ func newInformerWatchPod(ctx context.Context, f *framework.Framework, mutex *syn
 func newDensityTestPods(numPods int, volume bool, imageName, podType string) []*v1.Pod {
 	var pods []*v1.Pod
 
-	for i := 0; i < numPods; i++ {
+	for range numPods {
 
 		podName := "test-" + string(uuid.NewUUID())
 		pod := v1.Pod{

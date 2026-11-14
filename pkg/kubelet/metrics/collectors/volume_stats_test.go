@@ -21,19 +21,15 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/golang/mock/gomock"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/component-base/metrics/testutil"
 	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	statstest "k8s.io/kubernetes/pkg/kubelet/server/stats/testing"
+	"k8s.io/utils/ptr"
 )
 
-func newUint64Pointer(i uint64) *uint64 {
-	return &i
-}
-
 func TestVolumeStatsCollector(t *testing.T) {
-	ctx := context.Background()
+	ctx := context.TODO()
 	// Fixed metadata on type and help text. We prepend this to every expected
 	// output so we only have to modify a single place when doing adjustments.
 	const metadata = `
@@ -49,8 +45,6 @@ func TestVolumeStatsCollector(t *testing.T) {
 		# TYPE kubelet_volume_stats_inodes_used gauge
 		# HELP kubelet_volume_stats_used_bytes [ALPHA] Number of used bytes in the volume
 		# TYPE kubelet_volume_stats_used_bytes gauge
-		# HELP kubelet_volume_stats_health_status_abnormal [ALPHA] Abnormal volume health status. The count is either 1 or 0. 1 indicates the volume is unhealthy, 0 indicates volume is healthy
-		# TYPE kubelet_volume_stats_health_status_abnormal gauge
 	`
 
 	var (
@@ -62,12 +56,12 @@ func TestVolumeStatsCollector(t *testing.T) {
 					{
 						FsStats: statsapi.FsStats{
 							Time:           metav1.Now(),
-							AvailableBytes: newUint64Pointer(5.663154176e+09),
-							CapacityBytes:  newUint64Pointer(1.0434699264e+10),
-							UsedBytes:      newUint64Pointer(4.21789696e+09),
-							InodesFree:     newUint64Pointer(655344),
-							Inodes:         newUint64Pointer(655360),
-							InodesUsed:     newUint64Pointer(16),
+							AvailableBytes: ptr.To[uint64](5.663154176e+09),
+							CapacityBytes:  ptr.To[uint64](1.0434699264e+10),
+							UsedBytes:      ptr.To[uint64](4.21789696e+09),
+							InodesFree:     ptr.To[uint64](655344),
+							Inodes:         ptr.To[uint64](655360),
+							InodesUsed:     ptr.To[uint64](16),
 						},
 						Name:   "test",
 						PVCRef: nil,
@@ -75,20 +69,17 @@ func TestVolumeStatsCollector(t *testing.T) {
 					{
 						FsStats: statsapi.FsStats{
 							Time:           metav1.Now(),
-							AvailableBytes: newUint64Pointer(5.663154176e+09),
-							CapacityBytes:  newUint64Pointer(1.0434699264e+10),
-							UsedBytes:      newUint64Pointer(4.21789696e+09),
-							InodesFree:     newUint64Pointer(655344),
-							Inodes:         newUint64Pointer(655360),
-							InodesUsed:     newUint64Pointer(16),
+							AvailableBytes: ptr.To[uint64](5.663154176e+09),
+							CapacityBytes:  ptr.To[uint64](1.0434699264e+10),
+							UsedBytes:      ptr.To[uint64](4.21789696e+09),
+							InodesFree:     ptr.To[uint64](655344),
+							Inodes:         ptr.To[uint64](655360),
+							InodesUsed:     ptr.To[uint64](16),
 						},
 						Name: "test",
 						PVCRef: &statsapi.PVCReference{
 							Name:      "testpvc",
 							Namespace: "testns",
-						},
-						VolumeHealthStats: &statsapi.VolumeHealthStats{
-							Abnormal: true,
 						},
 					},
 				},
@@ -101,20 +92,17 @@ func TestVolumeStatsCollector(t *testing.T) {
 					{
 						FsStats: statsapi.FsStats{
 							Time:           metav1.Now(),
-							AvailableBytes: newUint64Pointer(5.663154176e+09),
-							CapacityBytes:  newUint64Pointer(1.0434699264e+10),
-							UsedBytes:      newUint64Pointer(4.21789696e+09),
-							InodesFree:     newUint64Pointer(655344),
-							Inodes:         newUint64Pointer(655360),
-							InodesUsed:     newUint64Pointer(16),
+							AvailableBytes: ptr.To[uint64](5.663154176e+09),
+							CapacityBytes:  ptr.To[uint64](1.0434699264e+10),
+							UsedBytes:      ptr.To[uint64](4.21789696e+09),
+							InodesFree:     ptr.To[uint64](655344),
+							Inodes:         ptr.To[uint64](655360),
+							InodesUsed:     ptr.To[uint64](16),
 						},
 						Name: "test",
 						PVCRef: &statsapi.PVCReference{
 							Name:      "testpvc",
 							Namespace: "testns",
-						},
-						VolumeHealthStats: &statsapi.VolumeHealthStats{
-							Abnormal: true,
 						},
 					},
 				},
@@ -128,7 +116,6 @@ func TestVolumeStatsCollector(t *testing.T) {
 			kubelet_volume_stats_inodes_free{namespace="testns",persistentvolumeclaim="testpvc"} 655344
 			kubelet_volume_stats_inodes_used{namespace="testns",persistentvolumeclaim="testpvc"} 16
 			kubelet_volume_stats_used_bytes{namespace="testns",persistentvolumeclaim="testpvc"} 4.21789696e+09
-			kubelet_volume_stats_health_status_abnormal{namespace="testns",persistentvolumeclaim="testpvc"} 1
 			`
 
 		metrics = []string{
@@ -138,23 +125,20 @@ func TestVolumeStatsCollector(t *testing.T) {
 			"kubelet_volume_stats_inodes_free",
 			"kubelet_volume_stats_inodes_used",
 			"kubelet_volume_stats_used_bytes",
-			"kubelet_volume_stats_health_status_abnormal",
 		}
 	)
 
-	mockCtrl := gomock.NewController(t)
-	defer mockCtrl.Finish()
-	mockStatsProvider := statstest.NewMockProvider(mockCtrl)
+	mockStatsProvider := statstest.NewMockProvider(t)
 
-	mockStatsProvider.EXPECT().ListPodStats(ctx).Return(podStats, nil).AnyTimes()
-	mockStatsProvider.EXPECT().ListPodStatsAndUpdateCPUNanoCoreUsage(ctx).Return(podStats, nil).AnyTimes()
+	mockStatsProvider.EXPECT().ListPodStats(ctx).Return(podStats, nil).Maybe()
+	mockStatsProvider.EXPECT().ListPodStatsAndUpdateCPUNanoCoreUsage(ctx).Return(podStats, nil).Maybe()
 	if err := testutil.CustomCollectAndCompare(&volumeStatsCollector{statsProvider: mockStatsProvider}, strings.NewReader(want), metrics...); err != nil {
 		t.Errorf("unexpected collecting result:\n%s", err)
 	}
 }
 
 func TestVolumeStatsCollectorWithNullVolumeStatus(t *testing.T) {
-	ctx := context.Background()
+	ctx := context.TODO()
 	// Fixed metadata on type and help text. We prepend this to every expected
 	// output so we only have to modify a single place when doing adjustments.
 	const metadata = `
@@ -181,12 +165,12 @@ func TestVolumeStatsCollectorWithNullVolumeStatus(t *testing.T) {
 					{
 						FsStats: statsapi.FsStats{
 							Time:           metav1.Now(),
-							AvailableBytes: newUint64Pointer(5.663154176e+09),
-							CapacityBytes:  newUint64Pointer(1.0434699264e+10),
-							UsedBytes:      newUint64Pointer(4.21789696e+09),
-							InodesFree:     newUint64Pointer(655344),
-							Inodes:         newUint64Pointer(655360),
-							InodesUsed:     newUint64Pointer(16),
+							AvailableBytes: ptr.To[uint64](5.663154176e+09),
+							CapacityBytes:  ptr.To[uint64](1.0434699264e+10),
+							UsedBytes:      ptr.To[uint64](4.21789696e+09),
+							InodesFree:     ptr.To[uint64](655344),
+							Inodes:         ptr.To[uint64](655360),
+							InodesUsed:     ptr.To[uint64](16),
 						},
 						Name:   "test",
 						PVCRef: nil,
@@ -194,12 +178,12 @@ func TestVolumeStatsCollectorWithNullVolumeStatus(t *testing.T) {
 					{
 						FsStats: statsapi.FsStats{
 							Time:           metav1.Now(),
-							AvailableBytes: newUint64Pointer(5.663154176e+09),
-							CapacityBytes:  newUint64Pointer(1.0434699264e+10),
-							UsedBytes:      newUint64Pointer(4.21789696e+09),
-							InodesFree:     newUint64Pointer(655344),
-							Inodes:         newUint64Pointer(655360),
-							InodesUsed:     newUint64Pointer(16),
+							AvailableBytes: ptr.To[uint64](5.663154176e+09),
+							CapacityBytes:  ptr.To[uint64](1.0434699264e+10),
+							UsedBytes:      ptr.To[uint64](4.21789696e+09),
+							InodesFree:     ptr.To[uint64](655344),
+							Inodes:         ptr.To[uint64](655360),
+							InodesUsed:     ptr.To[uint64](16),
 						},
 						Name: "test",
 						PVCRef: &statsapi.PVCReference{
@@ -230,12 +214,10 @@ func TestVolumeStatsCollectorWithNullVolumeStatus(t *testing.T) {
 		}
 	)
 
-	mockCtrl := gomock.NewController(t)
-	defer mockCtrl.Finish()
-	mockStatsProvider := statstest.NewMockProvider(mockCtrl)
+	mockStatsProvider := statstest.NewMockProvider(t)
 
-	mockStatsProvider.EXPECT().ListPodStats(ctx).Return(podStats, nil).AnyTimes()
-	mockStatsProvider.EXPECT().ListPodStatsAndUpdateCPUNanoCoreUsage(ctx).Return(podStats, nil).AnyTimes()
+	mockStatsProvider.EXPECT().ListPodStats(ctx).Return(podStats, nil).Maybe()
+	mockStatsProvider.EXPECT().ListPodStatsAndUpdateCPUNanoCoreUsage(ctx).Return(podStats, nil).Maybe()
 	if err := testutil.CustomCollectAndCompare(&volumeStatsCollector{statsProvider: mockStatsProvider}, strings.NewReader(want), metrics...); err != nil {
 		t.Errorf("unexpected collecting result:\n%s", err)
 	}

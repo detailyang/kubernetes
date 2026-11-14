@@ -39,13 +39,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer/streaming"
-	"k8s.io/apimachinery/pkg/util/dump"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/rest/fake"
 	restclientwatch "k8s.io/client-go/rest/watch"
 	"k8s.io/client-go/restmapper"
+	"k8s.io/utils/dump"
 	// TODO we need to remove this linkage and create our own scheme
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -1367,8 +1367,8 @@ func TestSingleResourceType(t *testing.T) {
 		SingleResourceType().
 		ResourceTypeOrNameArgs(true, "pods,services")
 
-	if b.Do().Err() == nil {
-		t.Errorf("unexpected non-error")
+	if err := b.Do().Err(); !errors.Is(err, ErrMultipleResourceTypes) {
+		t.Errorf("unexpected error: %s", err)
 	}
 }
 
@@ -1873,7 +1873,7 @@ func TestHasNames(t *testing.T) {
 			name:            "test8",
 			args:            []string{"rc/foo", "bar"},
 			expectedHasName: false,
-			expectedError:   fmt.Errorf("there is no need to specify a resource type as a separate argument when passing arguments in resource/name form (e.g. '" + basename + " get resource/<resource_name>' instead of '" + basename + " get resource resource/<resource_name>'"),
+			expectedError:   errors.New("there is no need to specify a resource type as a separate argument when passing arguments in resource/name form (e.g. '" + basename + " get resource/<resource_name>' instead of '" + basename + " get resource resource/<resource_name>'"),
 		},
 	}
 	for _, tt := range tests {

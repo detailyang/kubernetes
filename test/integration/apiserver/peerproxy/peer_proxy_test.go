@@ -19,11 +19,18 @@ package peerproxy
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	v1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,35 +38,26 @@ import (
 	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/server"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/transport"
 	"k8s.io/client-go/util/cert"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2"
 	kastesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
-	"k8s.io/kubernetes/pkg/controller/storageversiongc"
-	"k8s.io/kubernetes/pkg/controlplane"
-	kubefeatures "k8s.io/kubernetes/pkg/features"
+	controlplaneapiserver "k8s.io/kubernetes/pkg/controlplane/apiserver"
 
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/test/integration/framework"
 	testutil "k8s.io/kubernetes/test/utils"
-	"k8s.io/kubernetes/test/utils/ktesting"
 )
 
 func TestPeerProxiedRequest(t *testing.T) {
-
 	ktesting.SetDefaultVerbosity(1)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	t.Cleanup(cancel)
-
-	// ensure to stop cert reloading after shutdown
-	transport.DialerStopCh = ctx.Done()
 
 	// enable feature flags
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.APIServerIdentity, true)()
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StorageVersionAPI, true)()
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, kubefeatures.UnknownVersionInteroperabilityProxy, true)()
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.APIServerIdentity:                   true,
+		features.UnknownVersionInteroperabilityProxy: true,
+	})
 
 	// create sharedetcd
 	etcd := framework.SharedEtcd()
@@ -74,8 +72,8 @@ func TestPeerProxiedRequest(t *testing.T) {
 	serverA := kastesting.StartTestServerOrDie(t, &kastesting.TestServerInstanceOptions{
 		EnableCertAuth: true,
 		ProxyCA:        &proxyCA},
-		[]string{}, etcd)
-	defer serverA.TearDownFn()
+		[]string{"--runtime-config=api/all=true"}, etcd)
+	t.Cleanup(serverA.TearDownFn)
 
 	// start another test server with some api disabled
 	// override hostname to ensure unique ips
@@ -83,8 +81,8 @@ func TestPeerProxiedRequest(t *testing.T) {
 	serverB := kastesting.StartTestServerOrDie(t, &kastesting.TestServerInstanceOptions{
 		EnableCertAuth: true,
 		ProxyCA:        &proxyCA},
-		[]string{fmt.Sprintf("--runtime-config=%s", "batch/v1=false")}, etcd)
-	defer serverB.TearDownFn()
+		[]string{"--runtime-config=api/all=true,batch/v1=false"}, etcd)
+	t.Cleanup(serverB.TearDownFn)
 
 	kubeClientSetA, err := kubernetes.NewForConfig(serverA.ClientConfig)
 	require.NoError(t, err)
@@ -109,18 +107,13 @@ func TestPeerProxiedRequest(t *testing.T) {
 }
 
 func TestPeerProxiedRequestToThirdServerAfterFirstDies(t *testing.T) {
-
 	ktesting.SetDefaultVerbosity(1)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	t.Cleanup(cancel)
-
-	// ensure to stop cert reloading after shutdown
-	transport.DialerStopCh = ctx.Done()
 
 	// enable feature flags
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.APIServerIdentity, true)()
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StorageVersionAPI, true)()
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, kubefeatures.UnknownVersionInteroperabilityProxy, true)()
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.APIServerIdentity:                   true,
+		features.UnknownVersionInteroperabilityProxy: true,
+	})
 
 	// create sharedetcd
 	etcd := framework.SharedEtcd()
@@ -129,42 +122,39 @@ func TestPeerProxiedRequestToThirdServerAfterFirstDies(t *testing.T) {
 	proxyCA, err := createProxyCertContent()
 	require.NoError(t, err)
 
-	// set lease duration to 1s for serverA to ensure that storageversions for serverA are updated
-	// once it is shutdown
-	controlplane.IdentityLeaseDurationSeconds = 10
-	controlplane.IdentityLeaseGCPeriod = time.Second
-	controlplane.IdentityLeaseRenewIntervalPeriod = 10 * time.Second
+	// modify lease parameters so that they are garbage collected timely.
+	controlplaneapiserver.IdentityLeaseDurationSeconds = 10
+	controlplaneapiserver.IdentityLeaseGCPeriod = 2 * time.Second
+	controlplaneapiserver.IdentityLeaseRenewIntervalPeriod = time.Second
 
 	// start serverA with all APIs enabled
 	// override hostname to ensure unique ips
 	server.SetHostnameFuncForTests("test-server-a")
-	serverA := kastesting.StartTestServerOrDie(t, &kastesting.TestServerInstanceOptions{EnableCertAuth: true, ProxyCA: &proxyCA}, []string{}, etcd)
+	t.Log("starting apiserver for ServerA")
+	serverA := kastesting.StartTestServerOrDie(t, &kastesting.TestServerInstanceOptions{EnableCertAuth: true, ProxyCA: &proxyCA}, []string{"--runtime-config=api/all=true"}, etcd)
 	kubeClientSetA, err := kubernetes.NewForConfig(serverA.ClientConfig)
 	require.NoError(t, err)
-	// ensure storageversion garbage collector ctlr is set up
-	informersA := informers.NewSharedInformerFactory(kubeClientSetA, time.Second)
-	setupStorageVersionGC(ctx, kubeClientSetA, informersA)
+
 	// reset lease duration to default value for serverB and serverC since we will not be
 	// shutting these down
-	controlplane.IdentityLeaseDurationSeconds = 3600
+	controlplaneapiserver.IdentityLeaseDurationSeconds = 3600
 
 	// start serverB with some api disabled
 	// override hostname to ensure unique ips
 	server.SetHostnameFuncForTests("test-server-b")
+	t.Log("starting apiserver for ServerB")
 	serverB := kastesting.StartTestServerOrDie(t, &kastesting.TestServerInstanceOptions{EnableCertAuth: true, ProxyCA: &proxyCA}, []string{
-		fmt.Sprintf("--runtime-config=%v", "batch/v1=false")}, etcd)
-	defer serverB.TearDownFn()
+		"--runtime-config=api/all=true,batch/v1=false"}, etcd)
+	t.Cleanup(serverB.TearDownFn)
 	kubeClientSetB, err := kubernetes.NewForConfig(serverB.ClientConfig)
 	require.NoError(t, err)
-	// ensure storageversion garbage collector ctlr is set up
-	informersB := informers.NewSharedInformerFactory(kubeClientSetB, time.Second)
-	setupStorageVersionGC(ctx, kubeClientSetB, informersB)
 
 	// start serverC with all APIs enabled
 	// override hostname to ensure unique ips
 	server.SetHostnameFuncForTests("test-server-c")
-	serverC := kastesting.StartTestServerOrDie(t, &kastesting.TestServerInstanceOptions{EnableCertAuth: true, ProxyCA: &proxyCA}, []string{}, etcd)
-	defer serverC.TearDownFn()
+	t.Log("starting apiserver for ServerC")
+	serverC := kastesting.StartTestServerOrDie(t, &kastesting.TestServerInstanceOptions{EnableCertAuth: true, ProxyCA: &proxyCA}, []string{"--runtime-config=api/all=true"}, etcd)
+	t.Cleanup(serverC.TearDownFn)
 
 	// create jobs resource using serverA
 	job := createJobResource()
@@ -177,14 +167,24 @@ func TestPeerProxiedRequestToThirdServerAfterFirstDies(t *testing.T) {
 
 	var jobsB *v1.JobList
 	// list jobs using ServerB which it should proxy to ServerC and get back valid response
-	err = wait.PollImmediate(1*time.Second, 1*time.Minute, func() (bool, error) {
+	err = wait.PollUntilContextTimeout(t.Context(), 1*time.Second, 1*time.Minute, false, func(ctx context.Context) (bool, error) {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		default:
+		}
+
+		t.Log("retrieving jobs from ServerB")
 		jobsB, err = kubeClientSetB.BatchV1().Jobs("default").List(context.Background(), metav1.ListOptions{})
 		if err != nil {
+			t.Logf("error trying to list jobs from ServerB: %v", err)
 			return false, nil
 		}
+
 		if jobsB != nil {
 			return true, nil
 		}
+		t.Log("retrieved nil jobs from ServerB")
 		return false, nil
 	})
 	klog.Infof("\nServerB has retrieved jobs list of length %v \n\n", len(jobsB.Items))
@@ -193,14 +193,75 @@ func TestPeerProxiedRequestToThirdServerAfterFirstDies(t *testing.T) {
 	assert.Equal(t, job.Name, jobsB.Items[0].Name)
 }
 
-func setupStorageVersionGC(ctx context.Context, kubeClientSet *kubernetes.Clientset, informers informers.SharedInformerFactory) {
-	leaseInformer := informers.Coordination().V1().Leases()
-	storageVersionInformer := informers.Internal().V1alpha1().StorageVersions()
-	go leaseInformer.Informer().Run(ctx.Done())
-	go storageVersionInformer.Informer().Run(ctx.Done())
+func TestPeerProxy_EgressDialerIsUsed(t *testing.T) {
+	ktesting.SetDefaultVerbosity(1)
 
-	controller := storageversiongc.NewStorageVersionGC(ctx, kubeClientSet, leaseInformer, storageVersionInformer)
-	go controller.Run(ctx)
+	// Start a HTTP CONNECT proxy to act as a fake egress dialer over UDS
+	dialerHit, udsName := runMockEgressProxy(t)
+
+	// Write a temporary egress selector config file pointing to our proxy
+	egressSelectorConfigFile, err := os.CreateTemp("", "egress_selector_configuration.yaml")
+	require.NoError(t, err)
+	defer func() { _ = os.Remove(egressSelectorConfigFile.Name()) }()
+
+	configYAML := fmt.Sprintf(`
+apiVersion: apiserver.k8s.io/v1beta1
+kind: EgressSelectorConfiguration
+egressSelections:
+- name: controlplane
+  connection:
+      proxyProtocol: HTTPConnect
+      transport:
+        uds:
+          udsName: "%s"
+`, udsName)
+	err = os.WriteFile(egressSelectorConfigFile.Name(), []byte(configYAML), 0644)
+	require.NoError(t, err)
+
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.APIServerIdentity:                   true,
+		features.UnknownVersionInteroperabilityProxy: true,
+	})
+
+	etcd := framework.SharedEtcd()
+	proxyCA, err := createProxyCertContent()
+	require.NoError(t, err)
+
+	// Start two apiservers, one with batch/v1 disabled
+	server.SetHostnameFuncForTests("test-server-egress-a")
+	serverA := kastesting.StartTestServerOrDie(t, &kastesting.TestServerInstanceOptions{
+		EnableCertAuth: true,
+		ProxyCA:        &proxyCA},
+		[]string{"--runtime-config=api/all=true", "--egress-selector-config-file=" + egressSelectorConfigFile.Name()}, etcd)
+	t.Cleanup(serverA.TearDownFn)
+
+	server.SetHostnameFuncForTests("test-server-egress-b")
+	serverB := kastesting.StartTestServerOrDie(t, &kastesting.TestServerInstanceOptions{
+		EnableCertAuth: true,
+		ProxyCA:        &proxyCA},
+		[]string{"--runtime-config=api/all=true,batch/v1=false", "--egress-selector-config-file=" + egressSelectorConfigFile.Name()}, etcd)
+	t.Cleanup(serverB.TearDownFn)
+
+	kubeClientSetA, err := kubernetes.NewForConfig(serverA.ClientConfig)
+	require.NoError(t, err)
+	kubeClientSetB, err := kubernetes.NewForConfig(serverB.ClientConfig)
+	require.NoError(t, err)
+
+	// create jobs resource using serverA
+	job := createJobResource()
+	_, err = kubeClientSetA.BatchV1().Jobs("default").Create(context.Background(), job, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	// List jobs using ServerB (should be proxied to ServerA, hitting our dialer)
+	jobsB, err := kubeClientSetB.BatchV1().Jobs("default").List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	assert.NotEmpty(t, jobsB)
+	assert.Equal(t, job.Name, jobsB.Items[0].Name)
+
+	// Assert that our dialer was hit at least once
+	if atomic.LoadInt32(dialerHit) == 0 {
+		t.Errorf("expected egress dialer to be used, but it was not hit")
+	}
 }
 
 func createProxyCertContent() (kastesting.ProxyCA, error) {
@@ -241,4 +302,71 @@ func createJobResource() *v1.Job {
 			},
 		},
 	}
+}
+
+func runMockEgressProxy(t *testing.T) (*int32, string) {
+	t.Helper()
+	udsFile, err := os.CreateTemp("/tmp", "egress-*.sock")
+	require.NoError(t, err)
+	udsName := udsFile.Name()
+	_ = udsFile.Close()
+	_ = os.Remove(udsName) // Must remove so we can bind
+
+	listener, err := net.Listen("unix", udsName)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = listener.Close()
+		_ = os.Remove(udsName)
+	})
+
+	dialerHit := new(int32)
+	proxy := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		atomic.AddInt32(dialerHit, 1)
+
+		// A standard HTTP CONNECT proxy proxies opaque TCP streams.
+		if req.Method == http.MethodConnect {
+			// Actively establish a TCP connection to the destination API server
+			destConn, err := net.DialTimeout("tcp", req.Host, 5*time.Second)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+
+			// Acknowledge the connection stream has opened successfully
+			w.WriteHeader(http.StatusOK)
+
+			// 'Hijack' the underlying network connection away from Go's
+			// generic HTTP Server so we can use it as a raw TCP proxy socket.
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+				return
+			}
+			clientConn, _, err := hijacker.Hijack()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+
+			// Spin up two concurrent forwarding pipes to pass traffic between
+			// the client and the destination over our UDS socket.
+			go func() {
+				_, _ = io.Copy(destConn, clientConn)
+				_ = destConn.Close()
+				_ = clientConn.Close()
+			}()
+			go func() {
+				_, _ = io.Copy(clientConn, destConn)
+				_ = destConn.Close()
+				_ = clientConn.Close()
+			}()
+		} else {
+			http.Error(w, "this is a proxy", http.StatusBadRequest)
+		}
+	}))
+	proxy.Listener = listener
+	proxy.Start()
+	t.Cleanup(proxy.Close)
+
+	return dialerHit, udsName
 }

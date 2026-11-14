@@ -243,59 +243,6 @@ kube::util::find-binary() {
   kube::util::find-binary-for-platform "$1" "$(kube::util::host_platform)"
 }
 
-# Run all known doc generators (today gendocs and genman for kubectl)
-# $1 is the directory to put those generated documents
-kube::util::gen-docs() {
-  local dest="$1"
-
-  # Find binary
-  gendocs=$(kube::util::find-binary "gendocs")
-  genkubedocs=$(kube::util::find-binary "genkubedocs")
-  genman=$(kube::util::find-binary "genman")
-  genyaml=$(kube::util::find-binary "genyaml")
-
-  mkdir -p "${dest}/docs/user-guide/kubectl/"
-  "${gendocs}" "${dest}/docs/user-guide/kubectl/"
-  mkdir -p "${dest}/docs/admin/"
-  "${genkubedocs}" "${dest}/docs/admin/" "kube-apiserver"
-  "${genkubedocs}" "${dest}/docs/admin/" "kube-controller-manager"
-  "${genkubedocs}" "${dest}/docs/admin/" "kube-proxy"
-  "${genkubedocs}" "${dest}/docs/admin/" "kube-scheduler"
-  "${genkubedocs}" "${dest}/docs/admin/" "kubelet"
-  "${genkubedocs}" "${dest}/docs/admin/" "kubeadm"
-
-  mkdir -p "${dest}/docs/man/man1/"
-  "${genman}" "${dest}/docs/man/man1/" "kube-apiserver"
-  "${genman}" "${dest}/docs/man/man1/" "kube-controller-manager"
-  "${genman}" "${dest}/docs/man/man1/" "kube-proxy"
-  "${genman}" "${dest}/docs/man/man1/" "kube-scheduler"
-  "${genman}" "${dest}/docs/man/man1/" "kubelet"
-  "${genman}" "${dest}/docs/man/man1/" "kubectl"
-  "${genman}" "${dest}/docs/man/man1/" "kubeadm"
-
-  mkdir -p "${dest}/docs/yaml/kubectl/"
-  "${genyaml}" "${dest}/docs/yaml/kubectl/"
-
-  # create the list of generated files
-  pushd "${dest}" > /dev/null || return 1
-  touch docs/.generated_docs
-  find . -type f | cut -sd / -f 2- | LC_ALL=C sort > docs/.generated_docs
-  popd > /dev/null || return 1
-}
-
-# Removes previously generated docs-- we don't want to check them in. $KUBE_ROOT
-# must be set.
-kube::util::remove-gen-docs() {
-  if [ -e "${KUBE_ROOT}/docs/.generated_docs" ]; then
-    # remove all of the old docs; we don't want to check them in.
-    while read -r file; do
-      rm "${KUBE_ROOT}/${file}" 2>/dev/null || true
-    done <"${KUBE_ROOT}/docs/.generated_docs"
-    # The docs/.generated_docs file lists itself, so we don't need to explicitly
-    # delete it.
-  fi
-}
-
 # Takes a group/version and returns the path to its location on disk, sans
 # "pkg". E.g.:
 # * default behavior: extensions/v1beta1 -> apis/extensions/v1beta1
@@ -322,14 +269,14 @@ kube::util::group-version-to-pkg-path() {
     # Change "foo.bar.k8s.io/v1" -> "foo/v1" notation.
     local simple_gv="${group_version/.*k8s.io/}"
     if [[ "${api}" = "${simple_gv}" ]]; then
-      echo "vendor/k8s.io/api/${simple_gv}"
+      echo "staging/src/k8s.io/api/${simple_gv}"
       return
     fi
   done
 
   # "v1" is the API GroupVersion
   if [[ "${group_version}" == "v1" ]]; then
-    echo "vendor/k8s.io/api/core/v1"
+    echo "staging/src/k8s.io/api/core/v1"
     return
   fi
 
@@ -342,13 +289,13 @@ kube::util::group-version-to-pkg-path() {
       echo "pkg/apis/core"
       ;;
     meta/v1)
-      echo "vendor/k8s.io/apimachinery/pkg/apis/meta/v1"
+      echo "staging/src/k8s.io/apimachinery/pkg/apis/meta/v1"
       ;;
     meta/v1beta1)
-      echo "vendor/k8s.io/apimachinery/pkg/apis/meta/v1beta1"
+      echo "staging/src/k8s.io/apimachinery/pkg/apis/meta/v1beta1"
       ;;
     internal.apiserver.k8s.io/v1alpha1)
-      echo "vendor/k8s.io/api/apiserverinternal/v1alpha1"
+      echo "staging/src/k8s.io/api/apiserverinternal/v1alpha1"
       ;;
     *.k8s.io)
       echo "pkg/apis/${group_version%.*k8s.io}"
@@ -480,6 +427,25 @@ function kube::util::test_openssl_installed {
     OPENSSL_BIN=$(command -v openssl)
 }
 
+# OpenSSL 3.5.0 introduced native ML-DSA support:
+# https://openssl-library.org/news/openssl-3.5-notes/
+function kube::util::test_curl_mldsa_support {
+  local version
+  if ! version=$(curl --version 2>&1); then
+    kube::log::error "Failed to run curl --version: ${version}. ENABLE_MLDSA=true requires curl using OpenSSL 3.5.0 or newer; install a compatible curl build."
+    return 1
+  fi
+  version="${version%%$'\n'*}"
+  # Inactive TLS backends in MultiSSL builds are parenthesized.
+  if [[ "${version}" =~ (^|[[:space:]])OpenSSL/([0-9]+)\.([0-9]+)\.[0-9]+ ]]; then
+    if (( BASH_REMATCH[2] > 3 || (BASH_REMATCH[2] == 3 && BASH_REMATCH[3] >= 5) )); then
+      return 0
+    fi
+  fi
+  kube::log::error "ENABLE_MLDSA=true requires curl using OpenSSL 3.5.0 or newer; detected: ${version}. Upgrade or install curl built with a compatible OpenSSL backend."
+  return 1
+}
+
 # Query the API server for client certificate authentication capabilities
 function kube::util::test_client_certificate_authentication_enabled {
   local output
@@ -489,10 +455,20 @@ function kube::util::test_client_certificate_authentication_enabled {
     | "${OPENSSL_BIN}" s_client -connect "127.0.0.1:${SECURE_API_PORT}" 2> /dev/null \
     | grep -A3 'Acceptable client certificate CA names')
 
-  if [[ "${output}" != *"/CN=127.0.0.1"* ]] && [[ "${output}" != *"CN = 127.0.0.1"* ]]; then
+  if [[ "${output}" != *"CN=127.0.0.1"* ]] && [[ "${output}" != *"CN = 127.0.0.1"* ]]; then
     echo "API server not configured for client certificate authentication"
     echo "Output of from acceptable client certificate check: ${output}"
     exit 1
+  fi
+}
+
+function kube::util::cfssl_keyspec {
+  local key_algo="${KUBE_CERT_KEY_ALGO:-rsa}"
+  local key_size="${KUBE_CERT_KEY_SIZE:-2048}"
+  if [[ "${key_algo}" == mldsa* ]]; then
+    echo -n "{\"algo\":\"${key_algo}\"}"
+  else
+    echo -n "{\"algo\":\"${key_algo}\",\"size\":${key_size}}"
   fi
 }
 
@@ -506,15 +482,21 @@ function kube::util::create_signing_certkey {
     local dest_dir=$2
     local id=$3
     local purpose=$4
-    # Create client ca
+    local keyspec
+    keyspec=$(kube::util::cfssl_keyspec)
     ${sudo} /usr/bin/env bash -e <<EOF
     rm -f "${dest_dir}/${id}-ca.crt" "${dest_dir}/${id}-ca.key"
-    ${OPENSSL_BIN} req -x509 -sha256 -new -nodes -days 365 -newkey rsa:2048 -keyout "${dest_dir}/${id}-ca.key" -out "${dest_dir}/${id}-ca.crt" -subj "/C=xx/ST=x/L=x/O=x/OU=x/CN=ca/emailAddress=x/"
-    echo '{"signing":{"default":{"expiry":"43800h","usages":["signing","key encipherment",${purpose}]}}}' > "${dest_dir}/${id}-ca-config.json"
+    cd "${dest_dir}"
+    echo '{"CN":"${id}-ca","key":${keyspec}}' | ${CFSSL_BIN} gencert -initca - | ${CFSSLJSON_BIN} -bare ${id}-ca
+    mv "${id}-ca.pem" "${id}-ca.crt"
+    mv "${id}-ca-key.pem" "${id}-ca.key"
+    rm -f "${id}-ca.csr"
+    echo '{"signing":{"default":{"expiry":"43800h","usages":["signing","digital signature",${purpose}]}}}' > "${dest_dir}/${id}-ca-config.json"
 EOF
 }
 
 # signs a client certificate: args are sudo, dest-dir, CA, filename (roughly), username, groups...
+# When KUBE_CERT_KEY_ALGO is set (e.g. mldsa65), uses that algorithm instead of RSA-2048.
 function kube::util::create_client_certkey {
     local sudo=$1
     local dest_dir=$2
@@ -529,9 +511,11 @@ function kube::util::create_client_certkey {
         SEP=","
         shift 1
     done
+    local keyspec
+    keyspec=$(kube::util::cfssl_keyspec)
     ${sudo} /usr/bin/env bash -e <<EOF
     cd ${dest_dir}
-    echo '{"CN":"${cn}","names":[${groups}],"hosts":[""],"key":{"algo":"rsa","size":2048}}' | ${CFSSL_BIN} gencert -ca=${ca}.crt -ca-key=${ca}.key -config=${ca}-config.json - | ${CFSSLJSON_BIN} -bare client-${id}
+    echo '{"CN":"${cn}","names":[${groups}],"hosts":[],"key":${keyspec}}' | ${CFSSL_BIN} gencert -ca=${ca}.crt -ca-key=${ca}.key -config=${ca}-config.json - | ${CFSSLJSON_BIN} -bare client-${id}
     mv "client-${id}-key.pem" "client-${id}.key"
     mv "client-${id}.pem" "client-${id}.crt"
     rm -f "client-${id}.csr"
@@ -539,6 +523,7 @@ EOF
 }
 
 # signs a serving certificate: args are sudo, dest-dir, ca, filename (roughly), subject, hosts...
+# When KUBE_CERT_KEY_ALGO is set (e.g. mldsa65), uses that algorithm instead of RSA-2048.
 function kube::util::create_serving_certkey {
     local sudo=$1
     local dest_dir=$2
@@ -553,9 +538,11 @@ function kube::util::create_serving_certkey {
         SEP=","
         shift 1
     done
+    local keyspec
+    keyspec=$(kube::util::cfssl_keyspec)
     ${sudo} /usr/bin/env bash -e <<EOF
     cd ${dest_dir}
-    echo '{"CN":"${cn}","hosts":[${hosts}],"key":{"algo":"rsa","size":2048}}' | ${CFSSL_BIN} gencert -ca=${ca}.crt -ca-key=${ca}.key -config=${ca}-config.json - | ${CFSSLJSON_BIN} -bare serving-${id}
+    echo '{"CN":"${cn}","hosts":[${hosts}],"key":${keyspec}}' | ${CFSSL_BIN} gencert -ca=${ca}.crt -ca-key=${ca}.key -config=${ca}-config.json - | ${CFSSLJSON_BIN} -bare serving-${id}
     mv "serving-${id}-key.pem" "serving-${id}.key"
     mv "serving-${id}.pem" "serving-${id}.crt"
     rm -f "serving-${id}.csr"
@@ -676,15 +663,6 @@ function kube::util::ensure-cfssl {
     return 0
   fi
 
-  host_arch=$(kube::util::host_arch)
-
-  if [[ "${host_arch}" != "amd64" ]]; then
-    echo "Cannot download cfssl on non-amd64 hosts and cfssl does not appear to be installed."
-    echo "Please install cfssl and cfssljson and verify they are in \$PATH."
-    echo "Hint: export PATH=\$PATH:\$GOPATH/bin; go install github.com/cloudflare/cfssl/cmd/...@latest"
-    exit 1
-  fi
-
   # Create a temp dir for cfssl if no directory was given
   local cfssldir=${1:-}
   if [[ -z "${cfssldir}" ]]; then
@@ -696,21 +674,17 @@ function kube::util::ensure-cfssl {
   pushd "${cfssldir}" > /dev/null || return 1
 
     echo "Unable to successfully run 'cfssl' from ${PATH}; downloading instead..."
-    kernel=$(uname -s)
-    case "${kernel}" in
-      Linux)
-        curl --retry 10 -L -o cfssl https://github.com/cloudflare/cfssl/releases/download/v1.5.0/cfssl_1.5.0_linux_amd64
-        curl --retry 10 -L -o cfssljson https://github.com/cloudflare/cfssl/releases/download/v1.5.0/cfssljson_1.5.0_linux_amd64
-        ;;
-      Darwin)
-        curl --retry 10 -L -o cfssl https://github.com/cloudflare/cfssl/releases/download/v1.5.0/cfssl_1.5.0_darwin_amd64
-        curl --retry 10 -L -o cfssljson https://github.com/cloudflare/cfssl/releases/download/v1.5.0/cfssljson_1.5.0_darwin_amd64
-        ;;
-      *)
-        echo "Unknown, unsupported platform: ${kernel}." >&2
-        echo "Supported platforms: Linux, Darwin." >&2
-        exit 2
-    esac
+    local host_os; host_os=$(kube::util::host_os)
+    local host_arch; host_arch=$(kube::util::host_arch)
+    local cfssl_response; cfssl_response=$(curl --retry 10 --write-out "%{response_code}" -fL -o cfssl "https://github.com/cloudflare/cfssl/releases/download/v1.7.1/cfssl_1.7.1_${host_os}_${host_arch}")
+    local cfssljson_response; cfssljson_response=$(curl --retry 10 --write-out "%{response_code}" -fL -o cfssljson "https://github.com/cloudflare/cfssl/releases/download/v1.7.1/cfssljson_1.7.1_${host_os}_${host_arch}")
+
+    if [[ "$cfssl_response" == "404" || "$cfssljson_response" == "404" ]]; then
+      echo "cfssl download unavailable for $host_os/$host_arch and cfssl does not appear to be installed."
+      echo "Please install cfssl and cfssljson and verify they are in \$PATH."
+      echo "Hint: export PATH=\$PATH:\$GOPATH/bin; go install github.com/cloudflare/cfssl/cmd/...@latest"
+      exit 1
+    fi
 
     chmod +x cfssl || true
     chmod +x cfssljson || true
@@ -773,22 +747,22 @@ function kube::util::ensure-gnu-sed {
   kube::util::sourced_variable "${SED}"
 }
 
-# kube::util::ensure-gnu-date
+# kube::util::ensure-gnu-compatible-date
 # Determines which date binary is gnu-date on linux/darwin
 #
 # Sets:
 #  DATE: The name of the gnu-date binary
 #
-function kube::util::ensure-gnu-date {
+function kube::util::ensure-gnu-compatible-date {
   # NOTE: the echo below is a workaround to ensure date is executed before the grep.
   # see: https://github.com/kubernetes/kubernetes/issues/87251
-  date_help="$(LANG=C date --help 2>&1 || true)"
-  if echo "${date_help}" | grep -q "GNU\|BusyBox"; then
+  date_version="$(LANG=C date --version 2>&1 || true)"
+  if echo "${date_version}" | grep -q "GNU\|BusyBox\|uutils"; then
     DATE="date"
   elif command -v gdate &>/dev/null; then
     DATE="gdate"
   else
-    kube::log::error "Failed to find GNU date as date or gdate. If you are on Mac: brew install coreutils." >&2
+    kube::log::error "Failed to find GNU-compatible date as date or gdate. If you are on Mac: brew install coreutils." >&2
     return 1
   fi
   kube::util::sourced_variable "${DATE}"
@@ -832,8 +806,8 @@ function kube::util::md5() {
 # kube::util::read-array
 # Reads in stdin and adds it line by line to the array provided. This can be
 # used instead of "mapfile -t", and is bash 3 compatible.  If the named array
-# exists and is an array, it will be used.  Otherwise it will be unset and
-# recreated.
+# exists and is an array, it will be overwritten.  Otherwise it will be unset
+# and recreated.
 #
 # Assumed vars:
 #   $1 (name of array to create/modify)
@@ -879,6 +853,18 @@ function kube::util::read-array {
   if ! eval "[[ \${$1[--__read_array_i]} ]]"; then
     unset "$1[__read_array_i]" # ensures last element isn't empty
   fi
+}
+
+# kube::util::run-in
+# Changes directory to "$1", runs the rest of the arguments, and restores the initial directory
+# Returns 1 if a directory change fails, the result of running the arguments otherwise
+function kube::util::run-in {
+  pushd "$1" > /dev/null || return 1
+  shift
+  "$@"
+  local result=$?
+  popd > /dev/null || return 1
+  return $result
 }
 
 # Some useful colors.

@@ -18,15 +18,13 @@ package network
 
 import (
 	"context"
-	"fmt"
 	"net"
-	"time"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/labels"
 	admissionapi "k8s.io/pod-security-admission/api"
 
 	"k8s.io/kubernetes/test/e2e/framework"
@@ -63,7 +61,7 @@ var (
 
 // This test verifies that a Pod on each node in a cluster can talk to Pods on every other node without SNAT.
 // We use the [Feature:NoSNAT] tag so that most jobs will skip this test by default.
-var _ = common.SIGDescribe("NoSNAT [Feature:NoSNAT] [Slow]", func() {
+var _ = common.SIGDescribe("NoSNAT", func() {
 	f := framework.NewDefaultFramework("no-snat-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	ginkgo.It("Should be able to send traffic between Pods without SNAT", func(ctx context.Context) {
@@ -71,9 +69,9 @@ var _ = common.SIGDescribe("NoSNAT [Feature:NoSNAT] [Slow]", func() {
 		pc := cs.CoreV1().Pods(f.Namespace.Name)
 
 		ginkgo.By("creating a test pod on each Node")
-		nodes, err := e2enode.GetReadySchedulableNodes(ctx, cs)
+		nodes, err := e2enode.GetBoundedReadySchedulableNodes(ctx, cs, 3)
 		framework.ExpectNoError(err)
-		framework.ExpectNotEqual(len(nodes.Items), 0, "no Nodes in the cluster")
+		gomega.Expect(nodes.Items).ToNot(gomega.BeEmpty(), "no Nodes in the cluster")
 
 		for _, node := range nodes.Items {
 			// target Pod at Node
@@ -84,31 +82,12 @@ var _ = common.SIGDescribe("NoSNAT [Feature:NoSNAT] [Slow]", func() {
 		}
 
 		ginkgo.By("waiting for all of the no-snat-test pods to be scheduled and running")
-		err = wait.PollImmediate(10*time.Second, 1*time.Minute, func() (bool, error) {
-			pods, err := pc.List(ctx, metav1.ListOptions{LabelSelector: noSNATTestName})
-			if err != nil {
-				return false, err
-			}
-
-			// check all pods are running
-			for _, pod := range pods.Items {
-				if pod.Status.Phase != v1.PodRunning {
-					if pod.Status.Phase != v1.PodPending {
-						return false, fmt.Errorf("expected pod to be in phase \"Pending\" or \"Running\"")
-					}
-					return false, nil // pod is still pending
-				}
-			}
-			return true, nil // all pods are running
-		})
+		pods, err := e2epod.WaitForPodsWithLabelRunningReady(ctx, cs, f.Namespace.Name, labels.Set{noSNATTestName: ""}.AsSelector(), len(nodes.Items), framework.PodStartTimeout)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("sending traffic from each pod to the others and checking that SNAT does not occur")
-		pods, err := pc.List(ctx, metav1.ListOptions{LabelSelector: noSNATTestName})
-		framework.ExpectNoError(err)
-
 		// hit the /clientip endpoint on every other Pods to check if source ip is preserved
-		// this test is O(n^2) but it doesn't matter because we only run this test on small clusters (~3 nodes)
+		// this test is O(n^2) but it doesn't matter because we only run it on a max of 3 pods
 		for _, sourcePod := range pods.Items {
 			for _, targetPod := range pods.Items {
 				if targetPod.Name == sourcePod.Name {

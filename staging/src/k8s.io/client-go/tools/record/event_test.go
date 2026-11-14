@@ -19,12 +19,16 @@ package record
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"go.uber.org/goleak"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -34,6 +38,8 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	restclient "k8s.io/client-go/rest"
 	ref "k8s.io/client-go/tools/reference"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/ktesting"
 	"k8s.io/utils/clock"
 	testclocks "k8s.io/utils/clock/testing"
 )
@@ -104,15 +110,69 @@ func OnPatchFactory(testCache map[string]*v1.Event, patchEvent chan<- *v1.Event)
 	}
 }
 
+// newBroadcasterForTests creates a new broadcaster which produces per-test log
+// output if StartStructuredLogging is used. Will be shut down automatically
+// after the test.
+func newBroadcasterForTests(tb testing.TB) EventBroadcaster {
+	_, ctx := ktesting.NewTestContext(tb)
+	caster := NewBroadcaster(WithSleepDuration(0), WithContext(ctx))
+	tb.Cleanup(caster.Shutdown)
+	return caster
+}
+
+func TestBroadcasterShutdown(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	ctx, cancel := context.WithCancelCause(ctx)
+
+	// Start a broadcaster with background activity.
+	caster := NewBroadcaster(WithContext(ctx))
+	caster.StartStructuredLogging(0)
+
+	// Stop it.
+	cancel(stderrors.New("time to stop"))
+
+	// Ensure that the broadcaster goroutine is not left running.
+	goleak.VerifyNone(t)
+}
+
+// TestStartEventWatcherExitsOnDirectShutdown is a regression test for the
+// hot-loop that occurred when Broadcaster.Shutdown() closed the watcher's
+// result channel before the cancellation context was cancelled.
+//
+// When NewBroadcaster is called without a context, Shutdown() sequentially:
+//
+//  1. Calls e.Broadcaster.Shutdown() → watcher result channels are closed via
+//     closeAll(); all queued events have already been delivered at this point.
+//  2. Calls e.cancel() → cancelationCtx is cancelled.
+//
+// Between steps 1 and 2 there is a window where ResultChan() is closed but
+// cancelationCtx.Done() has not yet fired. The goroutine inside
+// StartEventWatcher must detect the closed channel (ok == false) and return
+// cleanly instead of spinning. goleak.VerifyTestMain (installed in
+// main_test.go) will report a leaked goroutine if the fix regresses.
+func TestStartEventWatcherExitsOnDirectShutdown(t *testing.T) {
+	// No context → haveCtxCancelation is false, so no background Broadcaster
+	// shutdown goroutine; Shutdown() is fully synchronous here.
+	caster := NewBroadcaster(WithSleepDuration(0))
+	caster.StartStructuredLogging(0)
+
+	// Direct shutdown: closes watcher channels first, then cancels context.
+	caster.Shutdown()
+
+	// goleak.VerifyTestMain checks for leaks across the whole test binary, but
+	// explicitly verifying here surfaces any regression in this specific path.
+	goleak.VerifyNone(t)
+}
+
 func TestNonRacyShutdown(t *testing.T) {
 	// Attempt to simulate previously racy conditions, and ensure that no race
 	// occurs: Nominally, calling "Eventf" *followed by* shutdown from the same
 	// thread should be a safe operation, but it's not if we launch recorder.Action
 	// in a goroutine.
 
-	caster := NewBroadcasterForTests(0)
+	caster := newBroadcasterForTests(t)
 	clock := testclocks.NewFakeClock(time.Now())
-	recorder := recorderWithFakeClock(v1.EventSource{Component: "eventTest"}, caster, clock)
+	recorder := recorderWithFakeClock(t, v1.EventSource{Component: "eventTest"}, caster, clock)
 
 	var wg sync.WaitGroup
 	wg.Add(100)
@@ -151,14 +211,15 @@ func TestEventf(t *testing.T) {
 		t.Fatal(err)
 	}
 	table := []struct {
-		obj          k8sruntime.Object
-		eventtype    string
-		reason       string
-		messageFmt   string
-		elements     []interface{}
-		expect       *v1.Event
-		expectLog    string
-		expectUpdate bool
+		obj                 k8sruntime.Object
+		eventtype           string
+		reason              string
+		messageFmt          string
+		elements            []interface{}
+		expect              *v1.Event
+		expectLog           string
+		expectStructuredLog string
+		expectUpdate        bool
 	}{
 		{
 			obj:        testRef,
@@ -186,7 +247,9 @@ func TestEventf(t *testing.T) {
 				Count:               1,
 				Type:                v1.EventTypeNormal,
 			},
-			expectLog:    `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"bar", APIVersion:"v1", ResourceVersion:"", FieldPath:"spec.containers[2]"}): type: 'Normal' reason: 'Started' some verbose message: 1`,
+			expectLog: `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"bar", APIVersion:"v1", ResourceVersion:"", FieldPath:"spec.containers[2]"}): type: 'Normal' reason: 'Started' some verbose message: 1`,
+			expectStructuredLog: `INFO Event occurred object="baz/foo" fieldPath="spec.containers[2]" kind="Pod" apiVersion="v1" type="Normal" reason="Started" message="some verbose message: 1"
+`,
 			expectUpdate: false,
 		},
 		{
@@ -214,7 +277,9 @@ func TestEventf(t *testing.T) {
 				Count:               1,
 				Type:                v1.EventTypeNormal,
 			},
-			expectLog:    `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"bar", APIVersion:"v1", ResourceVersion:"", FieldPath:""}): type: 'Normal' reason: 'Killed' some other verbose message: 1`,
+			expectLog: `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"bar", APIVersion:"v1", ResourceVersion:"", FieldPath:""}): type: 'Normal' reason: 'Killed' some other verbose message: 1`,
+			expectStructuredLog: `INFO Event occurred object="baz/foo" fieldPath="" kind="Pod" apiVersion="v1" type="Normal" reason="Killed" message="some other verbose message: 1"
+`,
 			expectUpdate: false,
 		},
 		{
@@ -243,7 +308,9 @@ func TestEventf(t *testing.T) {
 				Count:               2,
 				Type:                v1.EventTypeNormal,
 			},
-			expectLog:    `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"bar", APIVersion:"v1", ResourceVersion:"", FieldPath:"spec.containers[2]"}): type: 'Normal' reason: 'Started' some verbose message: 1`,
+			expectLog: `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"bar", APIVersion:"v1", ResourceVersion:"", FieldPath:"spec.containers[2]"}): type: 'Normal' reason: 'Started' some verbose message: 1`,
+			expectStructuredLog: `INFO Event occurred object="baz/foo" fieldPath="spec.containers[2]" kind="Pod" apiVersion="v1" type="Normal" reason="Started" message="some verbose message: 1"
+`,
 			expectUpdate: true,
 		},
 		{
@@ -272,7 +339,9 @@ func TestEventf(t *testing.T) {
 				Count:               1,
 				Type:                v1.EventTypeNormal,
 			},
-			expectLog:    `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"differentUid", APIVersion:"v1", ResourceVersion:"", FieldPath:"spec.containers[3]"}): type: 'Normal' reason: 'Started' some verbose message: 1`,
+			expectLog: `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"differentUid", APIVersion:"v1", ResourceVersion:"", FieldPath:"spec.containers[3]"}): type: 'Normal' reason: 'Started' some verbose message: 1`,
+			expectStructuredLog: `INFO Event occurred object="baz/foo" fieldPath="spec.containers[3]" kind="Pod" apiVersion="v1" type="Normal" reason="Started" message="some verbose message: 1"
+`,
 			expectUpdate: false,
 		},
 		{
@@ -301,7 +370,9 @@ func TestEventf(t *testing.T) {
 				Count:               3,
 				Type:                v1.EventTypeNormal,
 			},
-			expectLog:    `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"bar", APIVersion:"v1", ResourceVersion:"", FieldPath:"spec.containers[2]"}): type: 'Normal' reason: 'Started' some verbose message: 1`,
+			expectLog: `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"bar", APIVersion:"v1", ResourceVersion:"", FieldPath:"spec.containers[2]"}): type: 'Normal' reason: 'Started' some verbose message: 1`,
+			expectStructuredLog: `INFO Event occurred object="baz/foo" fieldPath="spec.containers[2]" kind="Pod" apiVersion="v1" type="Normal" reason="Started" message="some verbose message: 1"
+`,
 			expectUpdate: true,
 		},
 		{
@@ -330,7 +401,9 @@ func TestEventf(t *testing.T) {
 				Count:               1,
 				Type:                v1.EventTypeNormal,
 			},
-			expectLog:    `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"differentUid", APIVersion:"v1", ResourceVersion:"", FieldPath:"spec.containers[3]"}): type: 'Normal' reason: 'Stopped' some verbose message: 1`,
+			expectLog: `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"differentUid", APIVersion:"v1", ResourceVersion:"", FieldPath:"spec.containers[3]"}): type: 'Normal' reason: 'Stopped' some verbose message: 1`,
+			expectStructuredLog: `INFO Event occurred object="baz/foo" fieldPath="spec.containers[3]" kind="Pod" apiVersion="v1" type="Normal" reason="Stopped" message="some verbose message: 1"
+`,
 			expectUpdate: false,
 		},
 		{
@@ -359,7 +432,9 @@ func TestEventf(t *testing.T) {
 				Count:               2,
 				Type:                v1.EventTypeNormal,
 			},
-			expectLog:    `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"differentUid", APIVersion:"v1", ResourceVersion:"", FieldPath:"spec.containers[3]"}): type: 'Normal' reason: 'Stopped' some verbose message: 1`,
+			expectLog: `Event(v1.ObjectReference{Kind:"Pod", Namespace:"baz", Name:"foo", UID:"differentUid", APIVersion:"v1", ResourceVersion:"", FieldPath:"spec.containers[3]"}): type: 'Normal' reason: 'Stopped' some verbose message: 1`,
+			expectStructuredLog: `INFO Event occurred object="baz/foo" fieldPath="spec.containers[3]" kind="Pod" apiVersion="v1" type="Normal" reason="Stopped" message="some verbose message: 1"
+`,
 			expectUpdate: true,
 		},
 	}
@@ -377,22 +452,35 @@ func TestEventf(t *testing.T) {
 		},
 		OnPatch: OnPatchFactory(testCache, patchEvent),
 	}
-	eventBroadcaster := NewBroadcasterForTests(0)
+	logger := ktesting.NewLogger(t, ktesting.NewConfig(ktesting.BufferLogs(true)))
+	logSink := logger.GetSink().(ktesting.Underlier)
+	ctx := klog.NewContext(context.Background(), logger)
+	eventBroadcaster := NewBroadcaster(WithSleepDuration(0), WithContext(ctx))
+	defer eventBroadcaster.Shutdown()
 	sinkWatcher := eventBroadcaster.StartRecordingToSink(&testEvents)
 
 	clock := testclocks.NewFakeClock(time.Now())
-	recorder := recorderWithFakeClock(v1.EventSource{Component: "eventTest"}, eventBroadcaster, clock)
+	recorder := recorderWithFakeClock(t, v1.EventSource{Component: "eventTest"}, eventBroadcaster, clock)
 	for index, item := range table {
 		clock.Step(1 * time.Second)
+		//nolint:logcheck // Intentionally testing StartLogging here.
 		logWatcher := eventBroadcaster.StartLogging(func(formatter string, args ...interface{}) {
 			if e, a := item.expectLog, fmt.Sprintf(formatter, args...); e != a {
 				t.Errorf("Expected '%v', got '%v'", e, a)
 			}
 			logCalled <- struct{}{}
 		})
+		oldEnd := len(logSink.GetBuffer().String())
+		structuredLogWatcher := eventBroadcaster.StartStructuredLogging(0)
 		recorder.Eventf(item.obj, item.eventtype, item.reason, item.messageFmt, item.elements...)
 
 		<-logCalled
+
+		// We don't get notified by the structured test logger directly.
+		// Instead, we periodically check what new output it has produced.
+		assert.EventuallyWithT(t, func(t *assert.CollectT) {
+			assert.Equal(t, item.expectStructuredLog, logSink.GetBuffer().String()[oldEnd:], "new structured log output")
+		}, time.Minute, time.Millisecond)
 
 		// validate event
 		if item.expectUpdate {
@@ -403,11 +491,12 @@ func TestEventf(t *testing.T) {
 			validateEvent(strconv.Itoa(index), actualEvent, item.expect, t)
 		}
 		logWatcher.Stop()
+		structuredLogWatcher.Stop()
 	}
 	sinkWatcher.Stop()
 }
 
-func recorderWithFakeClock(eventSource v1.EventSource, eventBroadcaster EventBroadcaster, clock clock.Clock) EventRecorder {
+func recorderWithFakeClock(t *testing.T, eventSource v1.EventSource, eventBroadcaster EventBroadcaster, clock clock.Clock) EventRecorder {
 	return &recorderImpl{scheme.Scheme, eventSource, eventBroadcaster.(*eventBroadcasterImpl).Broadcaster, clock}
 }
 
@@ -561,8 +650,9 @@ func TestLotsOfEvents(t *testing.T) {
 		},
 	}
 
-	eventBroadcaster := NewBroadcasterForTests(0)
+	eventBroadcaster := newBroadcasterForTests(t)
 	sinkWatcher := eventBroadcaster.StartRecordingToSink(&testEvents)
+	//nolint:logcheck // Intentionally using StartLogging here to get notified.
 	logWatcher := eventBroadcaster.StartLogging(func(formatter string, args ...interface{}) {
 		loggerCalled <- struct{}{}
 	})
@@ -577,7 +667,7 @@ func TestLotsOfEvents(t *testing.T) {
 			APIVersion: "version",
 		}
 		// we need to vary the reason to prevent aggregation
-		go recorder.Eventf(ref, v1.EventTypeNormal, "Reason-"+strconv.Itoa(i), strconv.Itoa(i))
+		go recorder.Eventf(ref, v1.EventTypeNormal, "Reason-"+strconv.Itoa(i), "%s", strconv.Itoa(i))
 	}
 	// Make sure no events were dropped by either of the listeners.
 	for i := 0; i < maxQueuedEvents; i++ {
@@ -658,11 +748,11 @@ func TestEventfNoNamespace(t *testing.T) {
 		},
 		OnPatch: OnPatchFactory(testCache, patchEvent),
 	}
-	eventBroadcaster := NewBroadcasterForTests(0)
+	eventBroadcaster := newBroadcasterForTests(t)
 	sinkWatcher := eventBroadcaster.StartRecordingToSink(&testEvents)
 
 	clock := testclocks.NewFakeClock(time.Now())
-	recorder := recorderWithFakeClock(v1.EventSource{Component: "eventTest"}, eventBroadcaster, clock)
+	recorder := recorderWithFakeClock(t, v1.EventSource{Component: "eventTest"}, eventBroadcaster, clock)
 
 	for index, item := range table {
 		clock.Step(1 * time.Second)
@@ -953,9 +1043,9 @@ func TestMultiSinkCache(t *testing.T) {
 		OnPatch: OnPatchFactory(testCache2, patchEvent2),
 	}
 
-	eventBroadcaster := NewBroadcasterForTests(0)
+	eventBroadcaster := newBroadcasterForTests(t)
 	clock := testclocks.NewFakeClock(time.Now())
-	recorder := recorderWithFakeClock(v1.EventSource{Component: "eventTest"}, eventBroadcaster, clock)
+	recorder := recorderWithFakeClock(t, v1.EventSource{Component: "eventTest"}, eventBroadcaster, clock)
 
 	sinkWatcher := eventBroadcaster.StartRecordingToSink(&testEvents)
 	for index, item := range table {
@@ -971,6 +1061,9 @@ func TestMultiSinkCache(t *testing.T) {
 			validateEvent(strconv.Itoa(index), actualEvent, item.expect, t)
 		}
 	}
+	// Stop before creating more events, otherwise the On* callbacks above
+	// get stuck writing to the channel that we don't read from anymore.
+	sinkWatcher.Stop()
 
 	// Another StartRecordingToSink call should start to record events with new clean cache.
 	sinkWatcher2 := eventBroadcaster.StartRecordingToSink(&testEvents2)
@@ -988,6 +1081,5 @@ func TestMultiSinkCache(t *testing.T) {
 		}
 	}
 
-	sinkWatcher.Stop()
 	sinkWatcher2.Stop()
 }

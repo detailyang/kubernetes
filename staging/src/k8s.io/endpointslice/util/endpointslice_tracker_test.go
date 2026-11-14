@@ -23,6 +23,7 @@ import (
 	discovery "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 )
 
 func TestEndpointSliceTrackerUpdate(t *testing.T) {
@@ -125,8 +126,7 @@ func TestEndpointSliceTrackerStaleSlices(t *testing.T) {
 	epSlice1NewerGen.Generation = 2
 
 	epTerminatingSlice := epSlice1.DeepCopy()
-	now := metav1.Now()
-	epTerminatingSlice.DeletionTimestamp = &now
+	epTerminatingSlice.DeletionTimestamp = ptr.To(metav1.Now())
 
 	testCases := []struct {
 		name         string
@@ -399,6 +399,114 @@ func TestEndpointSliceTrackerDeleteService(t *testing.T) {
 				if tc.expectGeneration != generation {
 					t.Fatalf("expected generation to be %d, got %d", tc.expectGeneration, generation)
 				}
+			}
+		})
+	}
+}
+
+func TestEndpointSliceTrackerStaleSlicesServiceRecreated(t *testing.T) {
+	epSlice1 := &discovery.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "slice1",
+			Namespace: "ns1",
+			UID:       "slice-uid-1",
+			Labels: map[string]string{
+				discovery.LabelServiceName: "svc1",
+			},
+			Generation: 1,
+		},
+	}
+	epSlice2 := &discovery.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "slice2",
+			Namespace: "ns1",
+			UID:       "slice-uid-2",
+			Labels: map[string]string{
+				discovery.LabelServiceName: "svc1",
+			},
+			Generation: 1,
+		},
+	}
+
+	oldService := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "svc1",
+			Namespace: "ns1",
+			UID:       "service-uid-old",
+		},
+	}
+	newService := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "svc1",
+			Namespace: "ns1",
+			UID:       "service-uid-new",
+		},
+	}
+
+	testCases := []struct {
+		name         string
+		setup        func(tracker *EndpointSliceTracker)
+		serviceParam *v1.Service
+		slicesParam  []*discovery.EndpointSlice
+		expectStale  bool
+	}{{
+		name: "recreated service with residual generations and empty slices",
+		setup: func(tracker *EndpointSliceTracker) {
+			tracker.Update(epSlice1)
+			_ = tracker.StaleSlices(oldService, []*discovery.EndpointSlice{epSlice1})
+		},
+		serviceParam: newService,
+		slicesParam:  []*discovery.EndpointSlice{},
+		expectStale:  false,
+	}, {
+		name: "recreated service with residual generations and unrelated new slice",
+		setup: func(tracker *EndpointSliceTracker) {
+			tracker.Update(epSlice1)
+			_ = tracker.StaleSlices(oldService, []*discovery.EndpointSlice{epSlice1})
+		},
+		serviceParam: newService,
+		slicesParam:  []*discovery.EndpointSlice{epSlice2},
+		expectStale:  false,
+	}, {
+		name: "same service UID with missing tracked slice remains stale",
+		setup: func(tracker *EndpointSliceTracker) {
+			tracker.Update(epSlice1)
+			_ = tracker.StaleSlices(oldService, []*discovery.EndpointSlice{epSlice1})
+		},
+		serviceParam: oldService,
+		slicesParam:  []*discovery.EndpointSlice{},
+		expectStale:  true,
+	}, {
+		name: "same service UID with matching slice is not stale",
+		setup: func(tracker *EndpointSliceTracker) {
+			tracker.Update(epSlice1)
+			_ = tracker.StaleSlices(oldService, []*discovery.EndpointSlice{epSlice1})
+		},
+		serviceParam: oldService,
+		slicesParam:  []*discovery.EndpointSlice{epSlice1},
+		expectStale:  false,
+	}, {
+		name: "empty service UIDs do not clear residual generations",
+		setup: func(tracker *EndpointSliceTracker) {
+			tracker.Update(epSlice1)
+			svcNoUID := &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "svc1", Namespace: "ns1"}}
+			_ = tracker.StaleSlices(svcNoUID, []*discovery.EndpointSlice{epSlice1})
+		},
+		serviceParam: &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "svc1", Namespace: "ns1"}},
+		slicesParam:  []*discovery.EndpointSlice{},
+		expectStale:  true,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tracker := NewEndpointSliceTracker()
+			if tc.setup != nil {
+				tc.setup(tracker)
+			}
+
+			got := tracker.StaleSlices(tc.serviceParam, tc.slicesParam)
+			if got != tc.expectStale {
+				t.Errorf("StaleSlices() = %t, want %t", got, tc.expectStale)
 			}
 		})
 	}

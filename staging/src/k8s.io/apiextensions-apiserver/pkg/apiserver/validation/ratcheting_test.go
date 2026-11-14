@@ -17,6 +17,7 @@ limitations under the License.
 package validation_test
 
 import (
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -24,42 +25,43 @@ import (
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 	"k8s.io/kube-openapi/pkg/validation/strfmt"
+	"k8s.io/utils/ptr"
 )
 
 var zeroIntSchema *spec.Schema = &spec.Schema{
 	SchemaProps: spec.SchemaProps{
 		Type:    spec.StringOrArray{"number"},
-		Minimum: ptr(float64(0)),
-		Maximum: ptr(float64(0)),
+		Minimum: ptr.To[float64](0),
+		Maximum: ptr.To[float64](0),
 	},
 }
 
 var smallIntSchema *spec.Schema = &spec.Schema{
 	SchemaProps: spec.SchemaProps{
 		Type:    spec.StringOrArray{"number"},
-		Maximum: ptr(float64(50)),
+		Maximum: ptr.To[float64](50),
 	},
 }
 
 var mediumIntSchema *spec.Schema = &spec.Schema{
 	SchemaProps: spec.SchemaProps{
 		Type:    spec.StringOrArray{"number"},
-		Minimum: ptr(float64(50)),
-		Maximum: ptr(float64(10000)),
+		Minimum: ptr.To[float64](50),
+		Maximum: ptr.To[float64](10000),
 	},
 }
 
 var largeIntSchema *spec.Schema = &spec.Schema{
 	SchemaProps: spec.SchemaProps{
 		Type:    spec.StringOrArray{"number"},
-		Minimum: ptr(float64(10000)),
+		Minimum: ptr.To[float64](10000),
 	},
 }
 
 func TestScalarRatcheting(t *testing.T) {
 	validator := validation.NewRatchetingSchemaValidator(mediumIntSchema, nil, "", strfmt.Default)
-	require.True(t, validator.ValidateUpdate(1, 1).IsValid())
-	require.False(t, validator.ValidateUpdate(1, 2).IsValid())
+	require.True(t, validator.ValidateUpdate(1, 1, validation.WithRatcheting(nil)).IsValid())
+	require.False(t, validator.ValidateUpdate(1, 2, validation.WithRatcheting(nil)).IsValid())
 }
 
 var objectSchema *spec.Schema = &spec.Schema{
@@ -90,18 +92,18 @@ func TestObjectScalarFieldsRatcheting(t *testing.T) {
 		"small": 500,
 	}, map[string]interface{}{
 		"small": 500,
-	}).IsValid())
+	}, validation.WithRatcheting(nil)).IsValid())
 	assert.True(t, validator.ValidateUpdate(map[string]interface{}{
 		"small": 501,
 	}, map[string]interface{}{
 		"small":  501,
 		"medium": 500,
-	}).IsValid())
+	}, validation.WithRatcheting(nil)).IsValid())
 	assert.False(t, validator.ValidateUpdate(map[string]interface{}{
 		"small": 500,
 	}, map[string]interface{}{
 		"small": 501,
-	}).IsValid())
+	}, validation.WithRatcheting(nil)).IsValid())
 }
 
 // Shows schemas with object fields which themselves are ratcheted can be ratcheted
@@ -113,7 +115,7 @@ func TestObjectObjectFieldsRatcheting(t *testing.T) {
 		}}, map[string]interface{}{
 		"nested": map[string]interface{}{
 			"small": 500,
-		}}).IsValid())
+		}}, validation.WithRatcheting(nil)).IsValid())
 	assert.True(t, validator.ValidateUpdate(map[string]interface{}{
 		"nested": map[string]interface{}{
 			"small": 501,
@@ -121,16 +123,58 @@ func TestObjectObjectFieldsRatcheting(t *testing.T) {
 		"nested": map[string]interface{}{
 			"small":  501,
 			"medium": 500,
-		}}).IsValid())
+		}}, validation.WithRatcheting(nil)).IsValid())
 	assert.False(t, validator.ValidateUpdate(map[string]interface{}{
 		"nested": map[string]interface{}{
 			"small": 500,
 		}}, map[string]interface{}{
 		"nested": map[string]interface{}{
 			"small": 501,
-		}}).IsValid())
+		}}, validation.WithRatcheting(nil)).IsValid())
 }
 
-func ptr[T any](v T) *T {
-	return &v
+var numericFormatSchema *spec.Schema = &spec.Schema{
+	SchemaProps: spec.SchemaProps{
+		Type: spec.StringOrArray{"object"},
+		Properties: map[string]spec.Schema{
+			"intThirtyTwo": {
+				SchemaProps: spec.SchemaProps{
+					Type:   spec.StringOrArray{"integer"},
+					Format: "int32",
+				},
+			},
+			"unrelated": {
+				SchemaProps: spec.SchemaProps{
+					Type: spec.StringOrArray{"string"},
+				},
+			},
+		},
+	},
+}
+
+func TestNumericFormatRatcheting(t *testing.T) {
+	validator := validation.NewRatchetingSchemaValidator(numericFormatSchema, nil, "", strfmt.Default)
+
+	// Ratcheting should allow existing invalid value if unchanged
+	assert.True(t, validator.ValidateUpdate(map[string]interface{}{
+		"intThirtyTwo": int64(math.MaxInt32 + 1),
+	}, map[string]interface{}{
+		"intThirtyTwo": int64(math.MaxInt32 + 1),
+	}, validation.WithRatcheting(nil)).IsValid())
+
+	// Ratcheting should allow existing invalid value if other fields change
+	assert.True(t, validator.ValidateUpdate(map[string]interface{}{
+		"intThirtyTwo": int64(math.MaxInt32 + 1),
+		"unrelated":    "changed",
+	}, map[string]interface{}{
+		"intThirtyTwo": int64(math.MaxInt32 + 1),
+		"unrelated":    "original",
+	}, validation.WithRatcheting(nil)).IsValid())
+
+	// Should fail if value changes to another invalid value
+	assert.False(t, validator.ValidateUpdate(map[string]interface{}{
+		"intThirtyTwo": int64(math.MaxInt32 + 2),
+	}, map[string]interface{}{
+		"intThirtyTwo": int64(math.MaxInt32 + 1),
+	}, validation.WithRatcheting(nil)).IsValid())
 }

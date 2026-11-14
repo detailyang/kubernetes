@@ -19,7 +19,9 @@ package e2enode
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,22 +31,25 @@ import (
 	admissionapi "k8s.io/pod-security-admission/api"
 
 	"github.com/onsi/ginkgo/v2"
-	libcontainercgroups "github.com/opencontainers/runc/libcontainer/cgroups"
+	libcontainercgroups "github.com/opencontainers/cgroups"
+	"k8s.io/utils/ptr"
 )
 
 type testCase struct {
-	name                   string
-	podSpec                *v1.Pod
-	oomTargetContainerName string
+	name                    string
+	podSpec                 *v1.Pod
+	oomTargetContainerName  string
+	enableSingleProcessKill *bool
+	expectPodRunning        bool
 }
 
 // KubeReservedMemory is default fraction value of node capacity memory to
 // be reserved for K8s components.
 const KubeReservedMemory = 0.35
 
-var _ = SIGDescribe("OOMKiller for pod using more memory than node allocatable [LinuxOnly] [Serial]", func() {
+var _ = SIGDescribe("OOMKiller for pod using more memory than node allocatable [LinuxOnly]", framework.WithSerial(), func() {
 	f := framework.NewDefaultFramework("nodeallocatable-oomkiller-test")
-	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
 	testCases := []testCase{
 		{
@@ -60,7 +65,7 @@ var _ = SIGDescribe("OOMKiller for pod using more memory than node allocatable [
 	}
 })
 
-var _ = SIGDescribe("OOMKiller [LinuxOnly] [NodeConformance]", func() {
+var _ = SIGDescribe("OOMKiller [LinuxOnly]", framework.WithNodeConformance(), framework.WithSerial(), func() {
 	f := framework.NewDefaultFramework("oomkiller-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
@@ -87,6 +92,24 @@ var _ = SIGDescribe("OOMKiller [LinuxOnly] [NodeConformance]", func() {
 			oomTargetContainerName: "oomkill-multi-target-container",
 			podSpec: getOOMTargetPod("oomkill-target-pod", "oomkill-multi-target-container",
 				getOOMTargetContainerMultiProcess),
+			enableSingleProcessKill: nil,
+		})
+
+		testCases = append(testCases, testCase{
+			name:                   "multi process container (single process kill enabled)",
+			oomTargetContainerName: "oomkill-multi-target-container",
+			podSpec: getOOMTargetPod("oomkill-target-pod", "oomkill-multi-target-container",
+				getOOMTargetContainerMultiProcess),
+			enableSingleProcessKill: ptr.To(true),
+			expectPodRunning:        true,
+		})
+
+		testCases = append(testCases, testCase{
+			name:                   "multi process container (single process kill disabled)",
+			oomTargetContainerName: "oomkill-multi-target-container",
+			podSpec: getOOMTargetPod("oomkill-target-pod", "oomkill-multi-target-container",
+				getOOMTargetContainerMultiProcess),
+			enableSingleProcessKill: ptr.To(false),
 		})
 	}
 	for _, tc := range testCases {
@@ -97,8 +120,8 @@ var _ = SIGDescribe("OOMKiller [LinuxOnly] [NodeConformance]", func() {
 func runOomKillerTest(f *framework.Framework, testCase testCase, kubeReservedMemory float64) {
 	ginkgo.Context(testCase.name, func() {
 		// Update KubeReservedMemory in KubeletConfig.
-		if kubeReservedMemory > 0 {
-			tempSetCurrentKubeletConfig(f, func(ctx context.Context, initialConfig *kubeletconfig.KubeletConfiguration) {
+		tempSetCurrentKubeletConfig(f, func(ctx context.Context, initialConfig *kubeletconfig.KubeletConfiguration) {
+			if kubeReservedMemory > 0 {
 				if initialConfig.KubeReserved == nil {
 					initialConfig.KubeReserved = map[string]string{}
 				}
@@ -107,26 +130,50 @@ func runOomKillerTest(f *framework.Framework, testCase testCase, kubeReservedMem
 				// K8s components such that node allocatable memory is less than node capacity to
 				// observe OOM kills at cgroup level instead of system OOM kills.
 				initialConfig.KubeReserved["memory"] = fmt.Sprintf("%d", int(kubeReservedMemory*getLocalNode(context.TODO(), f).Status.Capacity.Memory().AsApproximateFloat64()))
-			})
-		}
+			}
+
+			initialConfig.SingleProcessOOMKill = testCase.enableSingleProcessKill
+		})
 
 		ginkgo.BeforeEach(func() {
+			// Precautionary check that kubelet is healthy before running the test.
+			waitForKubeletToStart(context.TODO(), f)
+
 			ginkgo.By("setting up the pod to be used in the test")
 			e2epod.NewPodClient(f).Create(context.TODO(), testCase.podSpec)
 		})
 
-		ginkgo.It("The containers terminated by OOM killer should have the reason set to OOMKilled", func() {
-			ginkgo.By("Waiting for the pod to be failed")
-			err := e2epod.WaitForPodTerminatedInNamespace(context.TODO(), f.ClientSet, testCase.podSpec.Name, "", f.Namespace.Name)
-			framework.ExpectNoError(err, "Failed waiting for pod to terminate, %s/%s", f.Namespace.Name, testCase.podSpec.Name)
+		if testCase.expectPodRunning {
+			ginkgo.It("The containers should not be OOMKilled", func() {
+				err := e2epod.WaitForPodsRunning(context.TODO(), f.ClientSet, f.Namespace.Name, 1, framework.PodStartTimeout)
+				framework.ExpectNoError(err, "Failed waiting for pod to be running state, %s/%s", f.Namespace.Name, testCase.podSpec.Name)
 
-			ginkgo.By("Fetching the latest pod status")
-			pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(context.TODO(), testCase.podSpec.Name, metav1.GetOptions{})
-			framework.ExpectNoError(err, "Failed to get the recent pod object for name: %q", pod.Name)
+				gomega.Consistently(context.TODO(), func(ctx context.Context) error {
+					pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, testCase.podSpec.Name, metav1.GetOptions{})
+					if err != nil {
+						return fmt.Errorf("expected the pod %s to exist: %w", pod.Name, err)
+					}
+					phase := pod.Status.Phase
+					if phase != v1.PodRunning && phase != v1.PodSucceeded {
+						return fmt.Errorf("pod %s: unexpected status %s, expected status: %s or %s", pod.Name, pod.Status.Phase, v1.PodRunning, v1.PodSucceeded)
+					}
+					return nil
+				}, 10*time.Second, f.Timeouts.Poll).Should(gomega.BeNil())
+			})
+		} else {
+			ginkgo.It("The containers terminated by OOM killer should have the reason set to OOMKilled", func() {
+				ginkgo.By("Waiting for the pod to be failed")
+				err := e2epod.WaitForPodTerminatedInNamespace(context.TODO(), f.ClientSet, testCase.podSpec.Name, "", f.Namespace.Name)
+				framework.ExpectNoError(err, "Failed waiting for pod to terminate, %s/%s", f.Namespace.Name, testCase.podSpec.Name)
 
-			ginkgo.By("Verifying the OOM target container has the expected reason")
-			verifyReasonForOOMKilledContainer(pod, testCase.oomTargetContainerName)
-		})
+				ginkgo.By("Fetching the latest pod status")
+				pod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(context.TODO(), testCase.podSpec.Name, metav1.GetOptions{})
+				framework.ExpectNoError(err, "Failed to get the recent pod object for name: %q", pod.Name)
+
+				ginkgo.By("Verifying the OOM target container has the expected reason")
+				verifyReasonForOOMKilledContainer(pod, testCase.oomTargetContainerName)
+			})
+		}
 
 		ginkgo.AfterEach(func() {
 			ginkgo.By(fmt.Sprintf("deleting pod: %s", testCase.podSpec.Name))
@@ -143,10 +190,17 @@ func verifyReasonForOOMKilledContainer(pod *v1.Pod, oomTargetContainerName strin
 	if container.State.Terminated == nil {
 		framework.Failf("OOM target pod %q, container %q is not in the terminated state", pod.Name, container.Name)
 	}
-	framework.ExpectEqual(container.State.Terminated.ExitCode, int32(137),
-		fmt.Sprintf("pod: %q, container: %q has unexpected exitCode: %q", pod.Name, container.Name, container.State.Terminated.ExitCode))
-	framework.ExpectEqual(container.State.Terminated.Reason, "OOMKilled",
-		fmt.Sprintf("pod: %q, container: %q has unexpected reason: %q", pod.Name, container.Name, container.State.Terminated.Reason))
+	gomega.Expect(container.State.Terminated.ExitCode).To(gomega.Equal(int32(137)),
+		"pod: %q, container: %q has unexpected exitCode: %q", pod.Name, container.Name, container.State.Terminated.ExitCode)
+
+	// This check is currently causing tests to flake on containerd & crio, https://github.com/kubernetes/kubernetes/issues/119600
+	// so we'll skip the reason check if we know its going to fail.
+	// TODO: Remove this once https://github.com/containerd/containerd/issues/8893 is resolved
+	if container.State.Terminated.Reason == "OOMKilled" {
+		gomega.Expect(container.State.Terminated.Reason).To(gomega.Equal("OOMKilled"),
+			"pod: %q, container: %q has unexpected reason: %q", pod.Name, container.Name, container.State.Terminated.Reason)
+	}
+
 }
 
 func getOOMTargetPod(podName string, ctnName string, createContainer func(name string) v1.Container) *v1.Pod {
@@ -155,7 +209,8 @@ func getOOMTargetPod(podName string, ctnName string, createContainer func(name s
 			Name: podName,
 		},
 		Spec: v1.PodSpec{
-			RestartPolicy: v1.RestartPolicyNever,
+			PriorityClassName: "system-node-critical",
+			RestartPolicy:     v1.RestartPolicyNever,
 			Containers: []v1.Container{
 				createContainer(ctnName),
 			},
@@ -203,6 +258,16 @@ func getOOMTargetContainer(name string) v1.Container {
 				v1.ResourceMemory: resource.MustParse("15Mi"),
 			},
 		},
+		SecurityContext: &v1.SecurityContext{
+			SeccompProfile: &v1.SeccompProfile{
+				Type: v1.SeccompProfileTypeRuntimeDefault,
+			},
+			AllowPrivilegeEscalation: ptr.To(false),
+			RunAsUser:                ptr.To[int64](999),
+			RunAsGroup:               ptr.To[int64](999),
+			RunAsNonRoot:             ptr.To(true),
+			Capabilities:             &v1.Capabilities{Drop: []v1.Capability{"ALL"}},
+		},
 	}
 }
 
@@ -226,6 +291,16 @@ func getOOMTargetContainerMultiProcess(name string) v1.Container {
 				v1.ResourceMemory: resource.MustParse("15Mi"),
 			},
 		},
+		SecurityContext: &v1.SecurityContext{
+			SeccompProfile: &v1.SeccompProfile{
+				Type: v1.SeccompProfileTypeRuntimeDefault,
+			},
+			AllowPrivilegeEscalation: ptr.To(false),
+			RunAsUser:                ptr.To[int64](999),
+			RunAsGroup:               ptr.To[int64](999),
+			RunAsNonRoot:             ptr.To(true),
+			Capabilities:             &v1.Capabilities{Drop: []v1.Capability{"ALL"}},
+		},
 	}
 }
 
@@ -239,7 +314,17 @@ func getOOMTargetContainerWithoutLimit(name string) v1.Container {
 			"sh",
 			"-c",
 			// use the dd tool to attempt to allocate huge block of memory which exceeds the node allocatable
-			"sleep 5 && dd if=/dev/zero of=/dev/null iflag=fullblock count=10 bs=10G",
+			"sleep 5 && dd if=/dev/zero of=/dev/null iflag=fullblock count=10 bs=1024G",
+		},
+		SecurityContext: &v1.SecurityContext{
+			SeccompProfile: &v1.SeccompProfile{
+				Type: v1.SeccompProfileTypeRuntimeDefault,
+			},
+			AllowPrivilegeEscalation: ptr.To(false),
+			RunAsUser:                ptr.To[int64](999),
+			RunAsGroup:               ptr.To[int64](999),
+			RunAsNonRoot:             ptr.To(true),
+			Capabilities:             &v1.Capabilities{Drop: []v1.Capability{"ALL"}},
 		},
 	}
 }

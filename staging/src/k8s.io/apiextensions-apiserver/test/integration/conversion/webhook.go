@@ -17,6 +17,7 @@ limitations under the License.
 package conversion
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -30,8 +31,8 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/wait"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	apiextensionsv1beta1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -63,9 +64,13 @@ func StartConversionWebhookServer(handler http.Handler) (func(), *apiextensionsv
 	}
 
 	// StartTLS returns immediately, there is a small chance of a race to avoid.
-	if err := wait.PollImmediate(time.Millisecond*100, wait.ForeverTestTimeout, func() (bool, error) {
-		_, err := webhookServer.Client().Get(webhookServer.URL) // even a 404 is fine
-		return err == nil, nil
+	if err := wait.PollUntilContextTimeout(context.Background(), time.Millisecond*100, wait.ForeverTestTimeout, true, func(ctx context.Context) (done bool, err error) {
+		resp, getErr := webhookServer.Client().Get(webhookServer.URL) // even a 404 is fine
+		if getErr != nil {
+			return false, nil
+		}
+		_ = resp.Body.Close()
+		return true, nil
 	}); err != nil {
 		webhookServer.Close()
 		return nil, nil, err

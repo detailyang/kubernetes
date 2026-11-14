@@ -27,7 +27,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"go.etcd.io/etcd/client/pkg/v3/transport"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"google.golang.org/grpc"
 	"sigs.k8s.io/yaml"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -37,10 +36,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/json"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	"k8s.io/apiextensions-api/pkg/client/clientset/clientset"
 	serveroptions "k8s.io/apiextensions-apiserver/pkg/cmd/server/options"
 	"k8s.io/apiextensions-apiserver/test/integration/fixtures"
 )
@@ -71,7 +70,7 @@ func TestPostInvalidObjectMeta(t *testing.T) {
 	if status, ok := err.(errors.APIStatus); !ok {
 		t.Fatalf("expected APIStatus error, but got: %#v", err)
 	} else if !errors.IsBadRequest(err) {
-		t.Fatalf("expected BadRequst error, but got: %v", errors.ReasonForError(err))
+		t.Fatalf("expected BadRequest error, but got: %v", errors.ReasonForError(err))
 	} else if !strings.Contains(status.Status().Message, "cannot be handled") {
 		t.Fatalf("expected 'cannot be handled' error message, got: %v", status.Status().Message)
 	}
@@ -122,7 +121,7 @@ func TestInvalidObjectMetaInStorage(t *testing.T) {
 				"embedded": {
 					Type:                   "object",
 					XEmbeddedResource:      true,
-					XPreserveUnknownFields: pointer.BoolPtr(true),
+					XPreserveUnknownFields: ptr.To(true),
 				},
 			},
 		},
@@ -132,8 +131,8 @@ func TestInvalidObjectMetaInStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	RESTOptionsGetter := serveroptions.NewCRDRESTOptionsGetter(*options.RecommendedOptions.Etcd, nil, nil)
-	restOptions, err := RESTOptionsGetter.GetRESTOptions(schema.GroupResource{Group: noxuDefinition.Spec.Group, Resource: noxuDefinition.Spec.Names.Plural})
+	RESTOptionsGetter := serveroptions.NewCRDRESTOptionsGetter(*options.RecommendedOptions.Etcd, nil, nil, nil)
+	restOptions, err := RESTOptionsGetter.GetRESTOptions(schema.GroupResource{Group: noxuDefinition.Spec.Group, Resource: noxuDefinition.Spec.Names.Plural}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,10 +148,7 @@ func TestInvalidObjectMetaInStorage(t *testing.T) {
 	etcdConfig := clientv3.Config{
 		Endpoints:   restOptions.StorageConfig.Transport.ServerList,
 		DialTimeout: 20 * time.Second,
-		DialOptions: []grpc.DialOption{
-			grpc.WithBlock(), // block until the underlying connection is up
-		},
-		TLS: tlsConfig,
+		TLS:         tlsConfig,
 	}
 	etcdclient, err := clientv3.New(etcdConfig)
 	if err != nil {

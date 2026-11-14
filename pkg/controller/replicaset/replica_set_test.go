@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/onsi/gomega"
 	"math/rand"
 	"net/http/httptest"
 	"net/url"
@@ -41,6 +42,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -50,11 +52,12 @@ import (
 	utiltesting "k8s.io/client-go/util/testing"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
-	"k8s.io/klog/v2/ktesting"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/pkg/controller"
 	. "k8s.io/kubernetes/pkg/controller/testutil"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/securitycontext"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 var (
@@ -64,9 +67,9 @@ var (
 func testNewReplicaSetControllerFromClient(tb testing.TB, client clientset.Interface, stopCh chan struct{}, burstReplicas int) (*ReplicaSetController, informers.SharedInformerFactory) {
 	informers := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
 
-	logger, _ := ktesting.NewTestContext(tb)
+	tCtx := ktesting.Init(tb)
 	ret := NewReplicaSetController(
-		logger,
+		tCtx,
 		informers.Apps().V1().ReplicaSets(),
 		informers.Core().V1().Pods(),
 		client,
@@ -105,7 +108,7 @@ func newReplicaSet(replicas int, selectorMap map[string]string) *apps.ReplicaSet
 			ResourceVersion: "18",
 		},
 		Spec: apps.ReplicaSetSpec{
-			Replicas: pointer.Int32(int32(replicas)),
+			Replicas: ptr.To[int32](int32(replicas)),
 			Selector: &metav1.LabelSelector{MatchLabels: selectorMap},
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -333,6 +336,7 @@ func TestSyncReplicaSetDormancy(t *testing.T) {
 	rsSpec.Status.Replicas = 1
 	rsSpec.Status.ReadyReplicas = 1
 	rsSpec.Status.AvailableReplicas = 1
+	rsSpec.Status.TerminatingReplicas = ptr.To[int32](0)
 	manager.syncReplicaSet(ctx, GetKey(rsSpec, t))
 	err := validateSyncReplicaSet(&fakePodControl, 1, 0, 0)
 	if err != nil {
@@ -621,23 +625,23 @@ func TestRelatedPodsLookup(t *testing.T) {
 }
 
 func TestWatchControllers(t *testing.T) {
-
-	fakeWatch := watch.NewFake()
+	logger, _ := ktesting.NewTestContext(t)
+	fakeWatch := watch.NewFakeWithOptions(watch.FakeOptions{Logger: &logger})
 	client := fake.NewSimpleClientset()
 	client.PrependWatchReactor("replicasets", core.DefaultWatchReactor(fakeWatch, nil))
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	informers := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
-	logger, ctx := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
 	manager := NewReplicaSetController(
-		logger,
+		tCtx,
 		informers.Apps().V1().ReplicaSets(),
 		informers.Core().V1().Pods(),
 		client,
 		BurstReplicas,
 	)
-	informers.Start(stopCh)
-	informers.WaitForCacheSync(stopCh)
+	informers.StartWithContext(tCtx)
+	informers.WaitForCacheSyncWithContext(tCtx)
 
 	var testRSSpec apps.ReplicaSet
 	received := make(chan string)
@@ -659,7 +663,7 @@ func TestWatchControllers(t *testing.T) {
 	}
 	// Start only the ReplicaSet watcher and the workqueue, send a watch event,
 	// and make sure it hits the sync method.
-	go wait.UntilWithContext(ctx, manager.worker, 10*time.Millisecond)
+	go wait.UntilWithContext(tCtx, manager.worker, 10*time.Millisecond)
 
 	testRSSpec.Name = "foo"
 	fakeWatch.Add(&testRSSpec)
@@ -672,10 +676,10 @@ func TestWatchControllers(t *testing.T) {
 }
 
 func TestWatchPods(t *testing.T) {
-	_, ctx := ktesting.NewTestContext(t)
+	logger, ctx := ktesting.NewTestContext(t)
 	client := fake.NewSimpleClientset()
 
-	fakeWatch := watch.NewFake()
+	fakeWatch := watch.NewFakeWithOptions(watch.FakeOptions{Logger: &logger})
 	client.PrependWatchReactor("pods", core.DefaultWatchReactor(fakeWatch, nil))
 
 	stopCh := make(chan struct{})
@@ -709,7 +713,7 @@ func TestWatchPods(t *testing.T) {
 
 	// Start only the pod watcher and the workqueue, send a watch event,
 	// and make sure it hits the sync method for the right ReplicaSet.
-	go informers.Core().V1().Pods().Informer().Run(stopCh)
+	go informers.Core().V1().Pods().Informer().RunWithContext(ctx)
 	go manager.Run(ctx, 1)
 
 	pods := newPodList(nil, 1, v1.PodRunning, labelMap, testRSSpec, "pod")
@@ -875,7 +879,7 @@ func TestControllerUpdateRequeue(t *testing.T) {
 	manager.podControl = &fakePodControl
 
 	// Enqueue once. Then process it. Disable rate-limiting for this.
-	manager.queue = workqueue.NewRateLimitingQueue(workqueue.NewMaxOfRateLimiter())
+	manager.queue = workqueue.NewTypedRateLimitingQueue(workqueue.NewTypedMaxOfRateLimiter[string]()) //nolint:logcheck // Intentionally testing old API here.
 	manager.enqueueRS(rs)
 	manager.processNextWorkItem(ctx)
 	// It should have been requeued.
@@ -895,7 +899,10 @@ func TestControllerUpdateStatusWithFailure(t *testing.T) {
 	numReplicas := int32(10)
 	newStatus := apps.ReplicaSetStatus{Replicas: numReplicas}
 	logger, _ := ktesting.NewTestContext(t)
-	updateReplicaSetStatus(logger, fakeRSClient, rs, newStatus)
+	_, err := updateReplicaSetStatus(logger, fakeRSClient, rs, newStatus, DefaultReplicaSetControllerFeatures())
+	if err == nil {
+		t.Errorf("Expected update err")
+	}
 	updates, gets := 0, 0
 	for _, a := range fakeClient.Actions() {
 		if a.GetResource().Resource != "replicasets" {
@@ -1189,22 +1196,22 @@ func TestDeleteControllerAndExpectations(t *testing.T) {
 }
 
 func TestExpectationsOnRecreate(t *testing.T) {
-	_, ctx := ktesting.NewTestContext(t)
 	client := fake.NewSimpleClientset()
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 
 	f := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
-	logger, _ := ktesting.NewTestContext(t)
+	tCtx := ktesting.Init(t)
+	logger := tCtx.Logger()
 	manager := NewReplicaSetController(
-		logger,
+		tCtx,
 		f.Apps().V1().ReplicaSets(),
 		f.Core().V1().Pods(),
 		client,
 		100,
 	)
-	f.Start(stopCh)
-	f.WaitForCacheSync(stopCh)
+	f.StartWithContext(tCtx)
+	f.WaitForCacheSyncWithContext(tCtx)
 	fakePodControl := controller.FakePodControl{}
 	manager.podControl = &fakePodControl
 
@@ -1213,7 +1220,7 @@ func TestExpectationsOnRecreate(t *testing.T) {
 	}
 
 	oldRS := newReplicaSet(1, map[string]string{"foo": "bar"})
-	oldRS, err := client.AppsV1().ReplicaSets(oldRS.Namespace).Create(ctx, oldRS, metav1.CreateOptions{})
+	oldRS, err := client.AppsV1().ReplicaSets(oldRS.Namespace).Create(tCtx, oldRS, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1226,9 +1233,17 @@ func TestExpectationsOnRecreate(t *testing.T) {
 		t.Fatalf("initial RS didn't result in new item in the queue: %v", err)
 	}
 
-	ok := manager.processNextWorkItem(ctx)
+	ok := manager.processNextWorkItem(tCtx)
 	if !ok {
 		t.Fatal("queue is shutting down")
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.DeploymentReplicaSetTerminatingReplicas) {
+		// DeploymentReplicaSetTerminatingReplicas feature results in the "terminatingReplicas nil->0" update, so we need to do empty sync.
+		ok = manager.processNextWorkItem(tCtx)
+		if !ok {
+			t.Fatal("queue is shutting down")
+		}
 	}
 
 	err = validateSyncReplicaSet(&fakePodControl, 1, 0, 0)
@@ -1257,7 +1272,7 @@ func TestExpectationsOnRecreate(t *testing.T) {
 		t.Fatal("Unexpected item in the queue")
 	}
 
-	err = client.AppsV1().ReplicaSets(oldRS.Namespace).Delete(ctx, oldRS.Name, metav1.DeleteOptions{})
+	err = client.AppsV1().ReplicaSets(oldRS.Namespace).Delete(tCtx, oldRS.Name, metav1.DeleteOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1294,7 +1309,7 @@ func TestExpectationsOnRecreate(t *testing.T) {
 
 	newRS := oldRS.DeepCopy()
 	newRS.UID = uuid.NewUUID()
-	newRS, err = client.AppsV1().ReplicaSets(newRS.Namespace).Create(ctx, newRS, metav1.CreateOptions{})
+	newRS, err = client.AppsV1().ReplicaSets(newRS.Namespace).Create(tCtx, newRS, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1312,7 +1327,7 @@ func TestExpectationsOnRecreate(t *testing.T) {
 		t.Fatalf("Re-creating RS didn't result in new item in the queue: %v", err)
 	}
 
-	ok = manager.processNextWorkItem(ctx)
+	ok = manager.processNextWorkItem(tCtx)
 	if !ok {
 		t.Fatal("Queue is shutting down!")
 	}
@@ -1613,6 +1628,85 @@ func TestDoNotAdoptOrCreateIfBeingDeletedRace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestReplicaSetAvailabilityCheck(t *testing.T) {
+	tCtx := ktesting.Init(t)
+
+	labelMap := map[string]string{"foo": "bar"}
+	rs := newReplicaSet(4, labelMap)
+	rs.Spec.MinReadySeconds = 5
+	client := fake.NewClientset(rs)
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	manager, informers := testNewReplicaSetControllerFromClient(t, client, stopCh, BurstReplicas)
+	if err := informers.Apps().V1().ReplicaSets().Informer().GetIndexer().Add(rs); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	pod1 := newPod("foobar-1", rs, v1.PodPending, nil, true)
+	pod2 := newPod("foobar-2", rs, v1.PodRunning, &metav1.Time{Time: now}, true)
+	pod3 := newPod("foobar-3", rs, v1.PodRunning, &metav1.Time{Time: now.Add(-2 * time.Second)}, true)
+	pod4 := newPod("foobar-4", rs, v1.PodRunning, &metav1.Time{Time: now.Add(-4300 * time.Millisecond)}, true)
+	if err := informers.Core().V1().Pods().Informer().GetIndexer().Add(pod1); err != nil {
+		t.Fatal(err)
+	}
+	if err := informers.Core().V1().Pods().Informer().GetIndexer().Add(pod2); err != nil {
+		t.Fatal(err)
+	}
+	if err := informers.Core().V1().Pods().Informer().GetIndexer().Add(pod3); err != nil {
+		t.Fatal(err)
+	}
+	if err := informers.Core().V1().Pods().Informer().GetIndexer().Add(pod4); err != nil {
+		t.Fatal(err)
+	}
+	fakePodControl := controller.FakePodControl{}
+	manager.podControl = &fakePodControl
+
+	err := manager.syncReplicaSet(tCtx, GetKey(rs, t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var updatedRs *apps.ReplicaSet
+	for _, a := range client.Actions() {
+		if a.GetResource().Resource != "replicasets" {
+			t.Errorf("Unexpected action %+v", a)
+			continue
+		}
+
+		switch action := a.(type) {
+		case core.UpdateAction:
+			var ok bool
+			if updatedRs, ok = action.GetObject().(*apps.ReplicaSet); !ok {
+				t.Errorf("Expected a ReplicaSet as the argument to update, got %T", updatedRs)
+			}
+		default:
+			t.Errorf("Unexpected action %+v", a)
+		}
+	}
+
+	// one pod is not ready
+	if updatedRs.Status.ReadyReplicas != 3 {
+		t.Errorf("Expected updated ReplicaSet to contain ready replicas %v, got %v instead",
+			3, updatedRs.Status.ReadyReplicas)
+	}
+	if updatedRs.Status.AvailableReplicas != 0 {
+		t.Errorf("Expected updated ReplicaSet to contain available replicas %v, got %v instead",
+			0, updatedRs.Status.AvailableReplicas)
+	}
+
+	if got, want := manager.queue.Len(), 0; got != want {
+		t.Errorf("queue.Len() = %v, want %v", got, want)
+	}
+
+	// RS should be re-queued after 700ms to recompute .status.availableReplicas (200ms extra for the test).
+	tCtx.Eventually(manager.queue.Len).WithTimeout(900*time.Millisecond).
+		WithPolling(10*time.Millisecond).
+		Should(gomega.Equal(1), " RS should be re-queued to recompute .status.availableReplicas")
+
 }
 
 var (

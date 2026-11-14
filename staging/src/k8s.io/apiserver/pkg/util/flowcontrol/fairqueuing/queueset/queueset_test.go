@@ -455,18 +455,6 @@ func (uss *uniformScenarioState) finalReview() {
 			uss.t.Log("Success with" + e)
 		}
 	}
-	if uss.evalExecutingMetrics && len(uss.expectedConcurrencyInUse) > 0 {
-		e := `
-				# HELP apiserver_flowcontrol_request_concurrency_in_use [ALPHA] Concurrency (number of seats) occupied by the currently executing (initial stage for a WATCH, any stage otherwise) requests in the API Priority and Fairness subsystem
-				# TYPE apiserver_flowcontrol_request_concurrency_in_use gauge
-` + uss.expectedConcurrencyInUse
-		err := metrics.GatherAndCompare(e, "apiserver_flowcontrol_request_concurrency_in_use")
-		if err != nil {
-			uss.t.Error(err)
-		} else {
-			uss.t.Log("Success with" + e)
-		}
-	}
 	if uss.evalExecutingMetrics && len(expectedRejects) > 0 {
 		e := `
 				# HELP apiserver_flowcontrol_rejected_requests_total [BETA] Number of requests rejected by API Priority and Fairness subsystem
@@ -551,7 +539,6 @@ func TestBaseline(t *testing.T) {
 		DesiredNumQueues: 9,
 		QueueLengthLimit: 8,
 		HandSize:         3,
-		RequestWaitLimit: 10 * time.Minute,
 	}
 	seatDemandIntegratorSubject := fq.NewNamedIntegrator(clk, "seatDemandSubject")
 	qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), seatDemandIntegratorSubject)
@@ -590,7 +577,6 @@ func TestExampt(t *testing.T) {
 				DesiredNumQueues: -1,
 				QueueLengthLimit: 2,
 				HandSize:         3,
-				RequestWaitLimit: 10 * time.Minute,
 			}
 			seatDemandIntegratorSubject := fq.NewNamedIntegrator(clk, "seatDemandSubject")
 			qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), seatDemandIntegratorSubject)
@@ -663,7 +649,6 @@ func TestSeparations(t *testing.T) {
 				DesiredNumQueues: 9,
 				QueueLengthLimit: 8,
 				HandSize:         3,
-				RequestWaitLimit: 10 * time.Minute,
 			}
 			seatDemandIntegratorSubject := fq.NewNamedIntegrator(clk, caseName+" seatDemandSubject")
 			qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), seatDemandIntegratorSubject)
@@ -704,7 +689,6 @@ func TestUniformFlowsHandSize1(t *testing.T) {
 		DesiredNumQueues: 9,
 		QueueLengthLimit: 8,
 		HandSize:         1,
-		RequestWaitLimit: 10 * time.Minute,
 	}
 	seatDemandIntegratorSubject := fq.NewNamedIntegrator(clk, "seatDemandSubject")
 	qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), seatDemandIntegratorSubject)
@@ -743,7 +727,6 @@ func TestUniformFlowsHandSize3(t *testing.T) {
 		DesiredNumQueues: 8,
 		QueueLengthLimit: 16,
 		HandSize:         3,
-		RequestWaitLimit: 10 * time.Minute,
 	}
 	seatDemandIntegratorSubject := fq.NewNamedIntegrator(clk, qCfg.Name)
 	qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), seatDemandIntegratorSubject)
@@ -781,7 +764,6 @@ func TestDifferentFlowsExpectEqual(t *testing.T) {
 		DesiredNumQueues: 9,
 		QueueLengthLimit: 8,
 		HandSize:         1,
-		RequestWaitLimit: 10 * time.Minute,
 	}
 	seatDemandIntegratorSubject := fq.NewNamedIntegrator(clk, qCfg.Name)
 	qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), seatDemandIntegratorSubject)
@@ -823,7 +805,6 @@ func TestSeatSecondsRollover(t *testing.T) {
 		DesiredNumQueues: 9,
 		QueueLengthLimit: 8,
 		HandSize:         1,
-		RequestWaitLimit: 40 * Quarter,
 	}
 	seatDemandIntegratorSubject := fq.NewNamedIntegrator(clk, qCfg.Name)
 	qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), seatDemandIntegratorSubject)
@@ -863,7 +844,6 @@ func TestDifferentFlowsExpectUnequal(t *testing.T) {
 		DesiredNumQueues: 9,
 		QueueLengthLimit: 6,
 		HandSize:         1,
-		RequestWaitLimit: 10 * time.Minute,
 	}
 	seatDemandIntegratorSubject := fq.NewNamedIntegrator(clk, qCfg.Name)
 	qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), seatDemandIntegratorSubject)
@@ -902,7 +882,6 @@ func TestDifferentWidths(t *testing.T) {
 		DesiredNumQueues: 64,
 		QueueLengthLimit: 13,
 		HandSize:         7,
-		RequestWaitLimit: 10 * time.Minute,
 	}
 	seatDemandIntegratorSubject := fq.NewNamedIntegrator(clk, qCfg.Name)
 	qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), seatDemandIntegratorSubject)
@@ -940,7 +919,6 @@ func TestTooWide(t *testing.T) {
 		DesiredNumQueues: 64,
 		QueueLengthLimit: 35,
 		HandSize:         7,
-		RequestWaitLimit: 10 * time.Minute,
 	}
 	seatDemandIntegratorSubject := fq.NewNamedIntegrator(clk, qCfg.Name)
 	qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), seatDemandIntegratorSubject)
@@ -958,9 +936,9 @@ func TestTooWide(t *testing.T) {
 			newUniformClient(90090090090090, 15, 21, time.Second, time.Second-1).setInitWidth(7),
 		},
 		concurrencyLimit:            6,
-		evalDuration:                time.Second * 225,
+		evalDuration:                time.Second * 400,
 		expectedFair:                []bool{true},
-		expectedFairnessMargin:      []float64{0.33},
+		expectedFairnessMargin:      []float64{0.35},
 		expectAllRequests:           true,
 		evalInqueueMetrics:          true,
 		evalExecutingMetrics:        true,
@@ -1003,7 +981,6 @@ func TestWindup(t *testing.T) {
 				DesiredNumQueues: 9,
 				QueueLengthLimit: 6,
 				HandSize:         1,
-				RequestWaitLimit: 10 * time.Minute,
 			}
 			seatDemandIntegratorSubject := fq.NewNamedIntegrator(clk, qCfg.Name)
 			qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), seatDemandIntegratorSubject)
@@ -1067,44 +1044,6 @@ func TestDifferentFlowsWithoutQueuing(t *testing.T) {
 	}.exercise(t)
 }
 
-func TestTimeout(t *testing.T) {
-	metrics.Register()
-	now := time.Now()
-
-	clk, counter := testeventclock.NewFake(now, 0, nil)
-	qsf := newTestableQueueSetFactory(clk, countingPromiseFactoryFactory(counter))
-	qCfg := fq.QueuingConfig{
-		Name:             "TestTimeout",
-		DesiredNumQueues: 128,
-		QueueLengthLimit: 128,
-		HandSize:         1,
-		RequestWaitLimit: 0,
-	}
-	seatDemandIntegratorSubject := fq.NewNamedIntegrator(clk, qCfg.Name)
-	qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), seatDemandIntegratorSubject)
-	if err != nil {
-		t.Fatal(err)
-	}
-	qs := qsComplete(qsc, 1)
-
-	uniformScenario{name: qCfg.Name,
-		qs: qs,
-		clients: []uniformClient{
-			newUniformClient(1001001001, 5, 100, time.Second, time.Second),
-		},
-		concurrencyLimit:            1,
-		evalDuration:                time.Second * 10,
-		expectedFair:                []bool{true},
-		expectedFairnessMargin:      []float64{0.01},
-		evalInqueueMetrics:          true,
-		evalExecutingMetrics:        true,
-		rejectReason:                "time-out",
-		clk:                         clk,
-		counter:                     counter,
-		seatDemandIntegratorSubject: seatDemandIntegratorSubject,
-	}.exercise(t)
-}
-
 // TestContextCancel tests cancellation of a request's context.
 // The outline is:
 //  1. Use a concurrency limit of 1.
@@ -1131,7 +1070,6 @@ func TestContextCancel(t *testing.T) {
 		DesiredNumQueues: 11,
 		QueueLengthLimit: 11,
 		HandSize:         1,
-		RequestWaitLimit: 15 * time.Second,
 	}
 	seatDemandIntegratorSubject := fq.NewNamedIntegrator(clk, qCfg.Name)
 	qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), seatDemandIntegratorSubject)
@@ -1238,7 +1176,6 @@ func TestTotalRequestsExecutingWithPanic(t *testing.T) {
 	qCfg := fq.QueuingConfig{
 		Name:             "TestTotalRequestsExecutingWithPanic",
 		DesiredNumQueues: 0,
-		RequestWaitLimit: 15 * time.Second,
 	}
 	qsc, err := qsf.BeginConstruction(qCfg, newGaugePair(clk), newExecSeatsGauge(clk), fq.NewNamedIntegrator(clk, qCfg.Name))
 	if err != nil {

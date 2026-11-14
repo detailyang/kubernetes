@@ -20,12 +20,13 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/google/cel-go/common/types"
+	"cel.dev/cel-go/common/types"
 
 	"google.golang.org/protobuf/proto"
 
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	apiservercel "k8s.io/apiserver/pkg/cel"
+	"k8s.io/utils/ptr"
 )
 
 func TestSchemaDeclType(t *testing.T) {
@@ -34,8 +35,8 @@ func TestSchemaDeclType(t *testing.T) {
 	if cust.TypeName() != "object" {
 		t.Errorf("incorrect type name, got %v, wanted object", cust.TypeName())
 	}
-	if len(cust.Fields) != 4 {
-		t.Errorf("incorrect number of fields, got %d, wanted 4", len(cust.Fields))
+	if len(cust.Fields) != 5 {
+		t.Errorf("incorrect number of fields, got %d, wanted 5", len(cust.Fields))
 	}
 	for _, f := range cust.Fields {
 		prop, found := ts.Properties[f.Name]
@@ -68,6 +69,13 @@ func TestSchemaDeclType(t *testing.T) {
 						"could not find field enum value in property definition. field: %s, enum: %v",
 						f.Name, fev)
 				}
+			}
+		}
+		if prop.ValueValidation != nil && prop.ValueValidation.MaxLength != nil {
+			if f.Type.MaxElements != 4*(*prop.ValueValidation.MaxLength) {
+				// When converting maxLength to maxElements, it's based on the number of bytes.]
+				// Worst case is that one rune is 4 bytes, so maxElements should be 4x maxLength.
+				t.Errorf("field maxElements does not match property 4x maxLength. field: %s, maxElements: %d, maxLength: %d", f.Name, f.Type.MaxElements, *prop.ValueValidation.MaxLength)
 			}
 		}
 	}
@@ -124,6 +132,200 @@ func TestSchemaDeclTypes(t *testing.T) {
 	}
 }
 
+func TestWithTypeAndObjectMetaNameLength(t *testing.T) {
+	const (
+		defaultMax             = nameMaxLength
+		defaultGenerateNameMax = nameMaxLength - 1 // generated suffix is at least 1 byte
+	)
+
+	maxLengthOf := func(s *schema.Structural, field string) *int64 {
+		md, ok := s.Properties["metadata"]
+		if !ok || md.Properties == nil {
+			return nil
+		}
+		f, ok := md.Properties[field]
+		if !ok || f.ValueValidation == nil {
+			return nil
+		}
+		return f.ValueValidation.MaxLength
+	}
+
+	cases := []struct {
+		name             string
+		input            *schema.Structural
+		wantName         int64
+		wantGenerateName int64
+	}{
+		{
+			name:             "metadata absent, defaults applied to both fields",
+			input:            &schema.Structural{Generic: schema.Generic{Type: "object"}},
+			wantName:         defaultMax,
+			wantGenerateName: defaultGenerateNameMax,
+		},
+		{
+			name: "author maxLength on name preserved, generateName defaulted",
+			input: &schema.Structural{
+				Generic: schema.Generic{Type: "object"},
+				Properties: map[string]schema.Structural{
+					"metadata": {
+						Generic: schema.Generic{Type: "object"},
+						Properties: map[string]schema.Structural{
+							"name": {
+								Generic:         schema.Generic{Type: "string"},
+								ValueValidation: &schema.ValueValidation{MaxLength: ptr.To[int64](10)},
+							},
+						},
+					},
+				},
+			},
+			wantName:         10,
+			wantGenerateName: defaultGenerateNameMax,
+		},
+		{
+			name: "author maxLength on generateName smaller than default is preserved",
+			input: &schema.Structural{
+				Generic: schema.Generic{Type: "object"},
+				Properties: map[string]schema.Structural{
+					"metadata": {
+						Generic: schema.Generic{Type: "object"},
+						Properties: map[string]schema.Structural{
+							"generateName": {
+								Generic:         schema.Generic{Type: "string"},
+								ValueValidation: &schema.ValueValidation{MaxLength: ptr.To[int64](100)},
+							},
+						},
+					},
+				},
+			},
+			wantName:         defaultMax,
+			wantGenerateName: 100,
+		},
+		{
+			name: "author maxLength larger than default is capped to the default",
+			input: &schema.Structural{
+				Generic: schema.Generic{Type: "object"},
+				Properties: map[string]schema.Structural{
+					"metadata": {
+						Generic: schema.Generic{Type: "object"},
+						Properties: map[string]schema.Structural{
+							"name": {
+								Generic:         schema.Generic{Type: "string"},
+								ValueValidation: &schema.ValueValidation{MaxLength: ptr.To[int64](1000)},
+							},
+							"generateName": {
+								Generic:         schema.Generic{Type: "string"},
+								ValueValidation: &schema.ValueValidation{MaxLength: ptr.To[int64](1000)},
+							},
+						},
+					},
+				},
+			},
+			wantName:         defaultMax,
+			wantGenerateName: defaultGenerateNameMax,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := WithTypeAndObjectMeta(tc.input)
+			if ml := maxLengthOf(got, "name"); ml == nil || *ml != tc.wantName {
+				t.Errorf("metadata.name maxLength = %v, want %d", ml, tc.wantName)
+			}
+			if ml := maxLengthOf(got, "generateName"); ml == nil || *ml != tc.wantGenerateName {
+				t.Errorf("metadata.generateName maxLength = %v, want %d", ml, tc.wantGenerateName)
+			}
+
+			// The bound must flow into CEL cost estimation: the declType's
+			// MaxElements for name and generateName reflect the bounded length
+			// (4 bytes per rune), not the request size.
+			root := SchemaDeclType(tc.input, true)
+			meta, ok := root.FindField("metadata")
+			if !ok {
+				t.Fatalf("metadata field missing from declType")
+			}
+			for _, f := range []struct {
+				field string
+				want  int64
+			}{
+				{"name", tc.wantName},
+				{"generateName", tc.wantGenerateName},
+			} {
+				field, ok := meta.Type.FindField(f.field)
+				if !ok {
+					t.Fatalf("metadata.%s field missing from declType", f.field)
+				}
+				if got := field.Type.MaxElements; got != f.want*4 {
+					t.Errorf("metadata.%s declType MaxElements = %d, want %d", f.field, got, f.want*4)
+				}
+				if field.Type.MaxElements >= apiservercel.DefaultMaxRequestSizeBytes-2 {
+					t.Errorf("metadata.%s declType MaxElements = %d, expected it bounded well below the request size", f.field, field.Type.MaxElements)
+				}
+			}
+		})
+	}
+}
+
+// TestWithTypeAndObjectMetaIdempotent ensures re-applying WithTypeAndObjectMeta
+// (which happens when a schema is processed more than once) keeps the bounds stable.
+func TestWithTypeAndObjectMetaIdempotent(t *testing.T) {
+	once := WithTypeAndObjectMeta(&schema.Structural{Generic: schema.Generic{Type: "object"}})
+	twice := WithTypeAndObjectMeta(once)
+	if twice != once {
+		t.Errorf("expected the already-bounded schema to be returned unchanged")
+	}
+	for _, f := range []struct {
+		field string
+		want  int64
+	}{
+		{"name", nameMaxLength},
+		{"generateName", nameMaxLength - 1},
+	} {
+		ml := twice.Properties["metadata"].Properties[f.field].ValueValidation.MaxLength
+		if ml == nil || *ml != f.want {
+			t.Errorf("metadata.%s maxLength = %v, want %d", f.field, ml, f.want)
+		}
+	}
+}
+
+// TestWithTypeAndObjectMetaDoesNotMutateInput verifies the maxLength bound is applied
+// only to the returned (CEL-only) schema and never written back to the caller's schema.
+// The input schema is also used for pruning, defaulting, and to build the value
+// validator, none of which should gain a metadata.name maxLength constraint.
+func TestWithTypeAndObjectMetaDoesNotMutateInput(t *testing.T) {
+	input := &schema.Structural{
+		Generic: schema.Generic{Type: "object"},
+		Properties: map[string]schema.Structural{
+			"metadata": {
+				Generic: schema.Generic{Type: "object"},
+				Properties: map[string]schema.Structural{
+					"name": {
+						Generic:         schema.Generic{Type: "string"},
+						ValueValidation: &schema.ValueValidation{Format: "k8s-short-name"},
+					},
+				},
+			},
+		},
+	}
+
+	result := WithTypeAndObjectMeta(input)
+
+	// The author's metadata.name in the input is untouched: no maxLength was added and
+	// its format is preserved.
+	inName := input.Properties["metadata"].Properties["name"]
+	if inName.ValueValidation == nil || inName.ValueValidation.MaxLength != nil {
+		t.Errorf("input metadata.name must not gain a maxLength, got %+v", inName.ValueValidation)
+	}
+	if inName.ValueValidation == nil || inName.ValueValidation.Format != "k8s-short-name" {
+		t.Errorf("input metadata.name format must be preserved, got %+v", inName.ValueValidation)
+	}
+
+	// The returned schema, used only for CEL cost/type modeling, carries the bound.
+	outName := result.Properties["metadata"].Properties["name"]
+	if outName.ValueValidation == nil || outName.ValueValidation.MaxLength == nil || *outName.ValueValidation.MaxLength != nameMaxLength {
+		t.Errorf("result metadata.name maxLength = %+v, want %d", outName.ValueValidation, nameMaxLength)
+	}
+}
+
 func testSchema() *schema.Structural {
 	// Manual construction of a schema with the following definition:
 	//
@@ -137,6 +339,7 @@ func testSchema() *schema.Structural {
 	//   properties:
 	//     name:
 	//       type: string
+	//       maxLength: 256
 	//     nested:
 	//       type: object
 	//       properties:
@@ -166,6 +369,12 @@ func testSchema() *schema.Structural {
 	//       format: int64
 	//       default: 1
 	//       enum: [1,2,3]
+	//     intOrString:
+	//       x-kubernetes-int-or-string: true
+	//       anyOf:
+	//       - type: "integer"
+	//		 - type: "string"
+	//       maxLength: 20
 	ts := &schema.Structural{
 		Generic: schema.Generic{
 			Type: "object",
@@ -174,6 +383,9 @@ func testSchema() *schema.Structural {
 			"name": {
 				Generic: schema.Generic{
 					Type: "string",
+				},
+				ValueValidation: &schema.ValueValidation{
+					MaxLength: ptr.To[int64](256),
 				},
 			},
 			"value": {
@@ -199,11 +411,11 @@ func testSchema() *schema.Structural {
 					"flags": {
 						Generic: schema.Generic{
 							Type: "object",
-							AdditionalProperties: &schema.StructuralOrBool{
-								Structural: &schema.Structural{
-									Generic: schema.Generic{
-										Type: "boolean",
-									},
+						},
+						AdditionalProperties: &schema.StructuralOrBool{
+							Structural: &schema.Structural{
+								Generic: schema.Generic{
+									Type: "boolean",
 								},
 							},
 						},
@@ -245,6 +457,26 @@ func testSchema() *schema.Structural {
 					},
 				},
 			},
+			"intOrString": {
+				Extensions: schema.Extensions{
+					XIntOrString: true,
+				},
+				ValueValidation: &schema.ValueValidation{
+					MaxLength: ptr.To[int64](20),
+					AnyOf: []schema.NestedValueValidation{
+						{
+							ForbiddenGenerics: schema.Generic{
+								Type: "integer",
+							},
+						},
+						{
+							ForbiddenGenerics: schema.Generic{
+								Type: "string",
+							},
+						},
+					},
+				},
+			},
 		},
 	}
 	return ts
@@ -274,6 +506,7 @@ func TestEstimateMaxLengthJSON(t *testing.T) {
 		Name                string
 		InputSchema         *schema.Structural
 		ExpectedMaxElements int64
+		ExpectNilType       bool
 	}
 	tests := []maxLengthTest{
 		{
@@ -317,12 +550,12 @@ func TestEstimateMaxLengthJSON(t *testing.T) {
 			InputSchema: &schema.Structural{
 				Generic: schema.Generic{
 					Type: "object",
-					AdditionalProperties: &schema.StructuralOrBool{Structural: &schema.Structural{
-						Generic: schema.Generic{
-							Type: "string",
-						},
-					}},
 				},
+				AdditionalProperties: &schema.StructuralOrBool{Structural: &schema.Structural{
+					Generic: schema.Generic{
+						Type: "string",
+					},
+				}},
 			},
 			// expected JSON is {"":"","":"",...} so our length should be (3000000 - 2) / 6
 			ExpectedMaxElements: 393215,
@@ -359,7 +592,7 @@ func TestEstimateMaxLengthJSON(t *testing.T) {
 		},
 		{
 			Name:        "arrayWithLength",
-			InputSchema: arraySchema("integer", "int64", maxPtr(10)),
+			InputSchema: arraySchema("integer", "int64", ptr.To[int64](10)),
 			// manually set by MaxItems
 			ExpectedMaxElements: 10,
 		},
@@ -370,7 +603,7 @@ func TestEstimateMaxLengthJSON(t *testing.T) {
 					Type: "string",
 				},
 				ValueValidation: &schema.ValueValidation{
-					MaxLength: maxPtr(20),
+					MaxLength: ptr.To[int64](20),
 				},
 			},
 			// manually set by MaxLength, but we expect a 4x multiplier compared to the original input
@@ -382,15 +615,15 @@ func TestEstimateMaxLengthJSON(t *testing.T) {
 			InputSchema: &schema.Structural{
 				Generic: schema.Generic{
 					Type: "object",
-					AdditionalProperties: &schema.StructuralOrBool{Structural: &schema.Structural{
-						Generic: schema.Generic{
-							Type: "string",
-						},
-					}},
 				},
+				AdditionalProperties: &schema.StructuralOrBool{Structural: &schema.Structural{
+					Generic: schema.Generic{
+						Type: "string",
+					},
+				}},
 				ValueValidation: &schema.ValueValidation{
 					Format:        "string",
-					MaxProperties: maxPtr(15),
+					MaxProperties: ptr.To[int64](15),
 				},
 			},
 			// manually set by MaxProperties
@@ -492,26 +725,70 @@ func TestEstimateMaxLengthJSON(t *testing.T) {
 				},
 				ValueValidation: &schema.ValueValidation{
 					Format:    "byte",
-					MaxLength: maxPtr(20),
+					MaxLength: ptr.To[int64](20),
 				},
 			},
 			// note that unlike regular strings we don't have to take unicode into account,
 			// so we expect the max length to be exactly equal to the user-supplied one
 			ExpectedMaxElements: 20,
 		},
+		{
+			Name: "Property under array",
+			InputSchema: &schema.Structural{
+				Generic: schema.Generic{
+					Type: "array",
+				},
+				Properties: map[string]schema.Structural{
+					"field": {
+						Generic: schema.Generic{
+							Type:    "string",
+							Default: schema.JSON{Object: "default"},
+						},
+					},
+				},
+			},
+			// Got nil for delType
+			ExpectedMaxElements: 0,
+			ExpectNilType:       true,
+		},
+		{
+			Name: "Items under object",
+			InputSchema: &schema.Structural{
+				Generic: schema.Generic{
+					Type: "object",
+				},
+				Items: &schema.Structural{
+					Generic: schema.Generic{
+						Type: "array",
+					},
+					Properties: map[string]schema.Structural{
+						"field": {
+							Generic: schema.Generic{
+								Type:    "string",
+								Default: schema.JSON{Object: "default"},
+							},
+						},
+					},
+					ValueValidation: &schema.ValueValidation{
+						Required: []string{"field"},
+					},
+				},
+			},
+			// Skip items under object for schema conversion.
+			ExpectedMaxElements: 0,
+		},
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.Name, func(t *testing.T) {
 			decl := SchemaDeclType(testCase.InputSchema, false)
-			if decl.MaxElements != testCase.ExpectedMaxElements {
+			if decl != nil && decl.MaxElements != testCase.ExpectedMaxElements {
 				t.Errorf("wrong maxElements (got %d, expected %d)", decl.MaxElements, testCase.ExpectedMaxElements)
+			}
+			if testCase.ExpectNilType && decl != nil {
+				t.Errorf("expected nil type, got %v", decl)
 			}
 		})
 	}
-}
-
-func maxPtr(max int64) *int64 {
-	return &max
 }
 
 func genNestedSchema(depth int) *schema.Structural {
@@ -519,15 +796,15 @@ func genNestedSchema(depth int) *schema.Structural {
 	generator = func(d int) schema.Structural {
 		nodeTemplate := schema.Structural{
 			Generic: schema.Generic{
-				Type:                 "object",
-				AdditionalProperties: &schema.StructuralOrBool{},
+				Type: "object",
 			},
+			AdditionalProperties: &schema.StructuralOrBool{},
 		}
 		if d == 1 {
 			return nodeTemplate
 		} else {
 			mapType := generator(d - 1)
-			nodeTemplate.Generic.AdditionalProperties.Structural = &mapType
+			nodeTemplate.AdditionalProperties.Structural = &mapType
 			return nodeTemplate
 		}
 	}

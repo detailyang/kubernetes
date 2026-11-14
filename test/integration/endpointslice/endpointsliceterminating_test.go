@@ -29,11 +29,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/klog/v2/ktesting"
+	"k8s.io/ktesting"
 	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/pkg/controller/endpointslice"
 	"k8s.io/kubernetes/test/integration/framework"
-	utilpointer "k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 // TestEndpointSliceTerminating tests that terminating endpoints are included with the
@@ -65,9 +65,9 @@ func TestEndpointSliceTerminating(t *testing.T) {
 				{
 					Addresses: []string{"10.0.0.1"},
 					Conditions: discovery.EndpointConditions{
-						Ready:       utilpointer.BoolPtr(false),
-						Serving:     utilpointer.BoolPtr(true),
-						Terminating: utilpointer.BoolPtr(true),
+						Ready:       ptr.To(false),
+						Serving:     ptr.To(true),
+						Terminating: ptr.To(true),
 					},
 				},
 			},
@@ -93,9 +93,9 @@ func TestEndpointSliceTerminating(t *testing.T) {
 				{
 					Addresses: []string{"10.0.0.1"},
 					Conditions: discovery.EndpointConditions{
-						Ready:       utilpointer.BoolPtr(false),
-						Serving:     utilpointer.BoolPtr(false),
-						Terminating: utilpointer.BoolPtr(true),
+						Ready:       ptr.To(false),
+						Serving:     ptr.To(false),
+						Terminating: ptr.To(true),
 					},
 				},
 			},
@@ -105,7 +105,7 @@ func TestEndpointSliceTerminating(t *testing.T) {
 	for _, testcase := range testcases {
 		t.Run(testcase.name, func(t *testing.T) {
 			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
-			server := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins=ServiceAccount"}, framework.SharedEtcd())
+			server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 			defer server.TearDownFn()
 
 			client, err := clientset.NewForConfig(server.ClientConfig)
@@ -116,9 +116,9 @@ func TestEndpointSliceTerminating(t *testing.T) {
 			resyncPeriod := 12 * time.Hour
 			informers := informers.NewSharedInformerFactory(client, resyncPeriod)
 
-			_, ctx := ktesting.NewTestContext(t)
+			tCtx := ktesting.Init(t)
 			epsController := endpointslice.NewController(
-				ctx,
+				tCtx,
 				informers.Core().V1().Pods(),
 				informers.Core().V1().Services(),
 				informers.Core().V1().Nodes(),
@@ -128,10 +128,8 @@ func TestEndpointSliceTerminating(t *testing.T) {
 				1*time.Second)
 
 			// Start informer and controllers
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-			informers.Start(ctx.Done())
-			go epsController.Run(ctx, 1)
+			informers.Start(tCtx.Done())
+			go epsController.Run(tCtx, 1)
 
 			// Create namespace
 			ns := framework.CreateNamespaceOrDie(client, "test-endpoints-terminating", t)

@@ -31,6 +31,7 @@ import (
 	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/server/mux"
+	"k8s.io/apiserver/pkg/util/responsewriter"
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/metrics/testutil"
 	v1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
@@ -131,6 +132,19 @@ func TestV2APIService(t *testing.T) {
 
 	apiServiceNames := specProxier.GetAPIServiceNames()
 	assert.ElementsMatch(t, []string{openAPIV2Converter, apiService.Name}, apiServiceNames)
+
+	// Ensure that OpenAPI v3 for legacy APIService is removed.
+	specProxier.RemoveAPIServiceSpec(apiService.Name)
+	data = sendReq(t, serveHandler, "/openapi/v3")
+	groupVersionList = handler3.OpenAPIV3Discovery{}
+	if err := json.Unmarshal(data, &groupVersionList); err != nil {
+		t.Fatal(err)
+	}
+
+	path, ok = groupVersionList.Paths["apis/group.example.com/v1"]
+	if ok {
+		t.Error("Expected group.example.com/v1 not to be in group version list")
+	}
 }
 
 func TestV3APIService(t *testing.T) {
@@ -288,14 +302,14 @@ func sendReq(t *testing.T, handler http.Handler, path string) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writer := newInMemoryResponseWriter()
+	writer := responsewriter.NewInMemoryResponseWriter()
 	handler.ServeHTTP(writer, req)
-	return writer.data
+	return writer.Data()
 }
 
 func getTestAPIServiceOpenAPIDefinitions(_ openapicommon.ReferenceCallback) map[string]openapicommon.OpenAPIDefinition {
 	return map[string]openapicommon.OpenAPIDefinition{
-		"k8s.io/kube-aggregator/pkg/apis/apiregistration/v1.APIService": buildTestAPIServiceOpenAPIDefinition(),
+		"io.k8s.kube-aggregator.pkg.apis.apiregistration.v1.APIService": buildTestAPIServiceOpenAPIDefinition(),
 	}
 }
 

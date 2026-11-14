@@ -27,6 +27,7 @@ import (
 	utilversion "k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apiserver/pkg/endpoints/discovery"
 	clientdiscovery "k8s.io/client-go/discovery"
+	"k8s.io/ktesting/format"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	"k8s.io/kubernetes/test/utils/crd"
@@ -128,7 +129,7 @@ var _ = SIGDescribe("Discovery", func() {
 		list := &metav1.APIGroupList{}
 		err := f.ClientSet.Discovery().RESTClient().Get().AbsPath("/apis/").Do(ctx).Into(list)
 		framework.ExpectNoError(err, "Failed to find /apis/")
-		framework.ExpectNotEqual(len(list.Groups), 0, "Missing APIGroups")
+		gomega.Expect(list.Groups).ToNot(gomega.BeEmpty(), "Missing APIGroups")
 
 		for _, group := range list.Groups {
 			if strings.HasSuffix(group.Name, ".example.com") {
@@ -142,7 +143,7 @@ var _ = SIGDescribe("Discovery", func() {
 			apiPath := "/apis/" + group.Name + "/"
 			err = f.ClientSet.Discovery().RESTClient().Get().AbsPath(apiPath).Do(ctx).Into(checkGroup)
 			framework.ExpectNoError(err, "Fail to access: %s", apiPath)
-			framework.ExpectNotEqual(len(checkGroup.Versions), 0, "No version found for %v", group.Name)
+			gomega.Expect(checkGroup.Versions).ToNot(gomega.BeEmpty(), "No version found for %v", group.Name)
 			framework.Logf("PreferredVersion.GroupVersion: %s", checkGroup.PreferredVersion.GroupVersion)
 			framework.Logf("Versions found %v", checkGroup.Versions)
 
@@ -155,7 +156,9 @@ var _ = SIGDescribe("Discovery", func() {
 					break
 				}
 			}
-			framework.ExpectEqual(true, match, "failed to find a valid version for PreferredVersion")
+			if !match {
+				framework.Failf("Failed to find a valid version for PreferredVersion %s in versions:\n%s", checkGroup.PreferredVersion.GroupVersion, format.Object(checkGroup.Versions, 1))
+			}
 		}
 	})
 
@@ -305,7 +308,7 @@ var _ = SIGDescribe("Discovery", func() {
 					break
 				}
 			}
-			gomega.Expect(foundResource).To(gomega.BeTrue(), "Resource %q was not found inside of resourceList\n%#v", t.validResource, resourceList.APIResources)
+			gomega.Expect(foundResource).To(gomega.BeTrueBecause("Resource %q was not found inside of resourceList\n%#v", t.validResource, resourceList.APIResources))
 		}
 	})
 })

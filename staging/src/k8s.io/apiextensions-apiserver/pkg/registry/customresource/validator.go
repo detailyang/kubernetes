@@ -24,6 +24,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/operation"
 	"k8s.io/apimachinery/pkg/api/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -32,6 +33,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	apimachineryvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/features"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsvalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
@@ -44,58 +47,32 @@ type customResourceValidator struct {
 	statusSchemaValidator apiextensionsvalidation.SchemaValidator
 }
 
-func (a customResourceValidator) Validate(ctx context.Context, obj runtime.Object, scale *apiextensions.CustomResourceSubresourceScale) field.ErrorList {
-	u, ok := obj.(*unstructured.Unstructured)
-	if !ok {
-		return field.ErrorList{field.Invalid(field.NewPath(""), u, fmt.Sprintf("has type %T. Must be a pointer to an Unstructured type", u))}
-	}
-	accessor, err := meta.Accessor(obj)
-	if err != nil {
-		return field.ErrorList{field.Invalid(field.NewPath("metadata"), nil, err.Error())}
-	}
-
-	if errs := a.ValidateTypeMeta(ctx, u); len(errs) > 0 {
+func (a customResourceValidator) Validate(ctx context.Context, obj *unstructured.Unstructured, scale *apiextensions.CustomResourceSubresourceScale) field.ErrorList {
+	if errs := a.ValidateTypeMeta(ctx, obj); len(errs) > 0 {
 		return errs
 	}
 
 	var allErrs field.ErrorList
 
-	allErrs = append(allErrs, validation.ValidateObjectMetaAccessor(accessor, a.namespaceScoped, validation.NameIsDNSSubdomain, field.NewPath("metadata"))...)
-	allErrs = append(allErrs, apiextensionsvalidation.ValidateCustomResource(nil, u.UnstructuredContent(), a.schemaValidator)...)
-	allErrs = append(allErrs, a.ValidateScaleSpec(ctx, u, scale)...)
-	allErrs = append(allErrs, a.ValidateScaleStatus(ctx, u, scale)...)
+	allErrs = append(allErrs, a.validateObjectMetaDeclaratively(ctx, obj)...)
+	allErrs = append(allErrs, apiextensionsvalidation.ValidateCustomResource(nil, obj.UnstructuredContent(), a.schemaValidator)...)
+	allErrs = append(allErrs, a.ValidateScaleSpec(ctx, obj, scale)...)
+	allErrs = append(allErrs, a.ValidateScaleStatus(ctx, obj, scale)...)
 
 	return allErrs
 }
 
-func (a customResourceValidator) ValidateUpdate(ctx context.Context, obj, old runtime.Object, scale *apiextensions.CustomResourceSubresourceScale) field.ErrorList {
-	u, ok := obj.(*unstructured.Unstructured)
-	if !ok {
-		return field.ErrorList{field.Invalid(field.NewPath(""), u, fmt.Sprintf("has type %T. Must be a pointer to an Unstructured type", u))}
-	}
-	oldU, ok := old.(*unstructured.Unstructured)
-	if !ok {
-		return field.ErrorList{field.Invalid(field.NewPath(""), old, fmt.Sprintf("has type %T. Must be a pointer to an Unstructured type", u))}
-	}
-	objAccessor, err := meta.Accessor(obj)
-	if err != nil {
-		return field.ErrorList{field.Invalid(field.NewPath("metadata"), nil, err.Error())}
-	}
-	oldAccessor, err := meta.Accessor(old)
-	if err != nil {
-		return field.ErrorList{field.Invalid(field.NewPath("metadata"), nil, err.Error())}
-	}
-
-	if errs := a.ValidateTypeMeta(ctx, u); len(errs) > 0 {
+func (a customResourceValidator) ValidateUpdate(ctx context.Context, obj, old *unstructured.Unstructured, scale *apiextensions.CustomResourceSubresourceScale, options ...apiextensionsvalidation.ValidationOption) field.ErrorList {
+	if errs := a.ValidateTypeMeta(ctx, obj); len(errs) > 0 {
 		return errs
 	}
 
 	var allErrs field.ErrorList
 
-	allErrs = append(allErrs, validation.ValidateObjectMetaAccessorUpdate(objAccessor, oldAccessor, field.NewPath("metadata"))...)
-	allErrs = append(allErrs, apiextensionsvalidation.ValidateCustomResourceUpdate(nil, u.UnstructuredContent(), oldU.UnstructuredContent(), a.schemaValidator)...)
-	allErrs = append(allErrs, a.ValidateScaleSpec(ctx, u, scale)...)
-	allErrs = append(allErrs, a.ValidateScaleStatus(ctx, u, scale)...)
+	allErrs = append(allErrs, a.validateObjectMetaUpdateDeclaratively(ctx, obj, old)...)
+	allErrs = append(allErrs, apiextensionsvalidation.ValidateCustomResourceUpdate(nil, obj.UnstructuredContent(), old.UnstructuredContent(), a.schemaValidator, options...)...)
+	allErrs = append(allErrs, a.ValidateScaleSpec(ctx, obj, scale)...)
+	allErrs = append(allErrs, a.ValidateScaleStatus(ctx, obj, scale)...)
 
 	return allErrs
 }
@@ -113,41 +90,28 @@ func validateKubeFinalizerName(stringValue string, fldPath *field.Path) []string
 	}
 	if len(strings.Split(stringValue, "/")) == 1 {
 		if !standardFinalizers.Has(stringValue) {
-			allWarnings = append(allWarnings, fmt.Sprintf("%s: %q: prefer a domain-qualified finalizer name to avoid accidental conflicts with other finalizer writers", fldPath.String(), stringValue))
+			if strings.Contains(stringValue, ".") {
+				allWarnings = append(allWarnings, fmt.Sprintf("%s: %q: prefer a domain-qualified finalizer name including a path (/) to avoid accidental conflicts with other finalizer writers", fldPath.String(), stringValue))
+			} else {
+				allWarnings = append(allWarnings, fmt.Sprintf("%s: %q: prefer a domain-qualified finalizer name to avoid accidental conflicts with other finalizer writers", fldPath.String(), stringValue))
+			}
 		}
 	}
 	return allWarnings
 }
 
-func (a customResourceValidator) ValidateStatusUpdate(ctx context.Context, obj, old runtime.Object, scale *apiextensions.CustomResourceSubresourceScale) field.ErrorList {
-	u, ok := obj.(*unstructured.Unstructured)
-	if !ok {
-		return field.ErrorList{field.Invalid(field.NewPath(""), u, fmt.Sprintf("has type %T. Must be a pointer to an Unstructured type", u))}
-	}
-	oldU, ok := old.(*unstructured.Unstructured)
-	if !ok {
-		return field.ErrorList{field.Invalid(field.NewPath(""), old, fmt.Sprintf("has type %T. Must be a pointer to an Unstructured type", u))}
-	}
-	objAccessor, err := meta.Accessor(obj)
-	if err != nil {
-		return field.ErrorList{field.Invalid(field.NewPath("metadata"), nil, err.Error())}
-	}
-	oldAccessor, err := meta.Accessor(old)
-	if err != nil {
-		return field.ErrorList{field.Invalid(field.NewPath("metadata"), nil, err.Error())}
-	}
-
-	if errs := a.ValidateTypeMeta(ctx, u); len(errs) > 0 {
+func (a customResourceValidator) ValidateStatusUpdate(ctx context.Context, obj, old *unstructured.Unstructured, scale *apiextensions.CustomResourceSubresourceScale, options ...apiextensionsvalidation.ValidationOption) field.ErrorList {
+	if errs := a.ValidateTypeMeta(ctx, obj); len(errs) > 0 {
 		return errs
 	}
 
 	var allErrs field.ErrorList
 
-	allErrs = append(allErrs, validation.ValidateObjectMetaAccessorUpdate(objAccessor, oldAccessor, field.NewPath("metadata"))...)
-	if status, hasStatus := u.UnstructuredContent()["status"]; hasStatus {
-		allErrs = append(allErrs, apiextensionsvalidation.ValidateCustomResourceUpdate(nil, status, oldU.UnstructuredContent()["status"], a.statusSchemaValidator)...)
+	allErrs = append(allErrs, a.validateObjectMetaUpdateDeclaratively(ctx, obj, old)...)
+	if status, hasStatus := obj.UnstructuredContent()["status"]; hasStatus {
+		allErrs = append(allErrs, apiextensionsvalidation.ValidateCustomResourceUpdate(field.NewPath("status"), status, old.UnstructuredContent()["status"], a.statusSchemaValidator, options...)...)
 	}
-	allErrs = append(allErrs, a.ValidateScaleStatus(ctx, u, scale)...)
+	allErrs = append(allErrs, a.ValidateScaleStatus(ctx, obj, scale)...)
 
 	return allErrs
 }
@@ -217,4 +181,43 @@ func (a customResourceValidator) ValidateScaleStatus(ctx context.Context, obj *u
 	}
 
 	return allErrs
+}
+
+func (a customResourceValidator) validateObjectMetaDeclaratively(ctx context.Context, obj *unstructured.Unstructured) field.ErrorList {
+	metadata, errs := getObjectMeta(obj)
+	if len(errs) > 0 {
+		return errs
+	}
+	return validation.ValidateObjectMetaDeclaratively(ctx, operation.Create, metadata, nil, a.namespaceScoped, validation.NameIsDNSSubdomain, field.NewPath("metadata"), utilfeature.DefaultFeatureGate.Enabled(features.DeclarativeValidationBeta))
+}
+
+func (a customResourceValidator) validateObjectMetaUpdateDeclaratively(ctx context.Context, obj, old *unstructured.Unstructured) field.ErrorList {
+	metadata, errs := getObjectMeta(obj)
+	if len(errs) > 0 {
+		return errs
+	}
+	oldMetadata, errs := getObjectMeta(old)
+	if len(errs) > 0 {
+		return errs
+	}
+	return validation.ValidateObjectMetaDeclaratively(ctx, operation.Update, metadata, oldMetadata, a.namespaceScoped, nil, field.NewPath("metadata"), utilfeature.DefaultFeatureGate.Enabled(features.DeclarativeValidationBeta))
+}
+
+func getObjectMeta(obj *unstructured.Unstructured) (*metav1.ObjectMeta, field.ErrorList) {
+	if obj == nil || obj.UnstructuredContent() == nil {
+		return &metav1.ObjectMeta{}, nil
+	}
+	raw := obj.UnstructuredContent()["metadata"]
+	if raw == nil {
+		return &metav1.ObjectMeta{}, nil
+	}
+	metadataMap, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, field.ErrorList{field.Invalid(field.NewPath("metadata"), raw, fmt.Sprintf("expected map[string]interface{}, got %T", raw))}
+	}
+	meta := &metav1.ObjectMeta{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(metadataMap, meta); err != nil {
+		return nil, field.ErrorList{field.Invalid(field.NewPath("metadata"), raw, err.Error())}
+	}
+	return meta, nil
 }

@@ -17,10 +17,16 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/registry/rest"
 	genericapiserver "k8s.io/apiserver/pkg/server"
@@ -28,6 +34,10 @@ import (
 	"k8s.io/client-go/informers"
 	restclient "k8s.io/client-go/rest"
 
+	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/runtime/serializer/cbor"
+	"k8s.io/apiserver/pkg/features"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	configmapstore "k8s.io/kubernetes/pkg/registry/core/configmap/storage"
@@ -48,6 +58,7 @@ type GenericConfig struct {
 	ServiceAccountIssuer        serviceaccount.TokenGenerator
 	ServiceAccountMaxExpiration time.Duration
 	ExtendExpiration            bool
+	MaxExtendedExpiration       time.Duration
 
 	APIAudiences authenticator.Audiences
 
@@ -63,70 +74,90 @@ func (c *GenericConfig) NewRESTStorage(apiResourceConfigSource serverstorage.API
 		ParameterCodec:               legacyscheme.ParameterCodec,
 		NegotiatedSerializer:         legacyscheme.Codecs,
 	}
-
-	eventStorage, err := eventstore.NewREST(restOptionsGetter, uint64(c.EventTTL.Seconds()))
-	if err != nil {
-		return genericapiserver.APIGroupInfo{}, err
+	opts := []serializer.CodecFactoryOptionsMutator{
+		serializer.WithStreamingCollectionEncodingToJSON(),
+		serializer.WithStreamingCollectionEncodingToProtobuf(),
 	}
-
-	resourceQuotaStorage, resourceQuotaStatusStorage, err := resourcequotastore.NewREST(restOptionsGetter)
-	if err != nil {
-		return genericapiserver.APIGroupInfo{}, err
+	if utilfeature.DefaultFeatureGate.Enabled(features.CBORServingAndStorage) {
+		opts = append(opts, serializer.WithSerializer(cbor.NewSerializerInfo))
 	}
-	secretStorage, err := secretstore.NewREST(restOptionsGetter)
-	if err != nil {
-		return genericapiserver.APIGroupInfo{}, err
-	}
-
-	configMapStorage, err := configmapstore.NewREST(restOptionsGetter)
-	if err != nil {
-		return genericapiserver.APIGroupInfo{}, err
-	}
-
-	namespaceStorage, namespaceStatusStorage, namespaceFinalizeStorage, err := namespacestore.NewREST(restOptionsGetter)
-	if err != nil {
-		return genericapiserver.APIGroupInfo{}, err
-	}
-
-	var serviceAccountStorage *serviceaccountstore.REST
-	if c.ServiceAccountIssuer != nil {
-		serviceAccountStorage, err = serviceaccountstore.NewREST(restOptionsGetter, c.ServiceAccountIssuer, c.APIAudiences, c.ServiceAccountMaxExpiration, nil, secretStorage.Store, c.ExtendExpiration)
-	} else {
-		serviceAccountStorage, err = serviceaccountstore.NewREST(restOptionsGetter, nil, nil, 0, nil, nil, false)
-	}
-	if err != nil {
-		return genericapiserver.APIGroupInfo{}, err
+	if len(opts) != 0 {
+		apiGroupInfo.NegotiatedSerializer = serializer.NewCodecFactory(legacyscheme.Scheme, opts...)
 	}
 
 	storage := map[string]rest.Storage{}
+
 	if resource := "events"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		eventStorage, err := eventstore.NewREST(restOptionsGetter, uint64(c.EventTTL.Seconds()))
+		if err != nil {
+			return genericapiserver.APIGroupInfo{}, err
+		}
 		storage[resource] = eventStorage
 	}
 
 	if resource := "resourcequotas"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		resourceQuotaStorage, resourceQuotaStatusStorage, err := resourcequotastore.NewREST(restOptionsGetter)
+		if err != nil {
+			return genericapiserver.APIGroupInfo{}, err
+		}
 		storage[resource] = resourceQuotaStorage
 		storage[resource+"/status"] = resourceQuotaStatusStorage
 	}
 
+	var secretGetter rest.Getter
+	if resource := "secrets"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		secretStorage, err := secretstore.NewREST(restOptionsGetter)
+		if err != nil {
+			return genericapiserver.APIGroupInfo{}, err
+		}
+		secretGetter = secretStorage.Store
+		storage[resource] = secretStorage
+	}
+
+	if resource := "configmaps"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		configMapStorage, err := configmapstore.NewREST(restOptionsGetter)
+		if err != nil {
+			return genericapiserver.APIGroupInfo{}, err
+		}
+		storage[resource] = configMapStorage
+	}
+
 	if resource := "namespaces"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		namespaceStorage, namespaceStatusStorage, namespaceFinalizeStorage, err := namespacestore.NewREST(restOptionsGetter)
+		if err != nil {
+			return genericapiserver.APIGroupInfo{}, err
+		}
 		storage[resource] = namespaceStorage
 		storage[resource+"/status"] = namespaceStatusStorage
 		storage[resource+"/finalize"] = namespaceFinalizeStorage
 	}
 
-	if resource := "secrets"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
-		storage[resource] = secretStorage
-	}
-
 	if resource := "serviceaccounts"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
+		var serviceAccountStorage *serviceaccountstore.REST
+		var err error
+		if c.ServiceAccountIssuer != nil {
+			// The ServiceAccount storage reads secrets to mint legacy tokens,
+			// so it needs the secret store even when secrets are not served.
+			if secretGetter == nil {
+				secretStorage, err := secretstore.NewREST(restOptionsGetter)
+				if err != nil {
+					return genericapiserver.APIGroupInfo{}, err
+				}
+				secretGetter = secretStorage.Store
+			}
+			serviceAccountStorage, err = serviceaccountstore.NewREST(restOptionsGetter, c.ServiceAccountIssuer, c.APIAudiences, authorizerfactory.NewAlwaysDenyAuthorizer(), c.ServiceAccountMaxExpiration, newNotFoundGetter(schema.GroupResource{Resource: "pods"}), secretGetter, newNotFoundGetter(schema.GroupResource{Resource: "nodes"}),
+				notFoundValidatingWebhookConfigurations{}, notFoundMutatingWebhookConfigurations{}, c.ExtendExpiration, c.MaxExtendedExpiration)
+		} else {
+			serviceAccountStorage, err = serviceaccountstore.NewREST(restOptionsGetter, nil, nil, authorizerfactory.NewAlwaysDenyAuthorizer(), 0, newNotFoundGetter(schema.GroupResource{Resource: "pods"}), newNotFoundGetter(schema.GroupResource{Resource: "secrets"}), newNotFoundGetter(schema.GroupResource{Resource: "nodes"}),
+				notFoundValidatingWebhookConfigurations{}, notFoundMutatingWebhookConfigurations{}, false, c.MaxExtendedExpiration)
+		}
+		if err != nil {
+			return genericapiserver.APIGroupInfo{}, err
+		}
 		storage[resource] = serviceAccountStorage
 		if serviceAccountStorage.Token != nil {
 			storage[resource+"/token"] = serviceAccountStorage.Token
 		}
-	}
-
-	if resource := "configmaps"; apiResourceConfigSource.ResourceEnabled(corev1.SchemeGroupVersion.WithResource(resource)) {
-		storage[resource] = configMapStorage
 	}
 
 	if len(storage) > 0 {
@@ -138,4 +169,16 @@ func (c *GenericConfig) NewRESTStorage(apiResourceConfigSource serverstorage.API
 
 func (c *GenericConfig) GroupName() string {
 	return api.GroupName
+}
+
+func newNotFoundGetter(gr schema.GroupResource) rest.Getter {
+	return notFoundGetter{gr: gr}
+}
+
+type notFoundGetter struct {
+	gr schema.GroupResource
+}
+
+func (g notFoundGetter) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	return nil, errors.NewNotFound(g.gr, name)
 }

@@ -45,7 +45,7 @@ import (
 	"k8s.io/pod-security-admission/metrics"
 	"k8s.io/pod-security-admission/policy"
 	"k8s.io/pod-security-admission/test"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 func TestDefaultExtractPodSpec(t *testing.T) {
@@ -470,19 +470,19 @@ func TestValidateNamespace(t *testing.T) {
 			oldLabels:            map[string]string{api.EnforceLevelLabel: string(api.LevelBaseline)},
 			pods: []*corev1.Pod{
 				// ensure exempt pods don't use up the limit of evaluated pods
-				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod1", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: pointer.String("runtimeclass1")}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod2", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: pointer.String("runtimeclass1")}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod3", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: pointer.String("runtimeclass1")}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod4", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: pointer.String("runtimeclass1")}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod1", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: ptr.To("runtimeclass1")}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod2", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: ptr.To("runtimeclass1")}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod3", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: ptr.To("runtimeclass1")}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "exemptpod4", Annotations: map[string]string{"error": "message1"}}, Spec: corev1.PodSpec{RuntimeClassName: ptr.To("runtimeclass1")}},
 				// ensure replicas from the same controller don't use up limit of evaluated pods
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod1", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod2", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod3", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod4", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod1", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod2", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod3", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: pointer.Bool(true)}}}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod4", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: pointer.Bool(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod1", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod2", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod3", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset1pod4", Annotations: map[string]string{"error": "replicaset1error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("1"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod1", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod2", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod3", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: ptr.To(true)}}}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "replicaset2pod4", Annotations: map[string]string{"error": "replicaset2error"}, OwnerReferences: []metav1.OwnerReference{{UID: types.UID("2"), Controller: ptr.To(true)}}}},
 				// ensure unique pods are prioritized before additional replicas
 				{ObjectMeta: metav1.ObjectMeta{Name: "uniquepod1", Annotations: map[string]string{"error": "uniquemessage1"}}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "uniquepod2", Annotations: map[string]string{"error": "uniquemessage2"}}},
@@ -561,11 +561,11 @@ func TestValidateNamespace(t *testing.T) {
 					},
 					{
 						ObjectMeta: metav1.ObjectMeta{Name: "runtimeclass1pod", Annotations: map[string]string{"error": "message"}},
-						Spec:       corev1.PodSpec{RuntimeClassName: pointer.String("runtimeclass1")},
+						Spec:       corev1.PodSpec{RuntimeClassName: ptr.To("runtimeclass1")},
 					},
 					{
 						ObjectMeta: metav1.ObjectMeta{Name: "runtimeclass2pod", Annotations: map[string]string{"error": "message"}},
-						Spec:       corev1.PodSpec{RuntimeClassName: pointer.String("runtimeclass2")},
+						Spec:       corev1.PodSpec{RuntimeClassName: ptr.To("runtimeclass2")},
 					},
 					{
 						ObjectMeta: metav1.ObjectMeta{Name: "runtimeclass3pod", Annotations: map[string]string{"error": "message, message2"}},
@@ -646,11 +646,11 @@ func TestValidatePodAndController(t *testing.T) {
 
 	privilegedPod := *baselinePod.DeepCopy()
 	privilegedPod.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{
-		Privileged: pointer.Bool(true),
+		Privileged: ptr.To(true),
 	}
 
 	exemptRCPod := *privilegedPod.DeepCopy()
-	exemptRCPod.Spec.RuntimeClassName = pointer.String(exemptRuntimeClass)
+	exemptRCPod.Spec.RuntimeClassName = ptr.To(exemptRuntimeClass)
 
 	tolerantPod := *privilegedPod.DeepCopy()
 	tolerantPod.Spec.Tolerations = []corev1.Toleration{{
@@ -662,6 +662,35 @@ func TestValidatePodAndController(t *testing.T) {
 
 	differentRestrictedPod := *restrictedPod.DeepCopy()
 	differentRestrictedPod.Spec.Containers[0].Image = "https://example.com/a-different-image"
+
+	// Pods for pods/dynamic updates, which add and remove containers.
+	twoContainerRestrictedPod := *restrictedPod.DeepCopy()
+	sidecar := *restrictedPod.Spec.Containers[0].DeepCopy()
+	sidecar.Name = "sidecar"
+	twoContainerRestrictedPod.Spec.Containers = append(twoContainerRestrictedPod.Spec.Containers, sidecar)
+
+	// Same container count and images as twoContainerRestrictedPod, but the sidecar is replaced by
+	// a privileged container.
+	swappedPrivilegedPod := *twoContainerRestrictedPod.DeepCopy()
+	swappedPrivilegedPod.Spec.Containers[1].Name = "added"
+	swappedPrivilegedPod.Spec.Containers[1].SecurityContext.Privileged = new(true)
+
+	addedPrivilegedPod := *twoContainerRestrictedPod.DeepCopy()
+	addedPrivilegedPod.Spec.Containers = append(addedPrivilegedPod.Spec.Containers, swappedPrivilegedPod.Spec.Containers[1])
+
+	addedRestrictedPod := *twoContainerRestrictedPod.DeepCopy()
+	added := *sidecar.DeepCopy()
+	added.Name = "added"
+	addedRestrictedPod.Spec.Containers = append(addedRestrictedPod.Spec.Containers, added)
+
+	// The remaining container violates the policy, but removing a container is never significant.
+	removedContainerPod := *twoContainerRestrictedPod.DeepCopy()
+	removedContainerPod.Spec.Containers[0].SecurityContext.Privileged = new(true)
+	oldRemovedContainerPod := *removedContainerPod.DeepCopy()
+	removedContainerPod.Spec.Containers = removedContainerPod.Spec.Containers[:1]
+
+	reorderedContainerPod := *oldRemovedContainerPod.DeepCopy()
+	reorderedContainerPod.Spec.Containers[0], reorderedContainerPod.Spec.Containers[1] = reorderedContainerPod.Spec.Containers[1], reorderedContainerPod.Spec.Containers[0]
 
 	emptyDeployment := appsv1.Deployment{
 		ObjectMeta: *objMetadata.DeepCopy(),
@@ -702,7 +731,7 @@ func TestValidatePodAndController(t *testing.T) {
 	config.Exemptions.RuntimeClasses = []string{exemptRuntimeClass}
 	config.Exemptions.Usernames = []string{exemptUser}
 
-	evaluator, err := policy.NewEvaluator(policy.DefaultChecks())
+	evaluator, err := policy.NewEvaluator(policy.DefaultChecks(), nil)
 	assert.NoError(t, err)
 
 	type testCase struct {
@@ -856,6 +885,65 @@ func TestValidatePodAndController(t *testing.T) {
 			oldPod:        restrictedPod,
 			expectAllowed: true,
 			expectEnforce: api.LevelRestricted,
+		},
+		{
+			desc:           "dynamic: swapped in privileged container denied",
+			namespace:      restrictedNs,
+			operation:      admissionv1.Update,
+			subresource:    "dynamic",
+			pod:            swappedPrivilegedPod.DeepCopy(),
+			oldPod:         twoContainerRestrictedPod.DeepCopy(),
+			expectAllowed:  false,
+			expectReason:   metav1.StatusReasonForbidden,
+			expectEnforce:  api.LevelRestricted,
+			expectWarning:  api.LevelRestricted,
+			expectAudit:    api.LevelRestricted,
+			skipDeployment: true,
+		},
+		{
+			desc:           "dynamic: added privileged container denied",
+			namespace:      restrictedNs,
+			operation:      admissionv1.Update,
+			subresource:    "dynamic",
+			pod:            addedPrivilegedPod.DeepCopy(),
+			oldPod:         twoContainerRestrictedPod.DeepCopy(),
+			expectAllowed:  false,
+			expectReason:   metav1.StatusReasonForbidden,
+			expectEnforce:  api.LevelRestricted,
+			expectWarning:  api.LevelRestricted,
+			expectAudit:    api.LevelRestricted,
+			skipDeployment: true,
+		},
+		{
+			desc:           "dynamic: added restricted container allowed",
+			namespace:      restrictedNs,
+			operation:      admissionv1.Update,
+			subresource:    "dynamic",
+			pod:            addedRestrictedPod.DeepCopy(),
+			oldPod:         twoContainerRestrictedPod.DeepCopy(),
+			expectAllowed:  true,
+			expectEnforce:  api.LevelRestricted,
+			skipDeployment: true,
+		},
+		{
+			desc:           "dynamic: removed container is insignificant",
+			namespace:      restrictedNs,
+			operation:      admissionv1.Update,
+			subresource:    "dynamic",
+			pod:            removedContainerPod.DeepCopy(),
+			oldPod:         oldRemovedContainerPod.DeepCopy(),
+			expectAllowed:  true,
+			skipDeployment: true,
+		},
+		{
+			desc:           "dynamic: reordered containers are insignificant",
+			namespace:      restrictedNs,
+			operation:      admissionv1.Update,
+			subresource:    "dynamic",
+			pod:            reorderedContainerPod.DeepCopy(),
+			oldPod:         oldRemovedContainerPod.DeepCopy(),
+			expectAllowed:  true,
+			skipDeployment: true,
 		},
 		{
 			desc:          "invalid namespace labels",

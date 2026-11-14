@@ -20,14 +20,12 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/component-helpers/storage/volume"
 	"k8s.io/klog/v2/ktesting"
 	pvtesting "k8s.io/kubernetes/pkg/controller/volume/persistentvolume/testing"
-	"k8s.io/kubernetes/pkg/features"
 )
 
 // Test single call to syncVolume, expecting recycling to happen.
@@ -36,8 +34,6 @@ import (
 // 3. Compare resulting volumes with expected volumes.
 func TestDeleteSync(t *testing.T) {
 	const gceDriver = "pd.csi.storage.gke.io"
-	// Default enable the HonorPVReclaimPolicy feature gate.
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.HonorPVReclaimPolicy, true)()
 	_, ctx := ktesting.NewTestContext(t)
 	tests := []controllerTest{
 		{
@@ -129,7 +125,7 @@ func TestDeleteSync(t *testing.T) {
 				// happen)
 				claim := newClaim("claim8-7", "uid8-7", "10Gi", "volume8-7", v1.ClaimBound, nil)
 				reactor.AddClaimBoundToVolume(claim)
-				ctrl.claims.Add(claim)
+				require.NoError(t, ctrl.claims.Indexer().Add(claim))
 			}),
 		},
 		{
@@ -148,9 +144,9 @@ func TestDeleteSync(t *testing.T) {
 		},
 		{
 			// PV requires external deleter
-			name:            "8-10 - external deleter",
-			initialVolumes:  []*v1.PersistentVolume{newExternalProvisionedVolume("volume8-10", "1Gi", "uid10-1", "claim10-1", v1.VolumeBound, v1.PersistentVolumeReclaimDelete, classEmpty, gceDriver, nil, volume.AnnBoundByController)},
-			expectedVolumes: []*v1.PersistentVolume{newExternalProvisionedVolume("volume8-10", "1Gi", "uid10-1", "claim10-1", v1.VolumeReleased, v1.PersistentVolumeReclaimDelete, classEmpty, gceDriver, nil, volume.AnnBoundByController)},
+			name:            "8-10-1 - external deleter when volume is dynamic provisioning",
+			initialVolumes:  []*v1.PersistentVolume{newExternalProvisionedVolume("volume8-10-1", "1Gi", "uid10-1-1", "claim10-1-1", v1.VolumeBound, v1.PersistentVolumeReclaimDelete, classEmpty, gceDriver, nil, volume.AnnBoundByController)},
+			expectedVolumes: []*v1.PersistentVolume{newExternalProvisionedVolume("volume8-10-1", "1Gi", "uid10-1-1", "claim10-1-1", v1.VolumeReleased, v1.PersistentVolumeReclaimDelete, classEmpty, gceDriver, nil, volume.AnnBoundByController)},
 			initialClaims:   noclaims,
 			expectedClaims:  noclaims,
 			expectedEvents:  noevents,
@@ -161,6 +157,28 @@ func TestDeleteSync(t *testing.T) {
 				test.expectedVolumes[0].Annotations[volume.AnnDynamicallyProvisioned] = "external.io/test"
 				return testSyncVolume(ctrl, reactor, test)
 			},
+		},
+		{
+			// PV requires external deleter
+			name:            "8-10-2 - external deleter when volume is static provisioning",
+			initialVolumes:  []*v1.PersistentVolume{newExternalProvisionedVolume("volume8-10-2", "1Gi", "uid10-1-2", "claim10-1-2", v1.VolumeBound, v1.PersistentVolumeReclaimDelete, classEmpty, gceDriver, nil, volume.AnnBoundByController)},
+			expectedVolumes: []*v1.PersistentVolume{newExternalProvisionedVolume("volume8-10-2", "1Gi", "uid10-1-2", "claim10-1-2", v1.VolumeReleased, v1.PersistentVolumeReclaimDelete, classEmpty, gceDriver, nil, volume.AnnBoundByController)},
+			initialClaims:   noclaims,
+			expectedClaims:  noclaims,
+			expectedEvents:  noevents,
+			errors:          noerrors,
+			test:            testSyncVolume,
+		},
+		{
+			// PV requires external deleter
+			name:            "8-10-3 - external deleter when volume is migrated",
+			initialVolumes:  []*v1.PersistentVolume{volumeWithAnnotation(volume.AnnMigratedTo, "pd.csi.storage.gke.io", volumeWithAnnotation(volume.AnnDynamicallyProvisioned, "kubernetes.io/gce-pd", newVolume("volume8-10-3", "1Gi", "uid10-1-3", "claim10-1-3", v1.VolumeBound, v1.PersistentVolumeReclaimDelete, classEmpty, volume.AnnDynamicallyProvisioned)))},
+			expectedVolumes: []*v1.PersistentVolume{volumeWithAnnotation(volume.AnnMigratedTo, "pd.csi.storage.gke.io", volumeWithAnnotation(volume.AnnDynamicallyProvisioned, "kubernetes.io/gce-pd", newVolume("volume8-10-3", "1Gi", "uid10-1-3", "claim10-1-3", v1.VolumeReleased, v1.PersistentVolumeReclaimDelete, classEmpty, volume.AnnDynamicallyProvisioned)))},
+			initialClaims:   noclaims,
+			expectedClaims:  noclaims,
+			expectedEvents:  noevents,
+			errors:          noerrors,
+			test:            testSyncVolume,
 		},
 		{
 			// delete success - two PVs are provisioned for a single claim.

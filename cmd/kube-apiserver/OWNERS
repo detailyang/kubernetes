@@ -4,22 +4,17 @@ approvers:
   - caesarxuchao
   - deads2k
   - liggitt
-  - smarterclayton
   - sttts
   - jpbetz
 reviewers:
   - cheftako
-  - smarterclayton
   - wojtek-t
   - deads2k
   - derekwaynecarr
   - caesarxuchao
-  - mikedanese
   - liggitt
-  - ncdc
   - sttts
   - hzxuzhonghu
-  - logicalhan
   - yue9944882
   - jpbetz
 labels:
@@ -28,3 +23,5 @@ labels:
 emeritus_approvers:
   - nikhiljindal
   - lavalamp
+emeritus_reviewers:
+  - ncdc

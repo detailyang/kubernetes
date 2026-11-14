@@ -20,9 +20,9 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/common/types/traits"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/types/traits"
 
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 )
@@ -100,10 +100,10 @@ var (
 	mapSchema = schema.Structural{
 		Generic: schema.Generic{
 			Type: "object",
-			AdditionalProperties: &schema.StructuralOrBool{
-				Bool:       true,
-				Structural: &stringSchema,
-			},
+		},
+		AdditionalProperties: &schema.StructuralOrBool{
+			Bool:       true,
+			Structural: &stringSchema,
 		},
 	}
 )
@@ -530,9 +530,18 @@ func TestLister(t *testing.T) {
 			}
 
 			addition := UnstructuredToVal(tc.addition, tc.schema).(traits.Lister)
-			added := lister.Add(addition).Value()
-			if !reflect.DeepEqual(added, tc.expectAdded) {
-				t.Errorf("Expected Add to return %v but got %v", tc.expectAdded, added)
+			added, ok := lister.Add(addition).(traits.Lister)
+			if !ok {
+				t.Fatal("Expected Add to return a list")
+			}
+			if added.Size().Value() != int64(len(tc.expectAdded)) {
+				t.Errorf("Expected Add to return a list of size %d but got %d", len(tc.expectAdded), added.Size().Value())
+			}
+			for i := range tc.expectAdded {
+				expect := UnstructuredToVal(tc.expectAdded[i], tc.itemSchema)
+				if got := added.Get(types.Int(i)); expect.Equal(got) != types.True {
+					t.Errorf("Expected Add result at index %d to equal %v but got %v", i, expect.Value(), got.Value())
+				}
 			}
 		})
 	}

@@ -17,6 +17,7 @@ limitations under the License.
 package flexvolume
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -39,18 +40,20 @@ type flexVolumeProber struct {
 	watcher        utilfs.FSWatcher
 	factory        PluginFactory
 	fs             utilfs.Filesystem
+	ctx            context.Context
 	probeAllNeeded bool
 	eventsMap      map[string]volume.ProbeOperation // the key is the driver directory path, the value is the corresponding operation
 }
 
 // GetDynamicPluginProber creates dynamic plugin prober
-func GetDynamicPluginProber(pluginDir string, runner exec.Interface) volume.DynamicPluginProber {
+func GetDynamicPluginProber(ctx context.Context, pluginDir string, runner exec.Interface) volume.DynamicPluginProber {
 	return &flexVolumeProber{
 		pluginDir: pluginDir,
 		watcher:   utilfs.NewFsnotifyWatcher(),
 		factory:   pluginFactory{},
 		runner:    runner,
 		fs:        &utilfs.DefaultFs{},
+		ctx:       ctx,
 	}
 }
 
@@ -228,6 +231,10 @@ func (prober *flexVolumeProber) updateEventsMap(eventDirAbs string, op volume.Pr
 // Each file or directory change triggers two events: one from the watch on itself, another from the watch
 // on its parent directory.
 func (prober *flexVolumeProber) addWatchRecursive(filename string) error {
+	// this may be called with an actual absolute path on Windows (with a C:\ prefix).
+	// But the prober.fs.Walk below will execute filepath.Join(fs.root, filenameAbove), which
+	// will result in an incorrect path, you can't join C:\path and C:\another\path.
+	filename = strings.TrimPrefix(filename, `C:\`)
 	addWatch := func(path string, info os.FileInfo, err error) error {
 		if err == nil && info.IsDir() {
 			if err := prober.watcher.AddWatch(path); err != nil {
@@ -250,14 +257,14 @@ func (prober *flexVolumeProber) initWatcher() error {
 		klog.Errorf("Received an error from watcher: %s", err)
 	})
 	if err != nil {
-		return fmt.Errorf("error initializing watcher: %s", err)
+		return fmt.Errorf("flex volume: %w", err)
 	}
 
 	if err := prober.addWatchRecursive(prober.pluginDir); err != nil {
 		return fmt.Errorf("error adding watch on Flexvolume directory: %s", err)
 	}
 
-	prober.watcher.Run()
+	prober.watcher.Run(prober.ctx)
 
 	return nil
 }

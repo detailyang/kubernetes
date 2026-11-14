@@ -48,6 +48,7 @@ source "${KUBE_ROOT}/test/cmd/generic-resources.sh"
 source "${KUBE_ROOT}/test/cmd/get.sh"
 source "${KUBE_ROOT}/test/cmd/help.sh"
 source "${KUBE_ROOT}/test/cmd/kubeconfig.sh"
+source "${KUBE_ROOT}/test/cmd/kuberc.sh"
 source "${KUBE_ROOT}/test/cmd/node-management.sh"
 source "${KUBE_ROOT}/test/cmd/plugins.sh"
 source "${KUBE_ROOT}/test/cmd/proxy.sh"
@@ -56,6 +57,7 @@ source "${KUBE_ROOT}/test/cmd/request-timeout.sh"
 source "${KUBE_ROOT}/test/cmd/results.sh"
 source "${KUBE_ROOT}/test/cmd/run.sh"
 source "${KUBE_ROOT}/test/cmd/save-config.sh"
+source "${KUBE_ROOT}/test/cmd/scale.sh"
 source "${KUBE_ROOT}/test/cmd/storage.sh"
 source "${KUBE_ROOT}/test/cmd/template-output.sh"
 source "${KUBE_ROOT}/test/cmd/version.sh"
@@ -81,7 +83,7 @@ export IMAGE_STATEFULSET_R1="registry.k8s.io/nginx-slim:0.7"
 export IMAGE_STATEFULSET_R2="registry.k8s.io/nginx-slim:0.8"
 
 # Expose kubectl directly for readability
-PATH="${KUBE_OUTPUT_HOSTBIN}":$PATH
+PATH="${THIS_PLATFORM_BIN}":$PATH
 
 # Define variables for resource types to prevent typos.
 clusterroles="clusterroles"
@@ -314,7 +316,7 @@ setup() {
 
   # Check kubectl
   kube::log::status "Running kubectl with no options"
-  "${KUBE_OUTPUT_HOSTBIN}/kubectl"
+  "${THIS_PLATFORM_BIN}/kubectl"
 
   # TODO: we need to note down the current default namespace and set back to this
   # namespace after the tests are done.
@@ -326,6 +328,17 @@ setup() {
   kubectl config view
 
   kube::log::status "Setup complete"
+}
+
+# Generate a random namespace name, based on the current time (to make
+# debugging slightly easier) and a random number. Don't use `date +%N`
+# because that doesn't work on OSX.
+create_and_use_new_namespace() {
+  local ns_name
+  ns_name="namespace-$(date +%s)-${RANDOM}"
+  kube::log::status "Creating namespace ${ns_name}"
+  kubectl create namespace "${ns_name}"
+  kubectl config set-context "${CONTEXT}" --namespace="${ns_name}"
 }
 
 # Runs all kubectl tests.
@@ -340,17 +353,6 @@ runTests() {
   fi
   kube::log::status "Checking kubectl version"
   kubectl version
-
-  # Generate a random namespace name, based on the current time (to make
-  # debugging slightly easier) and a random number. Don't use `date +%N`
-  # because that doesn't work on OSX.
-  create_and_use_new_namespace() {
-    local ns_name
-    ns_name="namespace-$(date +%s)-${RANDOM}"
-    kube::log::status "Creating namespace ${ns_name}"
-    kubectl create namespace "${ns_name}"
-    kubectl config set-context "${CONTEXT}" --namespace="${ns_name}"
-  }
 
   kube_flags=( '-s' "https://127.0.0.1:${SECURE_API_PORT}" '--insecure-skip-tls-verify' )
 
@@ -516,6 +518,22 @@ runTests() {
 
   if kube::test::if_supports_resource "${customresourcedefinitions}" && kube::test::if_supports_resource "${pods}" ; then
     record_command run_assert_singular_name_tests
+  fi
+
+  #########################
+  # Ambiguous short name  #
+  #########################
+
+  if kube::test::if_supports_resource "${customresourcedefinitions}" ; then
+    record_command run_ambiguous_shortname_tests
+  fi
+
+  ################
+  # Explain crd  #
+  ################
+
+  if kube::test::if_supports_resource "${customresourcedefinitions}" ; then
+    record_command run_explain_crd_with_additional_properties_tests
   fi
 
   #########################
@@ -1025,17 +1043,33 @@ runTests() {
   # kubectl debug    #
   ####################
   if kube::test::if_supports_resource "${pods}" ; then
-    record_command run_kubectl_debug_pod_tests
-    record_command run_kubectl_debug_general_tests
+    record_command run_kubectl_debug_tests
+    record_command run_kubectl_debug_legacy_tests
     record_command run_kubectl_debug_baseline_tests
     record_command run_kubectl_debug_restricted_tests
+    record_command run_kubectl_debug_netadmin_tests
+    record_command run_kubectl_debug_custom_profile_tests
+    record_command run_kubectl_debug_warning_tests
   fi
   if kube::test::if_supports_resource "${nodes}" ; then
     record_command run_kubectl_debug_node_tests
-    record_command run_kubectl_debug_general_node_tests
+    record_command run_kubectl_debug_legacy_node_tests
     record_command run_kubectl_debug_baseline_node_tests
     record_command run_kubectl_debug_restricted_node_tests
+    record_command run_kubectl_debug_netadmin_node_tests
   fi
+
+  #######################
+  # kuberc              #
+  #######################
+
+  record_command run_kuberc_tests
+
+  ###########
+  # Scale #
+  ###########
+
+  record_command run_kubectl_scale_tests
 
   cleanup_tests
 }

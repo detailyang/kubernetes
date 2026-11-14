@@ -18,29 +18,44 @@ package framework
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"os"
 	"path"
 	"strings"
-	"testing"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 
+	apiextensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	genericapiserveroptions "k8s.io/apiserver/pkg/server/options"
+	"k8s.io/apiserver/pkg/util/compatibility"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	client "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/cert"
+	basecompatibility "k8s.io/component-base/compatibility"
+	"k8s.io/component-base/featuregate"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	aggregatorscheme "k8s.io/kube-aggregator/pkg/apiserver/scheme"
+	netutils "k8s.io/utils/net"
+
+	featuremetrics "k8s.io/component-base/metrics/prometheus/feature"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/controlplane"
+	controlplaneapiserver "k8s.io/kubernetes/pkg/controlplane/apiserver"
+	generatedopenapi "k8s.io/kubernetes/pkg/generated/openapi"
+	"k8s.io/kubernetes/test/e2e/invariants/metrics"
 	"k8s.io/kubernetes/test/utils"
-	netutils "k8s.io/utils/net"
 )
 
 // This key is for testing purposes only and is not considered secure.
@@ -54,13 +69,42 @@ AwEHoUQDQgAEH6cuzP8XuD5wal6wf9M6xDljTOPLX2i8uIp/C/ASqiIGUeeKQtX0
 type TestServerSetup struct {
 	ModifyServerRunOptions func(*options.ServerRunOptions)
 	ModifyServerConfig     func(*controlplane.Config)
+	// DisableInvariantChecks skips the invariant checks at the end of the test.
+	DisableInvariantChecks bool
+
+	// observeTearDown, if non-nil, gets called with the server's internal
+	// context right after it gets canceled during tear-down. It is used
+	// only by StartTestServer's own tests, to verify that the context is
+	// canceled (ctx.Err() == context.Canceled) with the intended cause
+	// (parent context cancellation, explicit tear-down, or test
+	// completion), obtainable via context.Cause(ctx).
+	observeTearDown func(ctx context.Context)
 }
 
 type TearDownFunc func()
 
 // StartTestServer runs a kube-apiserver, optionally calling out to the setup.ModifyServerRunOptions and setup.ModifyServerConfig functions
-func StartTestServer(ctx context.Context, t testing.TB, setup TestServerSetup) (client.Interface, *rest.Config, TearDownFunc) {
-	ctx, cancel := context.WithCancel(ctx)
+// TODO (pohly): convert to ktesting contexts
+//
+// The kube-apiserver runs until one of the following happens:
+//   - ctx cancellation
+//   - TearDownFunc gets called (blocks until shutdown is complete)
+//   - the test ends and cleanup starts
+func StartTestServer(ctx context.Context, t utils.TB, setup TestServerSetup) (client.Interface, *rest.Config, TearDownFunc) {
+	// This code manages the lifecycle of ctx itself, via the explicit
+	// cancel call in tearDown below. It must not get canceled
+	// automatically once the test ends because TearDownFn still needs a
+	// working context at that point, in particular for the metrics
+	// invariant check below.
+	//
+	// While starting up, ctx cancellation gets propagated directly, without going through
+	// the full teardown.
+	parentCtx := ctx
+	ctx = context.WithoutCancel(ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
+	stopCtxPropagation := context.AfterFunc(parentCtx, func() {
+		cancel(context.Cause(parentCtx))
+	})
 
 	certDir, err := os.MkdirTemp("", "test-integration-"+strings.ReplaceAll(t.Name(), "/", "_"))
 	if err != nil {
@@ -68,24 +112,6 @@ func StartTestServer(ctx context.Context, t testing.TB, setup TestServerSetup) (
 	}
 
 	var errCh chan error
-	tearDownFn := func() {
-		// Calling cancel function is stopping apiserver and cleaning up
-		// after itself, including shutting down its storage layer.
-		cancel()
-
-		// If the apiserver was started, let's wait for it to
-		// shutdown clearly.
-		if errCh != nil {
-			err, ok := <-errCh
-			if ok && err != nil {
-				t.Error(err)
-			}
-		}
-		if err := os.RemoveAll(certDir); err != nil {
-			t.Log(err)
-		}
-	}
-
 	_, defaultServiceClusterIPRange, _ := netutils.ParseCIDRSloppy("10.0.0.0/24")
 	proxySigningKey, err := utils.NewPrivateKey()
 	if err != nil {
@@ -128,6 +154,17 @@ func StartTestServer(ctx context.Context, t testing.TB, setup TestServerSetup) (
 	}
 
 	opts := options.NewServerRunOptions()
+	// If EmulationVersion of DefaultFeatureGate is set during test, we need to propagate it to the apiserver ComponentGlobalsRegistry.
+	featureGate := utilfeature.DefaultMutableFeatureGate.DeepCopy()
+	effectiveVersion := compatibility.DefaultKubeEffectiveVersionForTest()
+	effectiveVersion.SetEmulationVersion(featureGate.EmulationVersion())
+	// set up new instance of ComponentGlobalsRegistry instead of using the DefaultComponentGlobalsRegistry to avoid contention in parallel tests.
+	componentGlobalsRegistry := basecompatibility.NewComponentGlobalsRegistry()
+	if err := componentGlobalsRegistry.Register(basecompatibility.DefaultKubeComponent, effectiveVersion, featureGate); err != nil {
+		t.Fatal(err)
+	}
+	opts.GenericServerRunOptions.ComponentGlobalsRegistry = componentGlobalsRegistry
+
 	opts.SecureServing.Listener = listener
 	opts.SecureServing.BindAddress = netutils.ParseIPSloppy("127.0.0.1")
 	opts.SecureServing.ServerCert.CertDirectory = certDir
@@ -150,7 +187,23 @@ func StartTestServer(ctx context.Context, t testing.TB, setup TestServerSetup) (
 		setup.ModifyServerRunOptions(opts)
 	}
 
-	completedOptions, err := opts.Complete()
+	// If the local ComponentGlobalsRegistry is changed by ModifyServerRunOptions,
+	// we need to copy the new feature values back to the DefaultFeatureGate because most feature checks still use the DefaultFeatureGate.
+	if !featureGate.EmulationVersion().EqualTo(utilfeature.DefaultMutableFeatureGate.EmulationVersion()) || !featureGate.MinCompatibilityVersion().EqualTo(utilfeature.DefaultMutableFeatureGate.MinCompatibilityVersion()) {
+		featuregatetesting.SetFeatureGateVersionsDuringTest(t, utilfeature.DefaultMutableFeatureGate, effectiveVersion.EmulationVersion(), effectiveVersion.MinCompatibilityVersion())
+	}
+	featureOverrides := map[featuregate.Feature]bool{}
+	for f := range utilfeature.DefaultMutableFeatureGate.GetAll() {
+		if featureGate.Enabled(f) != utilfeature.DefaultFeatureGate.Enabled(f) {
+			featureOverrides[f] = featureGate.Enabled(f)
+		}
+	}
+	if len(featureOverrides) > 0 {
+		featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featureOverrides)
+	}
+	utilfeature.DefaultMutableFeatureGate.AddMetrics(featuremetrics.RecordFeatureInfo)
+
+	completedOptions, err := opts.Complete(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +212,18 @@ func StartTestServer(ctx context.Context, t testing.TB, setup TestServerSetup) (
 		t.Fatalf("failed to validate ServerRunOptions: %v", utilerrors.NewAggregate(errs))
 	}
 
-	kubeAPIServerConfig, _, _, err := app.CreateKubeAPIServerConfig(completedOptions)
+	genericConfig, versionedInformers, storageFactory, err := controlplaneapiserver.BuildGenericConfig(
+		completedOptions.CompletedOptions,
+		[]*runtime.Scheme{legacyscheme.Scheme, apiextensionsapiserver.Scheme, aggregatorscheme.Scheme},
+		controlplane.DefaultAPIResourceConfigSource(),
+		generatedopenapi.GetOpenAPIDefinitions,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kubeAPIServerConfig, _, _, err := app.CreateKubeAPIServerConfig(completedOptions, genericConfig, versionedInformers, storageFactory)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,19 +239,19 @@ func StartTestServer(ctx context.Context, t testing.TB, setup TestServerSetup) (
 	errCh = make(chan error)
 	go func() {
 		defer close(errCh)
-		if err := kubeAPIServer.GenericAPIServer.PrepareRun().Run(ctx.Done()); err != nil {
+		if err := kubeAPIServer.ControlPlane.GenericAPIServer.PrepareRun().RunWithContext(ctx); err != nil {
 			errCh <- err
 		}
 	}()
 
 	// Adjust the loopback config for external use (external server name and CA)
-	kubeAPIServerClientConfig := rest.CopyConfig(kubeAPIServerConfig.GenericConfig.LoopbackClientConfig)
+	kubeAPIServerClientConfig := rest.CopyConfig(kubeAPIServerConfig.ControlPlane.Generic.LoopbackClientConfig)
 	kubeAPIServerClientConfig.CAFile = path.Join(certDir, "apiserver.crt")
 	kubeAPIServerClientConfig.CAData = nil
 	kubeAPIServerClientConfig.ServerName = ""
 
 	// wait for health
-	err = wait.PollImmediate(100*time.Millisecond, 10*time.Second, func() (done bool, err error) {
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (done bool, err error) {
 		select {
 		case err := <-errCh:
 			return false, err
@@ -228,5 +292,58 @@ func StartTestServer(ctx context.Context, t testing.TB, setup TestServerSetup) (
 		t.Fatal(err)
 	}
 
-	return kubeAPIServerClient, kubeAPIServerClientConfig, tearDownFn
+	// tearDown runs exactly once, either triggered by
+	// the parent context cancellation (context.AfterFunc), test cleanup
+	// or an explicit request to tear down.
+	var tearDownOnce sync.Once
+	tearDown := func(cause error) {
+		// Scrape metrics before stopping
+		if !setup.DisableInvariantChecks {
+			// Context cancellation might have been propagated during startup,
+			// therefore the context might be canceled already.
+			if ctx.Err() != nil {
+				t.Logf("Skipping metrics scrape because context is already canceled: %v", context.Cause(ctx))
+			} else {
+				if err := metrics.CheckMetricInvariants(ctx, kubeAPIServerClient, false); err != nil {
+					t.Errorf("Invariant check failed (if the test intentionally breaks metrics/auth, consider setting DisableInvariantChecks: true in TestServerSetup): %v", err)
+				}
+			}
+		}
+		// Calling cancel function is stopping apiserver and cleaning up
+		// after itself, including shutting down its storage layer.
+		cancel(cause)
+		if setup.observeTearDown != nil {
+			setup.observeTearDown(ctx)
+		}
+
+		// If the apiserver was started, let's wait for it to
+		// shutdown clearly.
+		if errCh != nil {
+			err, ok := <-errCh
+			if ok && err != nil {
+				t.Error(err)
+			}
+		}
+		if err := os.RemoveAll(certDir); err != nil {
+			t.Log(err)
+		}
+	}
+	tearDownFn := func(cause error) {
+		tearDownOnce.Do(func() { tearDown(cause) })
+	}
+	t.Cleanup(func() {
+		tearDownFn(errors.New("test has completed"))
+	})
+
+	// Swap the simple cancellation propagation with the more complete tear-down.
+	// This is not atomic, so tear-down has to be prepared for ctx to be canceled
+	// already when it starts.
+	context.AfterFunc(parentCtx, func() {
+		tearDownFn(context.Cause(parentCtx))
+	})
+	stopCtxPropagation()
+
+	return kubeAPIServerClient, kubeAPIServerClientConfig, func() {
+		tearDownFn(errors.New("tear-down requested"))
+	}
 }

@@ -21,7 +21,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/cel-go/cel"
+	"cel.dev/cel-go/cel"
 
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/admission"
@@ -70,7 +70,7 @@ func TestCompositedPolicies(t *testing.T) {
 			expectedResult: true,
 		},
 		{
-			name: "delayed compile error",
+			name: "early compile error",
 			variables: []NamedExpressionAccessor{
 				&testVariable{
 					name:       "name",
@@ -80,20 +80,20 @@ func TestCompositedPolicies(t *testing.T) {
 			attributes:           endpointCreateAttributes(),
 			expression:           "variables.name == 'endpoints1'",
 			expectErr:            true,
-			expectedErrorMessage: `composited variable "name" fails to compile:`,
+			expectedErrorMessage: `found no matching overload for '_==_' applied to '(int, string)'`,
 		},
 		{
 			name: "delayed eval error",
 			variables: []NamedExpressionAccessor{
 				&testVariable{
-					name:       "name",
-					expression: "object.spec.subsets[114514].addresses.size()", // array index out of bound
+					name:       "count",
+					expression: "object.subsets[114514].addresses.size()", // array index out of bound
 				},
 			},
 			attributes:           endpointCreateAttributes(),
-			expression:           "variables.name == 'endpoints1'",
+			expression:           "variables.count == 810",
 			expectErr:            true,
-			expectedErrorMessage: `composited variable "name" fails to evaluate:`,
+			expectedErrorMessage: `composited variable "count" fails to evaluate: index out of bounds: 114514`,
 		},
 		{
 			name: "out of budget during lazy evaluation",
@@ -123,6 +123,82 @@ func TestCompositedPolicies(t *testing.T) {
 			expectedResult:    true,
 			runtimeCostBudget: 10, // enough for one lazy evaluation but not two, should pass
 		},
+		{
+			name: "single boolean variable in expression",
+			variables: []NamedExpressionAccessor{
+				&testVariable{
+					name:       "fortuneTelling",
+					expression: "true",
+				},
+			},
+			attributes:     endpointCreateAttributes(),
+			expression:     "variables.fortuneTelling",
+			expectedResult: true,
+		},
+		{
+			name: "variable of a list",
+			variables: []NamedExpressionAccessor{
+				&testVariable{
+					name:       "list",
+					expression: "[1, 2, 3, 4]",
+				},
+			},
+			attributes:     endpointCreateAttributes(),
+			expression:     "variables.list.sum() == 10",
+			expectedResult: true,
+		},
+		{
+			name: "variable of a map",
+			variables: []NamedExpressionAccessor{
+				&testVariable{
+					name:       "dict",
+					expression: `{"foo": "bar"}`,
+				},
+			},
+			attributes:     endpointCreateAttributes(),
+			expression:     "variables.dict['foo'].contains('bar')",
+			expectedResult: true,
+		},
+		{
+			name: "variable of a list but confused as a map",
+			variables: []NamedExpressionAccessor{
+				&testVariable{
+					name:       "list",
+					expression: "[1, 2, 3, 4]",
+				},
+			},
+			attributes:           endpointCreateAttributes(),
+			expression:           "variables.list['invalid'] == 'invalid'",
+			expectErr:            true,
+			expectedErrorMessage: "found no matching overload for '_[_]' applied to '(list(int), string)'",
+		},
+		{
+			name: "list of strings, but element is confused as an integer",
+			variables: []NamedExpressionAccessor{
+				&testVariable{
+					name:       "list",
+					expression: "['1', '2', '3', '4']",
+				},
+			},
+			attributes:           endpointCreateAttributes(),
+			expression:           "variables.list[0] == 1",
+			expectErr:            true,
+			expectedErrorMessage: "found no matching overload for '_==_' applied to '(string, int)'",
+		},
+		{
+			name: "exceeds cost budget",
+			variables: []NamedExpressionAccessor{
+				&testVariable{
+					name:       "dict",
+					expression: "'abc 123 def 123'.split(' ')",
+				},
+			},
+			attributes:           endpointCreateAttributes(),
+			expression:           "size(variables.dict) > 0",
+			expectErr:            true,
+			expectedErrorMessage: "validation failed due to running out of cost budget, no further validation rules will be run",
+			runtimeCostBudget:    5,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -131,8 +207,8 @@ func TestCompositedPolicies(t *testing.T) {
 				t.Fatal(err)
 			}
 			compiler.CompileAndStoreVariables(tc.variables, OptionalVariableDeclarations{HasParams: false, HasAuthorizer: false}, environment.NewExpressions)
-			validations := []ExpressionAccessor{&condition{Expression: tc.expression}}
-			f := compiler.Compile(validations, OptionalVariableDeclarations{HasParams: false, HasAuthorizer: false}, environment.NewExpressions)
+			validations := []ExpressionAccessor{&testCondition{Expression: tc.expression}}
+			f := compiler.CompileCondition(validations, OptionalVariableDeclarations{HasParams: false, HasAuthorizer: false}, environment.NewExpressions)
 			versionedAttr, err := admission.NewVersionedAttributes(tc.attributes, tc.attributes.GetKind(), newObjectInterfacesForTest())
 			if err != nil {
 				t.Fatal(err)
@@ -169,5 +245,48 @@ func TestCompositedPolicies(t *testing.T) {
 			}
 
 		})
+	}
+}
+
+// TestCompilerIsolation verifies that each call to NewCompositedCompiler
+// creates an isolated environment where variables from one compiler
+// do not leak into another.
+func TestCompilerIsolation(t *testing.T) {
+	baseEnv := environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion())
+
+	// Create first compiler with variable "foo"
+	compiler1, err := NewCompositedCompiler(baseEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vars1 := []NamedExpressionAccessor{
+		&testVariable{name: "foo", expression: "'bar'"},
+	}
+	compiler1.CompileAndStoreVariables(vars1, OptionalVariableDeclarations{}, environment.StoredExpressions)
+
+	// Create second compiler with variable "baz"
+	compiler2, err := NewCompositedCompiler(baseEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vars2 := []NamedExpressionAccessor{
+		&testVariable{name: "baz", expression: "'qux'"},
+	}
+	compiler2.CompileAndStoreVariables(vars2, OptionalVariableDeclarations{}, environment.StoredExpressions)
+
+	// Verify isolation: compiler1 should not have "baz", compiler2 should not have "foo"
+	if _, ok := compiler1.state.mapType.Fields["baz"]; ok {
+		t.Error("compiler1 should not have variable 'baz' from compiler2")
+	}
+	if _, ok := compiler2.state.mapType.Fields["foo"]; ok {
+		t.Error("compiler2 should not have variable 'foo' from compiler1")
+	}
+
+	// Verify each compiler has its own variable
+	if _, ok := compiler1.state.mapType.Fields["foo"]; !ok {
+		t.Error("compiler1 should have variable 'foo'")
+	}
+	if _, ok := compiler2.state.mapType.Fields["baz"]; !ok {
+		t.Error("compiler2 should have variable 'baz'")
 	}
 }

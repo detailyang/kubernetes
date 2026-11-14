@@ -35,9 +35,12 @@ metadata:
 spec:
   attachRequired: true
   fsGroupPolicy: fsGroupPolicyValue
+  nodeAllocatableUpdatePeriodSeconds: 9
   podInfoOnMount: true
+  preventPodSchedulingIfMissing: true
   requiresRepublish: true
   seLinuxMount: true
+  serviceAccountTokenInSecrets: true
   storageCapacity: true
   tokenRequests:
   - audience: audienceValue

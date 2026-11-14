@@ -1,6 +1,181 @@
 {
   "components": {
     "schemas": {
+      "io.k8s.api.authorization.v1.AuthorizationOptions": {
+        "description": "AuthorizationOptions contains options for specifying the client's authorization abilities.",
+        "properties": {
+          "handledDecisionTypes": {
+            "description": "handledDecisionTypes specifies what decision types the client can handle in the context it is in. Currently valid values are: - [Allow, Deny, NoOpinion] (for conditions-unaware clients) or - [Allow, Deny, NoOpinion, ConditionsMap, Union, ...] (for conditions-aware clients) If the authorizer would like to return conditions, but the client does not opt in to handle those here,\n  the authorizer must fail closed to a safe unconditional decision\n  (Deny if any Deny conditions were present, otherwise NoOpinion).\nOrder does not matter in this slice; set semantics should be used. The server does not reject unrecognized decision types, but focuses on whether the client supports a mode that the server does. All clients must support \"classic\", conditions-unaware authorization.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "x-kubernetes-list-type": "set"
+          }
+        },
+        "required": [
+          "handledDecisionTypes"
+        ],
+        "type": "object"
+      },
+      "io.k8s.api.authorization.v1.Condition": {
+        "description": "Condition represents a single authorization condition to be evaluated against data available later in the request chain, e.g. objects available in admission.",
+        "properties": {
+          "condition": {
+            "description": "condition returns a string encoding of the condition to be evaluated. It is a pure, deterministic function from ConditionsData to a boolean (or error). Might or might not be human-readable. Optional, if the ID alone is enough for the authorizer to know how to evaluate the condition.",
+            "type": "string"
+          },
+          "description": {
+            "description": "description is an optional human-friendly description that can be shown as an error message or for debugging. Optional.",
+            "type": "string"
+          },
+          "id": {
+            "default": "",
+            "description": "id uniquely identifies this condition within the scope of the authorizer that authored it and ConditionsMap it is part of. Validated as a Kubernetes label key. Any domain of form *.k8s.io or *.kubernetes.io is reserved for Kubernetes use.",
+            "type": "string"
+          },
+          "type": {
+            "description": "type describes the type of the condition, if there are multiple possibilities. Should be formatted as a Kubernetes label key. Any domain of form *.k8s.io or *.kubernetes.io is reserved for Kubernetes use. authorizer.kubernetes.io/cel is a conditions type for CEL, handled by kube-apiserver. Optional. Can be omitted if the authorizer already knows how to evaluate the condition.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "io.k8s.api.authorization.v1.ConditionsAwareDecision": {
+        "description": "ConditionsAwareDecision represents one authorizer's decision. It is an enum type, with variants described in ConditionsAwareDecisionType, plus a reason and error.",
+        "properties": {
+          "allow": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.authorization.v1.UnconditionalDecision"
+              }
+            ],
+            "description": "allow represents an unconditional Allow decision. Must be non-null when type == \"Allow\", otherwise this field must be unset."
+          },
+          "conditionsMap": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.authorization.v1.ConditionsMap"
+              }
+            ],
+            "description": "conditionsMap represents a conditional decision, modelled as a map of conditions. Must be non-null when type == \"ConditionsMap\", otherwise this field must be unset."
+          },
+          "deny": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.authorization.v1.UnconditionalDecision"
+              }
+            ],
+            "description": "deny represents an unconditional Deny decision. Must be non-null when type == \"Deny\", otherwise this field must be unset."
+          },
+          "noOpinion": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.authorization.v1.UnconditionalDecision"
+              }
+            ],
+            "description": "noOpinion represents an unconditional NoOpinion decision. Must be non-null when type == \"NoOpinion\", otherwise this field must be unset."
+          },
+          "type": {
+            "default": "",
+            "description": "type describes the type of the decision, and acts as an enum discriminator.",
+            "type": "string"
+          },
+          "union": {
+            "description": "union forms an ordered tree of decisions, where the union decision is represented by an internal node, and all other decision types are leaf nodes. During evaluation, the leaf decisions are evaluated in depth-first order, until an Allow or Deny decision is found. The order of the decisions should match the order of the authorizers in the union authorizer for interpretability, but the authorizerName is the map key. At least one of the leaves must be of type ConditionsMap, as otherwise the union could be trivially reduced to just a single Allow/Deny/NoOpinion.\n\nMust have at least one element when type == \"Union\", otherwise this field must be unset.",
+            "items": {
+              "$ref": "#/components/schemas/io.k8s.api.authorization.v1.NamedConditionsAwareDecision"
+            },
+            "type": "array",
+            "x-kubernetes-list-map-keys": [
+              "authorizerName"
+            ],
+            "x-kubernetes-list-type": "map"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
+      "io.k8s.api.authorization.v1.ConditionsMap": {
+        "description": "ConditionsMap represents a map of conditions, keyed by ID across all conditions, across all effects. The ConditionsMap must have at least one Allow condition or at least one Deny condition. It cannot contain more than 128 conditions in total. The conditions are evaluated against data available later, to determine whether the authorizer that authored the conditions allows or denies the request. If all conditions in the map evaluate to false, the final decision must be NoOpinion.",
+        "properties": {
+          "allowConditions": {
+            "description": "allowConditions contains the conditions with Allow effect. If any such condition evaluates to true, the ConditionsMap as a whole must evaluate to Allow.",
+            "items": {
+              "$ref": "#/components/schemas/io.k8s.api.authorization.v1.Condition"
+            },
+            "type": "array",
+            "x-kubernetes-list-map-keys": [
+              "id"
+            ],
+            "x-kubernetes-list-type": "map"
+          },
+          "denyConditions": {
+            "description": "denyConditions contains the conditions with Deny effect. If any such condition evaluates to true or error, the ConditionsMap as a whole must evaluate to Deny.",
+            "items": {
+              "$ref": "#/components/schemas/io.k8s.api.authorization.v1.Condition"
+            },
+            "type": "array",
+            "x-kubernetes-list-map-keys": [
+              "id"
+            ],
+            "x-kubernetes-list-type": "map"
+          },
+          "noOpinionConditions": {
+            "description": "noOpinionConditions contains the conditions with NoOpinion effect. If any such condition evaluates to true or error, the ConditionsMap as a whole must evaluate to NoOpinion.",
+            "items": {
+              "$ref": "#/components/schemas/io.k8s.api.authorization.v1.Condition"
+            },
+            "type": "array",
+            "x-kubernetes-list-map-keys": [
+              "id"
+            ],
+            "x-kubernetes-list-type": "map"
+          }
+        },
+        "type": "object"
+      },
+      "io.k8s.api.authorization.v1.FieldSelectorAttributes": {
+        "description": "FieldSelectorAttributes indicates a field limited access. Webhook authors are encouraged to * ensure rawSelector and requirements are not both set * consider the requirements field if set * not try to parse or consider the rawSelector field if set. This is to avoid another CVE-2022-2880 (i.e. getting different systems to agree on how exactly to parse a query is not something we want), see https://www.oxeye.io/resources/golang-parameter-smuggling-attack for more details. For the *SubjectAccessReview endpoints of the kube-apiserver: * If rawSelector is empty and requirements are empty, the request is not limited. * If rawSelector is present and requirements are empty, the rawSelector will be parsed and limited if the parsing succeeds. * If rawSelector is empty and requirements are present, the requirements should be honored * If rawSelector is present and requirements are present, the request is invalid.",
+        "properties": {
+          "rawSelector": {
+            "description": "rawSelector is the serialization of a field selector that would be included in a query parameter. Webhook implementations are encouraged to ignore rawSelector. The kube-apiserver's *SubjectAccessReview will parse the rawSelector as long as the requirements are not present.",
+            "type": "string"
+          },
+          "requirements": {
+            "description": "requirements is the parsed interpretation of a field selector. All requirements must be met for a resource instance to match the selector. Webhook implementations should handle requirements, but how to handle them is up to the webhook. Since requirements can only limit the request, it is safe to authorize as unlimited request if the requirements are not understood.",
+            "items": {
+              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.FieldSelectorRequirement"
+            },
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
+          }
+        },
+        "type": "object"
+      },
+      "io.k8s.api.authorization.v1.LabelSelectorAttributes": {
+        "description": "LabelSelectorAttributes indicates a label limited access. Webhook authors are encouraged to * ensure rawSelector and requirements are not both set * consider the requirements field if set * not try to parse or consider the rawSelector field if set. This is to avoid another CVE-2022-2880 (i.e. getting different systems to agree on how exactly to parse a query is not something we want), see https://www.oxeye.io/resources/golang-parameter-smuggling-attack for more details. For the *SubjectAccessReview endpoints of the kube-apiserver: * If rawSelector is empty and requirements are empty, the request is not limited. * If rawSelector is present and requirements are empty, the rawSelector will be parsed and limited if the parsing succeeds. * If rawSelector is empty and requirements are present, the requirements should be honored * If rawSelector is present and requirements are present, the request is invalid.",
+        "properties": {
+          "rawSelector": {
+            "description": "rawSelector is the serialization of a field selector that would be included in a query parameter. Webhook implementations are encouraged to ignore rawSelector. The kube-apiserver's *SubjectAccessReview will parse the rawSelector as long as the requirements are not present.",
+            "type": "string"
+          },
+          "requirements": {
+            "description": "requirements is the parsed interpretation of a label selector. All requirements must be met for a resource instance to match the selector. Webhook implementations should handle requirements, but how to handle them is up to the webhook. Since requirements can only limit the request, it is safe to authorize as unlimited request if the requirements are not understood.",
+            "items": {
+              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.LabelSelectorRequirement"
+            },
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
+          }
+        },
+        "type": "object"
+      },
       "io.k8s.api.authorization.v1.LocalSubjectAccessReview": {
         "description": "LocalSubjectAccessReview checks whether or not a user or group can perform an action in a given namespace. Having a namespace scoped resource makes it much easier to grant namespace scoped policy that includes permissions checking.",
         "properties": {
@@ -19,7 +194,7 @@
               }
             ],
             "default": {},
-            "description": "Standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
+            "description": "metadata is the standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
           },
           "spec": {
             "allOf": [
@@ -28,7 +203,7 @@
               }
             ],
             "default": {},
-            "description": "Spec holds information about the request being evaluated.  spec.namespace must be equal to the namespace you made the request against.  If empty, it is defaulted."
+            "description": "spec holds information about the request being evaluated.  spec.namespace must be equal to the namespace you made the request against.  If empty, it is defaulted."
           },
           "status": {
             "allOf": [
@@ -37,7 +212,7 @@
               }
             ],
             "default": {},
-            "description": "Status is filled in by the server and indicates whether the request is allowed or not"
+            "description": "status is filled in by the server and indicates whether the request is allowed or not"
           }
         },
         "required": [
@@ -52,15 +227,39 @@
           }
         ]
       },
+      "io.k8s.api.authorization.v1.NamedConditionsAwareDecision": {
+        "description": "NamedConditionsAwareDecision is a named ConditionsAwareDecision, returned by a unioned authorizer.",
+        "properties": {
+          "authorizerName": {
+            "default": "",
+            "description": "authorizerName details the name of the authorizer that authored the condition, such that the right Decision can be paired with the right authorizer when evaluating the conditions, even across API server replicas. The name must be stable over time. This name must be unique within a given union authorizer, not necessarily globally.",
+            "type": "string"
+          },
+          "decision": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.authorization.v1.ConditionsAwareDecision"
+              }
+            ],
+            "default": {},
+            "description": "decision carries the inner decision returned from the authorizer."
+          }
+        },
+        "required": [
+          "authorizerName",
+          "decision"
+        ],
+        "type": "object"
+      },
       "io.k8s.api.authorization.v1.NonResourceAttributes": {
         "description": "NonResourceAttributes includes the authorization attributes available for non-resource requests to the Authorizer interface",
         "properties": {
           "path": {
-            "description": "Path is the URL path of the request",
+            "description": "path is the URL path of the request",
             "type": "string"
           },
           "verb": {
-            "description": "Verb is the standard HTTP verb",
+            "description": "verb is the standard HTTP verb",
             "type": "string"
           }
         },
@@ -70,56 +269,69 @@
         "description": "NonResourceRule holds information that describes a rule for the non-resource",
         "properties": {
           "nonResourceURLs": {
-            "description": "NonResourceURLs is a set of partial urls that a user should have access to.  *s are allowed, but only as the full, final step in the path.  \"*\" means all.",
+            "description": "nonResourceURLs is a set of partial urls that a user should have access to.  *s are allowed, but only as the full, final step in the path.  \"*\" means all.",
             "items": {
-              "default": "",
               "type": "string"
             },
-            "type": "array"
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
           },
           "verbs": {
-            "description": "Verb is a list of kubernetes non-resource API verbs, like: get, post, put, delete, patch, head, options.  \"*\" means all.",
+            "description": "verbs is a list of kubernetes non-resource API verbs, like: get, post, put, delete, patch, head, options.  \"*\" means all.",
             "items": {
-              "default": "",
               "type": "string"
             },
-            "type": "array"
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
           }
         },
-        "required": [
-          "verbs"
-        ],
         "type": "object"
       },
       "io.k8s.api.authorization.v1.ResourceAttributes": {
         "description": "ResourceAttributes includes the authorization attributes available for resource requests to the Authorizer interface",
         "properties": {
+          "fieldSelector": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.authorization.v1.FieldSelectorAttributes"
+              }
+            ],
+            "description": "fieldSelector describes the limitation on access based on field.  It can only limit access, not broaden it."
+          },
           "group": {
-            "description": "Group is the API Group of the Resource.  \"*\" means all.",
+            "description": "group is the API Group of the Resource.  \"*\" means all.",
             "type": "string"
           },
+          "labelSelector": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.authorization.v1.LabelSelectorAttributes"
+              }
+            ],
+            "description": "labelSelector describes the limitation on access based on labels.  It can only limit access, not broaden it."
+          },
           "name": {
-            "description": "Name is the name of the resource being requested for a \"get\" or deleted for a \"delete\". \"\" (empty) means all.",
+            "description": "name is the name of the resource being requested for a \"get\" or deleted for a \"delete\". \"\" (empty) means all.",
             "type": "string"
           },
           "namespace": {
-            "description": "Namespace is the namespace of the action being requested.  Currently, there is no distinction between no namespace and all namespaces \"\" (empty) is defaulted for LocalSubjectAccessReviews \"\" (empty) is empty for cluster-scoped resources \"\" (empty) means \"all\" for namespace scoped resources from a SubjectAccessReview or SelfSubjectAccessReview",
+            "description": "namespace is the namespace of the action being requested.  Currently, there is no distinction between no namespace and all namespaces \"\" (empty) is defaulted for LocalSubjectAccessReviews \"\" (empty) is empty for cluster-scoped resources \"\" (empty) means \"all\" for namespace scoped resources from a SubjectAccessReview or SelfSubjectAccessReview",
             "type": "string"
           },
           "resource": {
-            "description": "Resource is one of the existing resource types.  \"*\" means all.",
+            "description": "resource is one of the existing resource types.  \"*\" means all.",
             "type": "string"
           },
           "subresource": {
-            "description": "Subresource is one of the existing resource types.  \"\" means none.",
+            "description": "subresource is one of the existing resource types.  \"\" means none.",
             "type": "string"
           },
           "verb": {
-            "description": "Verb is a kubernetes resource API verb, like: get, list, watch, create, update, delete, proxy.  \"*\" means all.",
+            "description": "verb is a kubernetes resource API verb, like: get, list, watch, create, update, delete, proxy.  \"*\" means all.",
             "type": "string"
           },
           "version": {
-            "description": "Version is the API Version of the Resource.  \"*\" means all.",
+            "description": "version is the API Version of the Resource.  \"*\" means all.",
             "type": "string"
           }
         },
@@ -129,41 +341,38 @@
         "description": "ResourceRule is the list of actions the subject is allowed to perform on resources. The list ordering isn't significant, may contain duplicates, and possibly be incomplete.",
         "properties": {
           "apiGroups": {
-            "description": "APIGroups is the name of the APIGroup that contains the resources.  If multiple API groups are specified, any action requested against one of the enumerated resources in any API group will be allowed.  \"*\" means all.",
+            "description": "apiGroups is the name of the APIGroup that contains the resources.  If multiple API groups are specified, any action requested against one of the enumerated resources in any API group will be allowed.  \"*\" means all.",
             "items": {
-              "default": "",
               "type": "string"
             },
-            "type": "array"
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
           },
           "resourceNames": {
-            "description": "ResourceNames is an optional white list of names that the rule applies to.  An empty set means that everything is allowed.  \"*\" means all.",
+            "description": "resourceNames is an optional white list of names that the rule applies to.  An empty set means that everything is allowed.  \"*\" means all.",
             "items": {
-              "default": "",
               "type": "string"
             },
-            "type": "array"
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
           },
           "resources": {
-            "description": "Resources is a list of resources this rule applies to.  \"*\" means all in the specified apiGroups.\n \"*/foo\" represents the subresource 'foo' for all resources in the specified apiGroups.",
+            "description": "resources is a list of resources this rule applies to.  \"*\" means all in the specified apiGroups.\n \"*/foo\" represents the subresource 'foo' for all resources in the specified apiGroups.",
             "items": {
-              "default": "",
               "type": "string"
             },
-            "type": "array"
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
           },
           "verbs": {
-            "description": "Verb is a list of kubernetes resource API verbs, like: get, list, watch, create, update, delete, proxy.  \"*\" means all.",
+            "description": "verbs is a list of kubernetes resource API verbs, like: get, list, watch, create, update, delete, proxy.  \"*\" means all.",
             "items": {
-              "default": "",
               "type": "string"
             },
-            "type": "array"
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
           }
         },
-        "required": [
-          "verbs"
-        ],
         "type": "object"
       },
       "io.k8s.api.authorization.v1.SelfSubjectAccessReview": {
@@ -184,7 +393,7 @@
               }
             ],
             "default": {},
-            "description": "Standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
+            "description": "metadata is the standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
           },
           "spec": {
             "allOf": [
@@ -193,7 +402,7 @@
               }
             ],
             "default": {},
-            "description": "Spec holds information about the request being evaluated.  user and groups must be empty"
+            "description": "spec holds information about the request being evaluated.  user and groups must be empty"
           },
           "status": {
             "allOf": [
@@ -202,7 +411,7 @@
               }
             ],
             "default": {},
-            "description": "Status is filled in by the server and indicates whether the request is allowed or not"
+            "description": "status is filled in by the server and indicates whether the request is allowed or not"
           }
         },
         "required": [
@@ -218,15 +427,23 @@
         ]
       },
       "io.k8s.api.authorization.v1.SelfSubjectAccessReviewSpec": {
-        "description": "SelfSubjectAccessReviewSpec is a description of the access request.  Exactly one of ResourceAuthorizationAttributes and NonResourceAuthorizationAttributes must be set",
+        "description": "SelfSubjectAccessReviewSpec is a description of the access request.  Exactly one of resourceAttributes and nonResourceAttributes must be set",
         "properties": {
+          "authorizationOptions": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.authorization.v1.AuthorizationOptions"
+              }
+            ],
+            "description": "authorizationOptions contains options for specifying the client's authorization abilities. If unset, only unconditional authorization is supported, for backwards-compatibility. Requires the ConditionalAuthorization feature to be enabled."
+          },
           "nonResourceAttributes": {
             "allOf": [
               {
                 "$ref": "#/components/schemas/io.k8s.api.authorization.v1.NonResourceAttributes"
               }
             ],
-            "description": "NonResourceAttributes describes information for a non-resource access request"
+            "description": "nonResourceAttributes describes information for a non-resource access request"
           },
           "resourceAttributes": {
             "allOf": [
@@ -234,7 +451,7 @@
                 "$ref": "#/components/schemas/io.k8s.api.authorization.v1.ResourceAttributes"
               }
             ],
-            "description": "ResourceAuthorizationAttributes describes information for a resource access request"
+            "description": "resourceAttributes describes information for a resource access request"
           }
         },
         "type": "object"
@@ -257,7 +474,7 @@
               }
             ],
             "default": {},
-            "description": "Standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
+            "description": "metadata is the standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
           },
           "spec": {
             "allOf": [
@@ -266,7 +483,7 @@
               }
             ],
             "default": {},
-            "description": "Spec holds information about the request being evaluated."
+            "description": "spec holds information about the request being evaluated."
           },
           "status": {
             "allOf": [
@@ -275,7 +492,7 @@
               }
             ],
             "default": {},
-            "description": "Status is filled in by the server and indicates the set of actions a user can perform."
+            "description": "status is filled in by the server and indicates the set of actions a user can perform."
           }
         },
         "required": [
@@ -294,10 +511,13 @@
         "description": "SelfSubjectRulesReviewSpec defines the specification for SelfSubjectRulesReview.",
         "properties": {
           "namespace": {
-            "description": "Namespace to evaluate rules for. Required.",
+            "description": "namespace to evaluate rules for. Required.",
             "type": "string"
           }
         },
+        "required": [
+          "namespace"
+        ],
         "type": "object"
       },
       "io.k8s.api.authorization.v1.SubjectAccessReview": {
@@ -318,7 +538,7 @@
               }
             ],
             "default": {},
-            "description": "Standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
+            "description": "metadata is the standard list metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
           },
           "spec": {
             "allOf": [
@@ -327,7 +547,7 @@
               }
             ],
             "default": {},
-            "description": "Spec holds information about the request being evaluated"
+            "description": "spec holds information about the request being evaluated"
           },
           "status": {
             "allOf": [
@@ -336,7 +556,7 @@
               }
             ],
             "default": {},
-            "description": "Status is filled in by the server and indicates whether the request is allowed or not"
+            "description": "status is filled in by the server and indicates whether the request is allowed or not"
           }
         },
         "required": [
@@ -352,26 +572,33 @@
         ]
       },
       "io.k8s.api.authorization.v1.SubjectAccessReviewSpec": {
-        "description": "SubjectAccessReviewSpec is a description of the access request.  Exactly one of ResourceAuthorizationAttributes and NonResourceAuthorizationAttributes must be set",
+        "description": "SubjectAccessReviewSpec is a description of the access request.  Exactly one of resourceAttributes and nonResourceAttributes must be set",
         "properties": {
+          "authorizationOptions": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.authorization.v1.AuthorizationOptions"
+              }
+            ],
+            "description": "authorizationOptions contains options for specifying the client's authorization abilities. If unset, only unconditional authorization is supported, for backwards-compatibility. Requires the ConditionalAuthorization feature to be enabled."
+          },
           "extra": {
             "additionalProperties": {
               "items": {
-                "default": "",
                 "type": "string"
               },
               "type": "array"
             },
-            "description": "Extra corresponds to the user.Info.GetExtra() method from the authenticator.  Since that is input to the authorizer it needs a reflection here.",
+            "description": "extra corresponds to the user.Info.GetExtra() method from the authenticator.  Since that is input to the authorizer it needs a reflection here.",
             "type": "object"
           },
           "groups": {
-            "description": "Groups is the groups you're testing for.",
+            "description": "groups is the groups you're testing for.",
             "items": {
-              "default": "",
               "type": "string"
             },
-            "type": "array"
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
           },
           "nonResourceAttributes": {
             "allOf": [
@@ -379,7 +606,7 @@
                 "$ref": "#/components/schemas/io.k8s.api.authorization.v1.NonResourceAttributes"
               }
             ],
-            "description": "NonResourceAttributes describes information for a non-resource access request"
+            "description": "nonResourceAttributes describes information for a non-resource access request"
           },
           "resourceAttributes": {
             "allOf": [
@@ -387,14 +614,14 @@
                 "$ref": "#/components/schemas/io.k8s.api.authorization.v1.ResourceAttributes"
               }
             ],
-            "description": "ResourceAuthorizationAttributes describes information for a resource access request"
+            "description": "resourceAttributes describes information for a resource access request"
           },
           "uid": {
-            "description": "UID information about the requesting user.",
+            "description": "uid information about the requesting user.",
             "type": "string"
           },
           "user": {
-            "description": "User is the user you're testing for. If you specify \"User\" but not \"Groups\", then is it interpreted as \"What if User were not a member of any groups",
+            "description": "user is the user you're testing for. If you specify \"User\" but not \"Groups\", then is it interpreted as \"What if User were not a member of any groups",
             "type": "string"
           }
         },
@@ -405,69 +632,75 @@
         "properties": {
           "allowed": {
             "default": false,
-            "description": "Allowed is required. True if the action would be allowed, false otherwise.",
+            "description": "allowed is true if the action would be allowed, false otherwise. allowed=true is mutually exclusive with denied=true and conditionalDecision != nil.",
             "type": "boolean"
           },
+          "conditionalDecision": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/io.k8s.api.authorization.v1.ConditionsAwareDecision"
+              }
+            ],
+            "description": "conditionalDecision represents a conditional decision returned by the authorizer. When conditionalDecision is set, allowed, denied, reason and evaluationError must have their zero values. The top-level decision type should be ConditionsAwareDecisionTypeConditionsMap or ConditionsAwareDecisionTypeUnion, as Allow/Deny/NoOpinion decisions can be represented with SubjectAccessReviewStatus.Allowed and SubjectAccessReviewStatus.Denied alone. May only be set if spec.authorizationOptions.handledDecisionTypes includes `ConditionsMap` and `Union`. Requires the ConditionalAuthorization feature to be enabled."
+          },
           "denied": {
-            "description": "Denied is optional. True if the action would be denied, otherwise false. If both allowed is false and denied is false, then the authorizer has no opinion on whether to authorize the action. Denied may not be true if Allowed is true.",
+            "description": "denied is optional. True if the action would be denied, otherwise false If allowed is false, denied is false, and conditionalDecision is unset, then the authorizer has no opinion on whether to authorize the action. denied=true is mutually exclusive with allowed=true and conditionalDecision != nil.",
             "type": "boolean"
           },
           "evaluationError": {
-            "description": "EvaluationError is an indication that some error occurred during the authorization check. It is entirely possible to get an error and be able to continue determine authorization status in spite of it. For instance, RBAC can be missing a role, but enough roles are still present and bound to reason about the request.",
+            "description": "evaluationError is an indication that some error occurred during the authorization check. It is entirely possible to get an error and be able to continue determine authorization status in spite of it. For instance, RBAC can be missing a role, but enough roles are still present and bound to reason about the request.",
             "type": "string"
           },
           "reason": {
-            "description": "Reason is optional.  It indicates why a request was allowed or denied.",
+            "description": "reason is optional.  It indicates why a request was allowed or denied.",
             "type": "string"
           }
         },
-        "required": [
-          "allowed"
-        ],
         "type": "object"
       },
       "io.k8s.api.authorization.v1.SubjectRulesReviewStatus": {
         "description": "SubjectRulesReviewStatus contains the result of a rules check. This check can be incomplete depending on the set of authorizers the server is configured with and any errors experienced during evaluation. Because authorization rules are additive, if a rule appears in a list it's safe to assume the subject has that permission, even if that list is incomplete.",
         "properties": {
           "evaluationError": {
-            "description": "EvaluationError can appear in combination with Rules. It indicates an error occurred during rule evaluation, such as an authorizer that doesn't support rule evaluation, and that ResourceRules and/or NonResourceRules may be incomplete.",
+            "description": "evaluationError can appear in combination with Rules. It indicates an error occurred during rule evaluation, such as an authorizer that doesn't support rule evaluation, and that ResourceRules and/or NonResourceRules may be incomplete.",
             "type": "string"
           },
           "incomplete": {
             "default": false,
-            "description": "Incomplete is true when the rules returned by this call are incomplete. This is most commonly encountered when an authorizer, such as an external authorizer, doesn't support rules evaluation.",
+            "description": "incomplete is true when the rules returned by this call are incomplete. This is most commonly encountered when an authorizer, such as an external authorizer, doesn't support rules evaluation.",
             "type": "boolean"
           },
           "nonResourceRules": {
-            "description": "NonResourceRules is the list of actions the subject is allowed to perform on non-resources. The list ordering isn't significant, may contain duplicates, and possibly be incomplete.",
+            "description": "nonResourceRules is the list of actions the subject is allowed to perform on non-resources. The list ordering isn't significant, may contain duplicates, and possibly be incomplete.",
             "items": {
-              "allOf": [
-                {
-                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.NonResourceRule"
-                }
-              ],
-              "default": {}
+              "$ref": "#/components/schemas/io.k8s.api.authorization.v1.NonResourceRule"
             },
-            "type": "array"
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
           },
           "resourceRules": {
-            "description": "ResourceRules is the list of actions the subject is allowed to perform on resources. The list ordering isn't significant, may contain duplicates, and possibly be incomplete.",
+            "description": "resourceRules is the list of actions the subject is allowed to perform on resources. The list ordering isn't significant, may contain duplicates, and possibly be incomplete.",
             "items": {
-              "allOf": [
-                {
-                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.ResourceRule"
-                }
-              ],
-              "default": {}
+              "$ref": "#/components/schemas/io.k8s.api.authorization.v1.ResourceRule"
             },
-            "type": "array"
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
           }
         },
-        "required": [
-          "resourceRules",
-          "nonResourceRules",
-          "incomplete"
-        ],
+        "type": "object"
+      },
+      "io.k8s.api.authorization.v1.UnconditionalDecision": {
+        "description": "UnconditionalDecision represents the data associated with an unconditional decision.",
+        "properties": {
+          "evaluationError": {
+            "description": "evaluationError is an indication that some error occurred during the authorization check. It is entirely possible to get an error and be able to continue determine authorization status in spite of it. For instance, RBAC can be missing a role, but enough roles are still present and bound to reason about the request.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "reason is optional. It indicates why a request was allowed or denied.",
+            "type": "string"
+          }
+        },
         "type": "object"
       },
       "io.k8s.apimachinery.pkg.apis.meta.v1.APIResource": {
@@ -476,10 +709,10 @@
           "categories": {
             "description": "categories is a list of the grouped resources this resource belongs to (e.g. 'all')",
             "items": {
-              "default": "",
               "type": "string"
             },
-            "type": "array"
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
           },
           "group": {
             "description": "group is the preferred group of the resource.  Empty implies the group of the containing resource list. For subresources, this may have a different value, for example: Scale\".",
@@ -503,10 +736,10 @@
           "shortNames": {
             "description": "shortNames is a list of suggested short names of the resource.",
             "items": {
-              "default": "",
               "type": "string"
             },
-            "type": "array"
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
           },
           "singularName": {
             "default": "",
@@ -520,7 +753,6 @@
           "verbs": {
             "description": "verbs is a list of supported kube verbs (this includes get, list, watch, create, update, patch, delete, deletecollection, and proxy)",
             "items": {
-              "default": "",
               "type": "string"
             },
             "type": "array"
@@ -558,14 +790,10 @@
           "resources": {
             "description": "resources contains the name of the resources and if they are namespaced.",
             "items": {
-              "allOf": [
-                {
-                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.APIResource"
-                }
-              ],
-              "default": {}
+              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.APIResource"
             },
-            "type": "array"
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
           }
         },
         "required": [
@@ -581,8 +809,64 @@
           }
         ]
       },
+      "io.k8s.apimachinery.pkg.apis.meta.v1.FieldSelectorRequirement": {
+        "description": "FieldSelectorRequirement is a selector that contains values, a key, and an operator that relates the key and values.",
+        "properties": {
+          "key": {
+            "default": "",
+            "description": "key is the field selector key that the requirement applies to.",
+            "type": "string"
+          },
+          "operator": {
+            "default": "",
+            "description": "operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists, DoesNotExist. The list of operators may grow in the future.",
+            "type": "string"
+          },
+          "values": {
+            "description": "values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
+          }
+        },
+        "required": [
+          "key",
+          "operator"
+        ],
+        "type": "object"
+      },
       "io.k8s.apimachinery.pkg.apis.meta.v1.FieldsV1": {
         "description": "FieldsV1 stores a set of fields in a data structure like a Trie, in JSON format.\n\nEach key is either a '.' representing the field itself, and will always map to an empty set, or a string representing a sub-field or item. The string will follow one of these four formats: 'f:<name>', where <name> is the name of a field in a struct, or key in a map 'v:<value>', where <value> is the exact json formatted value of a list item 'i:<index>', where <index> is position of a item in a list 'k:<keys>', where <keys> is a map of  a list item's key fields to their unique values If a key maps to an empty Fields value, the field that key represents is part of the set.\n\nThe exact format is defined in sigs.k8s.io/structured-merge-diff",
+        "type": "object"
+      },
+      "io.k8s.apimachinery.pkg.apis.meta.v1.LabelSelectorRequirement": {
+        "description": "A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values.",
+        "properties": {
+          "key": {
+            "default": "",
+            "description": "key is the label key that the selector applies to.",
+            "type": "string"
+          },
+          "operator": {
+            "default": "",
+            "description": "operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist.",
+            "type": "string"
+          },
+          "values": {
+            "description": "values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
+          }
+        },
+        "required": [
+          "key",
+          "operator"
+        ],
         "type": "object"
       },
       "io.k8s.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry": {
@@ -632,7 +916,6 @@
         "properties": {
           "annotations": {
             "additionalProperties": {
-              "default": "",
               "type": "string"
             },
             "description": "Annotations is an unstructured key value map stored with a resource that may be set by external tools to store and retrieve arbitrary metadata. They are not queryable and should be preserved when modifying objects. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations",
@@ -644,7 +927,6 @@
                 "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.Time"
               }
             ],
-            "default": {},
             "description": "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
           },
           "deletionGracePeriodSeconds": {
@@ -663,10 +945,10 @@
           "finalizers": {
             "description": "Must be empty before the object is deleted from the registry. Each entry is an identifier for the responsible component that will remove the entry from the list. If the deletionTimestamp of the object is non-nil, entries in this list can only be removed. Finalizers may be processed and removed in any order.  Order is NOT enforced because it introduces significant risk of stuck finalizers. finalizers is a shared field, any actor with permission can reorder it. If the finalizer list is processed in order, then this can lead to a situation in which the component responsible for the first finalizer in the list is waiting for a signal (field value, external system, or other) produced by a component responsible for a finalizer later in the list, resulting in a deadlock. Without enforced ordering finalizers are free to order amongst themselves and are not vulnerable to ordering changes in the list.",
             "items": {
-              "default": "",
               "type": "string"
             },
             "type": "array",
+            "x-kubernetes-list-type": "set",
             "x-kubernetes-patch-strategy": "merge"
           },
           "generateName": {
@@ -680,7 +962,6 @@
           },
           "labels": {
             "additionalProperties": {
-              "default": "",
               "type": "string"
             },
             "description": "Map of string keys and values that can be used to organize and categorize (scope and select) objects. May match selectors of replication controllers and services. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels",
@@ -689,14 +970,10 @@
           "managedFields": {
             "description": "ManagedFields maps workflow-id and version to the set of fields that are managed by that workflow. This is mostly for internal housekeeping, and users typically shouldn't need to set or understand this field. A workflow can be the user's name, a controller's name, or the name of a specific apply path like \"ci-cd\". The set of fields is always in the version that the workflow used when modifying the object.",
             "items": {
-              "allOf": [
-                {
-                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry"
-                }
-              ],
-              "default": {}
+              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry"
             },
-            "type": "array"
+            "type": "array",
+            "x-kubernetes-list-type": "atomic"
           },
           "name": {
             "description": "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
@@ -709,14 +986,13 @@
           "ownerReferences": {
             "description": "List of objects depended by this object. If ALL objects in the list have been deleted, this object will be garbage collected. If this object is managed by a controller, then an entry in this list will point to this controller, with the controller field set to true. There cannot be more than one managing controller.",
             "items": {
-              "allOf": [
-                {
-                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference"
-                }
-              ],
-              "default": {}
+              "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference"
             },
             "type": "array",
+            "x-kubernetes-list-map-keys": [
+              "uid"
+            ],
+            "x-kubernetes-list-type": "map",
             "x-kubernetes-patch-merge-key": "uid",
             "x-kubernetes-patch-strategy": "merge"
           },
@@ -804,6 +1080,11 @@
         "responses": {
           "200": {
             "content": {
+              "application/cbor": {
+                "schema": {
+                  "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.APIResourceList"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.APIResourceList"
@@ -871,7 +1152,7 @@
           }
         },
         {
-          "description": "If 'true', then the output is pretty printed.",
+          "description": "If 'true', then the output is pretty printed. Defaults to 'false' unless the user-agent indicates a browser or command-line HTTP tool (curl and wget).",
           "in": "query",
           "name": "pretty",
           "schema": {
@@ -890,11 +1171,17 @@
                 "$ref": "#/components/schemas/io.k8s.api.authorization.v1.LocalSubjectAccessReview"
               }
             }
-          }
+          },
+          "required": true
         },
         "responses": {
           "200": {
             "content": {
+              "application/cbor": {
+                "schema": {
+                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.LocalSubjectAccessReview"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/io.k8s.api.authorization.v1.LocalSubjectAccessReview"
@@ -915,6 +1202,11 @@
           },
           "201": {
             "content": {
+              "application/cbor": {
+                "schema": {
+                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.LocalSubjectAccessReview"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/io.k8s.api.authorization.v1.LocalSubjectAccessReview"
@@ -935,6 +1227,11 @@
           },
           "202": {
             "content": {
+              "application/cbor": {
+                "schema": {
+                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.LocalSubjectAccessReview"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/io.k8s.api.authorization.v1.LocalSubjectAccessReview"
@@ -998,7 +1295,7 @@
           }
         },
         {
-          "description": "If 'true', then the output is pretty printed.",
+          "description": "If 'true', then the output is pretty printed. Defaults to 'false' unless the user-agent indicates a browser or command-line HTTP tool (curl and wget).",
           "in": "query",
           "name": "pretty",
           "schema": {
@@ -1017,11 +1314,17 @@
                 "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectAccessReview"
               }
             }
-          }
+          },
+          "required": true
         },
         "responses": {
           "200": {
             "content": {
+              "application/cbor": {
+                "schema": {
+                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectAccessReview"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectAccessReview"
@@ -1042,6 +1345,11 @@
           },
           "201": {
             "content": {
+              "application/cbor": {
+                "schema": {
+                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectAccessReview"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectAccessReview"
@@ -1062,6 +1370,11 @@
           },
           "202": {
             "content": {
+              "application/cbor": {
+                "schema": {
+                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectAccessReview"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectAccessReview"
@@ -1125,7 +1438,7 @@
           }
         },
         {
-          "description": "If 'true', then the output is pretty printed.",
+          "description": "If 'true', then the output is pretty printed. Defaults to 'false' unless the user-agent indicates a browser or command-line HTTP tool (curl and wget).",
           "in": "query",
           "name": "pretty",
           "schema": {
@@ -1144,11 +1457,17 @@
                 "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectRulesReview"
               }
             }
-          }
+          },
+          "required": true
         },
         "responses": {
           "200": {
             "content": {
+              "application/cbor": {
+                "schema": {
+                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectRulesReview"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectRulesReview"
@@ -1169,6 +1488,11 @@
           },
           "201": {
             "content": {
+              "application/cbor": {
+                "schema": {
+                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectRulesReview"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectRulesReview"
@@ -1189,6 +1513,11 @@
           },
           "202": {
             "content": {
+              "application/cbor": {
+                "schema": {
+                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectRulesReview"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SelfSubjectRulesReview"
@@ -1252,7 +1581,7 @@
           }
         },
         {
-          "description": "If 'true', then the output is pretty printed.",
+          "description": "If 'true', then the output is pretty printed. Defaults to 'false' unless the user-agent indicates a browser or command-line HTTP tool (curl and wget).",
           "in": "query",
           "name": "pretty",
           "schema": {
@@ -1271,11 +1600,17 @@
                 "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SubjectAccessReview"
               }
             }
-          }
+          },
+          "required": true
         },
         "responses": {
           "200": {
             "content": {
+              "application/cbor": {
+                "schema": {
+                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SubjectAccessReview"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SubjectAccessReview"
@@ -1296,6 +1631,11 @@
           },
           "201": {
             "content": {
+              "application/cbor": {
+                "schema": {
+                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SubjectAccessReview"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SubjectAccessReview"
@@ -1316,6 +1656,11 @@
           },
           "202": {
             "content": {
+              "application/cbor": {
+                "schema": {
+                  "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SubjectAccessReview"
+                }
+              },
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/io.k8s.api.authorization.v1.SubjectAccessReview"

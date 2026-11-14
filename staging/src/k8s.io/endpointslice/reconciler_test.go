@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
@@ -38,17 +39,22 @@ import (
 	corelisters "k8s.io/client-go/listers/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/metrics/testutil"
 	"k8s.io/endpointslice/metrics"
 	"k8s.io/endpointslice/topologycache"
 	endpointsliceutil "k8s.io/endpointslice/util"
 	"k8s.io/klog/v2/ktesting"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 const (
 	controllerName = "endpointslice-controller.k8s.io"
 )
+
+func init() {
+	metrics.RegisterMetrics()
+}
 
 func expectAction(t *testing.T, actions []k8stesting.Action, index int, verb, resource string) {
 	t.Helper()
@@ -113,7 +119,7 @@ var defaultMaxEndpointsPerSlice = int32(100)
 // Even when there are no pods, we want to have a placeholder slice for each service
 func TestReconcileEmpty(t *testing.T) {
 	client := newClientset()
-	setupMetrics()
+	resetMetrics()
 	namespace := "test"
 	svc, _ := newServiceAndEndpointMeta("foo", namespace)
 
@@ -136,9 +142,6 @@ func TestReconcileEmpty(t *testing.T) {
 // a slice should be created
 func TestReconcile1Pod(t *testing.T) {
 	namespace := "test"
-	noFamilyService, _ := newServiceAndEndpointMeta("foo", namespace)
-	noFamilyService.Spec.ClusterIP = "10.0.0.10"
-	noFamilyService.Spec.IPFamilies = nil
 
 	svcv4, _ := newServiceAndEndpointMeta("foo", namespace)
 	svcv4ClusterIP, _ := newServiceAndEndpointMeta("foo", namespace)
@@ -181,32 +184,6 @@ func TestReconcile1Pod(t *testing.T) {
 		expectedLabels           map[string]string
 		expectedEndpointPerSlice map[discovery.AddressType][]discovery.Endpoint
 	}{
-		"no-family-service": {
-			service: noFamilyService,
-			expectedEndpointPerSlice: map[discovery.AddressType][]discovery.Endpoint{
-				discovery.AddressTypeIPv4: {
-					{
-						Addresses: []string{"1.2.3.4"},
-						Conditions: discovery.EndpointConditions{
-							Ready:       pointer.Bool(true),
-							Serving:     pointer.Bool(true),
-							Terminating: pointer.Bool(false),
-						},
-						Zone:     pointer.String("us-central1-a"),
-						NodeName: pointer.String("node-1"),
-						TargetRef: &corev1.ObjectReference{
-							Kind:      "Pod",
-							Namespace: namespace,
-							Name:      "pod1",
-						},
-					},
-				},
-			},
-			expectedLabels: map[string]string{
-				discovery.LabelManagedBy:   controllerName,
-				discovery.LabelServiceName: "foo",
-			},
-		},
 		"ipv4": {
 			service: svcv4,
 			expectedEndpointPerSlice: map[discovery.AddressType][]discovery.Endpoint{
@@ -214,12 +191,12 @@ func TestReconcile1Pod(t *testing.T) {
 					{
 						Addresses: []string{"1.2.3.4"},
 						Conditions: discovery.EndpointConditions{
-							Ready:       pointer.Bool(true),
-							Serving:     pointer.Bool(true),
-							Terminating: pointer.Bool(false),
+							Ready:       ptr.To(true),
+							Serving:     ptr.To(true),
+							Terminating: ptr.To(false),
 						},
-						Zone:     pointer.String("us-central1-a"),
-						NodeName: pointer.String("node-1"),
+						Zone:     ptr.To("us-central1-a"),
+						NodeName: ptr.To("node-1"),
 						TargetRef: &corev1.ObjectReference{
 							Kind:      "Pod",
 							Namespace: namespace,
@@ -241,12 +218,12 @@ func TestReconcile1Pod(t *testing.T) {
 					{
 						Addresses: []string{"1.2.3.4"},
 						Conditions: discovery.EndpointConditions{
-							Ready:       pointer.Bool(true),
-							Serving:     pointer.Bool(true),
-							Terminating: pointer.Bool(false),
+							Ready:       ptr.To(true),
+							Serving:     ptr.To(true),
+							Terminating: ptr.To(false),
 						},
-						Zone:     pointer.String("us-central1-a"),
-						NodeName: pointer.String("node-1"),
+						Zone:     ptr.To("us-central1-a"),
+						NodeName: ptr.To("node-1"),
 						TargetRef: &corev1.ObjectReference{
 							Kind:      "Pod",
 							Namespace: namespace,
@@ -259,12 +236,12 @@ func TestReconcile1Pod(t *testing.T) {
 			expectedEndpoint: discovery.Endpoint{
 				Addresses: []string{"1.2.3.4"},
 				Conditions: discovery.EndpointConditions{
-					Ready:       pointer.Bool(true),
-					Serving:     pointer.Bool(true),
-					Terminating: pointer.Bool(false),
+					Ready:       ptr.To(true),
+					Serving:     ptr.To(true),
+					Terminating: ptr.To(false),
 				},
-				Zone:     pointer.String("us-central1-a"),
-				NodeName: pointer.String("node-1"),
+				Zone:     ptr.To("us-central1-a"),
+				NodeName: ptr.To("node-1"),
 				TargetRef: &corev1.ObjectReference{
 					Kind:      "Pod",
 					Namespace: namespace,
@@ -283,12 +260,12 @@ func TestReconcile1Pod(t *testing.T) {
 					{
 						Addresses: []string{"1.2.3.4"},
 						Conditions: discovery.EndpointConditions{
-							Ready:       pointer.Bool(true),
-							Serving:     pointer.Bool(true),
-							Terminating: pointer.Bool(false),
+							Ready:       ptr.To(true),
+							Serving:     ptr.To(true),
+							Terminating: ptr.To(false),
 						},
-						Zone:     pointer.String("us-central1-a"),
-						NodeName: pointer.String("node-1"),
+						Zone:     ptr.To("us-central1-a"),
+						NodeName: ptr.To("node-1"),
 						TargetRef: &corev1.ObjectReference{
 							Kind:      "Pod",
 							Namespace: namespace,
@@ -301,12 +278,12 @@ func TestReconcile1Pod(t *testing.T) {
 			expectedEndpoint: discovery.Endpoint{
 				Addresses: []string{"1.2.3.4"},
 				Conditions: discovery.EndpointConditions{
-					Ready:       pointer.Bool(true),
-					Serving:     pointer.Bool(true),
-					Terminating: pointer.Bool(false),
+					Ready:       ptr.To(true),
+					Serving:     ptr.To(true),
+					Terminating: ptr.To(false),
 				},
-				Zone:     pointer.String("us-central1-a"),
-				NodeName: pointer.String("node-1"),
+				Zone:     ptr.To("us-central1-a"),
+				NodeName: ptr.To("node-1"),
 				TargetRef: &corev1.ObjectReference{
 					Kind:      "Pod",
 					Namespace: namespace,
@@ -327,12 +304,12 @@ func TestReconcile1Pod(t *testing.T) {
 					{
 						Addresses: []string{"1.2.3.4"},
 						Conditions: discovery.EndpointConditions{
-							Ready:       pointer.Bool(true),
-							Serving:     pointer.Bool(true),
-							Terminating: pointer.Bool(false),
+							Ready:       ptr.To(true),
+							Serving:     ptr.To(true),
+							Terminating: ptr.To(false),
 						},
-						Zone:     pointer.String("us-central1-a"),
-						NodeName: pointer.String("node-1"),
+						Zone:     ptr.To("us-central1-a"),
+						NodeName: ptr.To("node-1"),
 						TargetRef: &corev1.ObjectReference{
 							Kind:      "Pod",
 							Namespace: namespace,
@@ -345,12 +322,12 @@ func TestReconcile1Pod(t *testing.T) {
 			expectedEndpoint: discovery.Endpoint{
 				Addresses: []string{"1.2.3.4"},
 				Conditions: discovery.EndpointConditions{
-					Ready:       pointer.Bool(true),
-					Serving:     pointer.Bool(true),
-					Terminating: pointer.Bool(false),
+					Ready:       ptr.To(true),
+					Serving:     ptr.To(true),
+					Terminating: ptr.To(false),
 				},
-				Zone:     pointer.String("us-central1-a"),
-				NodeName: pointer.String("node-1"),
+				Zone:     ptr.To("us-central1-a"),
+				NodeName: ptr.To("node-1"),
 				TargetRef: &corev1.ObjectReference{
 					Kind:      "Pod",
 					Namespace: namespace,
@@ -369,14 +346,14 @@ func TestReconcile1Pod(t *testing.T) {
 			expectedEndpointPerSlice: map[discovery.AddressType][]discovery.Endpoint{
 				discovery.AddressTypeIPv6: {
 					{
-						Addresses: []string{"1234::5678:0000:0000:9abc:def0"},
+						Addresses: []string{"1234::5678:0:0:9abc:def0"},
 						Conditions: discovery.EndpointConditions{
-							Ready:       pointer.Bool(true),
-							Serving:     pointer.Bool(true),
-							Terminating: pointer.Bool(false),
+							Ready:       ptr.To(true),
+							Serving:     ptr.To(true),
+							Terminating: ptr.To(false),
 						},
-						Zone:     pointer.String("us-central1-a"),
-						NodeName: pointer.String("node-1"),
+						Zone:     ptr.To("us-central1-a"),
+						NodeName: ptr.To("node-1"),
 						TargetRef: &corev1.ObjectReference{
 							Kind:      "Pod",
 							Namespace: namespace,
@@ -397,14 +374,14 @@ func TestReconcile1Pod(t *testing.T) {
 			expectedEndpointPerSlice: map[discovery.AddressType][]discovery.Endpoint{
 				discovery.AddressTypeIPv6: {
 					{
-						Addresses: []string{"1234::5678:0000:0000:9abc:def0"},
+						Addresses: []string{"1234::5678:0:0:9abc:def0"},
 						Conditions: discovery.EndpointConditions{
-							Ready:       pointer.Bool(true),
-							Serving:     pointer.Bool(true),
-							Terminating: pointer.Bool(false),
+							Ready:       ptr.To(true),
+							Serving:     ptr.To(true),
+							Terminating: ptr.To(false),
 						},
-						Zone:     pointer.String("us-central1-a"),
-						NodeName: pointer.String("node-1"),
+						Zone:     ptr.To("us-central1-a"),
+						NodeName: ptr.To("node-1"),
 						TargetRef: &corev1.ObjectReference{
 							Kind:      "Pod",
 							Namespace: namespace,
@@ -424,14 +401,14 @@ func TestReconcile1Pod(t *testing.T) {
 			expectedEndpointPerSlice: map[discovery.AddressType][]discovery.Endpoint{
 				discovery.AddressTypeIPv6: {
 					{
-						Addresses: []string{"1234::5678:0000:0000:9abc:def0"},
+						Addresses: []string{"1234::5678:0:0:9abc:def0"},
 						Conditions: discovery.EndpointConditions{
-							Ready:       pointer.Bool(true),
-							Serving:     pointer.Bool(true),
-							Terminating: pointer.Bool(false),
+							Ready:       ptr.To(true),
+							Serving:     ptr.To(true),
+							Terminating: ptr.To(false),
 						},
-						Zone:     pointer.String("us-central1-a"),
-						NodeName: pointer.String("node-1"),
+						Zone:     ptr.To("us-central1-a"),
+						NodeName: ptr.To("node-1"),
 						TargetRef: &corev1.ObjectReference{
 							Kind:      "Pod",
 							Namespace: namespace,
@@ -443,12 +420,12 @@ func TestReconcile1Pod(t *testing.T) {
 					{
 						Addresses: []string{"1.2.3.4"},
 						Conditions: discovery.EndpointConditions{
-							Ready:       pointer.Bool(true),
-							Serving:     pointer.Bool(true),
-							Terminating: pointer.Bool(false),
+							Ready:       ptr.To(true),
+							Serving:     ptr.To(true),
+							Terminating: ptr.To(false),
 						},
-						Zone:     pointer.String("us-central1-a"),
-						NodeName: pointer.String("node-1"),
+						Zone:     ptr.To("us-central1-a"),
+						NodeName: ptr.To("node-1"),
 						TargetRef: &corev1.ObjectReference{
 							Kind:      "Pod",
 							Namespace: namespace,
@@ -467,7 +444,7 @@ func TestReconcile1Pod(t *testing.T) {
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
 			client := newClientset()
-			setupMetrics()
+			resetMetrics()
 			triggerTime := time.Now().UTC()
 			r := newReconciler(client, []*corev1.Node{node1}, defaultMaxEndpointsPerSlice)
 			reconcileHelper(t, r, &testCase.service, []*corev1.Pod{pod1}, []*discovery.EndpointSlice{}, triggerTime)
@@ -573,13 +550,13 @@ func TestReconcile1EndpointSlice(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
 			client := newClientset()
-			setupMetrics()
+			resetMetrics()
 
 			existingSlices := []*discovery.EndpointSlice{}
 			if tc.existing != nil {
 				existingSlices = append(existingSlices, tc.existing)
 				_, createErr := client.DiscoveryV1().EndpointSlices(namespace).Create(context.TODO(), tc.existing, metav1.CreateOptions{})
-				assert.Nil(t, createErr, "Expected no error creating endpoint slice")
+				assert.NoError(t, createErr, "Expected no error creating endpoint slice")
 			}
 
 			numActionsBefore := len(client.Actions())
@@ -677,6 +654,35 @@ func TestPlaceHolderSliceCompare(t *testing.T) {
 			y:    &discovery.EndpointSlice{AddressType: discovery.AddressTypeIPv6},
 			want: false,
 		},
+
+		{
+			desc: "OwnerReferences with different UID",
+			x: &discovery.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
+				OwnerReferences: []metav1.OwnerReference{{UID: "uid-1"}},
+			}},
+			y: &discovery.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
+				OwnerReferences: []metav1.OwnerReference{{UID: "uid-2"}},
+			}},
+			want: false,
+		},
+		{
+			desc: "OwnerReferences with different length",
+			x: &discovery.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
+				OwnerReferences: []metav1.OwnerReference{{UID: "uid-1"}},
+			}},
+			y:    &discovery.EndpointSlice{},
+			want: false,
+		},
+		{
+			desc: "OwnerReferences matching",
+			x: &discovery.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
+				OwnerReferences: []metav1.OwnerReference{{UID: "uid-1"}},
+			}},
+			y: &discovery.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
+				OwnerReferences: []metav1.OwnerReference{{UID: "uid-1"}},
+			}},
+			want: true,
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
@@ -699,7 +705,7 @@ func TestReconcile1EndpointSlicePublishNotReadyAddresses(t *testing.T) {
 	// start with 50 pods, 1/3 not ready
 	pods := []*corev1.Pod{}
 	for i := 0; i < 50; i++ {
-		ready := !(i%3 == 0)
+		ready := i%3 != 0
 		pods = append(pods, newPod(i, namespace, ready, 1, false))
 	}
 
@@ -726,14 +732,14 @@ func TestReconcile1EndpointSlicePublishNotReadyAddresses(t *testing.T) {
 // reconcile should create 3 slices, completely filling 2 of them
 func TestReconcileManyPods(t *testing.T) {
 	client := newClientset()
-	setupMetrics()
+	resetMetrics()
 	namespace := "test"
 	svc, _ := newServiceAndEndpointMeta("foo", namespace)
 
 	// start with 250 pods
 	pods := []*corev1.Pod{}
 	for i := 0; i < 250; i++ {
-		ready := !(i%3 == 0)
+		ready := i%3 != 0
 		pods = append(pods, newPod(i, namespace, ready, 1, false))
 	}
 
@@ -759,14 +765,14 @@ func TestReconcileManyPods(t *testing.T) {
 // this approach requires 1 update + 1 create instead of 2 updates + 1 create
 func TestReconcileEndpointSlicesSomePreexisting(t *testing.T) {
 	client := newClientset()
-	setupMetrics()
+	resetMetrics()
 	namespace := "test"
 	svc, endpointMeta := newServiceAndEndpointMeta("foo", namespace)
 
 	// start with 250 pods
 	pods := []*corev1.Pod{}
 	for i := 0; i < 250; i++ {
-		ready := !(i%3 == 0)
+		ready := i%3 != 0
 		pods = append(pods, newPod(i, namespace, ready, 1, false))
 	}
 
@@ -791,7 +797,7 @@ func TestReconcileEndpointSlicesSomePreexisting(t *testing.T) {
 	reconcileHelper(t, r, &svc, pods, existingSlices, time.Now())
 
 	actions := client.Actions()
-	assert.Equal(t, numActionsBefore+2, len(actions), "Expected 2 additional client actions as part of reconcile")
+	assert.Len(t, actions, numActionsBefore+2, "Expected 2 additional client actions as part of reconcile")
 	assert.True(t, actions[numActionsBefore].Matches("create", "endpointslices"), "First action should be create endpoint slice")
 	assert.True(t, actions[numActionsBefore+1].Matches("update", "endpointslices"), "Second action should be update endpoint slice")
 
@@ -815,14 +821,14 @@ func TestReconcileEndpointSlicesSomePreexisting(t *testing.T) {
 // this approach requires 2 creates instead of 2 updates + 1 create
 func TestReconcileEndpointSlicesSomePreexistingWorseAllocation(t *testing.T) {
 	client := newClientset()
-	setupMetrics()
+	resetMetrics()
 	namespace := "test"
 	svc, endpointMeta := newServiceAndEndpointMeta("foo", namespace)
 
 	// start with 300 pods
 	pods := []*corev1.Pod{}
 	for i := 0; i < 300; i++ {
-		ready := !(i%3 == 0)
+		ready := i%3 != 0
 		pods = append(pods, newPod(i, namespace, ready, 1, false))
 	}
 
@@ -847,7 +853,7 @@ func TestReconcileEndpointSlicesSomePreexistingWorseAllocation(t *testing.T) {
 	reconcileHelper(t, r, &svc, pods, existingSlices, time.Now())
 
 	actions := client.Actions()
-	assert.Equal(t, numActionsBefore+2, len(actions), "Expected 2 additional client actions as part of reconcile")
+	assert.Len(t, actions, numActionsBefore+2, "Expected 2 additional client actions as part of reconcile")
 	expectActions(t, client.Actions(), 2, "create", "endpointslices")
 
 	// 2 new slices (100, 52) in addition to existing slices (74, 74)
@@ -868,7 +874,7 @@ func TestReconcileEndpointSlicesUpdating(t *testing.T) {
 	// start with 250 pods
 	pods := []*corev1.Pod{}
 	for i := 0; i < 250; i++ {
-		ready := !(i%3 == 0)
+		ready := i%3 != 0
 		pods = append(pods, newPod(i, namespace, ready, 1, false))
 	}
 
@@ -901,7 +907,7 @@ func TestReconcileEndpointSlicesServicesLabelsUpdating(t *testing.T) {
 	// start with 250 pods
 	pods := []*corev1.Pod{}
 	for i := 0; i < 250; i++ {
-		ready := !(i%3 == 0)
+		ready := i%3 != 0
 		pods = append(pods, newPod(i, namespace, ready, 1, false))
 	}
 
@@ -945,7 +951,7 @@ func TestReconcileEndpointSlicesServicesReservedLabels(t *testing.T) {
 	// start with 250 pods
 	pods := []*corev1.Pod{}
 	for i := 0; i < 250; i++ {
-		ready := !(i%3 == 0)
+		ready := i%3 != 0
 		pods = append(pods, newPod(i, namespace, ready, 1, false))
 	}
 
@@ -972,14 +978,14 @@ func TestReconcileEndpointSlicesServicesReservedLabels(t *testing.T) {
 // reconcile repacks the endpoints into 3 slices, and deletes the extras
 func TestReconcileEndpointSlicesRecycling(t *testing.T) {
 	client := newClientset()
-	setupMetrics()
+	resetMetrics()
 	namespace := "test"
 	svc, endpointMeta := newServiceAndEndpointMeta("foo", namespace)
 
 	// start with 300 pods
 	pods := []*corev1.Pod{}
 	for i := 0; i < 300; i++ {
-		ready := !(i%3 == 0)
+		ready := i%3 != 0
 		pods = append(pods, newPod(i, namespace, ready, 1, false))
 	}
 
@@ -1000,14 +1006,14 @@ func TestReconcileEndpointSlicesRecycling(t *testing.T) {
 	r := newReconciler(client, []*corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}}, defaultMaxEndpointsPerSlice)
 	reconcileHelper(t, r, &svc, pods, existingSlices, time.Now())
 	// initial reconcile should be a no op, all pods are accounted for in slices, no repacking should be done
-	assert.Equal(t, numActionsBefore+0, len(client.Actions()), "Expected 0 additional client actions as part of reconcile")
+	assert.Len(t, client.Actions(), numActionsBefore+0, "Expected 0 additional client actions as part of reconcile")
 
 	// changing a service port should require all slices to be updated, time for a repack
 	svc.Spec.Ports[0].TargetPort.IntVal = 81
 	reconcileHelper(t, r, &svc, pods, existingSlices, time.Now())
 
 	// this should reflect 3 updates + 7 deletes
-	assert.Equal(t, numActionsBefore+10, len(client.Actions()), "Expected 10 additional client actions as part of reconcile")
+	assert.Len(t, client.Actions(), numActionsBefore+10, "Expected 10 additional client actions as part of reconcile")
 
 	// thanks to recycling, we get a free repack of endpoints, resulting in 3 full slices instead of 10 mostly empty slices
 	expectUnorderedSlicesWithLengths(t, fetchEndpointSlices(t, client, namespace), []int{100, 100, 100})
@@ -1022,7 +1028,7 @@ func TestReconcileEndpointSlicesRecycling(t *testing.T) {
 // for update.
 func TestReconcileEndpointSlicesUpdatePacking(t *testing.T) {
 	client := newClientset()
-	setupMetrics()
+	resetMetrics()
 	namespace := "test"
 	svc, endpointMeta := newServiceAndEndpointMeta("foo", namespace)
 
@@ -1081,7 +1087,7 @@ func TestReconcileEndpointSlicesUpdatePacking(t *testing.T) {
 // address type will be replaced with a newer IPv4 type.
 func TestReconcileEndpointSlicesReplaceDeprecated(t *testing.T) {
 	client := newClientset()
-	setupMetrics()
+	resetMetrics()
 	namespace := "test"
 
 	svc, endpointMeta := newServiceAndEndpointMeta("foo", namespace)
@@ -1132,6 +1138,108 @@ func TestReconcileEndpointSlicesReplaceDeprecated(t *testing.T) {
 	cmc.Check(t)
 }
 
+func TestReconcilerDeleteEndpointSlice(t *testing.T) {
+	deletePaths := []struct {
+		name   string
+		delete func(*testing.T, *Reconciler, *corev1.Service, *discovery.EndpointSlice) error
+	}{
+		{
+			name: "unsupported address type",
+			delete: func(t *testing.T, r *Reconciler, service *corev1.Service, slice *discovery.EndpointSlice) error {
+				logger, _ := ktesting.NewTestContext(t)
+				return r.Reconcile(logger, service, nil, []*discovery.EndpointSlice{slice}, time.Now())
+			},
+		},
+		{
+			name: "finalize",
+			delete: func(_ *testing.T, r *Reconciler, service *corev1.Service, slice *discovery.EndpointSlice) error {
+				return r.finalize(service, nil, nil, []*discovery.EndpointSlice{slice}, time.Now())
+			},
+		},
+	}
+
+	testCases := []struct {
+		name                 string
+		createStoredSlice    bool
+		wantDeletionExpected bool
+		wantDeleteMetric     float64
+	}{
+		{
+			name: "already deleted",
+		},
+		{
+			name:                 "existing slice",
+			createStoredSlice:    true,
+			wantDeletionExpected: true,
+			wantDeleteMetric:     1,
+		},
+	}
+
+	for _, deletePath := range deletePaths {
+		t.Run(deletePath.name, func(t *testing.T) {
+			for _, testCase := range testCases {
+				t.Run(testCase.name, func(t *testing.T) {
+					client := newClientset()
+					resetMetrics()
+					namespace := "test"
+					service, endpointMeta := newServiceAndEndpointMeta("foo", namespace)
+					cachedSlice := newEmptyEndpointSlice(1, namespace, endpointMeta, service)
+					cachedSlice.Generation = 1
+					cachedSlice.AddressType = discovery.AddressTypeIPv6
+					cachedSlice.Labels = map[string]string{
+						discovery.LabelManagedBy:   controllerName,
+						discovery.LabelServiceName: service.Name,
+					}
+
+					if testCase.createStoredSlice {
+						createEndpointSlices(t, client, namespace, []*discovery.EndpointSlice{cachedSlice})
+					}
+					client.ClearActions()
+
+					r := newReconciler(client, nil, defaultMaxEndpointsPerSlice)
+					r.endpointSliceTracker.Update(cachedSlice)
+
+					if err := deletePath.delete(t, r, &service, cachedSlice); err != nil {
+						t.Fatalf("Expected EndpointSlice deletion to succeed, got %v", err)
+					}
+					expectActions(t, client.Actions(), 1, "delete", "endpointslices")
+
+					expectedGeneration := cachedSlice.Generation
+					if testCase.wantDeletionExpected {
+						expectedGeneration = -1
+					}
+					expectTrackedGeneration(t, r.endpointSliceTracker, cachedSlice, expectedGeneration)
+
+					//nolint:staticcheck // intentionally asserting the deprecated metric during the deprecation period
+					deleted, err := testutil.GetCounterMetricValue(metrics.EndpointSliceChanges.WithLabelValues("delete"))
+					if err != nil {
+						t.Fatalf("Failed to get EndpointSlice deletion metric: %v", err)
+					}
+					if deleted != testCase.wantDeleteMetric {
+						t.Errorf("Expected EndpointSlice deletion metric %v, got %v", testCase.wantDeleteMetric, deleted)
+					}
+					deletedTotal, err := testutil.GetCounterMetricValue(metrics.EndpointSliceChangesTotal.WithLabelValues("delete"))
+					if err != nil {
+						t.Fatalf("Failed to get EndpointSlice deletion total metric: %v", err)
+					}
+					if deletedTotal != testCase.wantDeleteMetric {
+						t.Errorf("Expected EndpointSlice deletion total metric %v, got %v", testCase.wantDeleteMetric, deletedTotal)
+					}
+					if deletePath.name == "finalize" {
+						changed, err := testutil.GetHistogramMetricValue(metrics.EndpointSlicesChangedPerSync.WithLabelValues("Disabled", ""))
+						if err != nil {
+							t.Fatalf("Failed to get EndpointSlice changes per sync metric: %v", err)
+						}
+						if changed != 1 {
+							t.Errorf("Expected EndpointSlice changes per sync metric 1, got %v", changed)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 // In this test, we want to verify that a Service recreation will result in new
 // EndpointSlices being created.
 func TestReconcileEndpointSlicesRecreation(t *testing.T) {
@@ -1154,7 +1262,7 @@ func TestReconcileEndpointSlicesRecreation(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			client := newClientset()
-			setupMetrics()
+			resetMetrics()
 			namespace := "test"
 
 			svc, endpointMeta := newServiceAndEndpointMeta("foo", namespace)
@@ -1203,7 +1311,7 @@ func TestReconcileEndpointSlicesRecreation(t *testing.T) {
 // This test ensures that EndpointSlices are grouped correctly in that case.
 func TestReconcileEndpointSlicesNamedPorts(t *testing.T) {
 	client := newClientset()
-	setupMetrics()
+	resetMetrics()
 	namespace := "test"
 
 	portNameIntStr := intstr.IntOrString{
@@ -1226,7 +1334,7 @@ func TestReconcileEndpointSlicesNamedPorts(t *testing.T) {
 	// start with 300 pods
 	pods := []*corev1.Pod{}
 	for i := 0; i < 300; i++ {
-		ready := !(i%3 == 0)
+		ready := i%3 != 0
 		portOffset := i % 5
 		pod := newPod(i, namespace, ready, 1, false)
 		pod.Spec.Containers[0].Ports = []corev1.ContainerPort{{
@@ -1241,7 +1349,7 @@ func TestReconcileEndpointSlicesNamedPorts(t *testing.T) {
 	reconcileHelper(t, r, &svc, pods, []*discovery.EndpointSlice{}, time.Now())
 
 	// reconcile should create 5 endpoint slices
-	assert.Equal(t, 5, len(client.Actions()), "Expected 5 client actions as part of reconcile")
+	assert.Len(t, client.Actions(), 5, "Expected 5 client actions as part of reconcile")
 	expectActions(t, client.Actions(), 5, "create", "endpointslices")
 	expectMetrics(t, expectedMetrics{desiredSlices: 5, actualSlices: 5, desiredEndpoints: 300, addedPerSync: 300, removedPerSync: 0, numCreated: 5, numUpdated: 0, numDeleted: 0, slicesChangedPerSync: 5})
 
@@ -1251,14 +1359,13 @@ func TestReconcileEndpointSlicesNamedPorts(t *testing.T) {
 	expectUnorderedSlicesWithLengths(t, fetchedSlices, []int{60, 60, 60, 60, 60})
 
 	// generate data structures for expected slice ports and address types
-	protoTCP := corev1.ProtocolTCP
 	expectedSlices := []discovery.EndpointSlice{}
 	for i := range fetchedSlices {
 		expectedSlices = append(expectedSlices, discovery.EndpointSlice{
 			Ports: []discovery.EndpointPort{{
-				Name:     pointer.String(""),
-				Protocol: &protoTCP,
-				Port:     pointer.Int32(int32(8080 + i)),
+				Name:     ptr.To(""),
+				Protocol: ptr.To(corev1.ProtocolTCP),
+				Port:     ptr.To[int32](int32(8080 + i)),
 			}},
 			AddressType: discovery.AddressTypeIPv4,
 		})
@@ -1277,7 +1384,7 @@ func TestReconcileMaxEndpointsPerSlice(t *testing.T) {
 	// start with 250 pods
 	pods := []*corev1.Pod{}
 	for i := 0; i < 250; i++ {
-		ready := !(i%3 == 0)
+		ready := i%3 != 0
 		pods = append(pods, newPod(i, namespace, ready, 1, false))
 	}
 
@@ -1312,7 +1419,7 @@ func TestReconcileMaxEndpointsPerSlice(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(fmt.Sprintf("maxEndpointsPerSlice: %d", testCase.maxEndpointsPerSlice), func(t *testing.T) {
 			client := newClientset()
-			setupMetrics()
+			resetMetrics()
 			r := newReconciler(client, []*corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}}, testCase.maxEndpointsPerSlice)
 			reconcileHelper(t, r, &svc, pods, []*discovery.EndpointSlice{}, time.Now())
 			expectUnorderedSlicesWithLengths(t, fetchEndpointSlices(t, client, namespace), testCase.expectedSliceLengths)
@@ -1323,7 +1430,7 @@ func TestReconcileMaxEndpointsPerSlice(t *testing.T) {
 
 func TestReconcileEndpointSlicesMetrics(t *testing.T) {
 	client := newClientset()
-	setupMetrics()
+	resetMetrics()
 	namespace := "test"
 	svc, _ := newServiceAndEndpointMeta("foo", namespace)
 
@@ -1337,7 +1444,7 @@ func TestReconcileEndpointSlicesMetrics(t *testing.T) {
 	reconcileHelper(t, r, &svc, pods, []*discovery.EndpointSlice{}, time.Now())
 
 	actions := client.Actions()
-	assert.Equal(t, 1, len(actions), "Expected 1 additional client actions as part of reconcile")
+	assert.Len(t, actions, 1, "Expected 1 additional client actions as part of reconcile")
 	assert.True(t, actions[0].Matches("create", "endpointslices"), "First action should be create endpoint slice")
 
 	expectMetrics(t, expectedMetrics{desiredSlices: 1, actualSlices: 1, desiredEndpoints: 20, addedPerSync: 20, removedPerSync: 0, numCreated: 1, numUpdated: 0, numDeleted: 0, slicesChangedPerSync: 1})
@@ -1345,6 +1452,154 @@ func TestReconcileEndpointSlicesMetrics(t *testing.T) {
 	fetchedSlices := fetchEndpointSlices(t, client, namespace)
 	reconcileHelper(t, r, &svc, pods[0:10], []*discovery.EndpointSlice{&fetchedSlices[0]}, time.Now())
 	expectMetrics(t, expectedMetrics{desiredSlices: 1, actualSlices: 1, desiredEndpoints: 10, addedPerSync: 20, removedPerSync: 10, numCreated: 1, numUpdated: 1, numDeleted: 0, slicesChangedPerSync: 2})
+}
+
+func TestReconcileEndpointSlicesMetrics_EndpointsAddedPerSync_CollectAndCompare(t *testing.T) {
+	resetMetrics()
+	client := newClientset()
+	namespace := "test"
+	svc, endpointMeta := newServiceAndEndpointMeta("foo", namespace)
+
+	keepPod := newPod(1, namespace, true, 1, false)
+	newDesiredPod := newPod(2, namespace, true, 1, false)
+
+	// Existing slice has one endpoint that should remain. Reconcile should add exactly 1 endpoint.
+	existingSlice := newEmptyEndpointSlice(1, namespace, endpointMeta, svc)
+	existingSlice.Endpoints = []discovery.Endpoint{
+		podToEndpoint(keepPod, &corev1.Node{}, &svc, discovery.AddressTypeIPv4),
+	}
+	createdSlice, err := client.DiscoveryV1().EndpointSlices(namespace).Create(context.TODO(), existingSlice, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Expected no error creating EndpointSlice, got: %v", err)
+	}
+
+	r := newReconciler(client, []*corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}}, defaultMaxEndpointsPerSlice)
+	reconcileHelper(t, r, &svc, []*corev1.Pod{keepPod, newDesiredPod}, []*discovery.EndpointSlice{createdSlice}, time.Now())
+
+	want := `
+# HELP endpoint_slice_controller_endpoints_added_per_sync [BETA] Number of endpoints added on each Service sync
+# TYPE endpoint_slice_controller_endpoints_added_per_sync histogram
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="2"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="4"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="8"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="16"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="32"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="64"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="128"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="256"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="512"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="1024"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="2048"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="4096"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="8192"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="16384"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="32768"} 1
+endpoint_slice_controller_endpoints_added_per_sync_bucket{le="+Inf"} 1
+endpoint_slice_controller_endpoints_added_per_sync_sum 1
+endpoint_slice_controller_endpoints_added_per_sync_count 1
+`
+
+	if err := testutil.CollectAndCompare(metrics.EndpointsAddedPerSync, strings.NewReader(want), "endpoint_slice_controller_endpoints_added_per_sync"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconcileEndpointSlicesMetrics_EndpointsRemovedPerSync_CollectAndCompare(t *testing.T) {
+	resetMetrics()
+
+	client := newClientset()
+	namespace := "test"
+	svc, endpointMeta := newServiceAndEndpointMeta("foo", namespace)
+
+	stalePod := newPod(0, namespace, true, 1, false)
+	keepPod := newPod(1, namespace, true, 1, false)
+
+	// Existing slice has one stale endpoint and one endpoint that should remain.
+	// Reconcile should remove exactly 1 endpoint.
+	existingSlice := newEmptyEndpointSlice(1, namespace, endpointMeta, svc)
+	existingSlice.Endpoints = []discovery.Endpoint{
+		podToEndpoint(stalePod, &corev1.Node{}, &svc, discovery.AddressTypeIPv4),
+		podToEndpoint(keepPod, &corev1.Node{}, &svc, discovery.AddressTypeIPv4),
+	}
+	createdSlice, err := client.DiscoveryV1().EndpointSlices(namespace).Create(context.TODO(), existingSlice, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Expected no error creating EndpointSlice, got: %v", err)
+	}
+
+	r := newReconciler(client, []*corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}}, defaultMaxEndpointsPerSlice)
+	reconcileHelper(t, r, &svc, []*corev1.Pod{keepPod}, []*discovery.EndpointSlice{createdSlice}, time.Now())
+
+	want := `
+# HELP endpoint_slice_controller_endpoints_removed_per_sync [BETA] Number of endpoints removed on each Service sync
+# TYPE endpoint_slice_controller_endpoints_removed_per_sync histogram
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="2"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="4"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="8"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="16"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="32"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="64"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="128"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="256"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="512"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="1024"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="2048"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="4096"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="8192"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="16384"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="32768"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_bucket{le="+Inf"} 1
+endpoint_slice_controller_endpoints_removed_per_sync_sum 1
+endpoint_slice_controller_endpoints_removed_per_sync_count 1
+`
+
+	if err := testutil.CollectAndCompare(metrics.EndpointsRemovedPerSync, strings.NewReader(want), "endpoint_slice_controller_endpoints_removed_per_sync"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconcileEndpointSlicesMetrics_GaugeUpdates(t *testing.T) {
+	resetMetrics()
+	client := newClientset()
+	namespace := "test"
+	svc, _ := newServiceAndEndpointMeta("foo", namespace)
+
+	r := newReconciler(client, []*corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}}, defaultMaxEndpointsPerSlice)
+
+	svc.Spec.TrafficDistribution = ptr.To(corev1.ServiceTrafficDistributionPreferClose)
+	if _, err := client.CoreV1().Services(namespace).Create(context.TODO(), &svc, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Expected no error creating Service, got: %v", err)
+	}
+
+	// Reconcile with exactly 2 pods to deterministically set gauge metric values.
+	pod1 := newPod(1, namespace, true, 1, false)
+	pod2 := newPod(2, namespace, true, 1, false)
+	reconcileHelper(t, r, &svc, []*corev1.Pod{pod1, pod2}, []*discovery.EndpointSlice{}, time.Unix(0, 0))
+
+	want := `
+# HELP endpoint_slice_controller_desired_endpoint_slices [BETA] Number of EndpointSlices that would exist with perfect endpoint allocation
+# TYPE endpoint_slice_controller_desired_endpoint_slices gauge
+endpoint_slice_controller_desired_endpoint_slices 1
+# HELP endpoint_slice_controller_endpoints_desired [BETA] Number of endpoints desired
+# TYPE endpoint_slice_controller_endpoints_desired gauge
+endpoint_slice_controller_endpoints_desired 2
+# HELP endpoint_slice_controller_num_endpoint_slices [BETA] Number of EndpointSlices
+# TYPE endpoint_slice_controller_num_endpoint_slices gauge
+endpoint_slice_controller_num_endpoint_slices 1
+# HELP endpoint_slice_controller_services_count_by_traffic_distribution [BETA] Number of Services using some specific trafficDistribution
+# TYPE endpoint_slice_controller_services_count_by_traffic_distribution gauge
+endpoint_slice_controller_services_count_by_traffic_distribution{traffic_distribution="PreferClose"} 1
+`
+
+	if err := testutil.GatherAndCompare(
+		legacyregistry.DefaultGatherer,
+		strings.NewReader(want),
+		"endpoint_slice_controller_endpoints_desired",
+		"endpoint_slice_controller_num_endpoint_slices",
+		"endpoint_slice_controller_desired_endpoint_slices",
+		"endpoint_slice_controller_services_count_by_traffic_distribution",
+	); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // When a Service has a non-nil deletionTimestamp we want to avoid creating any
@@ -1417,7 +1672,7 @@ func TestReconcilerFinalizeSvcDeletionTimestamp(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			client := newClientset()
-			setupMetrics()
+			resetMetrics()
 			r := newReconciler(client, []*corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}}, defaultMaxEndpointsPerSlice)
 
 			namespace := "test"
@@ -1670,7 +1925,7 @@ func TestReconcilerPodMissingNode(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			client := newClientset()
-			setupMetrics()
+			resetMetrics()
 			r := newReconciler(client, tc.existingNodes, defaultMaxEndpointsPerSlice)
 			logger, _ := ktesting.NewTestContext(t)
 
@@ -1900,7 +2155,7 @@ func TestReconcileTopology(t *testing.T) {
 			createEndpointSlices(t, client, ns, tc.existingSlices)
 			logger, _ := ktesting.NewTestContext(t)
 
-			setupMetrics()
+			resetMetrics()
 			r := newReconciler(client, tc.nodes, defaultMaxEndpointsPerSlice)
 			if tc.topologyCacheEnabled {
 				r.topologyCache = topologycache.NewTopologyCache()
@@ -1970,6 +2225,261 @@ func TestReconcileTopology(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Test reconciliation behaviour for trafficDistribution field.
+func TestReconcile_TrafficDistribution(t *testing.T) {
+	// Setup the following topology for the test.
+	//
+	// 	- node-0 IN zone-a CONTAINS {pod-0}
+	// 	- node-1 IN zone-b CONTAINS {pod-1, pod-2, pod-3}
+	// 	- node-2 IN zone-c CONTAINS {pod-4, pod-5}
+	ns := "ns1"
+	svc, _ := newServiceAndEndpointMeta("foo", ns)
+	nodes := []*corev1.Node{}
+	pods := []*corev1.Pod{}
+	for i := 0; i < 3; i++ {
+		nodes = append(nodes, &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("node-%v", i),
+				Labels: map[string]string{
+					corev1.LabelTopologyZone: fmt.Sprintf("zone-%c", 'a'+i),
+				},
+			},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{{
+					Type:   corev1.NodeReady,
+					Status: corev1.ConditionTrue,
+				}},
+				Allocatable: corev1.ResourceList{"cpu": resource.MustParse("100m")},
+			},
+		})
+	}
+	for i := 0; i < 6; i++ {
+		pods = append(pods, newPod(i, ns, true, 1, false))
+	}
+	pods[0].Spec.NodeName = nodes[0].Name
+	pods[1].Spec.NodeName = nodes[1].Name
+	pods[2].Spec.NodeName = nodes[1].Name
+	pods[3].Spec.NodeName = nodes[1].Name
+	pods[4].Spec.NodeName = nodes[2].Name
+	pods[5].Spec.NodeName = nodes[2].Name
+
+	// Define test cases.
+
+	testCases := []struct {
+		name string
+		desc string
+
+		trafficDistribution *string
+		topologyAnnotation  string
+
+		// Defines how many hints belong to a particular zone/node
+		wantHintsDistributionByZone map[string]int
+		wantHintsDistributionByNode map[string]int
+		// Number of endpoints where the zone hints are different from the zone of
+		// the endpoint itself.
+		wantEndpointsWithCrossZoneHints int
+		wantMetrics                     expectedMetrics
+	}{
+		{
+			name:                "trafficDistribution=PreferClose, topologyAnnotation=Disabled",
+			desc:                "When trafficDistribution is enabled and topologyAnnotation is disabled, hints should be distributed as per the trafficDistribution field",
+			trafficDistribution: ptr.To(corev1.ServiceTrafficDistributionPreferClose),
+			topologyAnnotation:  "Disabled",
+			wantHintsDistributionByZone: map[string]int{
+				"zone-a": 1, // {pod-0}
+				"zone-b": 3, // {pod-1, pod-2, pod-3}
+				"zone-c": 2, // {pod-4, pod-5}
+			},
+			wantMetrics: expectedMetrics{
+				desiredSlices:                   1,
+				actualSlices:                    1,
+				desiredEndpoints:                6,
+				addedPerSync:                    6,
+				removedPerSync:                  0,
+				numCreated:                      1,
+				numUpdated:                      0,
+				numDeleted:                      0,
+				slicesChangedPerSync:            0, // 0 means either topologyAnnotation or trafficDistribution was used.
+				slicesChangedPerSyncTopology:    0, // 0 means topologyAnnotation was not used.
+				slicesChangedPerSyncTrafficDist: 1, // 1 EPS configured using trafficDistribution.
+				servicesCountByTrafficDistribution: map[string]int{
+					"PreferClose": 1,
+				},
+			},
+		},
+		{
+			name:                "trafficDistribution=PreferClose, topologyAnnotation=Auto",
+			desc:                "When trafficDistribution and topologyAnnotation are both enabled, precedence should be given to topologyAnnotation",
+			trafficDistribution: ptr.To(corev1.ServiceTrafficDistributionPreferClose),
+			topologyAnnotation:  "Auto",
+			wantHintsDistributionByZone: map[string]int{
+				"zone-a": 2, // {pod-0, pod-3} (pod-3 is just an example, it could have also been either of the other two)
+				"zone-b": 2, // {pod-1, pod-2}
+				"zone-c": 2, // {pod-4, pod-5}
+			},
+			wantEndpointsWithCrossZoneHints: 1, // since a pod from zone-b is likely assigned a hint for zone-a
+			wantMetrics: expectedMetrics{
+				desiredSlices:                   1,
+				actualSlices:                    1,
+				desiredEndpoints:                6,
+				addedPerSync:                    6,
+				removedPerSync:                  0,
+				numCreated:                      1,
+				numUpdated:                      0,
+				numDeleted:                      0,
+				slicesChangedPerSync:            0, // 0 means either topologyAnnotation or trafficDistribution was used.
+				slicesChangedPerSyncTopology:    1, // 1 EPS configured using topologyAnnotation.
+				slicesChangedPerSyncTrafficDist: 0, // 0 means trafficDistribution was not used.
+			},
+		},
+		{
+			name:                        "trafficDistribution=nil, topologyAnnotation=<empty>",
+			desc:                        "When trafficDistribution and topologyAnnotation are both disabled, no hints should be added",
+			trafficDistribution:         nil,
+			topologyAnnotation:          "",
+			wantHintsDistributionByZone: map[string]int{"": 6}, // Equivalent to no hints.
+			wantMetrics: expectedMetrics{
+				desiredSlices:                   1,
+				actualSlices:                    1,
+				desiredEndpoints:                6,
+				addedPerSync:                    6,
+				removedPerSync:                  0,
+				numCreated:                      1,
+				numUpdated:                      0,
+				numDeleted:                      0,
+				slicesChangedPerSync:            1, // 1 means both topologyAnnotation and trafficDistribution were not used.
+				slicesChangedPerSyncTopology:    0, // 0 means topologyAnnotation was not used.
+				slicesChangedPerSyncTrafficDist: 0, // 0 means trafficDistribution was not used.
+			},
+		},
+		{
+			name:                "trafficDistribution=PreferSameNode",
+			desc:                "When trafficDistribution is PreferSameNode, both zone and node hints should be filled out",
+			trafficDistribution: ptr.To(corev1.ServiceTrafficDistributionPreferSameNode),
+			topologyAnnotation:  "Disabled",
+			wantHintsDistributionByZone: map[string]int{
+				"zone-a": 1, // {pod-0}
+				"zone-b": 3, // {pod-1, pod-2, pod-3}
+				"zone-c": 2, // {pod-4, pod-5}
+			},
+			wantHintsDistributionByNode: map[string]int{
+				"node-0": 1, // {pod-0}
+				"node-1": 3, // {pod-1, pod-2, pod-3}
+				"node-2": 2, // {pod-4, pod-5}
+			},
+			wantMetrics: expectedMetrics{
+				desiredSlices:                   1,
+				actualSlices:                    1,
+				desiredEndpoints:                6,
+				addedPerSync:                    6,
+				removedPerSync:                  0,
+				numCreated:                      1,
+				numUpdated:                      0,
+				numDeleted:                      0,
+				slicesChangedPerSync:            0, // 0 means either topologyAnnotation or trafficDistribution was used.
+				slicesChangedPerSyncTopology:    0, // 0 means topologyAnnotation was not used.
+				slicesChangedPerSyncTrafficDist: 1, // 1 EPS configured using trafficDistribution.
+				servicesCountByTrafficDistribution: map[string]int{
+					"PreferSameNode": 1,
+				},
+			},
+		},
+	}
+
+	// Make assertions.
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newClientset()
+			logger, _ := ktesting.NewTestContext(t)
+			resetMetrics()
+
+			r := newReconciler(client, nodes, defaultMaxEndpointsPerSlice)
+			r.topologyCache = topologycache.NewTopologyCache()
+			r.topologyCache.SetNodes(logger, nodes)
+
+			service := svc.DeepCopy()
+			service.Spec.TrafficDistribution = tc.trafficDistribution
+			service.Annotations = map[string]string{
+				corev1.DeprecatedAnnotationTopologyAwareHints: tc.topologyAnnotation,
+			}
+
+			err := r.Reconcile(logger, service, pods, nil, time.Now())
+
+			if err != nil {
+				t.Errorf("Reconcile(...): return error = %v; want no error", err)
+			}
+
+			fetchedSlices := fetchEndpointSlices(t, client, ns)
+			gotHintsDistributionByZone := make(map[string]int)
+			gotEndpointsWithCrossZoneHints := 0
+			for _, slice := range fetchedSlices {
+				for _, endpoint := range slice.Endpoints {
+					var zoneHint string
+					if endpoint.Hints != nil && len(endpoint.Hints.ForZones) == 1 {
+						zoneHint = endpoint.Hints.ForZones[0].Name
+					}
+					gotHintsDistributionByZone[zoneHint]++
+					if zoneHint != "" && *endpoint.Zone != zoneHint {
+						gotEndpointsWithCrossZoneHints++
+					}
+				}
+			}
+
+			if diff := cmp.Diff(tc.wantHintsDistributionByZone, gotHintsDistributionByZone); diff != "" {
+				t.Errorf("Reconcile(...): Incorrect distribution of endpoints among zones; (-want, +got)\n%v", diff)
+			}
+			if gotEndpointsWithCrossZoneHints != tc.wantEndpointsWithCrossZoneHints {
+				t.Errorf("Reconcile(...): EndpointSlices have endpoints with incorrect number of cross-zone hints; gotEndpointsWithCrossZoneHints=%v, want=%v", gotEndpointsWithCrossZoneHints, tc.wantEndpointsWithCrossZoneHints)
+			}
+
+			expectMetrics(t, tc.wantMetrics)
+		})
+	}
+}
+
+// TestReconcileHeadlessServiceNoPorts verifies that headless services with no ports
+// don't cause EndpointSlice churn. Validates fix for https://github.com/kubernetes/kubernetes/issues/133474
+func TestReconcileHeadlessServiceNoPorts(t *testing.T) {
+	namespace := "test"
+	client := newClientset()
+	resetMetrics()
+	svc := corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "headless-no-ports",
+			Namespace: namespace,
+			UID:       "test-uid",
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:  corev1.ClusterIPNone,
+			Selector:   map[string]string{"foo": "bar"},
+			IPFamilies: []corev1.IPFamily{corev1.IPv4Protocol},
+		},
+	}
+
+	pod := newPod(1, namespace, true, 1, false)
+
+	r := newReconciler(client, []*corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: pod.Spec.NodeName}}}, defaultMaxEndpointsPerSlice)
+
+	reconcileHelper(t, r, &svc, []*corev1.Pod{pod}, []*discovery.EndpointSlice{}, time.Now())
+	assert.Len(t, client.Actions(), 1, "Expected 1 additional clientset action")
+	expectActions(t, client.Actions(), 1, "create", "endpointslices")
+
+	var existingSlices []*discovery.EndpointSlice
+	for _, slice := range fetchEndpointSlices(t, client, namespace) {
+		copy := slice.DeepCopy()
+		// replicate API server behavior which serializes this empty slice as nil
+		copy.Ports = nil
+		existingSlices = append(existingSlices, copy)
+	}
+	assert.Len(t, existingSlices, 1, "Expected 1 endpoint slices")
+
+	reconcileHelper(t, r, &svc, []*corev1.Pod{pod}, existingSlices, time.Now())
+
+	assert.Len(t, client.Actions(), 2, "Expected second reconcile to only list")
+	expectActions(t, client.Actions(), 1, "list", "endpointslices")
 }
 
 // Test Helpers
@@ -2044,8 +2554,8 @@ func expectUnorderedSlicesWithTopLevelAttrs(t *testing.T, endpointSlices []disco
 		}
 	}
 
-	assert.Len(t, slicesWithNoMatch, 0, "EndpointSlice(s) found without matching attributes")
-	assert.Len(t, expectedSlices, 0, "Expected slices(s) not found in EndpointSlices")
+	assert.Empty(t, slicesWithNoMatch, "EndpointSlice(s) found without matching attributes")
+	assert.Empty(t, expectedSlices, "Expected slices(s) not found in EndpointSlices")
 }
 
 func expectActions(t *testing.T, actions []k8stesting.Action, num int, verb, resource string) {
@@ -2112,18 +2622,20 @@ func reconcileHelper(t *testing.T, r *Reconciler, service *corev1.Service, pods 
 // Metrics helpers
 
 type expectedMetrics struct {
-	desiredSlices                int
-	actualSlices                 int
-	desiredEndpoints             int
-	addedPerSync                 int
-	removedPerSync               int
-	numCreated                   int
-	numUpdated                   int
-	numDeleted                   int
-	slicesChangedPerSync         int
-	slicesChangedPerSyncTopology int
-	syncSuccesses                int
-	syncErrors                   int
+	desiredSlices                      int
+	actualSlices                       int
+	desiredEndpoints                   int
+	addedPerSync                       int
+	removedPerSync                     int
+	numCreated                         int
+	numUpdated                         int
+	numDeleted                         int
+	slicesChangedPerSync               int
+	slicesChangedPerSyncTopology       int
+	slicesChangedPerSyncTrafficDist    int
+	syncSuccesses                      int
+	syncErrors                         int
+	servicesCountByTrafficDistribution map[string]int
 }
 
 func expectMetrics(t *testing.T, em expectedMetrics) {
@@ -2164,11 +2676,21 @@ func expectMetrics(t *testing.T, em expectedMetrics) {
 	if actualCreated != float64(em.numCreated) {
 		t.Errorf("Expected endpointSliceChangesCreated to be %d, got %v", em.numCreated, actualCreated)
 	}
+	actualCreatedTotal, err := testutil.GetCounterMetricValue(metrics.EndpointSliceChangesTotal.WithLabelValues("create"))
+	handleErr(t, err, "endpointSliceChangesTotalCreated")
+	if actualCreatedTotal != float64(em.numCreated) {
+		t.Errorf("Expected endpointSliceChangesTotalCreated to be %d, got %v", em.numCreated, actualCreatedTotal)
+	}
 
 	actualUpdated, err := testutil.GetCounterMetricValue(metrics.EndpointSliceChanges.WithLabelValues("update"))
 	handleErr(t, err, "endpointSliceChangesUpdated")
 	if actualUpdated != float64(em.numUpdated) {
 		t.Errorf("Expected endpointSliceChangesUpdated to be %d, got %v", em.numUpdated, actualUpdated)
+	}
+	actualUpdatedTotal, err := testutil.GetCounterMetricValue(metrics.EndpointSliceChangesTotal.WithLabelValues("update"))
+	handleErr(t, err, "endpointSliceChangesTotalUpdated")
+	if actualUpdatedTotal != float64(em.numUpdated) {
+		t.Errorf("Expected endpointSliceChangesTotalUpdated to be %d, got %v", em.numUpdated, actualUpdatedTotal)
 	}
 
 	actualDeleted, err := testutil.GetCounterMetricValue(metrics.EndpointSliceChanges.WithLabelValues("delete"))
@@ -2176,17 +2698,33 @@ func expectMetrics(t *testing.T, em expectedMetrics) {
 	if actualDeleted != float64(em.numDeleted) {
 		t.Errorf("Expected endpointSliceChangesDeleted to be %d, got %v", em.numDeleted, actualDeleted)
 	}
+	actualDeletedTotal, err := testutil.GetCounterMetricValue(metrics.EndpointSliceChangesTotal.WithLabelValues("delete"))
+	handleErr(t, err, "endpointSliceChangesTotalDeleted")
+	if actualDeletedTotal != float64(em.numDeleted) {
+		t.Errorf("Expected endpointSliceChangesTotalDeleted to be %d, got %v", em.numDeleted, actualDeletedTotal)
+	}
 
-	actualSlicesChangedPerSync, err := testutil.GetHistogramMetricValue(metrics.EndpointSlicesChangedPerSync.WithLabelValues("Disabled"))
+	actualSlicesChangedPerSync, err := testutil.GetHistogramMetricValue(metrics.EndpointSlicesChangedPerSync.WithLabelValues("Disabled", ""))
 	handleErr(t, err, "slicesChangedPerSync")
 	if actualSlicesChangedPerSync != float64(em.slicesChangedPerSync) {
 		t.Errorf("Expected slicesChangedPerSync to be %d, got %v", em.slicesChangedPerSync, actualSlicesChangedPerSync)
 	}
 
-	actualSlicesChangedPerSyncTopology, err := testutil.GetHistogramMetricValue(metrics.EndpointSlicesChangedPerSync.WithLabelValues("Auto"))
+	actualSlicesChangedPerSyncTopology, err := testutil.GetHistogramMetricValue(metrics.EndpointSlicesChangedPerSync.WithLabelValues("Auto", ""))
 	handleErr(t, err, "slicesChangedPerSyncTopology")
 	if actualSlicesChangedPerSyncTopology != float64(em.slicesChangedPerSyncTopology) {
 		t.Errorf("Expected slicesChangedPerSyncTopology to be %d, got %v", em.slicesChangedPerSyncTopology, actualSlicesChangedPerSyncTopology)
+	}
+
+	actualSlicesChangedPreferClose, err := testutil.GetHistogramMetricValue(metrics.EndpointSlicesChangedPerSync.WithLabelValues("Disabled", "PreferClose"))
+	handleErr(t, err, "slicesChangedPreferClose")
+	actualSlicesChangedPreferSameZone, err := testutil.GetHistogramMetricValue(metrics.EndpointSlicesChangedPerSync.WithLabelValues("Disabled", "PreferSameZone"))
+	handleErr(t, err, "slicesChangedPreferSameZone")
+	actualSlicesChangedPreferSameNode, err := testutil.GetHistogramMetricValue(metrics.EndpointSlicesChangedPerSync.WithLabelValues("Disabled", "PreferSameNode"))
+	handleErr(t, err, "slicesChangedPreferSameNode")
+	actualSlicesChangedPerSyncTrafficDist := actualSlicesChangedPreferClose + actualSlicesChangedPreferSameZone + actualSlicesChangedPreferSameNode
+	if actualSlicesChangedPerSyncTrafficDist != float64(em.slicesChangedPerSyncTrafficDist) {
+		t.Errorf("Expected slicesChangedPerSyncTrafficDist to be %d, got %v", em.slicesChangedPerSyncTrafficDist, actualSlicesChangedPerSyncTrafficDist)
 	}
 
 	actualSyncSuccesses, err := testutil.GetCounterMetricValue(metrics.EndpointSliceSyncs.WithLabelValues("success"))
@@ -2200,6 +2738,23 @@ func expectMetrics(t *testing.T, em expectedMetrics) {
 	if actualSyncErrors != float64(em.syncErrors) {
 		t.Errorf("Expected endpointSliceSyncErrors to be %d, got %v", em.syncErrors, actualSyncErrors)
 	}
+
+	for _, trafficDistribution := range []string{
+		"PreferClose",
+		"PreferSameZone",
+		"PreferSameNode",
+		"ImplementationSpecific",
+	} {
+		gotServicesCount, err := testutil.GetGaugeMetricValue(metrics.ServicesCountByTrafficDistribution.WithLabelValues(trafficDistribution))
+		var wantServicesCount int
+		if em.servicesCountByTrafficDistribution != nil {
+			wantServicesCount = em.servicesCountByTrafficDistribution[trafficDistribution]
+		}
+		handleErr(t, err, fmt.Sprintf("%v[traffic_distribution=%v]", "services_count_by_traffic_distribution", trafficDistribution))
+		if int(gotServicesCount) != wantServicesCount {
+			t.Errorf("Expected servicesCountByTrafficDistribution for traffic_distribution=%v to be %v, got %v", trafficDistribution, wantServicesCount, gotServicesCount)
+		}
+	}
 }
 
 func handleErr(t *testing.T, err error, metricName string) {
@@ -2208,18 +2763,15 @@ func handleErr(t *testing.T, err error, metricName string) {
 	}
 }
 
-func setupMetrics() {
-	metrics.RegisterMetrics()
-	metrics.NumEndpointSlices.Delete(map[string]string{})
-	metrics.DesiredEndpointSlices.Delete(map[string]string{})
-	metrics.EndpointsDesired.Delete(map[string]string{})
-	metrics.EndpointsAddedPerSync.Delete(map[string]string{})
-	metrics.EndpointsRemovedPerSync.Delete(map[string]string{})
-	metrics.EndpointSliceChanges.Delete(map[string]string{"operation": "create"})
-	metrics.EndpointSliceChanges.Delete(map[string]string{"operation": "update"})
-	metrics.EndpointSliceChanges.Delete(map[string]string{"operation": "delete"})
-	metrics.EndpointSlicesChangedPerSync.Delete(map[string]string{"topology": "Disabled"})
-	metrics.EndpointSlicesChangedPerSync.Delete(map[string]string{"topology": "Auto"})
-	metrics.EndpointSliceSyncs.Delete(map[string]string{"result": "success"})
-	metrics.EndpointSliceSyncs.Delete(map[string]string{"result": "error"})
+func resetMetrics() {
+	metrics.NumEndpointSlices.Reset()
+	metrics.DesiredEndpointSlices.Reset()
+	metrics.EndpointsDesired.Reset()
+	metrics.EndpointsAddedPerSync.Reset()
+	metrics.EndpointsRemovedPerSync.Reset()
+	metrics.EndpointSliceChanges.Reset()
+	metrics.EndpointSliceChangesTotal.Reset()
+	metrics.EndpointSlicesChangedPerSync.Reset()
+	metrics.EndpointSliceSyncs.Reset()
+	metrics.ServicesCountByTrafficDistribution.Reset()
 }

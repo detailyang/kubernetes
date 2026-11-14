@@ -19,31 +19,35 @@ package types
 const (
 	// ResolvConfDefault is the system default DNS resolver configuration.
 	ResolvConfDefault = "/etc/resolv.conf"
-	// RFC3339NanoFixed is the fixed width version of time.RFC3339Nano.
-	RFC3339NanoFixed = "2006-01-02T15:04:05.000000000Z07:00"
-	// RFC3339NanoLenient is the variable width RFC3339 time format for lenient parsing of strings into timestamps.
-	RFC3339NanoLenient = "2006-01-02T15:04:05.999999999Z07:00"
 )
 
 // User visible keys for managing node allocatable enforcement on the node.
 const (
-	NodeAllocatableEnforcementKey = "pods"
-	SystemReservedEnforcementKey  = "system-reserved"
-	KubeReservedEnforcementKey    = "kube-reserved"
-	NodeAllocatableNoneKey        = "none"
+	NodeAllocatableEnforcementKey            = "pods"
+	SystemReservedEnforcementKey             = "system-reserved"
+	SystemReservedCompressibleEnforcementKey = "system-reserved-compressible"
+	KubeReservedEnforcementKey               = "kube-reserved"
+	KubeReservedCompressibleEnforcementKey   = "kube-reserved-compressible"
+	NodeAllocatableNoneKey                   = "none"
 )
 
 // SwapBehavior types
+type SwapBehavior string
+
 const (
-	LimitedSwap   = "LimitedSwap"
-	UnlimitedSwap = "UnlimitedSwap"
+	LimitedSwap SwapBehavior = "LimitedSwap"
+	NoSwap      SwapBehavior = "NoSwap"
 )
 
-// Alpha conditions managed by Kubelet that are not yet part of the API. The
-// entries here should be moved to staging/src/k8s.io.api/core/v1/types.go
-// once the feature managing the condition graduates to Beta.
+// Pod status condition reasons and messages
 const (
-	// PodReadyToStartContainers pod sandbox is successfully configured and
-	// the pod is ready to launch containers.
-	PodReadyToStartContainers = "PodReadyToStartContainers"
+	// PodReadyToStartContainers condition reason
+	PodSandboxNotReadyReason = "PodSandboxNotReady"
+
+	// PodReadyToStartContainers condition messages
+	PodSandboxNotReadyMsgNoPodSandbox         = "no pod sandbox exists"
+	PodSandboxNotReadyMsgMultipleSandboxes    = "multiple pod sandboxes are ready and need to be reconciled"
+	PodSandboxNotReadyMsgSandboxNotReady      = "pod sandbox is not ready"
+	PodSandboxNotReadyMsgNetworkNamespaceMode = "network namespace mode changed and sandbox needs to be recreated"
+	PodSandboxNotReadyMsgNoIPAddress          = "pod sandbox has no IP address"
 )

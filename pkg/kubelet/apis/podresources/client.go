@@ -24,9 +24,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"k8s.io/kubelet/pkg/apis/podresources/v1"
+	"k8s.io/cri-client/pkg/util"
+	v1 "k8s.io/kubelet/pkg/apis/podresources/v1"
 	"k8s.io/kubelet/pkg/apis/podresources/v1alpha1"
-	"k8s.io/kubernetes/pkg/kubelet/util"
 )
 
 // Note: Consumers of the pod resources API should not be importing this package.
@@ -34,15 +34,15 @@ import (
 
 // GetV1alpha1Client returns a client for the PodResourcesLister grpc service
 // Note: This is deprecated
-func GetV1alpha1Client(socket string, connectionTimeout time.Duration, maxMsgSize int) (v1alpha1.PodResourcesListerClient, *grpc.ClientConn, error) {
+func GetV1alpha1Client(ctx context.Context, socket string, connectionTimeout time.Duration, maxMsgSize int) (v1alpha1.PodResourcesListerClient, *grpc.ClientConn, error) {
 	addr, dialer, err := util.GetAddressAndDialer(socket)
 	if err != nil {
 		return nil, nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), connectionTimeout)
+	ctxT, cancel := context.WithTimeout(ctx, connectionTimeout)
 	defer cancel()
 
-	conn, err := grpc.DialContext(ctx, addr,
+	conn, err := grpc.DialContext(ctxT, addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(dialer),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)))
@@ -53,15 +53,15 @@ func GetV1alpha1Client(socket string, connectionTimeout time.Duration, maxMsgSiz
 }
 
 // GetV1Client returns a client for the PodResourcesLister grpc service
-func GetV1Client(socket string, connectionTimeout time.Duration, maxMsgSize int) (v1.PodResourcesListerClient, *grpc.ClientConn, error) {
+func GetV1Client(ctx context.Context, socket string, connectionTimeout time.Duration, maxMsgSize int) (v1.PodResourcesListerClient, *grpc.ClientConn, error) {
 	addr, dialer, err := util.GetAddressAndDialer(socket)
 	if err != nil {
 		return nil, nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), connectionTimeout)
+	ctxT, cancel := context.WithTimeout(ctx, connectionTimeout)
 	defer cancel()
 
-	conn, err := grpc.DialContext(ctx, addr,
+	conn, err := grpc.DialContext(ctxT, addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(dialer),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)))

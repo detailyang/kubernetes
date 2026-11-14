@@ -19,24 +19,21 @@ package metricsutil
 import (
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/cli-runtime/pkg/printers"
 	metricsapi "k8s.io/metrics/pkg/apis/metrics"
 )
 
 var (
-	MeasuredResources = []v1.ResourceName{
-		v1.ResourceCPU,
-		v1.ResourceMemory,
-	}
-	NodeColumns     = []string{"NAME", "CPU(cores)", "CPU%", "MEMORY(bytes)", "MEMORY%"}
-	PodColumns      = []string{"NAME", "CPU(cores)", "MEMORY(bytes)"}
 	NamespaceColumn = "NAMESPACE"
 	PodColumn       = "POD"
 )
+
+const ResourceSwap = "swap"
 
 type ResourceMetricsInfo struct {
 	Name      string
@@ -45,11 +42,33 @@ type ResourceMetricsInfo struct {
 }
 
 type TopCmdPrinter struct {
-	out io.Writer
+	out               io.Writer
+	measuredResources []v1.ResourceName
+	nodeColumns       []string
+	podColumns        []string
+	// a map from a node name to its missing resources
+	nodesMissingResources map[string][]string
 }
 
-func NewTopCmdPrinter(out io.Writer) *TopCmdPrinter {
-	return &TopCmdPrinter{out: out}
+func NewTopCmdPrinter(out io.Writer, showSwap bool) *TopCmdPrinter {
+	printer := &TopCmdPrinter{
+		out: out,
+		measuredResources: []v1.ResourceName{
+			v1.ResourceCPU,
+			v1.ResourceMemory,
+		},
+		nodeColumns:           []string{"NAME", "CPU(cores)", "CPU(%)", "MEMORY(bytes)", "MEMORY(%)"},
+		podColumns:            []string{"NAME", "CPU(cores)", "MEMORY(bytes)"},
+		nodesMissingResources: make(map[string][]string),
+	}
+
+	if showSwap {
+		printer.measuredResources = append(printer.measuredResources, ResourceSwap)
+		printer.nodeColumns = append(printer.nodeColumns, "SWAP(bytes)", "SWAP(%)")
+		printer.podColumns = append(printer.podColumns, "SWAP(bytes)")
+	}
+
+	return printer
 }
 
 func (printer *TopCmdPrinter) PrintNodeMetrics(metrics []metricsapi.NodeMetrics, availableResources map[string]v1.ResourceList, noHeaders bool, sortBy string) error {
@@ -59,25 +78,26 @@ func (printer *TopCmdPrinter) PrintNodeMetrics(metrics []metricsapi.NodeMetrics,
 	w := printers.GetNewTabWriter(printer.out)
 	defer w.Flush()
 
+	measuredResources := printer.measuredResources
 	sort.Sort(NewNodeMetricsSorter(metrics, sortBy))
 
 	if !noHeaders {
-		printColumnNames(w, NodeColumns)
+		printColumnNames(w, printer.nodeColumns)
 	}
 	var usage v1.ResourceList
 	for _, m := range metrics {
 		m.Usage.DeepCopyInto(&usage)
-		printMetricsLine(w, &ResourceMetricsInfo{
+		printer.printMetricsLine(w, &ResourceMetricsInfo{
 			Name:      m.Name,
 			Metrics:   usage,
 			Available: availableResources[m.Name],
-		})
+		}, measuredResources)
 		delete(availableResources, m.Name)
 	}
 
 	// print lines for nodes of which the metrics is unreachable.
 	for nodeName := range availableResources {
-		printMissingMetricsNodeLine(w, nodeName)
+		printer.printMissingMetricsNodeLine(w, nodeName, measuredResources)
 	}
 	return nil
 }
@@ -89,40 +109,51 @@ func (printer *TopCmdPrinter) PrintPodMetrics(metrics []metricsapi.PodMetrics, p
 	w := printers.GetNewTabWriter(printer.out)
 	defer w.Flush()
 
-	columnWidth := len(PodColumns)
+	columnWidth := len(printer.podColumns)
+	if withNamespace {
+		columnWidth++
+	}
+	if printContainers {
+		columnWidth++
+	}
+
 	if !noHeaders {
 		if withNamespace {
 			printValue(w, NamespaceColumn)
-			columnWidth++
 		}
 		if printContainers {
 			printValue(w, PodColumn)
-			columnWidth++
 		}
-		printColumnNames(w, PodColumns)
+		printColumnNames(w, printer.podColumns)
 	}
 
-	sort.Sort(NewPodMetricsSorter(metrics, withNamespace, sortBy))
+	sort.Sort(NewPodMetricsSorter(metrics, withNamespace, sortBy, printer.measuredResources))
 
 	for _, m := range metrics {
 		if printContainers {
 			sort.Sort(NewContainerMetricsSorter(m.Containers, sortBy))
-			printSinglePodContainerMetrics(w, &m, withNamespace)
+			printer.printSinglePodContainerMetrics(w, &m, withNamespace, printer.measuredResources)
 		} else {
-			printSinglePodMetrics(w, &m, withNamespace)
+			printer.printSinglePodMetrics(w, &m, withNamespace, printer.measuredResources)
 		}
-
 	}
 
 	if sum {
-		adder := NewResourceAdder(MeasuredResources)
+		adder := NewResourceAdder(printer.measuredResources)
 		for _, m := range metrics {
 			adder.AddPodMetrics(&m)
 		}
-		printPodResourcesSum(w, adder.total, columnWidth)
+		printer.printPodResourcesSum(w, adder.total, columnWidth, printer.measuredResources)
 	}
 
 	return nil
+}
+
+func (printer *TopCmdPrinter) RegisterMissingResource(nodeName, resourceName string) {
+	if slices.Contains(printer.nodesMissingResources[nodeName], resourceName) {
+		return
+	}
+	printer.nodesMissingResources[nodeName] = append(printer.nodesMissingResources[nodeName], resourceName)
 }
 
 func printColumnNames(out io.Writer, names []string) {
@@ -132,40 +163,40 @@ func printColumnNames(out io.Writer, names []string) {
 	fmt.Fprint(out, "\n")
 }
 
-func printSinglePodMetrics(out io.Writer, m *metricsapi.PodMetrics, withNamespace bool) {
-	podMetrics := getPodMetrics(m)
+func (printer *TopCmdPrinter) printSinglePodMetrics(out io.Writer, m *metricsapi.PodMetrics, withNamespace bool, measuredResources []v1.ResourceName) {
+	podMetrics := getPodMetrics(m, measuredResources)
 	if withNamespace {
 		printValue(out, m.Namespace)
 	}
-	printMetricsLine(out, &ResourceMetricsInfo{
+	printer.printMetricsLine(out, &ResourceMetricsInfo{
 		Name:      m.Name,
 		Metrics:   podMetrics,
 		Available: v1.ResourceList{},
-	})
+	}, measuredResources)
 }
 
-func printSinglePodContainerMetrics(out io.Writer, m *metricsapi.PodMetrics, withNamespace bool) {
+func (printer *TopCmdPrinter) printSinglePodContainerMetrics(out io.Writer, m *metricsapi.PodMetrics, withNamespace bool, measuredResources []v1.ResourceName) {
 	for _, c := range m.Containers {
 		if withNamespace {
 			printValue(out, m.Namespace)
 		}
 		printValue(out, m.Name)
-		printMetricsLine(out, &ResourceMetricsInfo{
+		printer.printMetricsLine(out, &ResourceMetricsInfo{
 			Name:      c.Name,
 			Metrics:   c.Usage,
 			Available: v1.ResourceList{},
-		})
+		}, measuredResources)
 	}
 }
 
-func getPodMetrics(m *metricsapi.PodMetrics) v1.ResourceList {
+func getPodMetrics(m *metricsapi.PodMetrics, measuredResources []v1.ResourceName) v1.ResourceList {
 	podMetrics := make(v1.ResourceList)
-	for _, res := range MeasuredResources {
+	for _, res := range measuredResources {
 		podMetrics[res], _ = resource.ParseQuantity("0")
 	}
 
 	for _, c := range m.Containers {
-		for _, res := range MeasuredResources {
+		for _, res := range measuredResources {
 			quantity := podMetrics[res]
 			quantity.Add(c.Usage[res])
 			podMetrics[res] = quantity
@@ -174,16 +205,16 @@ func getPodMetrics(m *metricsapi.PodMetrics) v1.ResourceList {
 	return podMetrics
 }
 
-func printMetricsLine(out io.Writer, metrics *ResourceMetricsInfo) {
+func (printer *TopCmdPrinter) printMetricsLine(out io.Writer, metrics *ResourceMetricsInfo, measuredResources []v1.ResourceName) {
 	printValue(out, metrics.Name)
-	printAllResourceUsages(out, metrics)
+	printer.printAllResourceUsages(out, metrics, measuredResources)
 	fmt.Fprint(out, "\n")
 }
 
-func printMissingMetricsNodeLine(out io.Writer, nodeName string) {
+func (printer *TopCmdPrinter) printMissingMetricsNodeLine(out io.Writer, nodeName string, measuredResources []v1.ResourceName) {
 	printValue(out, nodeName)
 	unknownMetricsStatus := "<unknown>"
-	for i := 0; i < len(MeasuredResources); i++ {
+	for i := 0; i < len(measuredResources); i++ {
 		printValue(out, unknownMetricsStatus)
 		printValue(out, unknownMetricsStatus)
 	}
@@ -194,13 +225,21 @@ func printValue(out io.Writer, value interface{}) {
 	fmt.Fprintf(out, "%v\t", value)
 }
 
-func printAllResourceUsages(out io.Writer, metrics *ResourceMetricsInfo) {
-	for _, res := range MeasuredResources {
+func (printer *TopCmdPrinter) printAllResourceUsages(out io.Writer, metrics *ResourceMetricsInfo, measuredResources []v1.ResourceName) {
+	for _, res := range measuredResources {
+		if missingResources, found := printer.nodesMissingResources[metrics.Name]; found && slices.Contains(missingResources, string(res)) {
+			printSingleMissingResource(out)
+			continue
+		}
+
 		quantity := metrics.Metrics[res]
 		printSingleResourceUsage(out, res, quantity)
 		fmt.Fprint(out, "\t")
 		if available, found := metrics.Available[res]; found {
-			fraction := float64(quantity.MilliValue()) / float64(available.MilliValue()) * 100
+			fraction := 0.0
+			if !available.IsZero() {
+				fraction = float64(quantity.MilliValue()) / float64(available.MilliValue()) * 100
+			}
 			fmt.Fprintf(out, "%d%%\t", int64(fraction))
 		}
 	}
@@ -210,27 +249,34 @@ func printSingleResourceUsage(out io.Writer, resourceType v1.ResourceName, quant
 	switch resourceType {
 	case v1.ResourceCPU:
 		fmt.Fprintf(out, "%vm", quantity.MilliValue())
-	case v1.ResourceMemory:
+	case v1.ResourceMemory, ResourceSwap:
 		fmt.Fprintf(out, "%vMi", quantity.Value()/(1024*1024))
 	default:
 		fmt.Fprintf(out, "%v", quantity.Value())
 	}
 }
 
-func printPodResourcesSum(out io.Writer, total v1.ResourceList, columnWidth int) {
-	for i := 0; i < columnWidth-2; i++ {
+func printSingleMissingResource(out io.Writer) {
+	const unavailableStr = "<unknown>"
+	_, _ = fmt.Fprintf(out, "%s\t%s\t", unavailableStr, unavailableStr)
+}
+
+func (printer *TopCmdPrinter) printPodResourcesSum(out io.Writer, total v1.ResourceList, columnWidth int, measuredResources []v1.ResourceName) {
+	nameColumns := columnWidth - len(measuredResources)
+	for range nameColumns {
 		printValue(out, "")
 	}
-	printValue(out, "________")
-	printValue(out, "________")
+	for range measuredResources {
+		printValue(out, "________")
+	}
 	fmt.Fprintf(out, "\n")
-	for i := 0; i < columnWidth-3; i++ {
+	for i := 0; i < nameColumns-1; i++ {
 		printValue(out, "")
 	}
-	printMetricsLine(out, &ResourceMetricsInfo{
+	printer.printMetricsLine(out, &ResourceMetricsInfo{
 		Name:      "",
 		Metrics:   total,
 		Available: v1.ResourceList{},
-	})
+	}, measuredResources)
 
 }

@@ -19,6 +19,7 @@ package lease
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -28,7 +29,7 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	coordclientset "k8s.io/client-go/kubernetes/typed/coordination/v1"
 	"k8s.io/utils/clock"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	"k8s.io/klog/v2"
 )
@@ -40,11 +41,15 @@ const (
 	maxUpdateRetries = 5
 	// maxBackoff is the maximum sleep time during backoff (e.g. in backoffEnsureLease)
 	maxBackoff = 7 * time.Second
+	// shutdownTimeout is the timeout for deleting the lease on shutdown.
+	shutdownTimeout = 10 * time.Second
 )
 
 // Controller manages creating and renewing the lease for this component (kube-apiserver, kubelet, etc.)
 type Controller interface {
 	Run(ctx context.Context)
+	Start(stopCh <-chan struct{}) error
+	Stop()
 }
 
 // ProcessLeaseFunc processes the given lease in-place
@@ -68,6 +73,12 @@ type controller struct {
 	// before every time the lease is created/refreshed(updated).
 	// Note that an error will block the lease operation.
 	newLeasePostProcessFunc ProcessLeaseFunc
+
+	reconcilingLock sync.Mutex
+	// stopCh is closed by Stop so that a sync stuck retrying a lease create
+	// releases reconcilingLock instead of blocking Stop forever.
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // NewController constructs and returns a controller
@@ -87,6 +98,49 @@ func NewController(clock clock.Clock, client clientset.Interface, holderIdentity
 		clock:                      clock,
 		onRepeatedHeartbeatFailure: onRepeatedHeartbeatFailure,
 		newLeasePostProcessFunc:    newLeasePostProcessFunc,
+		stopCh:                     make(chan struct{}),
+	}
+}
+
+// Start performs setup actions, and then starts the lease controller.
+func (c *controller) Start(stopCh <-chan struct{}) error {
+	if c.leaseClient == nil {
+		return nil
+	}
+
+	// We delete the lease on startup to ensure that if a new apiserver starts up,
+	// it removes any stale lease from a previous instance. This is important to
+	// prevent other components from discovering and communicating with a dead peer.
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	klog.FromContext(ctx).Info("Deleting old lease on startup", "lease", klog.KRef(c.leaseNamespace, c.leaseName))
+	if err := c.leaseClient.Delete(ctx, c.leaseName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		// The lease controller will eventually take over and update the lease.
+		klog.FromContext(ctx).Error(err, "error deleting old lease", "lease", klog.KRef(c.leaseNamespace, c.leaseName))
+	}
+
+	go c.Run(wait.ContextForChannel(stopCh))
+	return nil
+}
+
+// Stop gracefully shuts down the controller.
+func (c *controller) Stop() {
+	if c.leaseClient == nil {
+		return
+	}
+
+	// Unblock a sync stuck in backoffEnsureLease, which holds the lock
+	// acquired below.
+	c.stopOnce.Do(func() { close(c.stopCh) })
+	// Ensure that there will be no race condition with the sync.
+	c.reconcilingLock.Lock()
+	defer c.reconcilingLock.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	klog.FromContext(ctx).Info("Cleaning up lease on exit", "lease", klog.KRef(c.leaseNamespace, c.leaseName))
+	if err := c.leaseClient.Delete(ctx, c.leaseName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		klog.FromContext(ctx).Error(err, "Unable to delete lease", "lease", klog.KRef(c.leaseNamespace, c.leaseName))
 	}
 }
 
@@ -100,6 +154,15 @@ func (c *controller) Run(ctx context.Context) {
 }
 
 func (c *controller) sync(ctx context.Context) {
+	select {
+	case <-c.stopCh:
+		return
+	default:
+	}
+
+	c.reconcilingLock.Lock()
+	defer c.reconcilingLock.Unlock()
+
 	if c.latestLease != nil {
 		// As long as the lease is not (or very rarely) updated by any other agent than the component itself,
 		// we can optimistically assume it didn't change since our last update and try updating
@@ -143,9 +206,11 @@ func (c *controller) backoffEnsureLease(ctx context.Context) (*coordinationv1.Le
 		}
 		sleep = minDuration(2*sleep, maxBackoff)
 		klog.FromContext(ctx).Error(err, "Failed to ensure lease exists, will retry", "interval", sleep)
-		// backoff wait with early return if the context gets canceled
+		// backoff wait with early return if the context gets canceled or Stop is called
 		select {
 		case <-ctx.Done():
+			return nil, false
+		case <-c.stopCh:
 			return nil, false
 		case <-time.After(sleep):
 		}
@@ -221,13 +286,14 @@ func (c *controller) newLease(base *coordinationv1.Lease) (*coordinationv1.Lease
 				Namespace: c.leaseNamespace,
 			},
 			Spec: coordinationv1.LeaseSpec{
-				HolderIdentity:       pointer.StringPtr(c.holderIdentity),
-				LeaseDurationSeconds: pointer.Int32Ptr(c.leaseDurationSeconds),
+				HolderIdentity: ptr.To(c.holderIdentity),
 			},
 		}
 	} else {
 		lease = base.DeepCopy()
 	}
+	// update the duration, the controller's config may have changed since lease creation
+	lease.Spec.LeaseDurationSeconds = ptr.To(c.leaseDurationSeconds)
 	lease.Spec.RenewTime = &metav1.MicroTime{Time: c.clock.Now()}
 
 	if c.newLeasePostProcessFunc != nil {

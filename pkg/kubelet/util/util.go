@@ -21,6 +21,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/kubernetes/pkg/util/filesystem"
 )
 
 // FromApiserverCache modifies <opts> so that the GET request will
@@ -28,6 +29,8 @@ import (
 func FromApiserverCache(opts *metav1.GetOptions) {
 	opts.ResourceVersion = "0"
 }
+
+var IsUnixDomainSocket = filesystem.IsUnixDomainSocket
 
 // GetNodenameForKernel gets hostname value to set in the hostname field (the nodename field of struct utsname) of the pod.
 func GetNodenameForKernel(hostname string, hostDomainName string, setHostnameAsFQDN *bool) (string, error) {
@@ -56,4 +59,53 @@ func GetContainerByIndex(containers []v1.Container, statuses []v1.ContainerStatu
 		return v1.Container{}, false
 	}
 	return containers[idx], true
+}
+
+type ResourceOpts struct {
+	PodResources       *v1.ResourceRequirements
+	ContainerResources *v1.ResourceRequirements
+}
+
+// GetLimits calculates the resource limits for the container.
+// It uses the container's explicit limits first. If limits for CPU or Memory
+// are not explicitly set at the container level (i.e., they are zero),
+// the corresponding limits from the Pod's resource requirements are applied
+// as defaults to the returned map.
+// TODO(ndixita): Consolidate resource limit logic
+// The implementation of CPU/Memory limit calculation is duplicated here and in
+// pkg/kubelet/kuberuntime/kuberuntime_container_linux.go (getCPULimits/getMemoryLimits).
+// Refactor into a shared utility function.
+func GetLimits(res *ResourceOpts) v1.ResourceList {
+	if res == nil {
+		return v1.ResourceList{}
+	}
+
+	limitsOrEmpty := func(containerResources *v1.ResourceRequirements) v1.ResourceList {
+		if containerResources == nil || containerResources.Limits == nil {
+			return v1.ResourceList{}
+		}
+		return containerResources.Limits.DeepCopy()
+	}
+
+	containerLimits := limitsOrEmpty(res.ContainerResources)
+
+	if res.PodResources == nil || len(res.PodResources.Limits) == 0 {
+		// if pod-level limits are not set, return container-level limits
+		return containerLimits
+	}
+
+	podLevelLimits := res.PodResources.Limits
+
+	// When container-level CPU limit is not set, the pod-level
+	// limit CPU is applied at container-level
+	if containerLimits.Cpu().IsZero() && !podLevelLimits.Cpu().IsZero() {
+		containerLimits[v1.ResourceCPU] = podLevelLimits[v1.ResourceCPU].DeepCopy()
+	}
+
+	// When container-level Memory limit is not set, the pod-level
+	// limit Memory is applied at container-level
+	if containerLimits.Memory().IsZero() && !podLevelLimits.Memory().IsZero() {
+		containerLimits[v1.ResourceMemory] = podLevelLimits[v1.ResourceMemory].DeepCopy()
+	}
+	return containerLimits
 }

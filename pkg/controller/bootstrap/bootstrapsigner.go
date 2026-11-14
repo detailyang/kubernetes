@@ -19,6 +19,7 @@ package bootstrap
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -82,7 +83,7 @@ type Signer struct {
 	// have one item (Named <ConfigMapName>) in this queue. We are using it
 	// serializes and collapses updates as they can come from both the ConfigMap
 	// and Secrets controllers.
-	syncQueue workqueue.RateLimitingInterface
+	syncQueue workqueue.TypedRateLimitingInterface[string]
 
 	secretLister corelisters.SecretLister
 	secretSynced cache.InformerSynced
@@ -92,7 +93,8 @@ type Signer struct {
 }
 
 // NewSigner returns a new *Signer.
-func NewSigner(cl clientset.Interface, secrets informers.SecretInformer, configMaps informers.ConfigMapInformer, options SignerOptions) (*Signer, error) {
+func NewSigner(ctx context.Context, cl clientset.Interface, secrets informers.SecretInformer, configMaps informers.ConfigMapInformer, options SignerOptions) (*Signer, error) {
+	logger := klog.FromContext(ctx)
 	e := &Signer{
 		client:             cl,
 		configMapKey:       options.ConfigMapNamespace + "/" + options.ConfigMapName,
@@ -103,10 +105,16 @@ func NewSigner(cl clientset.Interface, secrets informers.SecretInformer, configM
 		secretSynced:       secrets.Informer().HasSynced,
 		configMapLister:    configMaps.Lister(),
 		configMapSynced:    configMaps.Informer().HasSynced,
-		syncQueue:          workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "bootstrap_signer_queue"),
+		syncQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: &logger,
+				Name:   "bootstrap_signer_queue",
+			},
+		),
 	}
 
-	configMaps.Informer().AddEventHandlerWithResyncPeriod(
+	_, _ = configMaps.Informer().AddEventHandlerWithOptions(
 		cache.FilteringResourceEventHandler{
 			FilterFunc: func(obj interface{}) bool {
 				switch t := obj.(type) {
@@ -122,10 +130,13 @@ func NewSigner(cl clientset.Interface, secrets informers.SecretInformer, configM
 				UpdateFunc: func(_, _ interface{}) { e.pokeConfigMapSync() },
 			},
 		},
-		options.ConfigMapResync,
+		cache.HandlerOptions{
+			Logger:       &logger,
+			ResyncPeriod: &options.ConfigMapResync,
+		},
 	)
 
-	secrets.Informer().AddEventHandlerWithResyncPeriod(
+	_, _ = secrets.Informer().AddEventHandlerWithOptions(
 		cache.FilteringResourceEventHandler{
 			FilterFunc: func(obj interface{}) bool {
 				switch t := obj.(type) {
@@ -142,7 +153,10 @@ func NewSigner(cl clientset.Interface, secrets informers.SecretInformer, configM
 				DeleteFunc: func(_ interface{}) { e.pokeConfigMapSync() },
 			},
 		},
-		options.SecretResync,
+		cache.HandlerOptions{
+			Logger:       &logger,
+			ResyncPeriod: &options.SecretResync,
+		},
 	)
 
 	return e, nil
@@ -150,19 +164,26 @@ func NewSigner(cl clientset.Interface, secrets informers.SecretInformer, configM
 
 // Run runs controller loops and returns when they are done
 func (e *Signer) Run(ctx context.Context) {
-	// Shut down queues
-	defer utilruntime.HandleCrash()
-	defer e.syncQueue.ShutDown()
+	defer utilruntime.HandleCrashWithContext(ctx)
 
-	if !cache.WaitForNamedCacheSync("bootstrap_signer", ctx.Done(), e.configMapSynced, e.secretSynced) {
+	logger := klog.FromContext(ctx)
+	logger.V(5).Info("Starting")
+
+	var wg sync.WaitGroup
+	defer func() {
+		logger.V(1).Info("Shutting down")
+		e.syncQueue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, e.configMapSynced, e.secretSynced) {
 		return
 	}
 
-	logger := klog.FromContext(ctx)
-	logger.V(5).Info("Starting workers")
-	go wait.UntilWithContext(ctx, e.serviceConfigMapQueue, 0)
+	wg.Go(func() {
+		wait.UntilWithContext(ctx, e.serviceConfigMapQueue, 0)
+	})
 	<-ctx.Done()
-	logger.V(1).Info("Shutting down")
 }
 
 func (e *Signer) pokeConfigMapSync() {

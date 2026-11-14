@@ -17,16 +17,18 @@ limitations under the License.
 package reconciler
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/ktesting"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	"k8s.io/kubernetes/pkg/kubelet/pluginmanager/cache"
 	"k8s.io/kubernetes/pkg/kubelet/pluginmanager/operationexecutor"
@@ -57,21 +59,22 @@ func cleanup(t *testing.T) {
 	os.MkdirAll(socketDir, 0755)
 }
 
-func runReconciler(reconciler Reconciler) {
-	go reconciler.Run(wait.NeverStop)
+func runReconciler(t *testing.T, reconciler Reconciler) {
+	tCtx := ktesting.Init(t)
+	go reconciler.Run(tCtx)
 }
 
 func waitForRegistration(
 	t *testing.T,
 	socketPath string,
-	previousTimestamp time.Time,
+	expectedUUID types.UID,
 	asw cache.ActualStateOfWorld) {
 	err := retryWithExponentialBackOff(
 		time.Duration(500*time.Millisecond),
 		func() (bool, error) {
 			registeredPlugins := asw.GetRegisteredPlugins()
 			for _, plugin := range registeredPlugins {
-				if plugin.SocketPath == socketPath && plugin.Timestamp.After(previousTimestamp) {
+				if plugin.SocketPath == socketPath && plugin.UUID == expectedUUID {
 					return true, nil
 				}
 			}
@@ -122,17 +125,17 @@ func NewDummyImpl() *DummyImpl {
 }
 
 // ValidatePlugin is a dummy implementation
-func (d *DummyImpl) ValidatePlugin(pluginName string, endpoint string, versions []string) error {
+func (d *DummyImpl) ValidatePlugin(_ context.Context, pluginName string, endpoint string, versions []string) error {
 	return nil
 }
 
 // RegisterPlugin is a dummy implementation
-func (d *DummyImpl) RegisterPlugin(pluginName string, endpoint string, versions []string) error {
+func (d *DummyImpl) RegisterPlugin(_ context.Context, pluginName string, endpoint string, versions []string, pluginClientTimeout *time.Duration) error {
 	return nil
 }
 
 // DeRegisterPlugin is a dummy implementation
-func (d *DummyImpl) DeRegisterPlugin(pluginName string) {
+func (d *DummyImpl) DeRegisterPlugin(_ context.Context, pluginName, endpoint string) {
 }
 
 // Calls Run()
@@ -153,7 +156,7 @@ func Test_Run_Positive_DoNothing(t *testing.T) {
 		asw,
 	)
 	// Act
-	runReconciler(reconciler)
+	runReconciler(t, reconciler)
 
 	// Get dsw and asw plugins; they should both be empty
 	if len(asw.GetRegisteredPlugins()) != 0 {
@@ -168,13 +171,9 @@ func Test_Run_Positive_DoNothing(t *testing.T) {
 // Calls Run()
 // Verifies the actual state of world contains that plugin
 func Test_Run_Positive_Register(t *testing.T) {
-	// Skip tests that fail on Windows, as discussed during the SIG Testing meeting from January 10, 2023
-	if runtime.GOOS == "windows" {
-		t.Skip("Skipping test that fails on Windows")
-	}
-
 	defer cleanup(t)
 
+	tCtx := ktesting.Init(t)
 	dsw := cache.NewDesiredStateOfWorld()
 	asw := cache.NewActualStateOfWorld()
 	di := NewDummyImpl()
@@ -191,19 +190,20 @@ func Test_Run_Positive_Register(t *testing.T) {
 	reconciler.AddHandler(registerapi.DevicePlugin, cache.PluginHandler(di))
 
 	// Start the reconciler to fill ASW.
-	stopChan := make(chan struct{})
-	defer close(stopChan)
-	go reconciler.Run(stopChan)
+	reconcilerCtx := tCtx.WithCancel()
+	defer reconcilerCtx.Cancel("stop reconciler")
+	go reconciler.Run(reconcilerCtx)
 	socketPath := filepath.Join(socketDir, "plugin.sock")
 	pluginName := fmt.Sprintf("example-plugin")
 	p := pluginwatcher.NewTestExamplePlugin(pluginName, registerapi.DevicePlugin, socketPath, supportedVersions...)
-	require.NoError(t, p.Serve("v1beta1", "v1beta2"))
+	require.NoError(t, p.Serve(tCtx, "v1beta1", "v1beta2"))
 	defer func() {
-		require.NoError(t, p.Stop())
+		require.NoError(t, p.Stop(tCtx))
 	}()
-	timestampBeforeRegistration := time.Now()
-	dsw.AddOrUpdatePlugin(socketPath)
-	waitForRegistration(t, socketPath, timestampBeforeRegistration, asw)
+	require.NoError(t, dsw.AddOrUpdatePlugin(tCtx, socketPath))
+
+	plugins := dsw.GetPluginsToRegister()
+	waitForRegistration(t, socketPath, plugins[0].UUID, asw)
 
 	// Get asw plugins; it should contain the added plugin
 	aswPlugins := asw.GetRegisteredPlugins()
@@ -221,13 +221,9 @@ func Test_Run_Positive_Register(t *testing.T) {
 // Deletes plugin from desired state of world.
 // Verifies that plugin no longer exists in actual state of world.
 func Test_Run_Positive_RegisterThenUnregister(t *testing.T) {
-	// Skip tests that fail on Windows, as discussed during the SIG Testing meeting from January 10, 2023
-	if runtime.GOOS == "windows" {
-		t.Skip("Skipping test that fails on Windows")
-	}
-
 	defer cleanup(t)
 
+	tCtx := ktesting.Init(t)
 	dsw := cache.NewDesiredStateOfWorld()
 	asw := cache.NewActualStateOfWorld()
 	di := NewDummyImpl()
@@ -244,17 +240,17 @@ func Test_Run_Positive_RegisterThenUnregister(t *testing.T) {
 	reconciler.AddHandler(registerapi.DevicePlugin, cache.PluginHandler(di))
 
 	// Start the reconciler to fill ASW.
-	stopChan := make(chan struct{})
-	defer close(stopChan)
-	go reconciler.Run(stopChan)
+	reconcilerCtx := tCtx.WithCancel()
+	defer reconcilerCtx.Cancel("stop reconciler")
+	go reconciler.Run(reconcilerCtx)
 
 	socketPath := filepath.Join(socketDir, "plugin.sock")
 	pluginName := fmt.Sprintf("example-plugin")
 	p := pluginwatcher.NewTestExamplePlugin(pluginName, registerapi.DevicePlugin, socketPath, supportedVersions...)
-	require.NoError(t, p.Serve("v1beta1", "v1beta2"))
-	timestampBeforeRegistration := time.Now()
-	dsw.AddOrUpdatePlugin(socketPath)
-	waitForRegistration(t, socketPath, timestampBeforeRegistration, asw)
+	require.NoError(t, p.Serve(tCtx, "v1beta1", "v1beta2"))
+	require.NoError(t, dsw.AddOrUpdatePlugin(tCtx, socketPath))
+	plugins := dsw.GetPluginsToRegister()
+	waitForRegistration(t, socketPath, plugins[0].UUID, asw)
 
 	// Get asw plugins; it should contain the added plugin
 	aswPlugins := asw.GetRegisteredPlugins()
@@ -282,13 +278,9 @@ func Test_Run_Positive_RegisterThenUnregister(t *testing.T) {
 // Verifies that the plugin is reregistered.
 // Verifies the plugin with updated timestamp now in actual state of world.
 func Test_Run_Positive_ReRegister(t *testing.T) {
-	// Skip tests that fail on Windows, as discussed during the SIG Testing meeting from January 10, 2023
-	if runtime.GOOS == "windows" {
-		t.Skip("Skipping test that fails on Windows")
-	}
-
 	defer cleanup(t)
 
+	tCtx := ktesting.Init(t)
 	dsw := cache.NewDesiredStateOfWorld()
 	asw := cache.NewActualStateOfWorld()
 	di := NewDummyImpl()
@@ -305,26 +297,26 @@ func Test_Run_Positive_ReRegister(t *testing.T) {
 	reconciler.AddHandler(registerapi.DevicePlugin, cache.PluginHandler(di))
 
 	// Start the reconciler to fill ASW.
-	stopChan := make(chan struct{})
-	defer close(stopChan)
-	go reconciler.Run(stopChan)
+	reconcilerCtx := tCtx.WithCancel()
+	defer reconcilerCtx.Cancel("stop reconciler")
+	go reconciler.Run(reconcilerCtx)
 
 	socketPath := filepath.Join(socketDir, "plugin2.sock")
 	pluginName := fmt.Sprintf("example-plugin2")
 	p := pluginwatcher.NewTestExamplePlugin(pluginName, registerapi.DevicePlugin, socketPath, supportedVersions...)
-	require.NoError(t, p.Serve("v1beta1", "v1beta2"))
-	timestampBeforeRegistration := time.Now()
-	dsw.AddOrUpdatePlugin(socketPath)
-	waitForRegistration(t, socketPath, timestampBeforeRegistration, asw)
+	require.NoError(t, p.Serve(tCtx, "v1beta1", "v1beta2"))
+	require.NoError(t, dsw.AddOrUpdatePlugin(tCtx, socketPath))
+	plugins := dsw.GetPluginsToRegister()
+	waitForRegistration(t, socketPath, plugins[0].UUID, asw)
 
-	timeStampBeforeReRegistration := time.Now()
 	// Add the plugin again to update the timestamp
-	dsw.AddOrUpdatePlugin(socketPath)
+	require.NoError(t, dsw.AddOrUpdatePlugin(tCtx, socketPath))
 	// This should trigger a deregistration and a regitration
 	// The process of unregistration and reregistration can happen so fast that
 	// we are not able to catch it with waitForUnregistration, so here we are checking
 	// the plugin has an updated timestamp.
-	waitForRegistration(t, socketPath, timeStampBeforeReRegistration, asw)
+	plugins = dsw.GetPluginsToRegister()
+	waitForRegistration(t, socketPath, plugins[0].UUID, asw)
 
 	// Get asw plugins; it should contain the added plugin
 	aswPlugins := asw.GetRegisteredPlugins()

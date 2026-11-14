@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/apimachinery/pkg/util/version"
 	fakeclient "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/component-base/metrics/testutil"
 	"k8s.io/kubernetes/pkg/volume"
@@ -94,12 +96,11 @@ func TestOperationGenerator_GenerateUnmapVolumeFunc_PluginName(t *testing.T) {
 
 func TestOperationGenerator_GenerateExpandAndRecoverVolumeFunc(t *testing.T) {
 	nodeResizePending := v1.PersistentVolumeClaimNodeResizePending
-	nodeResizeFailed := v1.PersistentVolumeClaimNodeResizeFailed
+	nodeResizeFailed := v1.PersistentVolumeClaimNodeResizeInfeasible
 	var tests = []struct {
 		name                 string
 		pvc                  *v1.PersistentVolumeClaim
 		pv                   *v1.PersistentVolume
-		recoverFeatureGate   bool
 		disableNodeExpansion bool
 		// expectations of test
 		expectedResizeStatus  v1.ClaimResourceStatus
@@ -110,7 +111,6 @@ func TestOperationGenerator_GenerateExpandAndRecoverVolumeFunc(t *testing.T) {
 			name:                  "pvc.spec.size > pv.spec.size, recover_expansion=on",
 			pvc:                   getTestPVC("test-vol0", "2G", "1G", "", nil),
 			pv:                    getTestPV("test-vol0", "1G"),
-			recoverFeatureGate:    true,
 			expectedResizeStatus:  v1.PersistentVolumeClaimNodeResizePending,
 			expectedAllocatedSize: resource.MustParse("2G"),
 			expectResizeCall:      true,
@@ -119,7 +119,6 @@ func TestOperationGenerator_GenerateExpandAndRecoverVolumeFunc(t *testing.T) {
 			name:                  "pvc.spec.size = pv.spec.size, recover_expansion=on",
 			pvc:                   getTestPVC("test-vol0", "1G", "1G", "", nil),
 			pv:                    getTestPV("test-vol0", "1G"),
-			recoverFeatureGate:    true,
 			expectedResizeStatus:  v1.PersistentVolumeClaimNodeResizePending,
 			expectedAllocatedSize: resource.MustParse("1G"),
 			expectResizeCall:      true,
@@ -128,7 +127,6 @@ func TestOperationGenerator_GenerateExpandAndRecoverVolumeFunc(t *testing.T) {
 			name:                  "pvc.spec.size = pv.spec.size, recover_expansion=on",
 			pvc:                   getTestPVC("test-vol0", "1G", "1G", "1G", &nodeResizePending),
 			pv:                    getTestPV("test-vol0", "1G"),
-			recoverFeatureGate:    true,
 			expectedResizeStatus:  v1.PersistentVolumeClaimNodeResizePending,
 			expectedAllocatedSize: resource.MustParse("1G"),
 			expectResizeCall:      false,
@@ -138,7 +136,6 @@ func TestOperationGenerator_GenerateExpandAndRecoverVolumeFunc(t *testing.T) {
 			pvc:                   getTestPVC("test-vol0", "2G", "1G", "", nil),
 			pv:                    getTestPV("test-vol0", "1G"),
 			disableNodeExpansion:  true,
-			recoverFeatureGate:    true,
 			expectedResizeStatus:  "",
 			expectedAllocatedSize: resource.MustParse("2G"),
 			expectResizeCall:      true,
@@ -147,7 +144,6 @@ func TestOperationGenerator_GenerateExpandAndRecoverVolumeFunc(t *testing.T) {
 			name:                  "pv.spec.size >= pvc.spec.size, recover_expansion=on, resize_status=node_expansion_failed",
 			pvc:                   getTestPVC("test-vol0", "2G", "1G", "2G", &nodeResizeFailed),
 			pv:                    getTestPV("test-vol0", "2G"),
-			recoverFeatureGate:    true,
 			expectedResizeStatus:  v1.PersistentVolumeClaimNodeResizePending,
 			expectedAllocatedSize: resource.MustParse("2G"),
 			expectResizeCall:      false,
@@ -156,7 +152,6 @@ func TestOperationGenerator_GenerateExpandAndRecoverVolumeFunc(t *testing.T) {
 	for i := range tests {
 		test := tests[i]
 		t.Run(test.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RecoverVolumeExpansionFailure, test.recoverFeatureGate)()
 			volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
 			fakePlugin.DisableNodeExpansion = test.disableNodeExpansion
 			pvc := test.pvc
@@ -176,7 +171,7 @@ func TestOperationGenerator_GenerateExpandAndRecoverVolumeFunc(t *testing.T) {
 			}
 			updatedPVC := expansionResponse.pvc
 			actualResizeStatus := updatedPVC.Status.AllocatedResourceStatuses[v1.ResourceStorage]
-			assert.Equal(t, actualResizeStatus, test.expectedResizeStatus)
+			assert.Equal(t, test.expectedResizeStatus, actualResizeStatus)
 			actualAllocatedSize := updatedPVC.Status.AllocatedResources.Storage()
 			if test.expectedAllocatedSize.Cmp(*actualAllocatedSize) != 0 {
 				t.Fatalf("GenerateExpandAndRecoverVolumeFunc failed: expected allocated size %s, got %s", test.expectedAllocatedSize.String(), actualAllocatedSize.String())
@@ -194,7 +189,7 @@ func TestOperationGenerator_nodeExpandVolume(t *testing.T) {
 		return &x
 	}
 
-	nodeResizeFailed := v1.PersistentVolumeClaimNodeResizeFailed
+	nodeResizeFailed := v1.PersistentVolumeClaimNodeResizeInfeasible
 	nodeResizePending := v1.PersistentVolumeClaimNodeResizePending
 	var tests = []struct {
 		name string
@@ -217,7 +212,7 @@ func TestOperationGenerator_nodeExpandVolume(t *testing.T) {
 			pvc:  getTestPVC("test-vol0", "2G", "1G", "", &nodeResizeFailed),
 			pv:   getTestPV("test-vol0", "2G"),
 
-			expectedResizeStatus: v1.PersistentVolumeClaimNodeResizeFailed,
+			expectedResizeStatus: v1.PersistentVolumeClaimNodeResizeInfeasible,
 			resizeCallCount:      0,
 			expectedStatusSize:   resource.MustParse("1G"),
 		},
@@ -231,10 +226,10 @@ func TestOperationGenerator_nodeExpandVolume(t *testing.T) {
 		},
 		{
 			name:                 "pv.spec.cap > pvc.status.cap, resizeStatus=node_expansion_pending, reize_op=failing",
-			pvc:                  getTestPVC(volumetesting.AlwaysFailNodeExpansion, "2G", "1G", "2G", &nodeResizePending),
-			pv:                   getTestPV(volumetesting.AlwaysFailNodeExpansion, "2G"),
+			pvc:                  getTestPVC(volumetesting.InfeasibleNodeExpansion, "2G", "1G", "2G", &nodeResizePending),
+			pv:                   getTestPV(volumetesting.InfeasibleNodeExpansion, "2G"),
 			expectError:          true,
-			expectedResizeStatus: v1.PersistentVolumeClaimNodeResizeFailed,
+			expectedResizeStatus: v1.PersistentVolumeClaimNodeResizeInfeasible,
 			resizeCallCount:      1,
 			expectedStatusSize:   resource.MustParse("1G"),
 		},
@@ -255,7 +250,7 @@ func TestOperationGenerator_nodeExpandVolume(t *testing.T) {
 			actualSize:  getSizeFunc("1G"),
 
 			expectedResizeStatus: "",
-			resizeCallCount:      1,
+			resizeCallCount:      0,
 			expectedStatusSize:   resource.MustParse("2G"),
 		},
 		{
@@ -265,7 +260,7 @@ func TestOperationGenerator_nodeExpandVolume(t *testing.T) {
 			desiredSize: getSizeFunc("2G"),
 			actualSize:  getSizeFunc("1G"),
 
-			expectedResizeStatus: v1.PersistentVolumeClaimNodeResizeFailed,
+			expectedResizeStatus: v1.PersistentVolumeClaimNodeResizeInfeasible,
 			resizeCallCount:      0,
 			expectedStatusSize:   resource.MustParse("2G"),
 		},
@@ -273,7 +268,6 @@ func TestOperationGenerator_nodeExpandVolume(t *testing.T) {
 	for i := range tests {
 		test := tests[i]
 		t.Run(test.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RecoverVolumeExpansionFailure, true)()
 			volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
 			test.pv.Spec.ClaimRef = &v1.ObjectReference{
 				Namespace: test.pvc.Namespace,
@@ -302,9 +296,10 @@ func TestOperationGenerator_nodeExpandVolume(t *testing.T) {
 				NewSize:    *desiredSize,
 				OldSize:    *actualSize,
 			}
+			asow := newFakeActualStateOfWorld()
 
 			ogInstance, _ := og.(*operationGenerator)
-			_, err := ogInstance.nodeExpandVolume(vmt, nil, pluginResizeOpts)
+			_, _, err := ogInstance.nodeExpandVolume(vmt, asow, pluginResizeOpts)
 
 			if !test.expectError && err != nil {
 				t.Errorf("For test %s, expected no error got: %v", test.name, err)
@@ -317,6 +312,354 @@ func TestOperationGenerator_nodeExpandVolume(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExpandDuringMount(t *testing.T) {
+	nodeResizePending := v1.PersistentVolumeClaimNodeResizePending
+	var tests = []struct {
+		name string
+		pvc  *v1.PersistentVolumeClaim
+		pv   *v1.PersistentVolume
+
+		// desired size, defaults to pv.Spec.Capacity
+		desiredSize *resource.Quantity
+		// actualSize, defaults to pvc.Status.Capacity
+		actualSize *resource.Quantity
+
+		// expectations of test
+		expectedResizeStatus v1.ClaimResourceStatus
+		expectedStatusSize   resource.Quantity
+		resizeCallCount      int
+		expectError          bool
+	}{
+		{
+			name:                 "pv.spec.cap > pvc.status.cap, resizeStatus=node_expansion_pending",
+			pvc:                  getTestPVC("test-vol0", "2G", "1G", "2G", &nodeResizePending),
+			pv:                   getTestPV("test-vol0", "2G"),
+			expectedResizeStatus: "",
+			resizeCallCount:      1,
+			expectedStatusSize:   resource.MustParse("2G"),
+		},
+	}
+	for i := range tests {
+		test := tests[i]
+		t.Run(test.name, func(t *testing.T) {
+			volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
+			test.pv.Spec.ClaimRef = &v1.ObjectReference{
+				Namespace: test.pvc.Namespace,
+				Name:      test.pvc.Name,
+			}
+
+			pvc := test.pvc
+			pv := test.pv
+			pod := getTestPod("test-pod", pvc.Name)
+			og := getTestOperatorGeneratorWithPVPVC(volumePluginMgr, pvc, pv)
+			vmt := VolumeToMount{
+				Pod:        pod,
+				VolumeName: v1.UniqueVolumeName(pv.Name),
+				VolumeSpec: volume.NewSpecFromPersistentVolume(pv, false),
+			}
+			desiredSize := test.desiredSize
+			if desiredSize == nil {
+				desiredSize = pv.Spec.Capacity.Storage()
+			}
+			actualSize := test.actualSize
+			if actualSize == nil {
+				actualSize = pvc.Status.Capacity.Storage()
+			}
+			pluginResizeOpts := volume.NodeResizeOptions{
+				NewSize: *desiredSize,
+				OldSize: *actualSize,
+			}
+			asow := newFakeActualStateOfWorld()
+
+			ogInstance, _ := og.(*operationGenerator)
+			_, err := ogInstance.expandVolumeDuringMount(vmt, asow, pluginResizeOpts)
+
+			if !test.expectError && err != nil {
+				t.Errorf("For test %s, expected no error got: %v", test.name, err)
+			}
+			if test.expectError && err == nil {
+				t.Errorf("For test %s, expected error but got none", test.name)
+			}
+			if test.resizeCallCount != fakePlugin.NodeExpandCallCount {
+				t.Errorf("for test %s, expected node-expand call count to be %d, got %d", test.name, test.resizeCallCount, fakePlugin.NodeExpandCallCount)
+			}
+
+			if test.resizeCallCount > 0 {
+				resizeOptions := fakePlugin.LastResizeOptions
+				if resizeOptions.VolumeSpec == nil {
+					t.Errorf("for test %s, expected volume spec to be set", test.name)
+				}
+			}
+		})
+	}
+}
+func TestCheckForRecoveryFromExpansion(t *testing.T) {
+	tests := []struct {
+		name                  string
+		pvc                   *v1.PersistentVolumeClaim
+		expectedRecoveryCheck bool
+	}{
+		{
+			name: "resize status and allocated resources set",
+			pvc: &v1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-pvc-3",
+				},
+				Status: v1.PersistentVolumeClaimStatus{
+					AllocatedResourceStatuses: map[v1.ResourceName]v1.ClaimResourceStatus{
+						v1.ResourceStorage: v1.PersistentVolumeClaimNodeResizePending,
+					},
+					AllocatedResources: v1.ResourceList{
+						v1.ResourceStorage: resource.MustParse("10Gi"),
+					},
+				},
+			},
+			expectedRecoveryCheck: true,
+		},
+		{
+			name: "no resize status or allocated resources",
+			pvc: &v1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-pvc-4",
+				},
+				Status: v1.PersistentVolumeClaimStatus{
+					AllocatedResourceStatuses: nil,
+					AllocatedResources:        nil,
+				},
+			},
+			expectedRecoveryCheck: false,
+		},
+		{
+			name: "older external resize controller",
+			pvc: &v1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-pvc-5",
+				},
+				Status: v1.PersistentVolumeClaimStatus{
+					AllocatedResourceStatuses: nil,
+					AllocatedResources:        nil,
+				},
+			},
+			expectedRecoveryCheck: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pod := getTestPod("test-pod", test.pvc.Name)
+			pv := getTestPV("test-vol0", "2G")
+			og := &operationGenerator{}
+
+			vmt := VolumeToMount{
+				Pod:        pod,
+				VolumeName: v1.UniqueVolumeName(pv.Name),
+				VolumeSpec: volume.NewSpecFromPersistentVolume(pv, false),
+			}
+			result := og.checkForRecoveryFromExpansion(test.pvc, vmt)
+
+			assert.Equal(t, test.expectedRecoveryCheck, result, "unexpected recovery check result for test: %s", test.name)
+		})
+	}
+}
+
+func TestGenerateMountVolumeFunc_AttemptTrackingRespectsFeatureGate(t *testing.T) {
+	featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.33"))
+
+	tests := []struct {
+		name                  string
+		featureGateEnabled    bool
+		expectedAttemptedCall int
+	}{
+		{
+			name:                  "feature gate disabled",
+			featureGateEnabled:    false,
+			expectedAttemptedCall: 0,
+		},
+		{
+			name:                  "feature gate enabled",
+			featureGateEnabled:    true,
+			expectedAttemptedCall: 2,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIVolumeHealth, test.featureGateEnabled)
+
+			volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
+			fakePlugin.DisableNodeExpansion = true
+			og := getTestOperationGenerator(volumePluginMgr)
+
+			pv := getTestPV("test-vol0", "1G")
+			pod := getTestPod("test-pod", "claim01")
+			asow := &attemptTrackingTestASW{}
+			volumeToMount := VolumeToMount{
+				VolumeName: v1.UniqueVolumeName(pv.Name),
+				PodName:    volumetypes.UniquePodName(pod.UID),
+				VolumeSpec: volume.NewSpecFromPersistentVolume(pv, false),
+				Pod:        pod,
+			}
+
+			ops := og.GenerateMountVolumeFunc(time.Second, volumeToMount, asow, false)
+			eventErr, detailedErr := ops.Run()
+			if eventErr != nil || detailedErr != nil {
+				t.Fatalf("GenerateMountVolumeFunc returned unexpected errors: event=%v detailed=%v", eventErr, detailedErr)
+			}
+
+			if asow.mountAttemptedCalls != test.expectedAttemptedCall {
+				t.Fatalf("expected MarkVolumeAsMountAttempted to be called %d times, got %d", test.expectedAttemptedCall, asow.mountAttemptedCalls)
+			}
+		})
+	}
+}
+
+func TestGenerateMapVolumeFunc_AttemptTrackingRespectsFeatureGate(t *testing.T) {
+	featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.33"))
+
+	tests := []struct {
+		name                  string
+		featureGateEnabled    bool
+		expectedAttemptedCall int
+	}{
+		{
+			name:                  "feature gate disabled",
+			featureGateEnabled:    false,
+			expectedAttemptedCall: 0,
+		},
+		{
+			name:               "feature gate enabled",
+			featureGateEnabled: true,
+			// MapVolume marks once before SetUpDevice (unlike MountVolume which marks
+			// before both MountDevice and SetUp).
+			expectedAttemptedCall: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIVolumeHealth, test.featureGateEnabled)
+
+			volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
+			fakePlugin.DisableNodeExpansion = true
+			og := getTestOperationGenerator(volumePluginMgr)
+
+			pv := getTestPV("test-vol0", "1G")
+			blockMode := v1.PersistentVolumeBlock
+			pv.Spec.VolumeMode = &blockMode
+
+			pod := getTestPod("test-pod", "claim01")
+			asow := &attemptTrackingTestASW{}
+			volumeToMount := VolumeToMount{
+				VolumeName: v1.UniqueVolumeName(pv.Name),
+				PodName:    volumetypes.UniquePodName(pod.UID),
+				VolumeSpec: volume.NewSpecFromPersistentVolume(pv, false),
+				Pod:        pod,
+			}
+
+			ops, err := og.GenerateMapVolumeFunc(time.Second, volumeToMount, asow)
+			if err != nil {
+				t.Fatalf("GenerateMapVolumeFunc returned unexpected error: %v", err)
+			}
+
+			eventErr, detailedErr := ops.Run()
+			if eventErr != nil || detailedErr != nil {
+				t.Fatalf("GenerateMapVolumeFunc returned unexpected errors: event=%v detailed=%v", eventErr, detailedErr)
+			}
+
+			if asow.mountAttemptedCalls != test.expectedAttemptedCall {
+				t.Fatalf("expected MarkVolumeAsMountAttempted to be called %d times, got %d", test.expectedAttemptedCall, asow.mountAttemptedCalls)
+			}
+		})
+	}
+}
+
+type attemptTrackingTestASW struct {
+	deviceMountState    DeviceMountState
+	mountAttemptedCalls int
+	lastAttemptedPod    volumetypes.UniquePodName
+	lastAttemptedVolume v1.UniqueVolumeName
+}
+
+func (a *attemptTrackingTestASW) MarkVolumeAsMounted(markVolumeOpts MarkVolumeOpts) error {
+	return nil
+}
+
+func (a *attemptTrackingTestASW) MarkVolumeAsUnmounted(podName volumetypes.UniquePodName, volumeName v1.UniqueVolumeName) error {
+	return nil
+}
+
+func (a *attemptTrackingTestASW) MarkVolumeMountAsUncertain(markVolumeOpts MarkVolumeOpts) error {
+	return nil
+}
+
+func (a *attemptTrackingTestASW) MarkDeviceAsMounted(volumeName v1.UniqueVolumeName, devicePath, deviceMountPath, seLinuxMountContext string) error {
+	a.deviceMountState = DeviceGloballyMounted
+	return nil
+}
+
+func (a *attemptTrackingTestASW) MarkDeviceAsUncertain(volumeName v1.UniqueVolumeName, devicePath, deviceMountPath, seLinuxMountContext string) error {
+	return nil
+}
+
+func (a *attemptTrackingTestASW) MarkDeviceAsUnmounted(volumeName v1.UniqueVolumeName) error {
+	a.deviceMountState = DeviceNotMounted
+	return nil
+}
+
+func (a *attemptTrackingTestASW) MarkVolumeAsResized(volumeName v1.UniqueVolumeName, claimSize resource.Quantity) bool {
+	return true
+}
+
+func (a *attemptTrackingTestASW) GetDeviceMountState(volumeName v1.UniqueVolumeName) DeviceMountState {
+	return a.deviceMountState
+}
+
+func (a *attemptTrackingTestASW) GetVolumeMountState(volumeName v1.UniqueVolumeName, podName volumetypes.UniquePodName) VolumeMountState {
+	return VolumeNotMounted
+}
+
+func (a *attemptTrackingTestASW) IsVolumeMountedElsewhere(volumeName v1.UniqueVolumeName, podName volumetypes.UniquePodName) bool {
+	return false
+}
+
+func (a *attemptTrackingTestASW) MarkForInUseExpansionError(volumeName v1.UniqueVolumeName) {}
+
+func (a *attemptTrackingTestASW) CheckAndMarkVolumeAsUncertainViaReconstruction(opts MarkVolumeOpts) (bool, error) {
+	return false, nil
+}
+
+func (a *attemptTrackingTestASW) CheckAndMarkDeviceUncertainViaReconstruction(volumeName v1.UniqueVolumeName, deviceMountPath string) bool {
+	return false
+}
+
+func (a *attemptTrackingTestASW) IsVolumeReconstructed(volumeName v1.UniqueVolumeName, podName volumetypes.UniquePodName) bool {
+	return false
+}
+
+func (a *attemptTrackingTestASW) IsVolumeDeviceReconstructed(volumeName v1.UniqueVolumeName) bool {
+	return false
+}
+
+func (a *attemptTrackingTestASW) MarkVolumeExpansionFailedWithFinalError(volumeName v1.UniqueVolumeName) {
+}
+
+func (a *attemptTrackingTestASW) RemoveVolumeFromFailedWithFinalErrors(volumeName v1.UniqueVolumeName) {
+}
+
+func (a *attemptTrackingTestASW) CheckVolumeInFailedExpansionWithFinalErrors(volumeName v1.UniqueVolumeName) bool {
+	return false
+}
+
+func (a *attemptTrackingTestASW) MarkVolumeAsMountAttempted(podName volumetypes.UniquePodName, volumeName v1.UniqueVolumeName) {
+	a.mountAttemptedCalls++
+	a.lastAttemptedPod = podName
+	a.lastAttemptedVolume = volumeName
+}
+
+func (a *attemptTrackingTestASW) IsVolumeMountAttempted(podName volumetypes.UniquePodName, volumeName v1.UniqueVolumeName) bool {
+	return a.mountAttemptedCalls > 0 && a.lastAttemptedPod == podName && a.lastAttemptedVolume == volumeName
 }
 
 func getTestPod(podName, pvcName string) *v1.Pod {
@@ -368,6 +711,19 @@ func getTestPVC(volumeName string, specSize, statusSize, allocatedSize string, r
 			v1.ResourceStorage: *resizeStatus,
 		}
 	}
+	return pvc
+}
+
+func addAccessMode(pvc *v1.PersistentVolumeClaim, mode v1.PersistentVolumeAccessMode) *v1.PersistentVolumeClaim {
+	pvc.Spec.AccessModes = append(pvc.Spec.AccessModes, mode)
+	return pvc
+}
+
+func addAnnotation(pvc *v1.PersistentVolumeClaim, key, value string) *v1.PersistentVolumeClaim {
+	if pvc.Annotations == nil {
+		pvc.Annotations = make(map[string]string)
+	}
+	pvc.Annotations[key] = value
 	return pvc
 }
 

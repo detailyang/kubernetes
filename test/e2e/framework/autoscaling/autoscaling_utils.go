@@ -18,38 +18,45 @@ package autoscaling
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	v1 "k8s.io/api/core/v1"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	crdclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	crdclientset "k8s.io/apiextensions-api/pkg/client/clientset/clientset"
 	"k8s.io/apiextensions-apiserver/test/integration/fixtures"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
 	scaleclient "k8s.io/client-go/scale"
+	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
+	aggregatorclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2edebug "k8s.io/kubernetes/test/e2e/framework/debug"
+	e2eendpointslice "k8s.io/kubernetes/test/e2e/framework/endpointslice"
 	e2ekubectl "k8s.io/kubernetes/test/e2e/framework/kubectl"
-	e2erc "k8s.io/kubernetes/test/e2e/framework/rc"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eresource "k8s.io/kubernetes/test/e2e/framework/resource"
 	e2eservice "k8s.io/kubernetes/test/e2e/framework/service"
 	testutils "k8s.io/kubernetes/test/utils"
-	utilpointer "k8s.io/utils/pointer"
 
 	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+	"k8s.io/utils/ptr"
 
 	imageutils "k8s.io/kubernetes/test/utils/image"
 )
@@ -60,15 +67,12 @@ const (
 	dynamicRequestSizeInMegabytes   = 100
 	dynamicRequestSizeCustomMetric  = 10
 	port                            = 80
+	portName                        = "http"
 	targetPort                      = 8080
 	sidecarTargetPort               = 8081
+	externalMetricsServerPort       = 6443
+	externalMetricsServicePort      = 443
 	timeoutRC                       = 120 * time.Second
-	startServiceTimeout             = time.Minute
-	startServiceInterval            = 5 * time.Second
-	rcIsNil                         = "ERROR: replicationController = nil"
-	deploymentIsNil                 = "ERROR: deployment = nil"
-	rsIsNil                         = "ERROR: replicaset = nil"
-	crdIsNil                        = "ERROR: CRD = nil"
 	invalidKind                     = "ERROR: invalid workload kind for resource consumer"
 	customMetricName                = "QPS"
 	serviceInitializationTimeout    = 2 * time.Minute
@@ -82,16 +86,10 @@ const (
 )
 
 var (
-	resourceConsumerImage = imageutils.GetE2EImage(imageutils.ResourceConsumer)
-)
-
-var (
-	// KindRC is the GVK for ReplicationController
-	KindRC = schema.GroupVersionKind{Version: "v1", Kind: "ReplicationController"}
 	// KindDeployment is the GVK for Deployment
-	KindDeployment = schema.GroupVersionKind{Group: "apps", Version: "v1beta2", Kind: "Deployment"}
+	KindDeployment = schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
 	// KindReplicaSet is the GVK for ReplicaSet
-	KindReplicaSet = schema.GroupVersionKind{Group: "apps", Version: "v1beta2", Kind: "ReplicaSet"}
+	KindReplicaSet = schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "ReplicaSet"}
 	// KindCRD is the GVK for CRD for test purposes
 	KindCRD = schema.GroupVersionKind{Group: crdGroup, Version: crdVersion, Kind: crdKind}
 )
@@ -123,6 +121,7 @@ type ResourceConsumer struct {
 	dynamicClient            dynamic.Interface
 	resourceClient           dynamic.ResourceInterface
 	scaleClient              scaleclient.ScalesGetter
+	customMetricName         string
 	cpu                      chan int
 	mem                      chan int
 	customMetric             chan int
@@ -137,19 +136,165 @@ type ResourceConsumer struct {
 	requestSizeCustomMetric  int
 	sidecarStatus            SidecarStatusType
 	sidecarType              SidecarWorkloadType
+	cpuPerPod                chan int
+	stopCPUPerPod            chan int
+}
+
+// ExternalMetricsController provides methods to control the external metrics server at runtime
+type ExternalMetricsController struct {
+	clientSet   clientset.Interface
+	serviceName string
+	namespace   string
+}
+
+// NewExternalMetricsController creates a new controller for the external metrics server
+func NewExternalMetricsController(clientSet clientset.Interface, serviceName, namespace string) *ExternalMetricsController {
+	return &ExternalMetricsController{
+		clientSet:   clientSet,
+		serviceName: serviceName,
+		namespace:   namespace,
+	}
+}
+
+// CreateMetric creates a new metric on the external metrics server
+func (emc *ExternalMetricsController) CreateMetric(ctx context.Context, metricName string, value int64, labels map[string]string, shouldFail bool) error {
+	params := url.Values{}
+	params.Set("value", strconv.FormatInt(value, 10))
+	params.Set("fail", strconv.FormatBool(shouldFail))
+	if len(labels) > 0 {
+		params.Set("labels", formatLabels(labels))
+	}
+	return emc.sendMetricRequest(ctx, "create", metricName, params)
+}
+
+// SetMetricValue updates the value of an existing metric
+func (emc *ExternalMetricsController) SetMetricValue(ctx context.Context, metricName string, value int64, labels map[string]string) error {
+	params := url.Values{}
+	params.Set("value", strconv.FormatInt(value, 10))
+	if len(labels) > 0 {
+		params.Set("labels", formatLabels(labels))
+	}
+	return emc.sendMetricRequest(ctx, "set", metricName, params)
+}
+
+// SetMetricFail configures whether a metric should return errors
+func (emc *ExternalMetricsController) SetMetricFail(ctx context.Context, metricName string, shouldFail bool, labels map[string]string) error {
+	params := url.Values{}
+	params.Set("fail", strconv.FormatBool(shouldFail))
+	if len(labels) > 0 {
+		params.Set("labels", formatLabels(labels))
+	}
+	return emc.sendMetricRequest(ctx, "fail", metricName, params)
+}
+
+func (emc *ExternalMetricsController) sendMetricRequest(ctx context.Context, action, metricName string, params url.Values) error {
+	return framework.Gomega().Eventually(ctx, func(ctx context.Context) error {
+		return emc.doRequestWithPortForward(ctx, action, metricName, params)
+	}).WithTimeout(serviceInitializationTimeout).WithPolling(serviceInitializationInterval).Should(gomega.Succeed())
+}
+
+func (emc *ExternalMetricsController) doRequestWithPortForward(ctx context.Context, action, metricName string, params url.Values) error {
+	// Find the pod
+	pods, err := emc.clientSet.CoreV1().Pods(emc.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "name=" + emc.serviceName,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list pods: %w", err)
+	}
+	if len(pods.Items) == 0 {
+		return fmt.Errorf("no pods found for service %s", emc.serviceName)
+	}
+	podName := pods.Items[0].Name
+
+	// Set up port-forward
+	config, err := framework.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// re-use NewTransport which supports both SPDY and WebSocket according to KEP-4006
+	transport := e2epod.NewTransport(emc.clientSet, config)
+	// the external metrics server uses a self-signed certificate.
+	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+
+	// test/e2e/framework/pod/dial.go#ParseAddr expects
+	// <namespace>.<pod>:<port number> format as the URL
+	requestURL := fmt.Sprintf("https://%s.%s:%d/%s/%s", emc.namespace, podName, externalMetricsServerPort, action, metricName)
+	if len(params) > 0 {
+		requestURL += "?" + params.Encode()
+	}
+
+	framework.Logf("ExternalMetrics %s URL: %s", action, requestURL)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		framework.Logf("ExternalMetrics %s failure: %v", action, err)
+		return err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// RunExternalMetricsServer creates and returns an ExternalMetricsController for controlling the server
+func RunExternalMetricsServer(ctx context.Context, c clientset.Interface, ns, name string, serviceAnnotations map[string]string) *ExternalMetricsController {
+	runServiceAndApiregistrationForExternalMetricsServer(ctx, c, ns, name, serviceAnnotations)
+	return NewExternalMetricsController(c, name, ns)
+}
+
+// CleanupExternalMetricsServer removes the external metrics server resources
+func CleanupExternalMetricsServer(ctx context.Context, c clientset.Interface, ns, name string) {
+	ginkgo.By(fmt.Sprintf("Cleaning up external metrics server %s", name))
+
+	// Delete the APIService
+	config, err := framework.LoadConfig()
+	if err == nil {
+		aggClient, err := aggregatorclient.NewForConfig(config)
+		if err == nil {
+			err = aggClient.ApiregistrationV1().APIServices().Delete(ctx, "v1beta1.external.metrics.k8s.io", metav1.DeleteOptions{})
+			if err != nil {
+				framework.Logf("Error deleting APIService: %v", err)
+			}
+		}
+	}
+
+	// Delete the deployment
+	err = c.AppsV1().Deployments(ns).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil {
+		framework.Logf("Error deleting deployment: %v", err)
+	}
+
+	// Delete the service
+	err = c.CoreV1().Services(ns).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil {
+		framework.Logf("Error deleting service: %v", err)
+	}
 }
 
 // NewDynamicResourceConsumer is a wrapper to create a new dynamic ResourceConsumer
-func NewDynamicResourceConsumer(ctx context.Context, name, nsName string, kind schema.GroupVersionKind, replicas, initCPUTotal, initMemoryTotal, initCustomMetric int, cpuLimit, memLimit int64, clientset clientset.Interface, scaleClient scaleclient.ScalesGetter, enableSidecar SidecarStatusType, sidecarType SidecarWorkloadType) *ResourceConsumer {
-	return newResourceConsumer(ctx, name, nsName, kind, replicas, initCPUTotal, initMemoryTotal, initCustomMetric, dynamicConsumptionTimeInSeconds,
-		dynamicRequestSizeInMillicores, dynamicRequestSizeInMegabytes, dynamicRequestSizeCustomMetric, cpuLimit, memLimit, clientset, scaleClient, nil, nil, enableSidecar, sidecarType)
+func NewDynamicResourceConsumer(ctx context.Context, name, nsName string, kind schema.GroupVersionKind, replicas, initCPUTotal, initMemoryTotal, initCustomMetric int, cpuLimit, memLimit int64, clientset clientset.Interface, scaleClient scaleclient.ScalesGetter, enableSidecar SidecarStatusType, sidecarType SidecarWorkloadType, podResources *v1.ResourceRequirements) *ResourceConsumer {
+	return NewResourceConsumer(ctx, name, nsName, kind, replicas, customMetricName, initCPUTotal, initMemoryTotal, initCustomMetric, dynamicConsumptionTimeInSeconds,
+		dynamicRequestSizeInMillicores, dynamicRequestSizeInMegabytes, dynamicRequestSizeCustomMetric, cpuLimit, memLimit, clientset, scaleClient, nil, nil, enableSidecar, sidecarType, podResources)
 }
 
 // getSidecarContainer returns sidecar container
 func getSidecarContainer(name string, cpuLimit, memLimit int64) v1.Container {
 	container := v1.Container{
 		Name:    name + "-sidecar",
-		Image:   resourceConsumerImage,
+		Image:   imageutils.GetE2EImage(imageutils.ResourceConsumer),
 		Command: []string{"/consumer", "-port=8081"},
 		Ports:   []v1.ContainerPort{{ContainerPort: 80}},
 	}
@@ -179,8 +324,8 @@ initMemoryTotal argument is in megabytes
 memLimit argument is in megabytes, memLimit is a maximum amount of memory that can be consumed by a single pod
 cpuLimit argument is in millicores, cpuLimit is a maximum amount of cpu that can be consumed by a single pod
 */
-func newResourceConsumer(ctx context.Context, name, nsName string, kind schema.GroupVersionKind, replicas, initCPUTotal, initMemoryTotal, initCustomMetric, consumptionTimeInSeconds, requestSizeInMillicores,
-	requestSizeInMegabytes int, requestSizeCustomMetric int, cpuLimit, memLimit int64, clientset clientset.Interface, scaleClient scaleclient.ScalesGetter, podAnnotations, serviceAnnotations map[string]string, sidecarStatus SidecarStatusType, sidecarType SidecarWorkloadType) *ResourceConsumer {
+func NewResourceConsumer(ctx context.Context, name, nsName string, kind schema.GroupVersionKind, replicas int, customMetricName string, initCPUTotal, initMemoryTotal, initCustomMetric, consumptionTimeInSeconds, requestSizeInMillicores,
+	requestSizeInMegabytes int, requestSizeCustomMetric int, cpuLimit, memLimit int64, clientset clientset.Interface, scaleClient scaleclient.ScalesGetter, podAnnotations, serviceAnnotations map[string]string, sidecarStatus SidecarStatusType, sidecarType SidecarWorkloadType, podResources *v1.ResourceRequirements) *ResourceConsumer {
 	if podAnnotations == nil {
 		podAnnotations = make(map[string]string)
 	}
@@ -203,7 +348,7 @@ func newResourceConsumer(ctx context.Context, name, nsName string, kind schema.G
 	framework.ExpectNoError(err)
 	resourceClient := dynamicClient.Resource(schema.GroupVersionResource{Group: crdGroup, Version: crdVersion, Resource: crdNamePlural}).Namespace(nsName)
 
-	runServiceAndWorkloadForResourceConsumer(ctx, clientset, resourceClient, apiExtensionClient, nsName, name, kind, replicas, cpuLimit, memLimit, podAnnotations, serviceAnnotations, additionalContainers)
+	runServiceAndWorkloadForResourceConsumer(ctx, clientset, resourceClient, apiExtensionClient, nsName, name, kind, replicas, cpuLimit, memLimit, podAnnotations, serviceAnnotations, additionalContainers, podResources)
 	controllerName := name + "-ctrl"
 	// If sidecar is enabled and busy, run service and consumer for sidecar
 	if sidecarStatus == Enable && sidecarType == Busy {
@@ -221,12 +366,15 @@ func newResourceConsumer(ctx context.Context, name, nsName string, kind schema.G
 		scaleClient:              scaleClient,
 		resourceClient:           resourceClient,
 		dynamicClient:            dynamicClient,
+		customMetricName:         customMetricName,
 		cpu:                      make(chan int),
 		mem:                      make(chan int),
 		customMetric:             make(chan int),
 		stopCPU:                  make(chan int),
 		stopMem:                  make(chan int),
 		stopCustomMetric:         make(chan int),
+		cpuPerPod:                make(chan int),
+		stopCPUPerPod:            make(chan int),
 		consumptionTimeInSeconds: consumptionTimeInSeconds,
 		sleepTime:                time.Duration(consumptionTimeInSeconds) * time.Second,
 		requestSizeInMillicores:  requestSizeInMillicores,
@@ -242,6 +390,7 @@ func newResourceConsumer(ctx context.Context, name, nsName string, kind schema.G
 	rc.ConsumeMem(initMemoryTotal)
 	go rc.makeConsumeCustomMetric(ctx)
 	rc.ConsumeCustomMetric(initCustomMetric)
+	go rc.makeConsumeCPUPerPodRequests(ctx)
 	return rc
 }
 
@@ -333,13 +482,13 @@ func (rc *ResourceConsumer) makeConsumeCustomMetric(ctx context.Context) {
 		select {
 		case delta = <-rc.customMetric:
 			if delta != 0 {
-				framework.Logf("RC %s: setting bump of metric %s to %d in total", rc.name, customMetricName, delta)
+				framework.Logf("RC %s: setting bump of metric %s to %d in total", rc.name, rc.customMetricName, delta)
 			} else {
-				framework.Logf("RC %s: disabling consumption of custom metric %s", rc.name, customMetricName)
+				framework.Logf("RC %s: disabling consumption of custom metric %s", rc.name, rc.customMetricName)
 			}
 		case <-tick:
 			if delta != 0 {
-				framework.Logf("RC %s: sending request to consume %d of custom metric %s", rc.name, delta, customMetricName)
+				framework.Logf("RC %s: sending request to consume %d of custom metric %s", rc.name, delta, rc.customMetricName)
 				rc.sendConsumeCustomMetric(ctx, delta)
 			}
 			tick = time.After(rc.sleepTime)
@@ -354,11 +503,13 @@ func (rc *ResourceConsumer) makeConsumeCustomMetric(ctx context.Context) {
 }
 
 func (rc *ResourceConsumer) sendConsumeCPURequest(ctx context.Context, millicores int) {
-	err := wait.PollUntilContextTimeout(ctx, serviceInitializationInterval, serviceInitializationTimeout, true, func(ctx context.Context) (bool, error) {
+	err := framework.Gomega().Eventually(ctx, func(ctx context.Context) error {
 		proxyRequest, err := e2eservice.GetServicesProxyRequest(rc.clientSet, rc.clientSet.CoreV1().RESTClient().Post())
-		framework.ExpectNoError(err)
+		if err != nil {
+			return err
+		}
 		req := proxyRequest.Namespace(rc.nsName).
-			Name(rc.controllerName).
+			Name(fmt.Sprintf("%s:%s", rc.controllerName, portName)).
 			Suffix("ConsumeCPU").
 			Param("millicores", strconv.Itoa(millicores)).
 			Param("durationSec", strconv.Itoa(rc.consumptionTimeInSeconds)).
@@ -367,10 +518,10 @@ func (rc *ResourceConsumer) sendConsumeCPURequest(ctx context.Context, millicore
 		_, err = req.DoRaw(ctx)
 		if err != nil {
 			framework.Logf("ConsumeCPU failure: %v", err)
-			return false, nil
+			return err
 		}
-		return true, nil
-	})
+		return nil
+	}).WithTimeout(serviceInitializationTimeout).WithPolling(serviceInitializationInterval).Should(gomega.Succeed())
 
 	// Test has already finished (ctx got canceled), so don't fail on err from PollUntilContextTimeout
 	// which is a side-effect to context cancelling from the cleanup task.
@@ -383,11 +534,13 @@ func (rc *ResourceConsumer) sendConsumeCPURequest(ctx context.Context, millicore
 
 // sendConsumeMemRequest sends POST request for memory consumption
 func (rc *ResourceConsumer) sendConsumeMemRequest(ctx context.Context, megabytes int) {
-	err := wait.PollUntilContextTimeout(ctx, serviceInitializationInterval, serviceInitializationTimeout, true, func(ctx context.Context) (bool, error) {
+	err := framework.Gomega().Eventually(ctx, func(ctx context.Context) error {
 		proxyRequest, err := e2eservice.GetServicesProxyRequest(rc.clientSet, rc.clientSet.CoreV1().RESTClient().Post())
-		framework.ExpectNoError(err)
+		if err != nil {
+			return err
+		}
 		req := proxyRequest.Namespace(rc.nsName).
-			Name(rc.controllerName).
+			Name(fmt.Sprintf("%s:%s", rc.controllerName, portName)).
 			Suffix("ConsumeMem").
 			Param("megabytes", strconv.Itoa(megabytes)).
 			Param("durationSec", strconv.Itoa(rc.consumptionTimeInSeconds)).
@@ -396,10 +549,10 @@ func (rc *ResourceConsumer) sendConsumeMemRequest(ctx context.Context, megabytes
 		_, err = req.DoRaw(ctx)
 		if err != nil {
 			framework.Logf("ConsumeMem failure: %v", err)
-			return false, nil
+			return err
 		}
-		return true, nil
-	})
+		return nil
+	}).WithTimeout(serviceInitializationTimeout).WithPolling(serviceInitializationInterval).Should(gomega.Succeed())
 
 	// Test has already finished (ctx got canceled), so don't fail on err from PollUntilContextTimeout
 	// which is a side-effect to context cancelling from the cleanup task.
@@ -412,13 +565,15 @@ func (rc *ResourceConsumer) sendConsumeMemRequest(ctx context.Context, megabytes
 
 // sendConsumeCustomMetric sends POST request for custom metric consumption
 func (rc *ResourceConsumer) sendConsumeCustomMetric(ctx context.Context, delta int) {
-	err := wait.PollUntilContextTimeout(ctx, serviceInitializationInterval, serviceInitializationTimeout, true, func(ctx context.Context) (bool, error) {
+	err := framework.Gomega().Eventually(ctx, func(ctx context.Context) error {
 		proxyRequest, err := e2eservice.GetServicesProxyRequest(rc.clientSet, rc.clientSet.CoreV1().RESTClient().Post())
-		framework.ExpectNoError(err)
+		if err != nil {
+			return err
+		}
 		req := proxyRequest.Namespace(rc.nsName).
-			Name(rc.controllerName).
+			Name(fmt.Sprintf("%s:%s", rc.controllerName, portName)).
 			Suffix("BumpMetric").
-			Param("metric", customMetricName).
+			Param("metric", rc.customMetricName).
 			Param("delta", strconv.Itoa(delta)).
 			Param("durationSec", strconv.Itoa(rc.consumptionTimeInSeconds)).
 			Param("requestSizeMetrics", strconv.Itoa(rc.requestSizeCustomMetric))
@@ -426,10 +581,10 @@ func (rc *ResourceConsumer) sendConsumeCustomMetric(ctx context.Context, delta i
 		_, err = req.DoRaw(ctx)
 		if err != nil {
 			framework.Logf("ConsumeCustomMetric failure: %v", err)
-			return false, nil
+			return err
 		}
-		return true, nil
-	})
+		return nil
+	}).WithTimeout(serviceInitializationTimeout).WithPolling(serviceInitializationInterval).Should(gomega.Succeed())
 
 	// Test has already finished (ctx got canceled), so don't fail on err from PollUntilContextTimeout
 	// which is a side-effect to context cancelling from the cleanup task.
@@ -440,51 +595,154 @@ func (rc *ResourceConsumer) sendConsumeCustomMetric(ctx context.Context, delta i
 	framework.ExpectNoError(err)
 }
 
-// GetReplicas get the replicas
-func (rc *ResourceConsumer) GetReplicas(ctx context.Context) int {
-	switch rc.kind {
-	case KindRC:
-		replicationController, err := rc.clientSet.CoreV1().ReplicationControllers(rc.nsName).Get(ctx, rc.name, metav1.GetOptions{})
-		framework.ExpectNoError(err)
-		if replicationController == nil {
-			framework.Failf(rcIsNil)
+/*
+ConsumeCPUPerPod sends CPU load directly to each consumer pod via the
+Kubernetes pod proxy API, bypassing kube-proxy's non-deterministic load
+balancing. millicoresTotal is divided evenly across all running pods,
+guaranteeing each pod receives an equal share regardless of cluster network config.
+*/
+func (rc *ResourceConsumer) ConsumeCPUPerPod(millicoresTotal int) {
+	framework.Logf("RC %s: consume %v millicores in total (evenly distributed per pod)", rc.name, millicoresTotal)
+	rc.cpuPerPod <- millicoresTotal
+}
+
+func (rc *ResourceConsumer) makeConsumeCPUPerPodRequests(ctx context.Context) {
+	defer ginkgo.GinkgoRecover()
+	rc.stopWaitGroup.Add(1)
+	defer rc.stopWaitGroup.Done()
+	tick := time.After(time.Duration(0))
+	millicoresTotal := 0
+	for {
+		select {
+		case millicoresTotal = <-rc.cpuPerPod:
+			if millicoresTotal != 0 {
+				framework.Logf("RC %s: setting per-pod CPU to %v millicores total", rc.name, millicoresTotal)
+			} else {
+				framework.Logf("RC %s: disabling per-pod CPU consumption", rc.name)
+			}
+		case <-tick:
+			if millicoresTotal != 0 {
+				framework.Logf("RC %s: sending per-pod CPU request: %d millicores total", rc.name, millicoresTotal)
+				rc.sendConsumeCPUPerPodRequest(ctx, millicoresTotal)
+			}
+			tick = time.After(rc.sleepTime)
+		case <-ctx.Done():
+			framework.Logf("RC %s: stopping per-pod CPU consumer: %v", rc.name, ctx.Err())
+			return
+		case <-rc.stopCPUPerPod:
+			framework.Logf("RC %s: stopping per-pod CPU consumer", rc.name)
+			return
 		}
-		return int(replicationController.Status.ReadyReplicas)
+	}
+}
+
+// sendConsumeCPUPerPodRequest distributes CPU load evenly across all running
+// pods by sending requests directly via the Kubernetes pod proxy API. This
+// bypasses kube-proxy load balancing, guaranteeing each pod receives exactly
+// its share.
+func (rc *ResourceConsumer) sendConsumeCPUPerPodRequest(ctx context.Context, millicoresTotal int) {
+	var readyPods []string
+	err := framework.Gomega().Eventually(ctx, func(ctx context.Context) error {
+		pods, err := rc.clientSet.CoreV1().Pods(rc.nsName).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("name=%s", rc.name),
+		})
+		if err != nil {
+			return err
+		}
+		for i := range pods.Items {
+			if pods.Items[i].Status.Phase == v1.PodRunning {
+				readyPods = append(readyPods, pods.Items[i].Name)
+			}
+		}
+		if len(readyPods) == 0 {
+			return fmt.Errorf("ConsumeCPUPerPod: no running pods labeled name=%s", rc.name)
+		}
+		return nil
+	}).WithTimeout(serviceInitializationTimeout).WithPolling(serviceInitializationInterval).Should(gomega.Succeed())
+	framework.ExpectNoError(err)
+
+	perPodMillicores := millicoresTotal / len(readyPods)
+	if perPodMillicores == 0 {
+		perPodMillicores = 1
+	}
+
+	framework.Logf("ConsumeCPUPerPod: distributing %d millicores across %d pods (%d per pod)",
+		millicoresTotal, len(readyPods), perPodMillicores)
+
+	var wg sync.WaitGroup
+	for _, podName := range readyPods {
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			// Pod proxy URL: /api/v1/namespaces/{ns}/pods/{podname}:{port}/proxy/{path}
+			// Both service and pod proxy support the name:port format. Without an explicit
+			// port the API server defaults to port 80, but resource-consumer listens on
+			// targetPort (8080), so the port must be specified.
+			err := framework.Gomega().Eventually(ctx, func(ctx context.Context) error {
+				_, podErr := rc.clientSet.CoreV1().RESTClient().Post().
+					Resource("pods").
+					Namespace(rc.nsName).
+					Name(fmt.Sprintf("%s:%d", name, targetPort)).
+					SubResource("proxy").
+					Suffix("ConsumeCPU").
+					Param("millicores", strconv.Itoa(perPodMillicores)).
+					Param("durationSec", strconv.Itoa(rc.consumptionTimeInSeconds)).
+					DoRaw(ctx)
+				if podErr != nil {
+					framework.Logf("ConsumeCPUPerPod: error sending to pod %s: %v", name, podErr)
+					return podErr
+				}
+				return nil
+			}).WithTimeout(serviceInitializationTimeout).WithPolling(serviceInitializationInterval).Should(gomega.Succeed())
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				framework.Logf("ConsumeCPUPerPod: giving up on pod %s: %v", name, err)
+			}
+		}(podName)
+	}
+	wg.Wait()
+}
+
+// GetReplicas get the replicas
+func (rc *ResourceConsumer) GetReplicas(ctx context.Context) (int, error) {
+	switch rc.kind {
 	case KindDeployment:
 		deployment, err := rc.clientSet.AppsV1().Deployments(rc.nsName).Get(ctx, rc.name, metav1.GetOptions{})
-		framework.ExpectNoError(err)
-		if deployment == nil {
-			framework.Failf(deploymentIsNil)
+		if err != nil {
+			return 0, err
 		}
-		return int(deployment.Status.ReadyReplicas)
+		return int(deployment.Status.ReadyReplicas), nil
 	case KindReplicaSet:
 		rs, err := rc.clientSet.AppsV1().ReplicaSets(rc.nsName).Get(ctx, rc.name, metav1.GetOptions{})
-		framework.ExpectNoError(err)
-		if rs == nil {
-			framework.Failf(rsIsNil)
+		if err != nil {
+			return 0, err
 		}
-		return int(rs.Status.ReadyReplicas)
+		return int(rs.Status.ReadyReplicas), nil
 	case KindCRD:
 		deployment, err := rc.clientSet.AppsV1().Deployments(rc.nsName).Get(ctx, rc.name, metav1.GetOptions{})
-		framework.ExpectNoError(err)
-		if deployment == nil {
-			framework.Failf(deploymentIsNil)
+		if err != nil {
+			return 0, err
 		}
-		deploymentReplicas := int64(deployment.Status.ReadyReplicas)
-
 		scale, err := rc.scaleClient.Scales(rc.nsName).Get(ctx, schema.GroupResource{Group: crdGroup, Resource: crdNamePlural}, rc.name, metav1.GetOptions{})
-		framework.ExpectNoError(err)
-		crdInstance, err := rc.resourceClient.Get(ctx, rc.name, metav1.GetOptions{})
-		framework.ExpectNoError(err)
-		// Update custom resource's status.replicas with child Deployment's current number of ready replicas.
-		framework.ExpectNoError(unstructured.SetNestedField(crdInstance.Object, deploymentReplicas, "status", "replicas"))
-		_, err = rc.resourceClient.Update(ctx, crdInstance, metav1.UpdateOptions{})
-		framework.ExpectNoError(err)
-		return int(scale.Spec.Replicas)
+		if err != nil {
+			return 0, err
+		}
+		// Stand in for the controller a real CRD would have by mirroring the child
+		// Deployment's ready replicas into status.replicas. A merge patch carries no
+		// resourceVersion, so it can't collide with the HPA writing spec.replicas
+		// through the scale subresource at the same moment; a read-modify-write
+		// Update did, and HandleRetry treats the resulting 409 as fatal.
+		patch := fmt.Sprintf(`{"status":{"replicas":%d}}`, deployment.Status.ReadyReplicas)
+		_, err = rc.resourceClient.Patch(ctx, rc.name, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+		if err != nil {
+			return 0, err
+		}
+		return int(scale.Spec.Replicas), nil
 	default:
-		framework.Failf(invalidKind)
+		return 0, fmt.Errorf(invalidKind)
 	}
-	return 0
 }
 
 // GetHpa get the corresponding horizontalPodAutoscaler object
@@ -495,40 +753,30 @@ func (rc *ResourceConsumer) GetHpa(ctx context.Context, name string) (*autoscali
 // WaitForReplicas wait for the desired replicas
 func (rc *ResourceConsumer) WaitForReplicas(ctx context.Context, desiredReplicas int, duration time.Duration) {
 	interval := 20 * time.Second
-	err := wait.PollImmediateWithContext(ctx, interval, duration, func(ctx context.Context) (bool, error) {
-		replicas := rc.GetReplicas(ctx)
-		framework.Logf("waiting for %d replicas (current: %d)", desiredReplicas, replicas)
-		return replicas == desiredReplicas, nil // Expected number of replicas found. Exit.
-	})
+	err := framework.Gomega().Eventually(ctx, framework.HandleRetry(rc.GetReplicas)).
+		WithTimeout(duration).
+		WithPolling(interval).
+		Should(gomega.Equal(desiredReplicas))
+
 	framework.ExpectNoErrorWithOffset(1, err, "timeout waiting %v for %d replicas", duration, desiredReplicas)
 }
 
 // EnsureDesiredReplicasInRange ensure the replicas is in a desired range
 func (rc *ResourceConsumer) EnsureDesiredReplicasInRange(ctx context.Context, minDesiredReplicas, maxDesiredReplicas int, duration time.Duration, hpaName string) {
 	interval := 10 * time.Second
-	err := wait.PollImmediateWithContext(ctx, interval, duration, func(ctx context.Context) (bool, error) {
-		replicas := rc.GetReplicas(ctx)
-		framework.Logf("expecting there to be in [%d, %d] replicas (are: %d)", minDesiredReplicas, maxDesiredReplicas, replicas)
-		as, err := rc.GetHpa(ctx, hpaName)
-		if err != nil {
-			framework.Logf("Error getting HPA: %s", err)
-		} else {
-			framework.Logf("HPA status: %+v", as.Status)
-		}
-		if replicas < minDesiredReplicas {
-			return false, fmt.Errorf("number of replicas below target")
-		} else if replicas > maxDesiredReplicas {
-			return false, fmt.Errorf("number of replicas above target")
-		} else {
-			return false, nil // Expected number of replicas found. Continue polling until timeout.
-		}
-	})
-	// The call above always returns an error, but if it is timeout, it's OK (condition satisfied all the time).
-	if err == wait.ErrWaitTimeout {
-		framework.Logf("Number of replicas was stable over %v", duration)
-		return
+	desiredReplicasErr := framework.Gomega().Consistently(ctx, framework.HandleRetry(rc.GetReplicas)).
+		WithTimeout(duration).
+		WithPolling(interval).
+		Should(gomega.And(gomega.BeNumerically(">=", minDesiredReplicas), gomega.BeNumerically("<=", maxDesiredReplicas)))
+
+	// dump HPA for debugging
+	as, err := rc.GetHpa(ctx, hpaName)
+	if err != nil {
+		framework.Logf("Error getting HPA: %s", err)
+	} else {
+		framework.Logf("HPA status: %+v", as.Status)
 	}
-	framework.ExpectNoErrorWithOffset(1, err)
+	framework.ExpectNoError(desiredReplicasErr)
 }
 
 // Pause stops background goroutines responsible for consuming resources.
@@ -537,6 +785,7 @@ func (rc *ResourceConsumer) Pause() {
 	rc.stopCPU <- 0
 	rc.stopMem <- 0
 	rc.stopCustomMetric <- 0
+	rc.stopCPUPerPod <- 0
 	rc.stopWaitGroup.Wait()
 }
 
@@ -546,6 +795,7 @@ func (rc *ResourceConsumer) Resume(ctx context.Context) {
 	go rc.makeConsumeCPURequests(ctx)
 	go rc.makeConsumeMemRequests(ctx)
 	go rc.makeConsumeCustomMetric(ctx)
+	go rc.makeConsumeCPUPerPodRequests(ctx)
 }
 
 // CleanUp clean up the background goroutines responsible for consuming resources.
@@ -554,6 +804,7 @@ func (rc *ResourceConsumer) CleanUp(ctx context.Context) {
 	close(rc.stopCPU)
 	close(rc.stopMem)
 	close(rc.stopCustomMetric)
+	close(rc.stopCPUPerPod)
 	rc.stopWaitGroup.Wait()
 	// Wait some time to ensure all child goroutines are finished.
 	time.Sleep(10 * time.Second)
@@ -567,7 +818,7 @@ func (rc *ResourceConsumer) CleanUp(ctx context.Context) {
 	}
 
 	framework.ExpectNoError(rc.clientSet.CoreV1().Services(rc.nsName).Delete(ctx, rc.name, metav1.DeleteOptions{}))
-	framework.ExpectNoError(e2eresource.DeleteResourceAndWaitForGC(ctx, rc.clientSet, schema.GroupKind{Kind: "ReplicationController"}, rc.nsName, rc.controllerName))
+	framework.ExpectNoError(e2eresource.DeleteResourceAndWaitForGC(ctx, rc.clientSet, schema.GroupKind{Group: "apps", Kind: "ReplicaSet"}, rc.nsName, rc.controllerName))
 	framework.ExpectNoError(rc.clientSet.CoreV1().Services(rc.nsName).Delete(ctx, rc.name+"-ctrl", metav1.DeleteOptions{}))
 	// Cleanup sidecar related resources
 	if rc.sidecarStatus == Enable && rc.sidecarType == Busy {
@@ -581,15 +832,77 @@ func createService(ctx context.Context, c clientset.Interface, name, ns string, 
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
 			Annotations: annotations,
+			Labels:      map[string]string{"name": name},
 		},
 		Spec: v1.ServiceSpec{
 			Ports: []v1.ServicePort{{
+				Name:       portName,
 				Port:       port,
 				TargetPort: intstr.FromInt32(int32(targetPort)),
 			}},
 			Selector: selectors,
 		},
 	}, metav1.CreateOptions{})
+}
+
+func createAPIService(ctx context.Context, port int32, targetService *v1.Service) (*apiregistrationv1.APIService, error) {
+	config, err := framework.LoadConfig()
+	if err != nil {
+		return nil, err
+	}
+	aggClient, err := aggregatorclient.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
+	apiService := &apiregistrationv1.APIService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "v1beta1.external.metrics.k8s.io",
+		},
+		Spec: apiregistrationv1.APIServiceSpec{
+			Service: &apiregistrationv1.ServiceReference{
+				Name:      targetService.Name,
+				Namespace: targetService.Namespace,
+				Port:      &port,
+			},
+			Group:                 "external.metrics.k8s.io",
+			Version:               "v1beta1",
+			InsecureSkipTLSVerify: true,
+			GroupPriorityMinimum:  100,
+			VersionPriority:       100,
+		},
+	}
+	return aggClient.ApiregistrationV1().APIServices().Create(ctx, apiService, metav1.CreateOptions{})
+}
+
+func runServiceAndApiregistrationForExternalMetricsServer(ctx context.Context, c clientset.Interface, ns, name string, serviceAnnotations map[string]string) {
+	ginkgo.By(fmt.Sprintf("Running external metrics server %s", name))
+	serviceSelectors := map[string]string{
+		"name": name,
+	}
+	ginkgo.By("Creating a service")
+	service, err := createService(ctx, c, name, ns, serviceAnnotations, serviceSelectors, externalMetricsServicePort, externalMetricsServerPort)
+	framework.ExpectNoError(err)
+
+	ginkgo.By("Creating an APIService")
+	_, err = createAPIService(ctx, externalMetricsServicePort, service)
+	framework.ExpectNoError(err)
+
+	dnsClusterFirst := v1.DNSClusterFirst
+	config := testutils.RCConfig{
+		Client:    c,
+		Image:     imageutils.GetE2EImage(imageutils.Agnhost),
+		Name:      name,
+		Namespace: ns,
+		Timeout:   timeoutRC,
+		Replicas:  1,
+		Command:   []string{"/agnhost", "external-metrics"},
+		DNSPolicy: &dnsClusterFirst,
+	}
+	extenalMetricsDeploymentConfig := testutils.DeploymentConfig{
+		RCConfig: config,
+	}
+	framework.ExpectNoError(testutils.RunDeployment(ctx, extenalMetricsDeploymentConfig))
 }
 
 // runServiceAndSidecarForResourceConsumer creates service and runs resource consumer for sidecar container
@@ -603,47 +916,52 @@ func runServiceAndSidecarForResourceConsumer(ctx context.Context, c clientset.In
 	_, err := createService(ctx, c, sidecarName, ns, serviceAnnotations, serviceSelectors, port, sidecarTargetPort)
 	framework.ExpectNoError(err)
 
-	ginkgo.By(fmt.Sprintf("Running controller for sidecar"))
+	ginkgo.By("Running controller for sidecar")
 	controllerName := sidecarName + "-ctrl"
 	_, err = createService(ctx, c, controllerName, ns, map[string]string{}, map[string]string{"name": controllerName}, port, targetPort)
 	framework.ExpectNoError(err)
 
 	dnsClusterFirst := v1.DNSClusterFirst
-	controllerRcConfig := testutils.RCConfig{
-		Client:    c,
-		Image:     imageutils.GetE2EImage(imageutils.Agnhost),
-		Name:      controllerName,
-		Namespace: ns,
-		Timeout:   timeoutRC,
-		Replicas:  1,
-		Command:   []string{"/agnhost", "resource-consumer-controller", "--consumer-service-name=" + sidecarName, "--consumer-service-namespace=" + ns, "--consumer-port=80"},
-		DNSPolicy: &dnsClusterFirst,
+	controllerRsConfig := testutils.ReplicaSetConfig{
+		RCConfig: testutils.RCConfig{
+			Client:    c,
+			Image:     imageutils.GetE2EImage(imageutils.Agnhost),
+			Name:      controllerName,
+			Namespace: ns,
+			Timeout:   timeoutRC,
+			Replicas:  1,
+			Command:   []string{"/agnhost", "resource-consumer-controller", "--consumer-service-name=" + sidecarName, "--consumer-service-namespace=" + ns, "--consumer-port=80"},
+			DNSPolicy: &dnsClusterFirst,
+		},
 	}
 
-	framework.ExpectNoError(e2erc.RunRC(ctx, controllerRcConfig))
+	framework.ExpectNoError(runReplicaSet(ctx, controllerRsConfig))
 	// Wait for endpoints to propagate for the controller service.
-	framework.ExpectNoError(framework.WaitForServiceEndpointsNum(
-		ctx, c, ns, controllerName, 1, startServiceInterval, startServiceTimeout))
+	framework.ExpectNoError(e2eendpointslice.WaitForEndpointCount(
+		ctx, c, ns, controllerName, 1))
 }
 
-func runServiceAndWorkloadForResourceConsumer(ctx context.Context, c clientset.Interface, resourceClient dynamic.ResourceInterface, apiExtensionClient crdclientset.Interface, ns, name string, kind schema.GroupVersionKind, replicas int, cpuLimitMillis, memLimitMb int64, podAnnotations, serviceAnnotations map[string]string, additionalContainers []v1.Container) {
+func runServiceAndWorkloadForResourceConsumer(ctx context.Context, c clientset.Interface, resourceClient dynamic.ResourceInterface, apiExtensionClient crdclientset.Interface, ns, name string, kind schema.GroupVersionKind, replicas int, cpuLimitMillis, memLimitMb int64, podAnnotations, serviceAnnotations map[string]string, additionalContainers []v1.Container, podResources *v1.ResourceRequirements) {
 	ginkgo.By(fmt.Sprintf("Running consuming RC %s via %s with %v replicas", name, kind, replicas))
 	_, err := createService(ctx, c, name, ns, serviceAnnotations, map[string]string{"name": name}, port, targetPort)
 	framework.ExpectNoError(err)
 
 	rcConfig := testutils.RCConfig{
 		Client:               c,
-		Image:                resourceConsumerImage,
+		Image:                imageutils.GetE2EImage(imageutils.ResourceConsumer),
 		Name:                 name,
 		Namespace:            ns,
 		Timeout:              timeoutRC,
 		Replicas:             replicas,
-		CpuRequest:           cpuLimitMillis,
-		CpuLimit:             cpuLimitMillis,
+		CPURequest:           cpuLimitMillis,
+		CPULimit:             cpuLimitMillis,
 		MemRequest:           memLimitMb * 1024 * 1024, // MemLimit is in bytes
 		MemLimit:             memLimitMb * 1024 * 1024,
 		Annotations:          podAnnotations,
 		AdditionalContainers: additionalContainers,
+	}
+	if podResources != nil {
+		rcConfig.PodResources = podResources.DeepCopy()
 	}
 
 	dpConfig := testutils.DeploymentConfig{
@@ -653,8 +971,6 @@ func runServiceAndWorkloadForResourceConsumer(ctx context.Context, c clientset.I
 	dpConfig.ContainerDumpFunc = e2ekubectl.LogFailedContainers
 
 	switch kind {
-	case KindRC:
-		framework.ExpectNoError(e2erc.RunRC(ctx, rcConfig))
 	case KindDeployment:
 		ginkgo.By(fmt.Sprintf("Creating deployment %s in namespace %s", dpConfig.Name, dpConfig.Namespace))
 		framework.ExpectNoError(testutils.RunDeployment(ctx, dpConfig))
@@ -686,27 +1002,29 @@ func runServiceAndWorkloadForResourceConsumer(ctx context.Context, c clientset.I
 		framework.Failf(invalidKind)
 	}
 
-	ginkgo.By(fmt.Sprintf("Running controller"))
+	ginkgo.By("Running controller")
 	controllerName := name + "-ctrl"
 	_, err = createService(ctx, c, controllerName, ns, map[string]string{}, map[string]string{"name": controllerName}, port, targetPort)
 	framework.ExpectNoError(err)
 
 	dnsClusterFirst := v1.DNSClusterFirst
-	controllerRcConfig := testutils.RCConfig{
-		Client:    c,
-		Image:     imageutils.GetE2EImage(imageutils.Agnhost),
-		Name:      controllerName,
-		Namespace: ns,
-		Timeout:   timeoutRC,
-		Replicas:  1,
-		Command:   []string{"/agnhost", "resource-consumer-controller", "--consumer-service-name=" + name, "--consumer-service-namespace=" + ns, "--consumer-port=80"},
-		DNSPolicy: &dnsClusterFirst,
+	controllerRsConfig := testutils.ReplicaSetConfig{
+		RCConfig: testutils.RCConfig{
+			Client:    c,
+			Image:     imageutils.GetE2EImage(imageutils.Agnhost),
+			Name:      controllerName,
+			Namespace: ns,
+			Timeout:   timeoutRC,
+			Replicas:  1,
+			Command:   []string{"/agnhost", "resource-consumer-controller", "--consumer-service-name=" + name, "--consumer-service-namespace=" + ns, "--consumer-port=80"},
+			DNSPolicy: &dnsClusterFirst,
+		},
 	}
 
-	framework.ExpectNoError(e2erc.RunRC(ctx, controllerRcConfig))
+	framework.ExpectNoError(runReplicaSet(ctx, controllerRsConfig))
 	// Wait for endpoints to propagate for the controller service.
-	framework.ExpectNoError(framework.WaitForServiceEndpointsNum(
-		ctx, c, ns, controllerName, 1, startServiceInterval, startServiceTimeout))
+	framework.ExpectNoError(e2eendpointslice.WaitForEndpointCount(
+		ctx, c, ns, controllerName, 1))
 }
 
 func CreateHorizontalPodAutoscaler(ctx context.Context, rc *ResourceConsumer, targetRef autoscalingv2.CrossVersionObjectReference, namespace string, metrics []autoscalingv2.MetricSpec, resourceType v1.ResourceName, metricTargetType autoscalingv2.MetricTargetType, metricTargetValue, minReplicas, maxReplicas int32) *autoscalingv2.HorizontalPodAutoscaler {
@@ -842,6 +1160,114 @@ func CreateCPUHorizontalPodAutoscalerWithBehavior(ctx context.Context, rc *Resou
 	return hpa
 }
 
+// CreateMultiMetricHorizontalPodAutoscaler creates an HPA with multiple metrics
+func CreateMultiMetricHorizontalPodAutoscaler(ctx context.Context, rc *ResourceConsumer, metrics []autoscalingv2.MetricSpec, minReplicas, maxReplicas int32) *autoscalingv2.HorizontalPodAutoscaler {
+	targetRef := autoscalingv2.CrossVersionObjectReference{
+		APIVersion: rc.kind.GroupVersion().String(),
+		Kind:       rc.kind.Kind,
+		Name:       rc.name,
+	}
+
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      rc.name,
+			Namespace: rc.nsName,
+		},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+			ScaleTargetRef: targetRef,
+			MinReplicas:    &minReplicas,
+			MaxReplicas:    maxReplicas,
+			Metrics:        metrics,
+		},
+	}
+
+	hpa, err := rc.clientSet.AutoscalingV2().HorizontalPodAutoscalers(rc.nsName).Create(ctx, hpa, metav1.CreateOptions{})
+	framework.ExpectNoError(err)
+	return hpa
+}
+
+// CreateExternalHorizontalPodAutoscalerWithBehavior creates an HPA with custom behavior
+func CreateExternalHorizontalPodAutoscalerWithBehavior(ctx context.Context, rc *ResourceConsumer, metricName string, metricSelector map[string]string, targetType autoscalingv2.MetricTargetType, targetValue int64, minReplicas, maxReplicas int32, behavior *autoscalingv2.HorizontalPodAutoscalerBehavior) *autoscalingv2.HorizontalPodAutoscaler {
+	targetRef := autoscalingv2.CrossVersionObjectReference{
+		APIVersion: rc.kind.GroupVersion().String(),
+		Kind:       rc.kind.Kind,
+		Name:       rc.name,
+	}
+
+	metrics := []autoscalingv2.MetricSpec{
+		CreateExternalMetricSpec(metricName, metricSelector, targetType, targetValue),
+	}
+
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      rc.name,
+			Namespace: rc.nsName,
+		},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+			ScaleTargetRef: targetRef,
+			MinReplicas:    &minReplicas,
+			MaxReplicas:    maxReplicas,
+			Metrics:        metrics,
+			Behavior:       behavior,
+		},
+	}
+
+	hpa, err := rc.clientSet.AutoscalingV2().HorizontalPodAutoscalers(rc.nsName).Create(ctx, hpa, metav1.CreateOptions{})
+	framework.ExpectNoError(err)
+	return hpa
+}
+
+// CreateExternalHorizontalPodAutoscaler creates an HPA with a single external metric
+func CreateExternalHorizontalPodAutoscaler(ctx context.Context, rc *ResourceConsumer, metricName string, metricSelector map[string]string, targetType autoscalingv2.MetricTargetType, targetValue int64, minReplicas, maxReplicas int32) *autoscalingv2.HorizontalPodAutoscaler {
+	metrics := []autoscalingv2.MetricSpec{
+		CreateExternalMetricSpec(metricName, metricSelector, targetType, targetValue),
+	}
+	return CreateMultiMetricHorizontalPodAutoscaler(ctx, rc, metrics, minReplicas, maxReplicas)
+}
+
+// CreateExternalMetricSpec creates a MetricSpec for external metrics
+func CreateExternalMetricSpec(metricName string, metricSelector map[string]string, targetType autoscalingv2.MetricTargetType, targetValue int64) autoscalingv2.MetricSpec {
+	var selector *metav1.LabelSelector
+	if len(metricSelector) > 0 {
+		selector = &metav1.LabelSelector{
+			MatchLabels: metricSelector,
+		}
+	}
+
+	target := autoscalingv2.MetricTarget{
+		Type: targetType,
+	}
+
+	switch targetType {
+	case autoscalingv2.ValueMetricType:
+		target.Value = resource.NewQuantity(targetValue, resource.DecimalSI)
+	case autoscalingv2.AverageValueMetricType:
+		target.AverageValue = resource.NewQuantity(targetValue, resource.DecimalSI)
+	}
+
+	return autoscalingv2.MetricSpec{
+		Type: autoscalingv2.ExternalMetricSourceType,
+		External: &autoscalingv2.ExternalMetricSource{
+			Metric: autoscalingv2.MetricIdentifier{
+				Name:     metricName,
+				Selector: selector,
+			},
+			Target: target,
+		},
+	}
+}
+
+// CreateResourceMetricSpec creates a MetricSpec for resource metrics (CPU/Memory)
+func CreateResourceMetricSpec(resourceType v1.ResourceName, targetType autoscalingv2.MetricTargetType, targetValue int32) autoscalingv2.MetricSpec {
+	return autoscalingv2.MetricSpec{
+		Type: autoscalingv2.ResourceMetricSourceType,
+		Resource: &autoscalingv2.ResourceMetricSource{
+			Name:   resourceType,
+			Target: CreateMetricTargetWithType(resourceType, targetType, targetValue),
+		},
+	}
+}
+
 func HPABehaviorWithScaleUpAndDownRules(scaleUpRule, scaleDownRule *autoscalingv2.HPAScalingRules) *autoscalingv2.HorizontalPodAutoscalerBehavior {
 	return &autoscalingv2.HorizontalPodAutoscalerBehavior{
 		ScaleUp:   scaleUpRule,
@@ -886,6 +1312,13 @@ func HPAScalingRuleWithScalingPolicy(policyType autoscalingv2.HPAScalingPolicyTy
 		},
 		SelectPolicy:               &selectPolicy,
 		StabilizationWindowSeconds: &stabilizationWindowDisabledDuration,
+	}
+}
+
+func HPAScalingRuleWithToleranceMilli(toleranceMilli int64) *autoscalingv2.HPAScalingRules {
+	quantity := resource.NewMilliQuantity(toleranceMilli, resource.DecimalSI)
+	return &autoscalingv2.HPAScalingRules{
+		Tolerance: quantity,
 	}
 }
 
@@ -951,7 +1384,7 @@ func CreateCustomResourceDefinition(ctx context.Context, c crdclientset.Interfac
 					Scale: &apiextensionsv1.CustomResourceSubresourceScale{
 						SpecReplicasPath:   ".spec.replicas",
 						StatusReplicasPath: ".status.replicas",
-						LabelSelectorPath:  utilpointer.String(".status.selector"),
+						LabelSelectorPath:  ptr.To(".status.selector"),
 					},
 				},
 			}},
@@ -964,30 +1397,22 @@ func CreateCustomResourceDefinition(ctx context.Context, c crdclientset.Interfac
 		crd, err = c.ApiextensionsV1().CustomResourceDefinitions().Create(ctx, crdSchema, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 		// Wait until just created CRD appears in discovery.
-		err = wait.PollImmediateWithContext(ctx, 500*time.Millisecond, 30*time.Second, func(ctx context.Context) (bool, error) {
-			return ExistsInDiscovery(crd, c, "v1")
-		})
+		err = framework.Gomega().Eventually(ctx, framework.RetryNotFound(framework.HandleRetry(func(ctx context.Context) (*metav1.APIResourceList, error) {
+			return c.Discovery().ServerResourcesForGroupVersion(crd.Spec.Group + "/" + "v1")
+		}))).Should(framework.MakeMatcher(func(actual *metav1.APIResourceList) (func() string, error) {
+			for _, g := range actual.APIResources {
+				if g.Name == crd.Spec.Names.Plural {
+					return nil, nil
+				}
+			}
+			return func() string {
+				return fmt.Sprintf("CRD %s not found in discovery", crd.Spec.Names.Plural)
+			}, nil
+		}))
 		framework.ExpectNoError(err)
 		ginkgo.By(fmt.Sprintf("Successfully created Custom Resource Definition: %v", crd))
 	}
 	return crd
-}
-
-func ExistsInDiscovery(crd *apiextensionsv1.CustomResourceDefinition, apiExtensionsClient crdclientset.Interface, version string) (bool, error) {
-	groupResource, err := apiExtensionsClient.Discovery().ServerResourcesForGroupVersion(crd.Spec.Group + "/" + version)
-	if err != nil {
-		// Ignore 404 errors as it means the resources doesn't exist
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	for _, g := range groupResource.APIResources {
-		if g.Name == crd.Spec.Names.Plural {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func CreateCustomSubresourceInstance(ctx context.Context, namespace, name string, client dynamic.ResourceInterface, definition *apiextensionsv1.CustomResourceDefinition) (*unstructured.Unstructured, error) {
@@ -1023,4 +1448,12 @@ func CreateCustomSubresourceInstance(ctx context.Context, namespace, name string
 	}
 	ginkgo.By(fmt.Sprintf("Successfully created instance of CRD of kind %v: %v", definition.Kind, instance))
 	return instance, nil
+}
+
+func formatLabels(labels map[string]string) string {
+	var parts []string
+	for k, v := range labels {
+		parts = append(parts, fmt.Sprintf("%s=%s", k, v))
+	}
+	return strings.Join(parts, ",")
 }

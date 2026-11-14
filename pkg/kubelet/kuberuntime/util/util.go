@@ -17,18 +17,21 @@ limitations under the License.
 package util
 
 import (
+	"context"
+
 	v1 "k8s.io/api/core/v1"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/klog/v2"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
 
 // PodSandboxChanged checks whether the spec of the pod is changed and returns
-// (changed, new attempt, original sandboxID if exist).
-func PodSandboxChanged(pod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, uint32, string) {
+// (changed, new attempt, original sandboxID if exist, reason for change).
+func PodSandboxChanged(logger klog.Logger, pod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, uint32, string, string) {
 	if len(podStatus.SandboxStatuses) == 0 {
-		klog.V(2).InfoS("No sandbox for pod can be found. Need to start a new one", "pod", klog.KObj(pod))
-		return true, 0, ""
+		logger.V(2).Info("No sandbox for pod can be found. Need to start a new one", "pod", klog.KObj(pod))
+		return true, 0, "", kubetypes.PodSandboxNotReadyMsgNoPodSandbox
 	}
 
 	readySandboxCount := 0
@@ -41,27 +44,27 @@ func PodSandboxChanged(pod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, u
 	// Needs to create a new sandbox when readySandboxCount > 1 or the ready sandbox is not the latest one.
 	sandboxStatus := podStatus.SandboxStatuses[0]
 	if readySandboxCount > 1 {
-		klog.V(2).InfoS("Multiple sandboxes are ready for Pod. Need to reconcile them", "pod", klog.KObj(pod))
-		return true, sandboxStatus.Metadata.Attempt + 1, sandboxStatus.Id
+		logger.V(2).Info("Multiple sandboxes are ready for Pod. Need to reconcile them", "pod", klog.KObj(pod))
+		return true, sandboxStatus.Metadata.Attempt + 1, sandboxStatus.Id, kubetypes.PodSandboxNotReadyMsgMultipleSandboxes
 	}
 	if sandboxStatus.State != runtimeapi.PodSandboxState_SANDBOX_READY {
-		klog.V(2).InfoS("No ready sandbox for pod can be found. Need to start a new one", "pod", klog.KObj(pod))
-		return true, sandboxStatus.Metadata.Attempt + 1, sandboxStatus.Id
+		logger.V(2).Info("No ready sandbox for pod can be found. Need to start a new one", "pod", klog.KObj(pod))
+		return true, sandboxStatus.Metadata.Attempt + 1, sandboxStatus.Id, kubetypes.PodSandboxNotReadyMsgSandboxNotReady
 	}
 
 	// Needs to create a new sandbox when network namespace changed.
 	if sandboxStatus.GetLinux().GetNamespaces().GetOptions().GetNetwork() != NetworkNamespaceForPod(pod) {
-		klog.V(2).InfoS("Sandbox for pod has changed. Need to start a new one", "pod", klog.KObj(pod))
-		return true, sandboxStatus.Metadata.Attempt + 1, ""
+		logger.V(2).Info("Sandbox for pod has changed. Need to start a new one", "pod", klog.KObj(pod))
+		return true, sandboxStatus.Metadata.Attempt + 1, "", kubetypes.PodSandboxNotReadyMsgNetworkNamespaceMode
 	}
 
 	// Needs to create a new sandbox when the sandbox does not have an IP address.
 	if !kubecontainer.IsHostNetworkPod(pod) && sandboxStatus.Network != nil && sandboxStatus.Network.Ip == "" {
-		klog.V(2).InfoS("Sandbox for pod has no IP address. Need to start a new one", "pod", klog.KObj(pod))
-		return true, sandboxStatus.Metadata.Attempt + 1, sandboxStatus.Id
+		logger.V(2).Info("Sandbox for pod has no IP address. Need to start a new one", "pod", klog.KObj(pod))
+		return true, sandboxStatus.Metadata.Attempt + 1, sandboxStatus.Id, kubetypes.PodSandboxNotReadyMsgNoIPAddress
 	}
 
-	return false, sandboxStatus.Metadata.Attempt, sandboxStatus.Id
+	return false, sandboxStatus.Metadata.Attempt, sandboxStatus.Id, ""
 }
 
 // IpcNamespaceForPod returns the runtimeapi.NamespaceMode
@@ -97,10 +100,24 @@ func PidNamespaceForPod(pod *v1.Pod) runtimeapi.NamespaceMode {
 	return runtimeapi.NamespaceMode_CONTAINER
 }
 
+// LookupRuntimeHandler is implemented by *runtimeclass.Manager.
+type RuntimeHandlerResolver interface {
+	LookupRuntimeHandler(runtimeClassName *string) (string, error)
+}
+
 // namespacesForPod returns the runtimeapi.NamespaceOption for a given pod.
 // An empty or nil pod can be used to get the namespace defaults for v1.Pod.
-func NamespacesForPod(pod *v1.Pod, runtimeHelper kubecontainer.RuntimeHelper) (*runtimeapi.NamespaceOption, error) {
-	userNs, err := runtimeHelper.GetOrCreateUserNamespaceMappings(pod)
+func NamespacesForPod(ctx context.Context, pod *v1.Pod, runtimeHelper kubecontainer.RuntimeHelper, rcManager RuntimeHandlerResolver) (*runtimeapi.NamespaceOption, error) {
+	logger := klog.FromContext(ctx)
+	runtimeHandler := ""
+	if pod != nil && rcManager != nil {
+		var err error
+		runtimeHandler, err = rcManager.LookupRuntimeHandler(pod.Spec.RuntimeClassName)
+		if err != nil {
+			return nil, err
+		}
+	}
+	userNs, err := runtimeHelper.GetOrCreateUserNamespaceMappings(logger, pod, runtimeHandler)
 	if err != nil {
 		return nil, err
 	}

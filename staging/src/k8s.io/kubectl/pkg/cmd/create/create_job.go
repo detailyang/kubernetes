@@ -35,6 +35,7 @@ import (
 	"k8s.io/kubectl/pkg/util"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
+	"k8s.io/utils/ptr"
 )
 
 var (
@@ -105,7 +106,7 @@ func NewCmdCreateJob(f cmdutil.Factory, ioStreams genericiooptions.IOStreams) *c
 	cmdutil.AddValidateFlags(cmd)
 	cmdutil.AddDryRunFlag(cmd)
 	cmd.Flags().StringVar(&o.Image, "image", o.Image, "Image name to run.")
-	cmd.Flags().StringVar(&o.From, "from", o.From, "The name of the resource to create a Job from (only cronjob is supported).")
+	cmd.Flags().StringVar(&o.From, "from", o.From, "The name of the resource to create a Job from (only CronJob is supported).")
 	cmdutil.AddFieldManagerFlagVar(cmd, &o.FieldManager, "kubectl-create")
 	return cmd
 }
@@ -261,10 +262,21 @@ func (o *CreateJobOptions) createJobFromCronJob(cronJob *batchv1.CronJob) *batch
 		// this is ok because we know exactly how we want to be serialized
 		TypeMeta: metav1.TypeMeta{APIVersion: batchv1.SchemeGroupVersion.String(), Kind: "Job"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            o.Name,
-			Annotations:     annotations,
-			Labels:          cronJob.Spec.JobTemplate.Labels,
-			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(cronJob, batchv1.SchemeGroupVersion.WithKind("CronJob"))},
+			Name:        o.Name,
+			Annotations: annotations,
+			Labels:      cronJob.Spec.JobTemplate.Labels,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					// we are not using metav1.NewControllerRef because it
+					// sets BlockOwnerDeletion to true which additionally mandates
+					// cronjobs/finalizer role and not backwards-compatible.
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       "CronJob",
+					Name:       cronJob.GetName(),
+					UID:        cronJob.GetUID(),
+					Controller: ptr.To(true),
+				},
+			},
 		},
 		Spec: cronJob.Spec.JobTemplate.Spec,
 	}

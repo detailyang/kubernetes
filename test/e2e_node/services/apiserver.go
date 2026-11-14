@@ -17,9 +17,10 @@ limitations under the License.
 package services
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
-	"testing"
 
 	utiltesting "k8s.io/client-go/util/testing"
 
@@ -45,19 +46,20 @@ AwEHoUQDQgAEH6cuzP8XuD5wal6wf9M6xDljTOPLX2i8uIp/C/ASqiIGUeeKQtX0
 // APIServer is a server which manages apiserver.
 type APIServer struct {
 	storageConfig storagebackend.Config
-	stopCh        chan struct{}
+	cancel        func(error)
 }
 
 // NewAPIServer creates an apiserver.
 func NewAPIServer(storageConfig storagebackend.Config) *APIServer {
 	return &APIServer{
 		storageConfig: storageConfig,
-		stopCh:        make(chan struct{}),
 	}
 }
 
 // Start starts the apiserver, returns when apiserver is ready.
-func (a *APIServer) Start() error {
+// The background goroutine runs until the context is canceled
+// or Stop is called, whether happens first.
+func (a *APIServer) Start(ctx context.Context) (finalErr error) {
 	const tokenFilePath = "known_tokens.csv"
 
 	o := options.NewServerRunOptions()
@@ -82,7 +84,7 @@ func (a *APIServer) Start() error {
 	if err != nil {
 		return fmt.Errorf("create temp file failed: %w", err)
 	}
-	defer utiltesting.CloseAndRemove(&testing.T{}, saSigningKeyFile)
+	defer utiltesting.CloseAndRemove(utiltesting.FatalToError(&finalErr), saSigningKeyFile)
 	if err = os.WriteFile(saSigningKeyFile.Name(), []byte(ecdsaPrivateKey), 0666); err != nil {
 		return fmt.Errorf("write file %s failed: %w", saSigningKeyFile.Name(), err)
 	}
@@ -93,10 +95,13 @@ func (a *APIServer) Start() error {
 
 	o.KubeletConfig.PreferredAddressTypes = []string{"InternalIP"}
 
+	ctx, cancel := context.WithCancelCause(ctx)
+	a.cancel = cancel
 	errCh := make(chan error)
 	go func() {
 		defer close(errCh)
-		completedOptions, err := o.Complete()
+		defer cancel(errors.New("shutting down")) // Calling Stop is optional, but cancel always should be invoked.
+		completedOptions, err := o.Complete(ctx)
 		if err != nil {
 			errCh <- fmt.Errorf("set apiserver default options error: %w", err)
 			return
@@ -106,7 +111,7 @@ func (a *APIServer) Start() error {
 			return
 		}
 
-		err = apiserver.Run(completedOptions, a.stopCh)
+		err = apiserver.Run(ctx, completedOptions)
 		if err != nil {
 			errCh <- fmt.Errorf("run apiserver error: %w", err)
 			return
@@ -120,12 +125,11 @@ func (a *APIServer) Start() error {
 	return nil
 }
 
-// Stop stops the apiserver. Currently, there is no way to stop the apiserver.
-// The function is here only for completion.
+// Stop stops the apiserver. Does not block.
 func (a *APIServer) Stop() error {
-	if a.stopCh != nil {
-		close(a.stopCh)
-		a.stopCh = nil
+	// nil when Start has never been called.
+	if a.cancel != nil {
+		a.cancel(errors.New("stopping API server"))
 	}
 	return nil
 }

@@ -18,15 +18,16 @@ package testsuites
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/onsi/ginkgo/v2"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/errors"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
-	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
 	storageutils "k8s.io/kubernetes/test/e2e/storage/utils"
 	admissionapi "k8s.io/pod-security-admission/api"
@@ -42,7 +43,7 @@ func InitCustomDisruptiveTestSuite(patterns []storageframework.TestPattern) stor
 	return &disruptiveTestSuite{
 		tsInfo: storageframework.TestSuiteInfo{
 			Name:         "disruptive",
-			FeatureTag:   "[Disruptive][LinuxOnly]",
+			TestTags:     []interface{}{framework.WithDisruptive(), framework.WithLabel("LinuxOnly"), framework.WithProvider(framework.ProvidersWithSSH...)},
 			TestPatterns: patterns,
 		},
 	}
@@ -66,12 +67,14 @@ func (s *disruptiveTestSuite) GetTestSuiteInfo() storageframework.TestSuiteInfo 
 	return s.tsInfo
 }
 
-func (s *disruptiveTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
-	skipVolTypePatterns(pattern, driver, storageframework.NewVolTypeMap(storageframework.PreprovisionedPV))
-	if pattern.VolMode == v1.PersistentVolumeBlock && !driver.GetDriverInfo().Capabilities[storageframework.CapBlock] {
-		e2eskipper.Skipf("Driver %s doesn't support %v -- skipping", driver.GetDriverInfo().Name, pattern.VolMode)
+func (s *disruptiveTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) string {
+	if reason := checkVolTypePatterns(pattern, driver, storageframework.NewVolTypeMap(storageframework.PreprovisionedPV)); reason != "" {
+		return reason
 	}
-	e2eskipper.SkipUnlessSSHKeyPresent()
+	if pattern.VolMode == v1.PersistentVolumeBlock && !driver.GetDriverInfo().Capabilities[storageframework.CapBlock] {
+		return fmt.Sprintf("Driver %s doesn't support %v", driver.GetDriverInfo().Name, pattern.VolMode)
+	}
+	return ""
 }
 
 func (s *disruptiveTestSuite) DefineTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
@@ -115,7 +118,8 @@ func (s *disruptiveTestSuite) DefineTests(driver storageframework.TestDriver, pa
 				l.config,
 				pattern,
 				testVolumeSizeRange,
-				accessModes)
+				accessModes,
+				nil)
 		}
 	}
 
@@ -207,26 +211,26 @@ func (s *disruptiveTestSuite) DefineTests(driver storageframework.TestDriver, pa
 	}
 	multiplePodTests := []multiplePodTest{
 		{
-			testItStmt: "Should test that pv used in a pod that is deleted while the kubelet is down is usable by a new pod when kubelet returns [Feature:SELinux].",
+			testItStmt: "Should test that pv used in a pod that is deleted while the kubelet is down is usable by a new pod when kubelet returns",
 			runTestFile: func(ctx context.Context, c clientset.Interface, f *framework.Framework, pod1, pod2 *v1.Pod) {
 				storageutils.TestVolumeUnmountsFromDeletedPodWithForceOption(ctx, c, f, pod1, false, false, pod2, e2epod.VolumeMountPath1)
 			},
 		},
 		{
-			testItStmt: "Should test that pv used in a pod that is force deleted while the kubelet is down is usable by a new pod when kubelet returns [Feature:SELinux].",
+			testItStmt: "Should test that pv used in a pod that is force deleted while the kubelet is down is usable by a new pod when kubelet returns",
 			runTestFile: func(ctx context.Context, c clientset.Interface, f *framework.Framework, pod1, pod2 *v1.Pod) {
 				storageutils.TestVolumeUnmountsFromDeletedPodWithForceOption(ctx, c, f, pod1, true, false, pod2, e2epod.VolumeMountPath1)
 			},
 		},
 		{
-			testItStmt:            "Should test that pv used in a pod that is deleted while the kubelet is down is usable by a new pod with a different SELinux context when kubelet returns [Feature:SELinux].",
+			testItStmt:            "Should test that pv used in a pod that is deleted while the kubelet is down is usable by a new pod with a different SELinux context when kubelet returns",
 			changeSELinuxContexts: true,
 			runTestFile: func(ctx context.Context, c clientset.Interface, f *framework.Framework, pod1, pod2 *v1.Pod) {
 				storageutils.TestVolumeUnmountsFromDeletedPodWithForceOption(ctx, c, f, pod1, false, false, pod2, e2epod.VolumeMountPath1)
 			},
 		},
 		{
-			testItStmt:            "Should test that pv used in a pod that is force deleted while the kubelet is down is usable by a new pod with a different SELinux context when kubelet returns [Feature:SELinux].",
+			testItStmt:            "Should test that pv used in a pod that is force deleted while the kubelet is down is usable by a new pod with a different SELinux context when kubelet returns",
 			changeSELinuxContexts: true,
 			runTestFile: func(ctx context.Context, c clientset.Interface, f *framework.Framework, pod1, pod2 *v1.Pod) {
 				storageutils.TestVolumeUnmountsFromDeletedPodWithForceOption(ctx, c, f, pod1, true, false, pod2, e2epod.VolumeMountPath1)
@@ -237,7 +241,7 @@ func (s *disruptiveTestSuite) DefineTests(driver storageframework.TestDriver, pa
 	for _, test := range multiplePodTests {
 		func(t multiplePodTest) {
 			if pattern.VolMode == v1.PersistentVolumeFilesystem && t.runTestFile != nil {
-				ginkgo.It(t.testItStmt, func(ctx context.Context) {
+				f.It(t.testItStmt, feature.SELinux, func(ctx context.Context) {
 					init(ctx, []v1.PersistentVolumeAccessMode{v1.ReadWriteOncePod})
 					ginkgo.DeferCleanup(cleanup)
 

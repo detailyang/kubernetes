@@ -26,16 +26,19 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/dump"
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/mergepatch"
 	"k8s.io/apimachinery/pkg/util/sets"
 	sptest "k8s.io/apimachinery/pkg/util/strategicpatch/testing"
+	"k8s.io/utils/dump"
 )
 
 var (
 	fakeMergeItemSchema     = sptest.Fake{Path: filepath.Join("testdata", "swagger-merge-item.json")}
 	fakePrecisionItemSchema = sptest.Fake{Path: filepath.Join("testdata", "swagger-precision-item.json")}
+
+	fakeMergeItemV3Schema     = sptest.OpenAPIV3Getter{Path: filepath.Join("testdata", "swagger-merge-item-v3.json")}
+	fakePrecisionItemV3Schema = sptest.OpenAPIV3Getter{Path: filepath.Join("testdata", "swagger-precision-item-v3.json")}
 )
 
 type SortMergeListTestCases struct {
@@ -104,6 +107,7 @@ type MergeItem struct {
 	MergeItemPtr          *MergeItem           `json:"mergeItemPtr,omitempty" patchStrategy:"merge" patchMergeKey:"name"`
 	SimpleMap             map[string]string    `json:"simpleMap,omitempty"`
 	ReplacingItem         runtime.RawExtension `json:"replacingItem,omitempty" patchStrategy:"replace"`
+	JSONItem              struct{ Raw []byte } `json:"jsonItem,omitempty"`
 	RetainKeysMap         RetainKeysMergeItem  `json:"retainKeysMap,omitempty" patchStrategy:"retainKeys"`
 	RetainKeysMergingList []MergeItem          `json:"retainKeysMergingList,omitempty" patchStrategy:"merge,retainKeys" patchMergeKey:"name"`
 }
@@ -284,9 +288,14 @@ func TestSortMergeLists(t *testing.T) {
 	mergeItemOpenapiSchema := PatchMetaFromOpenAPI{
 		Schema: sptest.GetSchemaOrDie(&fakeMergeItemSchema, "mergeItem"),
 	}
+	mergeItemOpenapiV3Schema := PatchMetaFromOpenAPIV3{
+		SchemaList: fakeMergeItemV3Schema.SchemaOrDie().Components.Schemas,
+		Schema:     fakeMergeItemV3Schema.SchemaOrDie().Components.Schemas["mergeItem"],
+	}
 	schemas := []LookupPatchMeta{
 		mergeItemStructSchema,
 		mergeItemOpenapiSchema,
+		mergeItemOpenapiV3Schema,
 	}
 
 	tc := SortMergeListTestCases{}
@@ -766,9 +775,14 @@ func TestCustomStrategicMergePatch(t *testing.T) {
 	mergeItemOpenapiSchema := PatchMetaFromOpenAPI{
 		Schema: sptest.GetSchemaOrDie(&fakeMergeItemSchema, "mergeItem"),
 	}
+	mergeItemOpenapiV3Schema := PatchMetaFromOpenAPIV3{
+		SchemaList: fakeMergeItemV3Schema.SchemaOrDie().Components.Schemas,
+		Schema:     fakeMergeItemV3Schema.SchemaOrDie().Components.Schemas["mergeItem"],
+	}
 	schemas := []LookupPatchMeta{
 		mergeItemStructSchema,
 		mergeItemOpenapiSchema,
+		mergeItemOpenapiV3Schema,
 	}
 
 	tc := StrategicMergePatchTestCases{}
@@ -6169,9 +6183,14 @@ func TestStrategicMergePatch(t *testing.T) {
 	mergeItemOpenapiSchema := PatchMetaFromOpenAPI{
 		Schema: sptest.GetSchemaOrDie(&fakeMergeItemSchema, "mergeItem"),
 	}
+	mergeItemOpenapiV3Schema := PatchMetaFromOpenAPIV3{
+		SchemaList: fakeMergeItemV3Schema.SchemaOrDie().Components.Schemas,
+		Schema:     fakeMergeItemV3Schema.SchemaOrDie().Components.Schemas["mergeItem"],
+	}
 	schemas := []LookupPatchMeta{
 		mergeItemStructSchema,
 		mergeItemOpenapiSchema,
+		mergeItemOpenapiV3Schema,
 	}
 
 	tc := StrategicMergePatchTestCases{}
@@ -6564,9 +6583,14 @@ func TestNumberConversion(t *testing.T) {
 	precisionItemOpenapiSchema := PatchMetaFromOpenAPI{
 		Schema: sptest.GetSchemaOrDie(&fakePrecisionItemSchema, "precisionItem"),
 	}
+	precisionItemOpenapiV3Schema := PatchMetaFromOpenAPIV3{
+		SchemaList: fakePrecisionItemV3Schema.SchemaOrDie().Components.Schemas,
+		Schema:     fakePrecisionItemV3Schema.SchemaOrDie().Components.Schemas["precisionItem"],
+	}
 	precisionItemSchemas := []LookupPatchMeta{
 		precisionItemStructSchema,
 		precisionItemOpenapiSchema,
+		precisionItemOpenapiV3Schema,
 	}
 
 	for _, schema := range precisionItemSchemas {
@@ -6774,9 +6798,14 @@ func TestReplaceWithRawExtension(t *testing.T) {
 	mergeItemOpenapiSchema := PatchMetaFromOpenAPI{
 		Schema: sptest.GetSchemaOrDie(&fakeMergeItemSchema, "mergeItem"),
 	}
+	mergeItemOpenapiV3Schema := PatchMetaFromOpenAPIV3{
+		SchemaList: fakeMergeItemV3Schema.SchemaOrDie().Components.Schemas,
+		Schema:     fakeMergeItemV3Schema.SchemaOrDie().Components.Schemas["mergeItem"],
+	}
 	schemas := []LookupPatchMeta{
 		mergeItemStructSchema,
 		mergeItemOpenapiSchema,
+		mergeItemOpenapiV3Schema,
 	}
 
 	for _, schema := range schemas {
@@ -6941,14 +6970,32 @@ func TestUnknownField(t *testing.T) {
 			ExpectedTwoWayErr:   `unable to find api field`,
 			ExpectedThreeWayErr: `unable to find api field`,
 		},
+
+		"json": {
+			Original: `{"name":"foo","jsonItem":{"nested":{"nested2":{"nested3":{}}}}}`,
+			Current:  `{"name":"foo","jsonItem":{"nested":{"nested2":{"nested3":{}}}}}`,
+			Modified: `{"name":"foo","jsonItem":{"nested":{"nested2":{"nested3":{"a":"b"}}}}}`,
+
+			ExpectedTwoWay:         `{"jsonItem":{"nested":{"nested2":{"nested3":{"a":"b"}}}}}`,
+			ExpectedTwoWayResult:   `{"jsonItem":{"nested":{"nested2":{"nested3":{"a":"b"}}}},"name":"foo"}`,
+			ExpectedThreeWay:       `{"jsonItem":{"nested":{"nested2":{"nested3":{"a":"b"}}}}}`,
+			ExpectedThreeWayResult: `{"jsonItem":{"nested":{"nested2":{"nested3":{"a":"b"}}}},"name":"foo"}`,
+			ExpectedTwoWayErr:      `unable to find api field`,
+			ExpectedThreeWayErr:    `unable to find api field`,
+		},
 	}
 
 	mergeItemOpenapiSchema := PatchMetaFromOpenAPI{
 		Schema: sptest.GetSchemaOrDie(&fakeMergeItemSchema, "mergeItem"),
 	}
+	mergeItemOpenapiV3Schema := PatchMetaFromOpenAPIV3{
+		SchemaList: fakeMergeItemV3Schema.SchemaOrDie().Components.Schemas,
+		Schema:     fakeMergeItemV3Schema.SchemaOrDie().Components.Schemas["mergeItem"],
+	}
 	schemas := []LookupPatchMeta{
 		mergeItemStructSchema,
 		mergeItemOpenapiSchema,
+		mergeItemOpenapiV3Schema,
 	}
 
 	for _, k := range sets.StringKeySet(testcases).List() {
@@ -6999,7 +7046,7 @@ func TestUnknownField(t *testing.T) {
 						return
 					}
 
-					threeWayResult, err := StrategicMergePatch([]byte(tc.Current), threeWay, schema)
+					threeWayResult, err := StrategicMergePatchUsingLookupPatchMeta([]byte(tc.Current), threeWay, schema)
 					if err != nil {
 						t.Errorf("using %s in testcase %s: error applying three-way patch: %v", getSchemaType(schema), k, err)
 						return

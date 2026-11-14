@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
@@ -232,13 +233,13 @@ func newTestController(ctx context.Context, kubeClient clientset.Interface, info
 		ClassInformer:             informerFactory.Storage().V1().StorageClasses(),
 		PodInformer:               informerFactory.Core().V1().Pods(),
 		NodeInformer:              informerFactory.Core().V1().Nodes(),
-		EventRecorder:             record.NewFakeRecorder(1000),
 		EnableDynamicProvisioning: enableDynamicProvisioning,
 	}
 	ctrl, err := NewController(ctx, params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to construct persistentvolume controller: %v", err)
 	}
+	ctrl.eventRecorder = record.NewFakeRecorder(1000)
 	ctrl.volumeListerSynced = alwaysReady
 	ctrl.claimListerSynced = alwaysReady
 	ctrl.classListerSynced = alwaysReady
@@ -409,6 +410,14 @@ func withExpectedCapacity(capacity string, claims []*v1.PersistentVolumeClaim) [
 	return claims
 }
 
+// withExpectedVAC sets the claim.Status.CurrentVolumeAttributesClassName of the first claim in the
+// array to given value and returns the array.  Meant to be used to compose
+// claims specified inline in a test.
+func withExpectedVAC(vacName *string, claims []*v1.PersistentVolumeClaim) []*v1.PersistentVolumeClaim {
+	claims[0].Status.CurrentVolumeAttributesClassName = vacName
+	return claims
+}
+
 // withMessage saves given message into volume.Status.Message of the first
 // volume in the array and returns the array.  Meant to be used to compose
 // volumes specified inline in a test.
@@ -419,6 +428,7 @@ func withMessage(message string, volumes []*v1.PersistentVolume) []*v1.Persisten
 
 // newVolumeArray returns array with a single volume that would be returned by
 // newVolume() with the same parameters.
+// TODO: make the newVolumeArray function accept volume attributes class name as an input parameter
 func newVolumeArray(name, capacity, boundToClaimUID, boundToClaimName string, phase v1.PersistentVolumePhase, reclaimPolicy v1.PersistentVolumeReclaimPolicy, class string, annotations ...string) []*v1.PersistentVolume {
 	return []*v1.PersistentVolume{
 		newVolume(name, capacity, boundToClaimUID, boundToClaimName, phase, reclaimPolicy, class, annotations...),
@@ -489,6 +499,9 @@ func newClaim(name, claimUID, capacity, boundToVolume string, phase v1.Persisten
 		// For most of the tests it's enough to copy claim's requested capacity,
 		// individual tests can adjust it using withExpectedCapacity()
 		claim.Status.Capacity = claim.Spec.Resources.Requests
+		// For most of the tests it's enough to copy claim's requested vac,
+		// individual tests can adjust it using withExpectedVAC()
+		claim.Status.CurrentVolumeAttributesClassName = claim.Spec.VolumeAttributesClassName
 	}
 
 	return &claim
@@ -496,10 +509,16 @@ func newClaim(name, claimUID, capacity, boundToVolume string, phase v1.Persisten
 
 // newClaimArray returns array with a single claim that would be returned by
 // newClaim() with the same parameters.
+// TODO: make the newClaimArray function accept volume attributes class name as an input parameter
 func newClaimArray(name, claimUID, capacity, boundToVolume string, phase v1.PersistentVolumeClaimPhase, class *string, annotations ...string) []*v1.PersistentVolumeClaim {
 	return []*v1.PersistentVolumeClaim{
 		newClaim(name, claimUID, capacity, boundToVolume, phase, class, annotations...),
 	}
+}
+
+func claimWithVAC(vacName *string, claims []*v1.PersistentVolumeClaim) []*v1.PersistentVolumeClaim {
+	claims[0].Spec.VolumeAttributesClassName = vacName
+	return claims
 }
 
 // claimWithAnnotation saves given annotation into given claims. Meant to be
@@ -534,6 +553,22 @@ func annotateClaim(claim *v1.PersistentVolumeClaim, ann map[string]string) *v1.P
 		claim.Annotations[key] = val
 	}
 	return claim
+}
+
+// volumeWithVAC saves given vac into given volume.
+// Meant to be used to compose volume specified inline in a test.
+func volumeWithVAC(vacName string, volume *v1.PersistentVolume) *v1.PersistentVolume {
+	volume.Spec.VolumeAttributesClassName = &vacName
+	return volume
+}
+
+// volumesWithVAC saves given vac into given volumes.
+// Meant to be used to compose volumes specified inline in a test.
+func volumesWithVAC(vacName string, volumes []*v1.PersistentVolume) []*v1.PersistentVolume {
+	for _, volume := range volumes {
+		volumeWithVAC(vacName, volume)
+	}
+	return volumes
 }
 
 // volumeWithAnnotation saves given annotation into given volume.
@@ -734,13 +769,13 @@ func runSyncTests(t *testing.T, ctx context.Context, tests []controllerTest, sto
 			if metav1.HasAnnotation(claim.ObjectMeta, annSkipLocalStore) {
 				continue
 			}
-			ctrl.claims.Add(claim)
+			require.NoError(t, ctrl.claims.Indexer().Add(claim))
 		}
 		for _, volume := range test.initialVolumes {
 			if metav1.HasAnnotation(volume.ObjectMeta, annSkipLocalStore) {
 				continue
 			}
-			ctrl.volumes.store.Add(volume)
+			require.NoError(t, ctrl.volumes.Indexer().Add(volume))
 		}
 		reactor.AddClaims(test.initialClaims)
 		reactor.AddVolumes(test.initialVolumes)
@@ -775,7 +810,6 @@ func runSyncTests(t *testing.T, ctx context.Context, tests []controllerTest, sto
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			doit(t, test)
 		})
@@ -818,10 +852,10 @@ func runMultisyncTests(t *testing.T, ctx context.Context, tests []controllerTest
 
 		reactor := newVolumeReactor(ctx, client, ctrl, nil, nil, test.errors)
 		for _, claim := range test.initialClaims {
-			ctrl.claims.Add(claim)
+			require.NoError(t, ctrl.claims.Indexer().Add(claim))
 		}
 		for _, volume := range test.initialVolumes {
-			ctrl.volumes.store.Add(volume)
+			require.NoError(t, ctrl.volumes.Indexer().Add(volume))
 		}
 		reactor.AddClaims(test.initialClaims)
 		reactor.AddVolumes(test.initialVolumes)
@@ -868,12 +902,11 @@ func runMultisyncTests(t *testing.T, ctx context.Context, tests []controllerTest
 			time.Sleep(600 * time.Millisecond)
 
 			// There were some changes, process them
-			switch obj.(type) {
+			switch obj := obj.(type) {
 			case *v1.PersistentVolumeClaim:
-				claim := obj.(*v1.PersistentVolumeClaim)
 				// Simulate "claim updated" event
-				ctrl.claims.Update(claim)
-				err = ctrl.syncClaim(context.TODO(), claim)
+				require.NoError(t, ctrl.claims.Indexer().Update(obj))
+				err = ctrl.syncClaim(context.TODO(), obj)
 				if err != nil {
 					if err == pvtesting.ErrVersionConflict {
 						// Ignore version errors
@@ -887,10 +920,9 @@ func runMultisyncTests(t *testing.T, ctx context.Context, tests []controllerTest
 				// Process generated changes
 				continue
 			case *v1.PersistentVolume:
-				volume := obj.(*v1.PersistentVolume)
 				// Simulate "volume updated" event
-				ctrl.volumes.store.Update(volume)
-				err = ctrl.syncVolume(context.TODO(), volume)
+				require.NoError(t, ctrl.volumes.Indexer().Update(obj))
+				err = ctrl.syncVolume(context.TODO(), obj)
 				if err != nil {
 					if err == pvtesting.ErrVersionConflict {
 						// Ignore version errors
@@ -910,7 +942,6 @@ func runMultisyncTests(t *testing.T, ctx context.Context, tests []controllerTest
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			run(t, test)
@@ -976,7 +1007,7 @@ func (plugin *mockVolumePlugin) SupportsSELinuxContextMount(spec *volume.Spec) (
 	return false, nil
 }
 
-func (plugin *mockVolumePlugin) NewMounter(spec *volume.Spec, podRef *v1.Pod, opts volume.VolumeOptions) (volume.Mounter, error) {
+func (plugin *mockVolumePlugin) NewMounter(spec *volume.Spec, podRef *v1.Pod) (volume.Mounter, error) {
 	return nil, fmt.Errorf("Mounter is not supported by this plugin")
 }
 

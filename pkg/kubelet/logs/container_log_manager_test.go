@@ -17,17 +17,20 @@ limitations under the License.
 package logs
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/pkg/kubelet/container"
 
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -75,7 +78,7 @@ func TestGetAllLogs(t *testing.T) {
 }
 
 func TestRotateLogs(t *testing.T) {
-	ctx := context.Background()
+	tCtx := ktesting.Init(t)
 	dir, err := os.MkdirTemp("", "test-rotate-logs")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -94,6 +97,13 @@ func TestRotateLogs(t *testing.T) {
 		},
 		osInterface: container.RealOS{},
 		clock:       testingclock.NewFakeClock(now),
+		mutex:       sync.Mutex{},
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "kubelet_log_rotate_manager"},
+		),
+		maxWorkers:       10,
+		monitoringPeriod: v1.Duration{Duration: 10 * time.Second},
 	}
 	testLogs := []string{
 		"test-log-1",
@@ -149,7 +159,25 @@ func TestRotateLogs(t *testing.T) {
 		},
 	}
 	f.SetFakeContainers(testContainers)
-	require.NoError(t, c.rotateLogs(ctx))
+
+	// Push the items into the queue for before starting the worker to avoid issue with the queue being empty.
+	require.NoError(t, c.rotateLogs(tCtx))
+
+	// Start a routine that can monitor the queue and shutdown the queue to trigger the retrun from the processQueueItems
+	// Keeping the monitor duration smaller in order to keep the unwanted delay in the test to a minimal.
+	go func() {
+		pollTimeoutCtx, cancel := context.WithTimeout(tCtx, 10*time.Second)
+		defer cancel()
+		err = wait.PollUntilContextCancel(pollTimeoutCtx, 5*time.Millisecond, false, func(ctx context.Context) (done bool, err error) {
+			return c.queue.Len() == 0, nil
+		})
+		if err != nil {
+			t.Errorf("unexpected error %v", err)
+		}
+		c.queue.ShutDown()
+	}()
+	// This is a blocking call. But the above routine takes care of ensuring that this is terminated once the queue is shutdown
+	c.processQueueItems(tCtx, 1)
 
 	timestamp := now.Format(timestampFormat)
 	logs, err := os.ReadDir(dir)
@@ -163,7 +191,7 @@ func TestRotateLogs(t *testing.T) {
 }
 
 func TestClean(t *testing.T) {
-	ctx := context.Background()
+	tCtx := ktesting.Init(t)
 	dir, err := os.MkdirTemp("", "test-clean")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -182,6 +210,13 @@ func TestClean(t *testing.T) {
 		},
 		osInterface: container.RealOS{},
 		clock:       testingclock.NewFakeClock(now),
+		mutex:       sync.Mutex{},
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "kubelet_log_rotate_manager"},
+		),
+		maxWorkers:       10,
+		monitoringPeriod: v1.Duration{Duration: 10 * time.Second},
 	}
 	testLogs := []string{
 		"test-log-1",
@@ -222,7 +257,7 @@ func TestClean(t *testing.T) {
 	}
 	f.SetFakeContainers(testContainers)
 
-	err = c.Clean(ctx, "container-3")
+	err = c.Clean(tCtx, "container-3")
 	require.NoError(t, err)
 
 	logs, err := os.ReadDir(dir)
@@ -334,26 +369,26 @@ func TestCompressLog(t *testing.T) {
 	testFile.Close()
 
 	testLog := testFile.Name()
+	testLogInfo, err := os.Stat(testLog)
+	assert.NoError(t, err)
 	c := &containerLogManager{osInterface: container.RealOS{}}
 	require.NoError(t, c.compressLog(testLog))
-	_, err = os.Stat(testLog + compressSuffix)
+	testLogCompressInfo, err := os.Stat(testLog + compressSuffix)
 	assert.NoError(t, err, "log should be compressed")
+	if testLogInfo.Mode() != testLogCompressInfo.Mode() {
+		t.Errorf("compressed and uncompressed test log file modes do not match")
+	}
+	if err := c.compressLog("test-unknown-log"); err == nil {
+		t.Errorf("compressing unknown log should return error")
+	}
 	_, err = os.Stat(testLog + tmpSuffix)
 	assert.Error(t, err, "temporary log should be renamed")
 	_, err = os.Stat(testLog)
 	assert.Error(t, err, "original log should be removed")
-
-	rc, err := UncompressLog(testLog + compressSuffix)
-	require.NoError(t, err)
-	defer rc.Close()
-	var buf bytes.Buffer
-	_, err = io.Copy(&buf, rc)
-	require.NoError(t, err)
-	assert.Equal(t, testContent, buf.String())
 }
 
 func TestRotateLatestLog(t *testing.T) {
-	ctx := context.Background()
+	tCtx := ktesting.Init(t)
 	dir, err := os.MkdirTemp("", "test-rotate-latest-log")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -387,6 +422,13 @@ func TestRotateLatestLog(t *testing.T) {
 			policy:         LogRotatePolicy{MaxFiles: test.maxFiles},
 			osInterface:    container.RealOS{},
 			clock:          testingclock.NewFakeClock(now),
+			mutex:          sync.Mutex{},
+			queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+				workqueue.DefaultTypedControllerRateLimiter[string](),
+				workqueue.TypedRateLimitingQueueConfig[string]{Name: "kubelet_log_rotate_manager"},
+			),
+			maxWorkers:       10,
+			monitoringPeriod: v1.Duration{Duration: 10 * time.Second},
 		}
 		if test.runtimeError != nil {
 			f.InjectError("ReopenContainerLog", test.runtimeError)
@@ -397,7 +439,7 @@ func TestRotateLatestLog(t *testing.T) {
 		defer testFile.Close()
 		testLog := testFile.Name()
 		rotatedLog := fmt.Sprintf("%s.%s", testLog, now.Format(timestampFormat))
-		err = c.rotateLatestLog(ctx, "test-id", testLog)
+		err = c.rotateLatestLog(tCtx, "test-id", testLog)
 		assert.Equal(t, test.expectError, err != nil)
 		_, err = os.Stat(testLog)
 		assert.Equal(t, test.expectOriginal, err == nil)

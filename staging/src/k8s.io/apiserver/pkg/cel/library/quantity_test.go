@@ -20,10 +20,12 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/ext"
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/ext"
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -34,11 +36,13 @@ import (
 
 func testQuantity(t *testing.T, expr string, expectResult ref.Val, expectRuntimeErrPattern string, expectCompileErrs []string) {
 	env, err := cel.NewEnv(
+		cel.OptionalTypes(cel.OptionalTypesVersion(2)),
 		ext.Strings(),
 		library.URLs(),
 		library.Regex(),
 		library.Lists(),
 		library.Quantity(),
+		library.Format(),
 	)
 	if err != nil {
 		t.Fatalf("%v", err)
@@ -79,7 +83,18 @@ func testQuantity(t *testing.T, expr string, expectResult ref.Val, expectRuntime
 		require.Empty(t, missingCompileErrs, "expected compilation errors")
 		return
 	} else if len(issues.Errors()) > 0 {
-		t.Fatalf("%v", issues.Errors())
+		errorStrings := []string{}
+		source := common.NewTextSource(expr)
+		for _, issue := range issues.Errors() {
+			errorStrings = append(errorStrings, issue.ToDisplayString(source))
+		}
+		t.Fatalf("%v", errorStrings)
+	}
+
+	// Typecheck expression
+	_, err = cel.AstToCheckedExpr(compiled)
+	if err != nil {
+		t.Fatalf("%v", err)
 	}
 
 	prog, err := env.Program(compiled)
@@ -99,7 +114,7 @@ func testQuantity(t *testing.T, expr string, expectResult ref.Val, expectRuntime
 		t.Fatalf("%v", err)
 	} else if expectResult != nil {
 		converted := res.Equal(expectResult).Value().(bool)
-		require.True(t, converted, "expectation not equal to output")
+		require.True(t, converted, "expectation not equal to output: %v", cmp.Diff(expectResult.Value(), res.Value()))
 	} else {
 		t.Fatal("expected result must not be nil")
 	}
@@ -280,10 +295,99 @@ func TestQuantity(t *testing.T) {
 			expr:        `quantity("50").isInteger()`,
 			expectValue: trueVal,
 		},
+		// A 19 digit quantity inside the int64 range is backed by an int64, so
+		// asInteger returns it exactly. One step past either rail is not, and
+		// nothing but isQuantity keeps working there: the value still parses,
+		// it just cannot be handed back as an int64.
+		{
+			name:        "is_integer_max_int64",
+			expr:        `quantity("9223372036854775807").isInteger()`,
+			expectValue: trueVal,
+		},
+		{
+			name:        "as_integer_max_int64",
+			expr:        `quantity("9223372036854775807").asInteger()`,
+			expectValue: types.Int(9223372036854775807),
+		},
+		{
+			name:        "is_integer_min_int64",
+			expr:        `quantity("-9223372036854775808").isInteger()`,
+			expectValue: trueVal,
+		},
+		{
+			name:        "as_integer_min_int64",
+			expr:        `quantity("-9223372036854775808").asInteger()`,
+			expectValue: types.Int(-9223372036854775808),
+		},
+		{
+			name:        "is_integer_above_max_int64",
+			expr:        `quantity("9223372036854775808").isInteger()`,
+			expectValue: falseVal,
+		},
+		{
+			name:               "as_integer_above_max_int64",
+			expr:               `quantity("9223372036854775808").asInteger()`,
+			expectedRuntimeErr: `cannot convert value to integer`,
+		},
+		{
+			name:        "is_integer_below_min_int64",
+			expr:        `quantity("-9223372036854775809").isInteger()`,
+			expectValue: falseVal,
+		},
+		{
+			name:        "is_quantity_above_max_int64",
+			expr:        `isQuantity("9223372036854775808")`,
+			expectValue: trueVal,
+		},
+		{
+			name:        "is_integer_19_digits",
+			expr:        `quantity("1000000000000000000").isInteger()`,
+			expectValue: trueVal,
+		},
+		{
+			name:        "as_integer_19_digits",
+			expr:        `quantity("1000000000000000000").asInteger()`,
+			expectValue: types.Int(1000000000000000000),
+		},
 		{
 			name:        "as_float",
 			expr:        `quantity("50.703k").asApproximateFloat()`,
 			expectValue: types.Double(50703),
+		},
+		{
+			name:        "add_does_not_mutate_receiver",
+			expr:        `[quantity("9999999999999999999999999999999999999")].all(x, x.add(quantity("1")).compareTo(x.add(quantity("2"))) == -1)`,
+			expectValue: trueVal,
+		},
+		{
+			name:        "is_integer_after_less_than_dec",
+			expr:        `[quantity("1Gi")].all(x, x.isLessThan(quantity("1.5Gi")) && x.isInteger())`,
+			expectValue: trueVal,
+		},
+		{
+			name:        "as_integer_after_less_than_dec",
+			expr:        `[quantity("1Gi")].all(x, x.isLessThan(quantity("1.5Gi")) && x.asInteger() == 1073741824)`,
+			expectValue: trueVal,
+		},
+		{
+			name:        "is_integer_after_greater_than_dec",
+			expr:        `[quantity("1Gi")].all(x, x.isGreaterThan(quantity("0.5Gi")) && x.isInteger())`,
+			expectValue: trueVal,
+		},
+		{
+			name:        "as_integer_after_greater_than_dec",
+			expr:        `[quantity("1Gi")].all(x, x.isGreaterThan(quantity("0.5Gi")) && x.asInteger() == 1073741824)`,
+			expectValue: trueVal,
+		},
+		{
+			name:        "is_integer_after_compare_to_dec",
+			expr:        `[quantity("1Gi")].all(x, x.compareTo(quantity("1.5Gi")) == -1 && x.isInteger())`,
+			expectValue: trueVal,
+		},
+		{
+			name:        "as_integer_after_compare_to_dec",
+			expr:        `[quantity("1Gi")].all(x, x.compareTo(quantity("1.5Gi")) == -1 && x.asInteger() == 1073741824)`,
+			expectValue: trueVal,
 		},
 	}
 

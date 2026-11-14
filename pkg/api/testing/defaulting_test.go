@@ -23,8 +23,9 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	fuzz "github.com/google/gofuzz"
+	"sigs.k8s.io/randfill"
 
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	apiv1 "k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	"k8s.io/apimachinery/pkg/api/apitesting/roundtrip"
@@ -93,6 +94,10 @@ func TestDefaulting(t *testing.T) {
 		{Group: "batch", Version: "v2alpha1", Kind: "CronJob"}:                                                     {},
 		{Group: "batch", Version: "v2alpha1", Kind: "CronJobList"}:                                                 {},
 		{Group: "batch", Version: "v2alpha1", Kind: "JobTemplate"}:                                                 {},
+		{Group: "certificates.k8s.io", Version: "v1beta1", Kind: "PodCertificateRequest"}:                          {},
+		{Group: "certificates.k8s.io", Version: "v1beta1", Kind: "PodCertificateRequestList"}:                      {},
+		{Group: "certificates.k8s.io", Version: "v1", Kind: "PodCertificateRequest"}:                               {},
+		{Group: "certificates.k8s.io", Version: "v1", Kind: "PodCertificateRequestList"}:                           {},
 		{Group: "certificates.k8s.io", Version: "v1beta1", Kind: "CertificateSigningRequest"}:                      {},
 		{Group: "certificates.k8s.io", Version: "v1beta1", Kind: "CertificateSigningRequestList"}:                  {},
 		{Group: "discovery.k8s.io", Version: "v1", Kind: "EndpointSlice"}:                                          {},
@@ -135,14 +140,46 @@ func TestDefaulting(t *testing.T) {
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBindingList"}:                        {},
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "RoleBinding"}:                                   {},
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "RoleBindingList"}:                               {},
-		{Group: "resource.k8s.io", Version: "v1alpha2", Kind: "ResourceClaim"}:                                     {},
-		{Group: "resource.k8s.io", Version: "v1alpha2", Kind: "ResourceClaimList"}:                                 {},
-		{Group: "resource.k8s.io", Version: "v1alpha2", Kind: "ResourceClaimTemplate"}:                             {},
-		{Group: "resource.k8s.io", Version: "v1alpha2", Kind: "ResourceClaimTemplateList"}:                         {},
+		{Group: "resource.k8s.io", Version: "v1alpha3", Kind: "DeviceTaintRule"}:                                   {},
+		{Group: "resource.k8s.io", Version: "v1alpha3", Kind: "DeviceTaintRuleList"}:                               {},
+		{Group: "resource.k8s.io", Version: "v1alpha3", Kind: "ResourceClaim"}:                                     {},
+		{Group: "resource.k8s.io", Version: "v1alpha3", Kind: "ResourceClaimList"}:                                 {},
+		{Group: "resource.k8s.io", Version: "v1alpha3", Kind: "ResourceClaimTemplate"}:                             {},
+		{Group: "resource.k8s.io", Version: "v1alpha3", Kind: "ResourceClaimTemplateList"}:                         {},
+		{Group: "resource.k8s.io", Version: "v1alpha3", Kind: "ResourceSlice"}:                                     {},
+		{Group: "resource.k8s.io", Version: "v1alpha3", Kind: "ResourceSliceList"}:                                 {},
+		{Group: "resource.k8s.io", Version: "v1beta1", Kind: "ResourceClaim"}:                                      {},
+		{Group: "resource.k8s.io", Version: "v1beta1", Kind: "ResourceClaimList"}:                                  {},
+		{Group: "resource.k8s.io", Version: "v1beta1", Kind: "ResourceClaimTemplate"}:                              {},
+		{Group: "resource.k8s.io", Version: "v1beta1", Kind: "ResourceClaimTemplateList"}:                          {},
+		{Group: "resource.k8s.io", Version: "v1beta1", Kind: "ResourceSlice"}:                                      {},
+		{Group: "resource.k8s.io", Version: "v1beta1", Kind: "ResourceSliceList"}:                                  {},
+		{Group: "resource.k8s.io", Version: "v1beta2", Kind: "DeviceTaintRule"}:                                    {},
+		{Group: "resource.k8s.io", Version: "v1beta2", Kind: "DeviceTaintRuleList"}:                                {},
+		{Group: "resource.k8s.io", Version: "v1beta2", Kind: "ResourceClaim"}:                                      {},
+		{Group: "resource.k8s.io", Version: "v1beta2", Kind: "ResourceClaimList"}:                                  {},
+		{Group: "resource.k8s.io", Version: "v1beta2", Kind: "ResourceClaimTemplate"}:                              {},
+		{Group: "resource.k8s.io", Version: "v1beta2", Kind: "ResourceClaimTemplateList"}:                          {},
+		{Group: "resource.k8s.io", Version: "v1beta2", Kind: "ResourceSlice"}:                                      {},
+		{Group: "resource.k8s.io", Version: "v1beta2", Kind: "ResourceSliceList"}:                                  {},
+		{Group: "resource.k8s.io", Version: "v1", Kind: "DeviceTaintRule"}:                                         {},
+		{Group: "resource.k8s.io", Version: "v1", Kind: "DeviceTaintRuleList"}:                                     {},
+		{Group: "resource.k8s.io", Version: "v1", Kind: "ResourceClaim"}:                                           {},
+		{Group: "resource.k8s.io", Version: "v1", Kind: "ResourceClaimList"}:                                       {},
+		{Group: "resource.k8s.io", Version: "v1", Kind: "ResourceClaimTemplate"}:                                   {},
+		{Group: "resource.k8s.io", Version: "v1", Kind: "ResourceClaimTemplateList"}:                               {},
+		{Group: "resource.k8s.io", Version: "v1", Kind: "ResourceSlice"}:                                           {},
+		{Group: "resource.k8s.io", Version: "v1", Kind: "ResourceSliceList"}:                                       {},
+		{Group: "resource.k8s.io", Version: "v1alpha3", Kind: "ResourcePoolStatusRequest"}:                         {},
+		{Group: "resource.k8s.io", Version: "v1alpha3", Kind: "ResourcePoolStatusRequestList"}:                     {},
 		{Group: "admissionregistration.k8s.io", Version: "v1alpha1", Kind: "ValidatingAdmissionPolicy"}:            {},
 		{Group: "admissionregistration.k8s.io", Version: "v1alpha1", Kind: "ValidatingAdmissionPolicyList"}:        {},
 		{Group: "admissionregistration.k8s.io", Version: "v1alpha1", Kind: "ValidatingAdmissionPolicyBinding"}:     {},
 		{Group: "admissionregistration.k8s.io", Version: "v1alpha1", Kind: "ValidatingAdmissionPolicyBindingList"}: {},
+		{Group: "admissionregistration.k8s.io", Version: "v1alpha1", Kind: "MutatingAdmissionPolicy"}:              {},
+		{Group: "admissionregistration.k8s.io", Version: "v1alpha1", Kind: "MutatingAdmissionPolicyList"}:          {},
+		{Group: "admissionregistration.k8s.io", Version: "v1alpha1", Kind: "MutatingAdmissionPolicyBinding"}:       {},
+		{Group: "admissionregistration.k8s.io", Version: "v1alpha1", Kind: "MutatingAdmissionPolicyBindingList"}:   {},
 		{Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "ValidatingWebhookConfiguration"}:        {},
 		{Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "ValidatingWebhookConfigurationList"}:    {},
 		{Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "MutatingWebhookConfiguration"}:          {},
@@ -151,10 +188,22 @@ func TestDefaulting(t *testing.T) {
 		{Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "ValidatingAdmissionPolicyList"}:         {},
 		{Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "ValidatingAdmissionPolicyBinding"}:      {},
 		{Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "ValidatingAdmissionPolicyBindingList"}:  {},
+		{Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "MutatingAdmissionPolicy"}:               {},
+		{Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "MutatingAdmissionPolicyList"}:           {},
+		{Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "MutatingAdmissionPolicyBinding"}:        {},
+		{Group: "admissionregistration.k8s.io", Version: "v1beta1", Kind: "MutatingAdmissionPolicyBindingList"}:    {},
+		{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "ValidatingAdmissionPolicy"}:                  {},
+		{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "ValidatingAdmissionPolicyList"}:              {},
+		{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "ValidatingAdmissionPolicyBinding"}:           {},
+		{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "ValidatingAdmissionPolicyBindingList"}:       {},
 		{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "ValidatingWebhookConfiguration"}:             {},
 		{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "ValidatingWebhookConfigurationList"}:         {},
 		{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "MutatingWebhookConfiguration"}:               {},
 		{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "MutatingWebhookConfigurationList"}:           {},
+		{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "MutatingAdmissionPolicy"}:                    {},
+		{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "MutatingAdmissionPolicyBinding"}:             {},
+		{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "MutatingAdmissionPolicyBindingList"}:         {},
+		{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "MutatingAdmissionPolicyList"}:                {},
 		{Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicy"}:                                         {},
 		{Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicyList"}:                                     {},
 		{Group: "networking.k8s.io", Version: "v1beta1", Kind: "Ingress"}:                                          {},
@@ -174,10 +223,16 @@ func TestDefaulting(t *testing.T) {
 		{Group: "storage.k8s.io", Version: "v1beta1", Kind: "VolumeAttachment"}:                                    {},
 		{Group: "storage.k8s.io", Version: "v1beta1", Kind: "VolumeAttachmentList"}:                                {},
 		{Group: "authentication.k8s.io", Version: "v1", Kind: "TokenRequest"}:                                      {},
-		{Group: "scheduling.k8s.io", Version: "v1alpha1", Kind: "PriorityClass"}:                                   {},
+		{Group: "scheduling.k8s.io", Version: "v1alpha3", Kind: "PodGroup"}:                                        {},
+		{Group: "scheduling.k8s.io", Version: "v1alpha3", Kind: "PodGroupList"}:                                    {},
+		{Group: "scheduling.k8s.io", Version: "v1beta1", Kind: "PodGroup"}:                                         {},
+		{Group: "scheduling.k8s.io", Version: "v1beta1", Kind: "PodGroupList"}:                                     {},
+		{Group: "scheduling.k8s.io", Version: "v1alpha3", Kind: "CompositePodGroup"}:                               {},
+		{Group: "scheduling.k8s.io", Version: "v1alpha3", Kind: "CompositePodGroupList"}:                           {},
+		{Group: "scheduling.k8s.io", Version: "v1beta1", Kind: "CompositePodGroup"}:                                {},
+		{Group: "scheduling.k8s.io", Version: "v1beta1", Kind: "CompositePodGroupList"}:                            {},
 		{Group: "scheduling.k8s.io", Version: "v1beta1", Kind: "PriorityClass"}:                                    {},
 		{Group: "scheduling.k8s.io", Version: "v1", Kind: "PriorityClass"}:                                         {},
-		{Group: "scheduling.k8s.io", Version: "v1alpha1", Kind: "PriorityClassList"}:                               {},
 		{Group: "scheduling.k8s.io", Version: "v1beta1", Kind: "PriorityClassList"}:                                {},
 		{Group: "scheduling.k8s.io", Version: "v1", Kind: "PriorityClassList"}:                                     {},
 		{Group: "flowcontrol.apiserver.k8s.io", Version: "v1alpha1", Kind: "PriorityLevelConfiguration"}:           {},
@@ -188,25 +243,9 @@ func TestDefaulting(t *testing.T) {
 		{Group: "flowcontrol.apiserver.k8s.io", Version: "v1beta2", Kind: "PriorityLevelConfigurationList"}:        {},
 		{Group: "flowcontrol.apiserver.k8s.io", Version: "v1beta3", Kind: "PriorityLevelConfiguration"}:            {},
 		{Group: "flowcontrol.apiserver.k8s.io", Version: "v1beta3", Kind: "PriorityLevelConfigurationList"}:        {},
+		{Group: "flowcontrol.apiserver.k8s.io", Version: "v1", Kind: "PriorityLevelConfiguration"}:                 {},
+		{Group: "flowcontrol.apiserver.k8s.io", Version: "v1", Kind: "PriorityLevelConfigurationList"}:             {},
 	}
-
-	f := fuzz.New().NilChance(.5).NumElements(1, 1).RandSource(rand.NewSource(1))
-	f.Funcs(
-		func(s *runtime.RawExtension, c fuzz.Continue) {},
-		func(s *metav1.LabelSelector, c fuzz.Continue) {
-			c.FuzzNoCustom(s)
-			s.MatchExpressions = nil // need to fuzz this specially
-		},
-		func(s *metav1.ListOptions, c fuzz.Continue) {
-			c.FuzzNoCustom(s)
-			s.LabelSelector = "" // need to fuzz requirement strings specially
-			s.FieldSelector = "" // need to fuzz requirement strings specially
-		},
-		func(s *extensionsv1beta1.ScaleStatus, c fuzz.Continue) {
-			c.FuzzNoCustom(s)
-			s.TargetSelector = "" // need to fuzz requirement strings specially
-		},
-	)
 
 	scheme := legacyscheme.Scheme
 	var testTypes orderedGroupVersionKinds
@@ -219,52 +258,103 @@ func TestDefaulting(t *testing.T) {
 	sort.Sort(testTypes)
 
 	for _, gvk := range testTypes {
-		_, expectedChanged := typesWithDefaulting[gvk]
-		iter := 0
-		changedOnce := false
-		for {
-			if iter > *roundtrip.FuzzIters {
-				if !expectedChanged || changedOnce {
-					break
+		t.Run(gvk.String(), func(t *testing.T) {
+			// Each sub-tests gets its own fuzzer instance to make running it independent
+			// from what other tests ran before.
+			f := randfill.New().NilChance(.5).NumElements(1, 1).RandSource(rand.NewSource(1))
+			f.Funcs(
+				func(s *runtime.RawExtension, c randfill.Continue) {},
+				func(s *metav1.LabelSelector, c randfill.Continue) {
+					c.FillNoCustom(s)
+					s.MatchExpressions = nil // need to fuzz this specially
+				},
+				func(s *metav1.ListOptions, c randfill.Continue) {
+					c.FillNoCustom(s)
+					s.LabelSelector = "" // need to fuzz requirement strings specially
+					s.FieldSelector = "" // need to fuzz requirement strings specially
+				},
+				func(s *extensionsv1beta1.ScaleStatus, c randfill.Continue) {
+					c.FillNoCustom(s)
+					s.TargetSelector = "" // need to fuzz requirement strings specially
+				},
+				// Custom fuzzer functions for admissionregistration.k8s.io/v1 types
+				func(s *admissionregistrationv1.MutatingAdmissionPolicySpec, c randfill.Continue) {
+					c.FillNoCustom(s)
+					s.FailurePolicy = nil     // Ensure FailurePolicy is nil to trigger defaulting
+					s.ReinvocationPolicy = "" // Ensure ReinvocationPolicy is empty to trigger defaulting
+				},
+				func(s *admissionregistrationv1.ValidatingAdmissionPolicySpec, c randfill.Continue) {
+					c.FillNoCustom(s)
+					s.FailurePolicy = nil // Ensure FailurePolicy is nil to trigger defaulting
+				},
+				func(s *admissionregistrationv1.MatchResources, c randfill.Continue) {
+					c.FillNoCustom(s)
+					s.MatchPolicy = nil       // Ensure MatchPolicy is nil to trigger defaulting
+					s.NamespaceSelector = nil // Ensure NamespaceSelector is nil to trigger defaulting
+					s.ObjectSelector = nil    // Ensure ObjectSelector is nil to trigger defaulting
+				},
+				func(s *admissionregistrationv1.Rule, c randfill.Continue) {
+					c.FillNoCustom(s)
+					s.Scope = nil // Ensure Scope is nil to trigger defaulting
+				},
+			)
+
+			_, expectedChanged := typesWithDefaulting[gvk]
+			iter := 0
+			changedOnce := false
+			for {
+				if iter > *roundtrip.FuzzIters {
+					if !expectedChanged || changedOnce {
+						break
+					}
+					// This uses to be 300, but for ResourceClaimList that was not high enough
+					// because depending on the starting conditions, the fuzzer never created the
+					// one combination where defaulting kicked in (empty string in non-empty slice
+					// in another non-empty slice).
+					if iter > 3000 {
+						t.Errorf("expected %s to trigger defaulting due to fuzzing", gvk)
+						break
+					}
+					// if we expected defaulting, continue looping until the fuzzer gives us one
+					// at worst, we will timeout
 				}
-				if iter > 300 {
-					t.Errorf("expected %s to trigger defaulting due to fuzzing", gvk)
-					break
+				iter++
+
+				src, err := scheme.New(gvk)
+				if err != nil {
+					t.Fatal(err)
 				}
-				// if we expected defaulting, continue looping until the fuzzer gives us one
-				// at worst, we will timeout
-			}
-			iter++
+				f.Fill(src)
 
-			src, err := scheme.New(gvk)
-			if err != nil {
-				t.Fatal(err)
-			}
-			f.Fuzz(src)
+				src.GetObjectKind().SetGroupVersionKind(schema.GroupVersionKind{})
 
-			src.GetObjectKind().SetGroupVersionKind(schema.GroupVersionKind{})
+				original := src.DeepCopyObject()
 
-			original := src.DeepCopyObject()
+				// get internal
+				withDefaults := src.DeepCopyObject()
+				scheme.Default(withDefaults)
 
-			// get internal
-			withDefaults := src.DeepCopyObject()
-			scheme.Default(withDefaults.(runtime.Object))
-
-			if !reflect.DeepEqual(original, withDefaults) {
-				changedOnce = true
-				if !expectedChanged {
-					t.Errorf("{Group: \"%s\", Version: \"%s\", Kind: \"%s\"} did not expect defaults to be set - update expected or check defaulter registering: %s", gvk.Group, gvk.Version, gvk.Kind, cmp.Diff(original, withDefaults))
+				if !reflect.DeepEqual(original, withDefaults) {
+					diff := cmp.Diff(original, withDefaults)
+					if !changedOnce {
+						t.Logf("got diff (-fuzzed, +with defaults):\n%s", diff)
+						changedOnce = true
+					}
+					if !expectedChanged {
+						t.Errorf("{Group: \"%s\", Version: \"%s\", Kind: \"%s\"} did not expect defaults to be set - update expected or check defaulter registering: %s", gvk.Group, gvk.Version, gvk.Kind, diff)
+					}
 				}
 			}
-		}
+		})
 	}
+
 }
 
 func BenchmarkPodDefaulting(b *testing.B) {
-	f := fuzz.New().NilChance(.5).NumElements(1, 1).RandSource(rand.NewSource(1))
+	f := randfill.New().NilChance(.5).NumElements(1, 1).RandSource(rand.NewSource(1))
 	items := make([]apiv1.Pod, 100)
 	for i := range items {
-		f.Fuzz(&items[i])
+		f.Fill(&items[i])
 	}
 
 	scheme := legacyscheme.Scheme

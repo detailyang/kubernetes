@@ -17,36 +17,14 @@ limitations under the License.
 package pod
 
 import (
-	"fmt"
+	"iter"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/kubernetes/pkg/features"
 )
-
-// FindPort locates the container port for the given pod and portName.  If the
-// targetPort is a number, use that.  If the targetPort is a string, look that
-// string up in all named ports in all containers in the target pod.  If no
-// match is found, fail.
-func FindPort(pod *v1.Pod, svcPort *v1.ServicePort) (int, error) {
-	portName := svcPort.TargetPort
-	switch portName.Type {
-	case intstr.String:
-		name := portName.StrVal
-		for _, container := range pod.Spec.Containers {
-			for _, port := range container.Ports {
-				if port.Name == name && port.Protocol == svcPort.Protocol {
-					return int(port.ContainerPort), nil
-				}
-			}
-		}
-	case intstr.Int:
-		return portName.IntValue(), nil
-	}
-
-	return 0, fmt.Errorf("no suitable port for manifest: %s", pod.UID)
-}
 
 // ContainerType signifies container type
 type ContainerType int
@@ -92,28 +70,115 @@ func skipEmptyNames(visitor Visitor) Visitor {
 // visiting is short-circuited. VisitContainers returns true if visiting completes,
 // false if visiting was short-circuited.
 func VisitContainers(podSpec *v1.PodSpec, mask ContainerType, visitor ContainerVisitor) bool {
-	if mask&InitContainers != 0 {
-		for i := range podSpec.InitContainers {
-			if !visitor(&podSpec.InitContainers[i], InitContainers) {
-				return false
-			}
-		}
-	}
-	if mask&Containers != 0 {
-		for i := range podSpec.Containers {
-			if !visitor(&podSpec.Containers[i], Containers) {
-				return false
-			}
-		}
-	}
-	if mask&EphemeralContainers != 0 {
-		for i := range podSpec.EphemeralContainers {
-			if !visitor((*v1.Container)(&podSpec.EphemeralContainers[i].EphemeralContainerCommon), EphemeralContainers) {
-				return false
-			}
+	for c, t := range ContainerIter(podSpec, mask) {
+		if !visitor(c, t) {
+			return false
 		}
 	}
 	return true
+}
+
+// ContainerIter returns an iterator over all containers in the given pod spec with a masked type.
+// The iteration order is InitContainers, then main Containers, then EphemeralContainers.
+func ContainerIter(podSpec *v1.PodSpec, mask ContainerType) iter.Seq2[*v1.Container, ContainerType] {
+	return func(yield func(*v1.Container, ContainerType) bool) {
+		if mask&InitContainers != 0 {
+			for i := range podSpec.InitContainers {
+				if !yield(&podSpec.InitContainers[i], InitContainers) {
+					return
+				}
+			}
+		}
+		if mask&Containers != 0 {
+			for i := range podSpec.Containers {
+				if !yield(&podSpec.Containers[i], Containers) {
+					return
+				}
+			}
+		}
+		if mask&EphemeralContainers != 0 {
+			for i := range podSpec.EphemeralContainers {
+				if !yield((*v1.Container)(&podSpec.EphemeralContainers[i].EphemeralContainerCommon), EphemeralContainers) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// ContainerPair is a container in two versions of a pod, matched by name. Old is nil for a
+// container that is only in the new pod (added), and New is nil for one that is only in the old
+// pod (removed).
+type ContainerPair struct {
+	New, Old *v1.Container
+}
+
+// ContainerPairs yields the containers of pod and oldPod of the types in mask, paired by name,
+// with their type. Containers are only matched within their type, where names are assumed to be
+// unique. The iteration order is InitContainers, then main Containers, then EphemeralContainers;
+// within each type, the containers of pod are yielded in order, followed by removed containers
+// from oldPod in order.
+func ContainerPairs(pod, oldPod *v1.Pod, mask ContainerType) iter.Seq2[ContainerPair, ContainerType] {
+	return func(yield func(ContainerPair, ContainerType) bool) {
+		containerPairs(pod, oldPod, mask, yield)
+	}
+}
+
+// containerPairs implements ContainerPairs. It keeps the calls to the generic pairContainers out
+// of the iterator, which is inlined into callers: called from another package, a generic function
+// makes the closures passed to it escape, and allocate.
+func containerPairs(pod, oldPod *v1.Pod, mask ContainerType, yield func(ContainerPair, ContainerType) bool) {
+	if mask&InitContainers != 0 && !pairContainers(pod.Spec.InitContainers, oldPod.Spec.InitContainers, identityContainer, func(p ContainerPair) bool {
+		return yield(p, InitContainers)
+	}) {
+		return
+	}
+	if mask&Containers != 0 && !pairContainers(pod.Spec.Containers, oldPod.Spec.Containers, identityContainer, func(p ContainerPair) bool {
+		return yield(p, Containers)
+	}) {
+		return
+	}
+	if mask&EphemeralContainers != 0 {
+		pairContainers(pod.Spec.EphemeralContainers, oldPod.Spec.EphemeralContainers, ephemeralAsContainer, func(p ContainerPair) bool {
+			return yield(p, EphemeralContainers)
+		})
+	}
+}
+
+func identityContainer(c *v1.Container) *v1.Container {
+	return c
+}
+
+func ephemeralAsContainer(ec *v1.EphemeralContainer) *v1.Container {
+	return (*v1.Container)(&ec.EphemeralContainerCommon)
+}
+
+// pairContainers pairs containers and oldContainers by name, and calls yield for each container in
+// containers (matched or added) followed by each removed container in oldContainers, in order.
+// unwrap returns the container of a slice element. It returns false if yield did.
+func pairContainers[E any](containers, oldContainers []E, unwrap func(*E) *v1.Container, yield func(ContainerPair) bool) bool {
+	for i := range containers {
+		c := unwrap(&containers[i])
+		if !yield(ContainerPair{New: c, Old: findContainer(oldContainers, unwrap, c.Name)}) {
+			return false
+		}
+	}
+	for j := range oldContainers {
+		old := unwrap(&oldContainers[j])
+		if findContainer(containers, unwrap, old.Name) == nil && !yield(ContainerPair{Old: old}) {
+			return false
+		}
+	}
+	return true
+}
+
+func findContainer[E any](containers []E, unwrap func(*E) *v1.Container, name string) *v1.Container {
+	for i := range containers {
+		if c := unwrap(&containers[i]); c.Name == name {
+			return c
+		}
+	}
+	return nil
 }
 
 // VisitPodSecretNames invokes the visitor function with the name of every secret
@@ -289,7 +354,7 @@ func GetIndexOfContainerStatus(statuses []v1.ContainerStatus, name string) (int,
 // Precondition for an available pod is that it must be ready. On top
 // of that, there are two cases when a pod can be considered available:
 // 1. minReadySeconds == 0, or
-// 2. LastTransitionTime (is set) + minReadySeconds < current time
+// 2. LastTransitionTime (is set) + minReadySeconds <= current time
 func IsPodAvailable(pod *v1.Pod, minReadySeconds int32, now metav1.Time) bool {
 	if !IsPodReady(pod) {
 		return false
@@ -297,7 +362,7 @@ func IsPodAvailable(pod *v1.Pod, minReadySeconds int32, now metav1.Time) bool {
 
 	c := GetPodReadyCondition(pod.Status)
 	minReadySecondsDuration := time.Duration(minReadySeconds) * time.Second
-	if minReadySeconds == 0 || (!c.LastTransitionTime.IsZero() && c.LastTransitionTime.Add(minReadySecondsDuration).Before(now.Time)) {
+	if minReadySeconds == 0 || (!c.LastTransitionTime.IsZero() && c.LastTransitionTime.Add(minReadySecondsDuration).Compare(now.Time) <= 0) {
 		return true
 	}
 	return false
@@ -389,9 +454,169 @@ func UpdatePodCondition(status *v1.PodStatus, condition *v1.PodCondition) bool {
 		condition.Reason == oldCondition.Reason &&
 		condition.Message == oldCondition.Message &&
 		condition.LastProbeTime.Equal(&oldCondition.LastProbeTime) &&
-		condition.LastTransitionTime.Equal(&oldCondition.LastTransitionTime)
+		condition.LastTransitionTime.Equal(&oldCondition.LastTransitionTime) &&
+		condition.ObservedGeneration == oldCondition.ObservedGeneration
 
 	status.Conditions[conditionIndex] = *condition
 	// Return true if one of the fields have changed.
 	return !isEqual
+}
+
+// IsRestartableInitContainer returns true if the container has ContainerRestartPolicyAlways.
+// This function is not checking if the container passed to it is indeed an init container.
+// It is just checking if the container restart policy has been set to always.
+func IsRestartableInitContainer(initContainer *v1.Container) bool {
+	if initContainer == nil || initContainer.RestartPolicy == nil {
+		return false
+	}
+	return *initContainer.RestartPolicy == v1.ContainerRestartPolicyAlways
+}
+
+// IsContainerRestartable returns true if the container can be restarted. A container can be
+// restarted if it has a pod-level restart policy "Always" or "OnFailure" and not override by
+// container-level restart policy, or a container-level restart policy "Always" or "OnFailure",
+// or a container level restart rule with action "Restart".
+func IsContainerRestartable(pod v1.PodSpec, container v1.Container) bool {
+	if container.RestartPolicy != nil {
+		for _, rule := range container.RestartPolicyRules {
+			if rule.Action == v1.ContainerRestartRuleActionRestart {
+				return true
+			}
+		}
+		return *container.RestartPolicy != v1.ContainerRestartPolicyNever
+	}
+	return pod.RestartPolicy != v1.RestartPolicyNever
+}
+
+// ContainerShouldRestart checks if a container should be restarted by its restart policy.
+// First, the container-level restartPolicyRules are evaluated in order. An action is taken if any
+// rules are matched. Second, the container-level restart policy is used. Lastly, if no container
+// level policy are specified, pod-level restart policy is used.
+func ContainerShouldRestart(container v1.Container, pod v1.PodSpec, exitCode int32) bool {
+	if container.RestartPolicy != nil {
+		rule, ok := FindMatchingContainerRestartRule(container, exitCode)
+		if ok {
+			switch rule.Action {
+			case v1.ContainerRestartRuleActionRestart:
+				return true
+			case v1.ContainerRestartRuleActionRestartAllContainers:
+				if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) {
+					return true
+				}
+				// If feature is not enabled, fallback to container-level policy.
+			default:
+				// Do nothing, fallback to container-level restart policy.
+			}
+		}
+
+		// Check container-level restart policy if no rules matched.
+		switch *container.RestartPolicy {
+		case v1.ContainerRestartPolicyAlways:
+			return true
+		case v1.ContainerRestartPolicyOnFailure:
+			return exitCode != 0
+		case v1.ContainerRestartPolicyNever:
+			return false
+		default:
+			// Do nothing, fallback to pod-level restart policy.
+		}
+	}
+
+	switch pod.RestartPolicy {
+	case v1.RestartPolicyAlways:
+		return true
+	case v1.RestartPolicyOnFailure:
+		return exitCode != 0
+	case v1.RestartPolicyNever:
+		return false
+	default:
+		// Default policy is Always, so we return true here.
+		return true
+	}
+}
+
+// FindMatchingContainerRestartRule returns a rule and true if the exitCode matched
+// one of the restart rules for the given container. Returns and empty rule and
+// false if no rules matched.
+func FindMatchingContainerRestartRule(container v1.Container, exitCode int32) (rule v1.ContainerRestartRule, found bool) {
+	for _, rule := range container.RestartPolicyRules {
+		if rule.ExitCodes != nil {
+			exitCodeMatched := false
+			for _, code := range rule.ExitCodes.Values {
+				if code == exitCode {
+					exitCodeMatched = true
+				}
+			}
+			switch rule.ExitCodes.Operator {
+			case v1.ContainerRestartRuleOnExitCodesOpIn:
+				if exitCodeMatched {
+					return rule, true
+				}
+			case v1.ContainerRestartRuleOnExitCodesOpNotIn:
+				if !exitCodeMatched {
+					return rule, true
+				}
+			default:
+				// Do nothing, continue to the next rule.
+			}
+		}
+	}
+	return v1.ContainerRestartRule{}, false
+}
+
+// AllContainersCouldRestart returns true if all containers could be restarted
+// for the given pod. This is true if any container has a RestartAllContainers
+// action.
+func AllContainersCouldRestart(pod *v1.PodSpec) bool {
+	if pod == nil {
+		return false
+	}
+	for _, container := range pod.InitContainers {
+		for _, rule := range container.RestartPolicyRules {
+			if rule.Action == v1.ContainerRestartRuleActionRestartAllContainers {
+				return true
+			}
+		}
+	}
+	for _, container := range pod.Containers {
+		for _, rule := range container.RestartPolicyRules {
+			if rule.Action == v1.ContainerRestartRuleActionRestartAllContainers {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// CalculatePodStatusObservedGeneration calculates the observedGeneration for the pod status.
+// This is used to track the generation of the pod that was observed by the kubelet.
+// The observedGeneration is set to the pod's generation when the feature gate
+// PodObservedGenerationTracking is enabled OR if status.observedGeneration is already set.
+// This protects against an infinite loop of kubelet trying to clear the value after the FG is turned off, and
+// the API server preserving existing values when an incoming update tries to clear it.
+func CalculatePodStatusObservedGeneration(pod *v1.Pod) int64 {
+	if pod.Status.ObservedGeneration != 0 || utilfeature.DefaultFeatureGate.Enabled(features.PodObservedGenerationTracking) {
+		return pod.Generation
+	}
+	return 0
+}
+
+// CalculatePodConditionObservedGeneration calculates the observedGeneration for a particular pod condition.
+// The observedGeneration is set to the pod's generation when the feature gate
+// PodObservedGenerationTracking is enabled OR if condition[].observedGeneration is already set.
+// This protects against an infinite loop of kubelet trying to clear the value after the FG is turned off, and
+// the API server preserving existing values when an incoming update tries to clear it.
+func CalculatePodConditionObservedGeneration(podStatus *v1.PodStatus, generation int64, conditionType v1.PodConditionType) int64 {
+	if podStatus == nil {
+		return 0
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodObservedGenerationTracking) {
+		return generation
+	}
+	for _, condition := range podStatus.Conditions {
+		if condition.Type == conditionType && condition.ObservedGeneration != 0 {
+			return generation
+		}
+	}
+	return 0
 }

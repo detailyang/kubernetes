@@ -18,7 +18,7 @@ package namespace
 
 import (
 	"context"
-	"fmt"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -57,7 +57,7 @@ type NamespaceController struct {
 	// returns true when the namespace cache is ready
 	listerSynced cache.InformerSynced
 	// namespaces that have been queued up for processing by workers
-	queue workqueue.RateLimitingInterface
+	queue pausableQueue[string]
 	// helper to delete all resources in the namespace when the namespace is deleted.
 	namespacedResourcesDeleter deletion.NamespacedResourcesDeleterInterface
 }
@@ -71,26 +71,33 @@ func NewNamespaceController(
 	namespaceInformer coreinformers.NamespaceInformer,
 	resyncPeriod time.Duration,
 	finalizerToken v1.FinalizerName) *NamespaceController {
+	logger := klog.FromContext(ctx)
 
 	// create the controller so we can inject the enqueue function
 	namespaceController := &NamespaceController{
-		queue:                      workqueue.NewNamedRateLimitingQueue(nsControllerRateLimiter(), "namespace"),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			nsControllerRateLimiter(),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: &logger,
+				Name:   "namespace",
+			},
+		).(pausableQueue[string]),
 		namespacedResourcesDeleter: deletion.NewNamespacedResourcesDeleter(ctx, kubeClient.CoreV1().Namespaces(), metadataClient, kubeClient.CoreV1(), discoverResourcesFn, finalizerToken),
 	}
 
 	// configure the namespace informer event handlers
-	namespaceInformer.Informer().AddEventHandlerWithResyncPeriod(
+	_, _ = namespaceInformer.Informer().AddEventHandlerWithOptions(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
 				namespace := obj.(*v1.Namespace)
-				namespaceController.enqueueNamespace(namespace)
+				namespaceController.enqueueNamespace(ctx, namespace)
 			},
 			UpdateFunc: func(oldObj, newObj interface{}) {
 				namespace := newObj.(*v1.Namespace)
-				namespaceController.enqueueNamespace(namespace)
+				namespaceController.enqueueNamespace(ctx, namespace)
 			},
 		},
-		resyncPeriod,
+		cache.HandlerOptions{Logger: &logger, ResyncPeriod: &resyncPeriod},
 	)
 	namespaceController.lister = namespaceInformer.Lister()
 	namespaceController.listerSynced = namespaceInformer.Informer().HasSynced
@@ -101,21 +108,21 @@ func NewNamespaceController(
 // nsControllerRateLimiter is tuned for a faster than normal recycle time with default backoff speed and default overall
 // requeing speed.  We do this so that namespace cleanup is reliably faster and we know that the number of namespaces being
 // deleted is smaller than total number of other namespace scoped resources in a cluster.
-func nsControllerRateLimiter() workqueue.RateLimiter {
-	return workqueue.NewMaxOfRateLimiter(
+func nsControllerRateLimiter() workqueue.TypedRateLimiter[string] {
+	return workqueue.NewTypedMaxOfRateLimiter(
 		// this ensures that we retry namespace deletion at least every minute, never longer.
-		workqueue.NewItemExponentialFailureRateLimiter(5*time.Millisecond, 60*time.Second),
+		workqueue.NewTypedItemExponentialFailureRateLimiter[string](5*time.Millisecond, 60*time.Second),
 		// 10 qps, 100 bucket size.  This is only for retry speed and its only the overall factor (not per item)
-		&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+		&workqueue.TypedBucketRateLimiter[string]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
 	)
 }
 
 // enqueueNamespace adds an object to the controller work queue
 // obj could be an *v1.Namespace, or a DeletionFinalStateUnknown item.
-func (nm *NamespaceController) enqueueNamespace(obj interface{}) {
+func (nm *NamespaceController) enqueueNamespace(ctx context.Context, obj interface{}) {
 	key, err := controller.KeyFunc(obj)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %+v: %v", obj, err))
+		utilruntime.HandleErrorWithContext(ctx, err, "Couldn't get key for object", "object", obj)
 		return
 	}
 
@@ -142,7 +149,7 @@ func (nm *NamespaceController) worker(ctx context.Context) {
 		}
 		defer nm.queue.Done(key)
 
-		err := nm.syncNamespaceFromKey(ctx, key.(string))
+		err := nm.syncNamespaceFromKey(ctx, key)
 		if err == nil {
 			// no error, forget this entry and return
 			nm.queue.Forget(key)
@@ -156,7 +163,7 @@ func (nm *NamespaceController) worker(ctx context.Context) {
 		} else {
 			// rather than wait for a full resync, re-add the namespace to the queue to be processed
 			nm.queue.AddRateLimited(key)
-			utilruntime.HandleError(fmt.Errorf("deletion of namespace %v failed: %v", key, err))
+			utilruntime.HandleErrorWithContext(ctx, err, "Deletion of namespace failed", "namespace", key)
 		}
 		return false
 	}
@@ -183,7 +190,7 @@ func (nm *NamespaceController) syncNamespaceFromKey(ctx context.Context, key str
 		return nil
 	}
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Unable to retrieve namespace %v from store: %v", key, err))
+		utilruntime.HandleErrorWithContext(ctx, err, "Unable to retrieve namespace from store", "namespace", key)
 		return err
 	}
 	return nm.namespacedResourcesDeleter.Delete(ctx, namespace.Name)
@@ -191,19 +198,47 @@ func (nm *NamespaceController) syncNamespaceFromKey(ctx context.Context, key str
 
 // Run starts observing the system with the specified number of workers.
 func (nm *NamespaceController) Run(ctx context.Context, workers int) {
-	defer utilruntime.HandleCrash()
-	defer nm.queue.ShutDown()
+	defer utilruntime.HandleCrashWithContext(ctx)
+
 	logger := klog.FromContext(ctx)
 	logger.Info("Starting namespace controller")
-	defer logger.Info("Shutting down namespace controller")
 
-	if !cache.WaitForNamedCacheSync("namespace", ctx.Done(), nm.listerSynced) {
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down namespace controller")
+		nm.queue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, nm.listerSynced) {
 		return
 	}
 
 	logger.V(5).Info("Starting workers of namespace controller")
+
 	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, nm.worker, time.Second)
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, nm.worker, time.Second)
+		})
 	}
 	<-ctx.Done()
+}
+
+// pausableQueue is a rate limiting workqueue that can be paused, which the
+// default one is; see Pause.
+type pausableQueue[T comparable] interface {
+	workqueue.TypedRateLimitingInterface[T]
+	workqueue.Pausable
+}
+
+// Pause blocks the controller workqueue from dequeuing items while the leader
+// election write gate is closed.
+func (nm *NamespaceController) Pause() {
+	nm.queue.Pause()
+}
+
+// Resume unblocks the controller workqueue after the leader election write gate
+// reopens.
+func (nm *NamespaceController) Resume() {
+	nm.queue.Resume()
 }

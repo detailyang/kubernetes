@@ -34,9 +34,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	"k8s.io/apiextensions-api/pkg/client/clientset/clientset"
 	"k8s.io/apiextensions-apiserver/test/integration/fixtures"
+	"k8s.io/utils/ptr"
 )
 
 var labelSelectorPath = ".status.labelSelector"
@@ -449,11 +450,11 @@ func TestApplyScaleSubresource(t *testing.T) {
 		t.Fatalf("Expected 3 managed fields, got %v: %v", len(managedFields), obj.GetManagedFields())
 	}
 	specEntry := managedFields[0]
-	if specEntry.Manager != "applier" || specEntry.APIVersion != "mygroup.example.com/v1" || specEntry.Operation != "Apply" || string(specEntry.FieldsV1.Raw) != `{"f:spec":{}}` || specEntry.Subresource != "" {
+	if specEntry.Manager != "applier" || specEntry.APIVersion != "mygroup.example.com/v1" || specEntry.Operation != "Apply" || specEntry.FieldsV1.GetRawString() != `{"f:spec":{}}` || specEntry.Subresource != "" {
 		t.Fatalf("Unexpected entry: %v", specEntry)
 	}
 	scaleEntry := managedFields[1]
-	if scaleEntry.Manager != "scaler" || scaleEntry.APIVersion != "mygroup.example.com/v1" || scaleEntry.Operation != "Update" || string(scaleEntry.FieldsV1.Raw) != `{"f:spec":{"f:replicas":{}}}` || scaleEntry.Subresource != "scale" {
+	if scaleEntry.Manager != "scaler" || scaleEntry.APIVersion != "mygroup.example.com/v1" || scaleEntry.Operation != "Update" || scaleEntry.FieldsV1.GetRawString() != `{"f:spec":{"f:replicas":{}}}` || scaleEntry.Subresource != "scale" {
 		t.Fatalf("Unexpected entry: %v", scaleEntry)
 	}
 	restEntry := managedFields[2]
@@ -527,7 +528,7 @@ func TestValidateOnlyStatus(t *testing.T) {
 				Properties: map[string]apiextensionsv1.JSONSchemaProps{
 					"num": {
 						Type:    "integer",
-						Maximum: float64Ptr(10),
+						Maximum: ptr.To[float64](10),
 					},
 				},
 			},
@@ -536,7 +537,7 @@ func TestValidateOnlyStatus(t *testing.T) {
 				Properties: map[string]apiextensionsv1.JSONSchemaProps{
 					"num": {
 						Type:    "integer",
-						Maximum: float64Ptr(10),
+						Maximum: ptr.To[float64](10),
 					},
 				},
 			},
@@ -595,8 +596,9 @@ func TestValidateOnlyStatus(t *testing.T) {
 			if !isStatus || statusError == nil {
 				t.Fatalf("expected status error, got %T: %v", err, err)
 			}
-			if !strings.Contains(statusError.Error(), "Invalid value") {
-				t.Fatalf("expected 'Invalid value' in error, got: %v", err)
+			expectedErr := "WishIHadChosenNoxu.mygroup.example.com \"foo\" is invalid: status.num: Invalid value: 15: num in body should be less than or equal to 10"
+			if !strings.Contains(statusError.Error(), expectedErr) {
+				t.Fatalf("expected %q in error, got: %v", expectedErr, err)
 			}
 			noxuResourceClient.Delete(context.TODO(), "foo", metav1.DeleteOptions{})
 		}

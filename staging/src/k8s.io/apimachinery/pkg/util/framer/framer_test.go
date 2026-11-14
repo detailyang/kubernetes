@@ -18,8 +18,14 @@ package framer
 
 import (
 	"bytes"
+	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
+
+	netutil "k8s.io/apimachinery/pkg/util/net"
 )
 
 func TestRead(t *testing.T) {
@@ -97,6 +103,7 @@ func TestReadLarge(t *testing.T) {
 		t.Fatalf("unexpected: %v %d", err, n)
 	}
 }
+
 func TestReadInvalidFrame(t *testing.T) {
 	data := []byte{
 		0x00, 0x00, 0x00, 0x04,
@@ -115,6 +122,46 @@ func TestReadInvalidFrame(t *testing.T) {
 	}
 	// read EOF
 	if n, err := r.Read(buf); err != io.EOF && n != 0 {
+		t.Fatalf("unexpected: %v %d", err, n)
+	}
+}
+
+func TestReadClientTimeout(t *testing.T) {
+	header := []byte{
+		0x00, 0x00, 0x00, 0x04,
+	}
+	data := []byte{
+		0x01, 0x02, 0x03, 0x04,
+		0x00, 0x00, 0x00, 0x03,
+		0x05, 0x06, 0x07,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x01,
+		0x08,
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(header)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(1 * time.Second)
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+
+	client := &http.Client{
+		Timeout: 500 * time.Millisecond,
+	}
+
+	resp, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+
+	r := NewLengthDelimitedFrameReader(resp.Body)
+	buf := make([]byte, 1)
+	if n, err := r.Read(buf); err == nil || !netutil.IsTimeout(err) {
 		t.Fatalf("unexpected: %v %d", err, n)
 	}
 }
@@ -170,6 +217,20 @@ func TestJSONFrameReaderShortBuffer(t *testing.T) {
 	}
 
 	if n, err := r.Read(buf); err != io.EOF || n != 0 {
+		t.Fatalf("unexpected: %v %d %q", err, n, buf)
+	}
+}
+
+func TestJSONFrameReaderShortBufferNoUnderlyingArrayReuse(t *testing.T) {
+	b := bytes.NewBufferString("{}")
+	r := NewJSONFramedReader(io.NopCloser(b))
+	buf := make([]byte, 1, 2) // cap(buf) > len(buf) && cap(buf) <= len("{}")
+
+	if n, err := r.Read(buf); !errors.Is(err, io.ErrShortBuffer) || n != 1 || string(buf[:n]) != "{" {
+		t.Fatalf("unexpected: %v %d %q", err, n, buf)
+	}
+	buf = append(buf, make([]byte, 1)...) // stomps the second byte of the backing array
+	if n, err := r.Read(buf[1:]); err != nil || n != 1 || string(buf[1:1+n]) != "}" {
 		t.Fatalf("unexpected: %v %d %q", err, n, buf)
 	}
 }

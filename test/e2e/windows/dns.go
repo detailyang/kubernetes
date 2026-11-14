@@ -22,6 +22,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
@@ -31,7 +32,7 @@ import (
 	"github.com/onsi/gomega"
 )
 
-var _ = SIGDescribe("[Feature:Windows] DNS", func() {
+var _ = sigDescribe(feature.Windows, "DNS", skipUnlessWindows(func() {
 
 	ginkgo.BeforeEach(func() {
 		e2eskipper.SkipUnlessNodeOSDistroIs("windows")
@@ -79,7 +80,7 @@ var _ = SIGDescribe("[Feature:Windows] DNS", func() {
 		// This isn't the best 'test' but it is a great diagnostic, see later test for the 'real' test.
 		ginkgo.By("Calling ipconfig to get debugging info for this pod's DNS and confirm that a dns server 1.1.1.1 can be injected, along with ")
 		cmd := []string{"ipconfig", "/all"}
-		stdout, _, err := e2epod.ExecWithOptions(f, e2epod.ExecOptions{
+		stdout, _, err := e2epod.Exec(f.TContext(ctx), e2epod.ExecOptions{
 			Command:       cmd,
 			Namespace:     f.Namespace.Name,
 			PodName:       testPod.Name,
@@ -104,7 +105,7 @@ var _ = SIGDescribe("[Feature:Windows] DNS", func() {
 		// TODO @jayunit100 add ResolveHost to agn images
 
 		cmd = []string{"curl.exe", "-k", "https://kubernetezzzzzzzz:443"}
-		stdout, _, err = e2epod.ExecWithOptions(f, e2epod.ExecOptions{
+		stdout, _, err = e2epod.Exec(f.TContext(ctx), e2epod.ExecOptions{
 			Command:       cmd,
 			Namespace:     f.Namespace.Name,
 			PodName:       testPod.Name,
@@ -119,7 +120,7 @@ var _ = SIGDescribe("[Feature:Windows] DNS", func() {
 
 		ginkgo.By("Verifying that injected dns records for 'kubernetes' resolve to the valid ip address")
 		cmd = []string{"curl.exe", "-k", "https://kubernetes:443"}
-		stdout, _, err = e2epod.ExecWithOptions(f, e2epod.ExecOptions{
+		stdout, _, err = e2epod.Exec(f.TContext(ctx), e2epod.ExecOptions{
 			Command:       cmd,
 			Namespace:     f.Namespace.Name,
 			PodName:       testPod.Name,
@@ -136,4 +137,4 @@ var _ = SIGDescribe("[Feature:Windows] DNS", func() {
 
 		// TODO: Add more test cases for other DNSPolicies.
 	})
-})
+}))

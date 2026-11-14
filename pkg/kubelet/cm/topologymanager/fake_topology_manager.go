@@ -17,7 +17,9 @@ limitations under the License.
 package topologymanager
 
 import (
-	"k8s.io/api/core/v1"
+	"context"
+
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/kubelet/cm/admission"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
@@ -26,17 +28,25 @@ import (
 type fakeManager struct {
 	hint   *TopologyHint
 	policy Policy
+	scope  string
 }
 
 // NewFakeManager returns an instance of FakeManager
-func NewFakeManager() Manager {
-	klog.InfoS("NewFakeManager")
+func NewFakeManager(logger klog.Logger) Manager {
+	logger.Info("NewFakeManager")
 	return &fakeManager{}
 }
 
+// NewFakeManagerWithScope returns an instance of fake topology manager with specified scope
+func NewFakeManagerWithScope(scope string) Manager {
+	return &fakeManager{
+		scope: scope,
+	}
+}
+
 // NewFakeManagerWithHint returns an instance of fake topology manager with specified topology hints
-func NewFakeManagerWithHint(hint *TopologyHint) Manager {
-	klog.InfoS("NewFakeManagerWithHint")
+func NewFakeManagerWithHint(logger klog.Logger, hint *TopologyHint) Manager {
+	logger.Info("NewFakeManagerWithHint")
 	return &fakeManager{
 		hint:   hint,
 		policy: NewNonePolicy(),
@@ -44,15 +54,15 @@ func NewFakeManagerWithHint(hint *TopologyHint) Manager {
 }
 
 // NewFakeManagerWithPolicy returns an instance of fake topology manager with specified policy
-func NewFakeManagerWithPolicy(policy Policy) Manager {
-	klog.InfoS("NewFakeManagerWithPolicy")
+func NewFakeManagerWithPolicy(logger klog.Logger, policy Policy) Manager {
+	logger.Info("NewFakeManagerWithPolicy", "policy", policy.Name())
 	return &fakeManager{
 		policy: policy,
 	}
 }
 
-func (m *fakeManager) GetAffinity(podUID string, containerName string) TopologyHint {
-	klog.InfoS("GetAffinity", "podUID", podUID, "containerName", containerName)
+func (m *fakeManager) GetAffinity(logger klog.Logger, podUID string, containerName string) TopologyHint {
+	logger.Info("GetAffinity", "podUID", podUID, "containerName", containerName)
 	if m.hint == nil {
 		return TopologyHint{}
 	}
@@ -64,20 +74,25 @@ func (m *fakeManager) GetPolicy() Policy {
 	return m.policy
 }
 
-func (m *fakeManager) AddHintProvider(h HintProvider) {
-	klog.InfoS("AddHintProvider", "hintProvider", h)
+func (m *fakeManager) Name() string {
+	return m.scope
 }
 
-func (m *fakeManager) AddContainer(pod *v1.Pod, container *v1.Container, containerID string) {
-	klog.InfoS("AddContainer", "pod", klog.KObj(pod), "containerName", container.Name, "containerID", containerID)
+func (m *fakeManager) AddHintProvider(logger klog.Logger, h HintProvider) {
+	logger.Info("AddHintProvider", "hintProvider", h)
 }
 
-func (m *fakeManager) RemoveContainer(containerID string) error {
-	klog.InfoS("RemoveContainer", "containerID", containerID)
+func (m *fakeManager) AddContainer(logger klog.Logger, pod *v1.Pod, container *v1.Container, containerID string) {
+	logger.Info("AddContainer", "pod", klog.KObj(pod), "containerName", container.Name, "containerID", containerID)
+}
+
+func (m *fakeManager) RemoveContainer(logger klog.Logger, containerID string) error {
+	logger.Info("RemoveContainer", "containerID", containerID)
 	return nil
 }
 
-func (m *fakeManager) Admit(attrs *lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult {
-	klog.InfoS("Topology Admit Handler")
+func (m *fakeManager) Admit(ctx context.Context, _ *lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult {
+	logger := klog.FromContext(ctx)
+	logger.Info("Topology Admit Handler")
 	return admission.GetPodAdmitResult(nil)
 }

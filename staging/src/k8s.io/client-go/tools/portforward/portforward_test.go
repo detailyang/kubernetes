@@ -299,6 +299,7 @@ func TestParsePortsAndNew(t *testing.T) {
 
 		var pf *PortForwarder
 		if len(test.addresses) > 0 {
+			//nolint:logcheck // Testing the original function.
 			pf, err = NewOnAddresses(dialer, test.addresses, test.input, expectedStopChan, readyChan, os.Stdout, os.Stderr)
 		} else {
 			pf, err = New(dialer, test.input, expectedStopChan, readyChan, os.Stdout, os.Stderr)
@@ -430,7 +431,8 @@ func TestGetListener(t *testing.T) {
 
 func TestGetPortsReturnsDynamicallyAssignedLocalPort(t *testing.T) {
 	dialer := &fakeDialer{
-		conn: newFakeConnection(),
+		conn:               newFakeConnection(),
+		negotiatedProtocol: PortForwardProtocolV1Name,
 	}
 
 	stopChan := make(chan struct{})
@@ -570,7 +572,8 @@ func TestWaitForConnectionExitsOnStreamConnClosed(t *testing.T) {
 
 func TestForwardPortsReturnsErrorWhenConnectionIsLost(t *testing.T) {
 	dialer := &fakeDialer{
-		conn: newFakeConnection(),
+		conn:               newFakeConnection(),
+		negotiatedProtocol: PortForwardProtocolV1Name,
 	}
 
 	stopChan := make(chan struct{})
@@ -601,7 +604,8 @@ func TestForwardPortsReturnsErrorWhenConnectionIsLost(t *testing.T) {
 
 func TestForwardPortsReturnsNilWhenStopChanIsClosed(t *testing.T) {
 	dialer := &fakeDialer{
-		conn: newFakeConnection(),
+		conn:               newFakeConnection(),
+		negotiatedProtocol: PortForwardProtocolV1Name,
 	}
 
 	stopChan := make(chan struct{})

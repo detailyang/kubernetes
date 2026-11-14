@@ -25,11 +25,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/resource"
 	"k8s.io/client-go/rest/fake"
@@ -277,7 +279,7 @@ func TestLabelFunc(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		err := labelFunc(test.obj, test.overwrite, test.version, test.labels, test.remove)
+		_, _, err := labelFunc(test.obj, test.overwrite, test.version, test.labels, test.remove)
 		if test.expectErr != "" {
 			if err == nil {
 				t.Errorf("unexpected non-error: %v", test)
@@ -291,7 +293,7 @@ func TestLabelFunc(t *testing.T) {
 			t.Errorf("unexpected error: %v %v", err, test)
 		}
 		if !reflect.DeepEqual(test.obj, test.expected) {
-			t.Errorf("expected: %v, got %v", test.expected, test.obj)
+			t.Errorf("unexpected Pod object:\n%s", cmp.Diff(test.expected, test.obj))
 		}
 	}
 }
@@ -299,6 +301,7 @@ func TestLabelFunc(t *testing.T) {
 func TestLabelErrors(t *testing.T) {
 	testCases := map[string]struct {
 		args  []string
+		list  bool
 		errFn func(error) bool
 	}{
 		"no args": {
@@ -337,6 +340,20 @@ func TestLabelErrors(t *testing.T) {
 				return strings.Contains(err.Error(), "resource(s) were provided, but no name was specified")
 			},
 		},
+		"cannot add labels when --list is specified": {
+			args: []string{"pods", "foo", "app=bar"},
+			list: true,
+			errFn: func(err error) bool {
+				return err != nil && strings.Contains(err.Error(), "cannot modify labels when --list is specified")
+			},
+		},
+		"cannot remove labels when --list is specified": {
+			args: []string{"pods", "foo", "app-"},
+			list: true,
+			errFn: func(err error) bool {
+				return err != nil && strings.Contains(err.Error(), "cannot modify labels when --list is specified")
+			},
+		},
 	}
 
 	for k, testCase := range testCases {
@@ -351,9 +368,9 @@ func TestLabelErrors(t *testing.T) {
 			cmd := NewCmdLabel(tf, ioStreams)
 			cmd.SetOut(buf)
 			cmd.SetErr(buf)
-
-			opts := NewLabelOptions(ioStreams)
-			err := opts.Complete(tf, cmd, testCase.args)
+			flags := NewLabelFlags(ioStreams)
+			flags.List = testCase.list
+			opts, err := flags.ToOptions(tf, cmd, testCase.args)
 			if err == nil {
 				err = opts.Validate()
 			}
@@ -408,9 +425,9 @@ func TestLabelForResourceFromFile(t *testing.T) {
 
 	ioStreams, _, buf, _ := genericiooptions.NewTestIOStreams()
 	cmd := NewCmdLabel(tf, ioStreams)
-	opts := NewLabelOptions(ioStreams)
-	opts.Filenames = []string{"../../../testdata/controller.yaml"}
-	err := opts.Complete(tf, cmd, []string{"a=b"})
+	flags := NewLabelFlags(ioStreams)
+	flags.Filenames = []string{"../../../testdata/controller.yaml"}
+	opts, err := flags.ToOptions(tf, cmd, []string{"a=b"})
 	if err == nil {
 		err = opts.Validate()
 	}
@@ -440,10 +457,10 @@ func TestLabelLocal(t *testing.T) {
 
 	ioStreams, _, buf, _ := genericiooptions.NewTestIOStreams()
 	cmd := NewCmdLabel(tf, ioStreams)
-	opts := NewLabelOptions(ioStreams)
-	opts.Filenames = []string{"../../../testdata/controller.yaml"}
+	flags := NewLabelFlags(ioStreams)
+	flags.Filenames = []string{"../../../testdata/controller.yaml"}
+	opts, err := flags.ToOptions(tf, cmd, []string{"a=b"})
 	opts.local = true
-	err := opts.Complete(tf, cmd, []string{"a=b"})
 	if err == nil {
 		err = opts.Validate()
 	}
@@ -496,10 +513,10 @@ func TestLabelMultipleObjects(t *testing.T) {
 	tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
 
 	ioStreams, _, buf, _ := genericiooptions.NewTestIOStreams()
-	opts := NewLabelOptions(ioStreams)
-	opts.all = true
+	flags := NewLabelFlags(ioStreams)
 	cmd := NewCmdLabel(tf, ioStreams)
-	err := opts.Complete(tf, cmd, []string{"pods", "a=b"})
+	opts, err := flags.ToOptions(tf, cmd, []string{"pods", "a=b"})
+	opts.all = true
 	if err == nil {
 		err = opts.Validate()
 	}
@@ -563,15 +580,15 @@ func TestLabelResourceVersion(t *testing.T) {
 		}),
 	}
 	tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
-
 	iostreams, _, bufOut, _ := genericiooptions.NewTestIOStreams()
 	cmd := NewCmdLabel(tf, iostreams)
 	cmd.SetOut(bufOut)
 	cmd.SetErr(bufOut)
-	options := NewLabelOptions(iostreams)
-	options.resourceVersion = "10"
+	flags := NewLabelFlags(iostreams)
 	args := []string{"pods/foo", "a=b"}
-	if err := options.Complete(tf, cmd, args); err != nil {
+	options, err := flags.ToOptions(tf, cmd, args)
+	options.resourceVersion = "10"
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if err := options.Validate(); err != nil {
@@ -626,12 +643,14 @@ func TestRunLabelMsg(t *testing.T) {
 	tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
 
 	testCases := []struct {
-		name          string
-		args          []string
-		overwrite     bool
-		dryRun        string
-		expectedOut   string
-		expectedError error
+		name           string
+		args           []string
+		overwrite      bool
+		dryRun         string
+		output         string
+		expectedOut    string
+		expectedErrOut string
+		expectedError  error
 	}{
 		{
 			name:        "set new label",
@@ -655,11 +674,36 @@ func TestRunLabelMsg(t *testing.T) {
 			expectedOut: "pod/foo unlabeled\n",
 		},
 		{
-			name: "unset nonexisting label",
-			args: []string{"pods/foo", "foo-"},
-			expectedOut: `label "foo" not found.
-pod/foo not labeled
-`,
+			name:           "unset nonexisting label",
+			args:           []string{"pods/foo", "foo-"},
+			expectedOut:    "pod/foo not labeled\n",
+			expectedErrOut: "label \"foo\" not found.\n",
+		},
+		{
+			name:           "unset nonexisting label with name output",
+			args:           []string{"pods/foo", "foo-"},
+			output:         "name",
+			expectedOut:    "pod/foo\n",
+			expectedErrOut: "label \"foo\" not found.\n",
+		},
+		{
+			name:           "unset nonexisting label with JSON output",
+			args:           []string{"pods/foo", "foo-"},
+			output:         "json",
+			expectedErrOut: "label \"foo\" not found.\n",
+		},
+		{
+			name:           "unset nonexisting label with YAML output",
+			args:           []string{"pods/foo", "foo-"},
+			output:         "yaml",
+			expectedErrOut: "label \"foo\" not found.\n",
+		},
+		{
+			name:           "unset nonexisting label with server dry run",
+			args:           []string{"pods/foo", "foo-"},
+			dryRun:         "server",
+			expectedOut:    "pod/foo not labeled (server dry run)\n",
+			expectedErrOut: "label \"foo\" not found.\n",
 		},
 		{
 			name:        "set new label with server dry run",
@@ -689,25 +733,31 @@ pod/foo not labeled
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			iostreams, _, bufOut, _ := genericiooptions.NewTestIOStreams()
+			iostreams, _, bufOut, bufErr := genericiooptions.NewTestIOStreams()
 			cmd := NewCmdLabel(tf, iostreams)
 			cmd.SetOut(bufOut)
-			cmd.SetErr(bufOut)
+			cmd.SetErr(bufErr)
 			if tc.dryRun != "" {
 				cmd.Flags().Set("dry-run", tc.dryRun)
 			}
-			options := NewLabelOptions(iostreams)
-			if tc.overwrite {
-				options.overwrite = true
+			flags := NewLabelFlags(iostreams)
+			if err := cmd.Flags().Set("output", tc.output); err != nil {
+				t.Fatal(err)
 			}
-			if err := options.Complete(tf, cmd, tc.args); err != nil {
+			*flags.PrintFlags.OutputFormat = tc.output
+			if tc.overwrite {
+				flags.Overwrite = true
+			}
+			options, err := flags.ToOptions(tf, cmd, tc.args)
+
+			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if err := options.Validate(); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			err := options.RunLabel()
+			err = options.RunLabel()
 			if tc.expectedError == nil {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
@@ -720,7 +770,25 @@ pod/foo not labeled
 				}
 			}
 
-			if bufOut.String() != tc.expectedOut {
+			if bufErr.String() != tc.expectedErrOut {
+				t.Errorf("unexpected stderr (-want +got):\n%s", cmp.Diff(tc.expectedErrOut, bufErr.String()))
+			}
+			if tc.output == "json" || tc.output == "yaml" {
+				decoder := yaml.NewYAMLOrJSONDecoder(bufOut, 4096)
+				var pod v1.Pod
+				if err := decoder.Decode(&pod); err != nil {
+					t.Fatalf("decode %s output: %v", tc.output, err)
+				}
+				if pod.Name != "foo" || pod.Namespace != "test" {
+					t.Errorf("expected pod test/foo, got %s/%s", pod.Namespace, pod.Name)
+				}
+				if diff := cmp.Diff(map[string]string{"existing": "abc"}, pod.Labels); diff != "" {
+					t.Errorf("unexpected labels (-want +got):\n%s", diff)
+				}
+				if err := decoder.Decode(&v1.Pod{}); err != io.EOF {
+					t.Errorf("expected end of output, got %v", err)
+				}
+			} else if bufOut.String() != tc.expectedOut {
 				t.Fatalf("wrong output\ngot:\n%s\nexpected:\n%s\n", bufOut.String(), tc.expectedOut)
 			}
 		})
@@ -729,6 +797,7 @@ pod/foo not labeled
 
 func TestLabelMsg(t *testing.T) {
 	tests := []struct {
+		name            string
 		obj             runtime.Object
 		overwrite       bool
 		resourceVersion string
@@ -739,6 +808,7 @@ func TestLabelMsg(t *testing.T) {
 		expectErr       bool
 	}{
 		{
+			name: "add existing label with the same value noop",
 			obj: &v1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"a": "b"},
@@ -748,6 +818,7 @@ func TestLabelMsg(t *testing.T) {
 			expectMsg: MsgNotLabeled,
 		},
 		{
+			name: "add first label",
 			obj: &v1.Pod{
 				ObjectMeta: metav1.ObjectMeta{},
 			},
@@ -760,6 +831,7 @@ func TestLabelMsg(t *testing.T) {
 			expectMsg: MsgLabeled,
 		},
 		{
+			name: "overwrite existing label",
 			obj: &v1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"a": "b"},
@@ -775,6 +847,7 @@ func TestLabelMsg(t *testing.T) {
 			expectMsg: MsgLabeled,
 		},
 		{
+			name: "add another label",
 			obj: &v1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"a": "b"},
@@ -789,6 +862,7 @@ func TestLabelMsg(t *testing.T) {
 			expectMsg: MsgLabeled,
 		},
 		{
+			name: "add another label use resource version",
 			obj: &v1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"a": "b"},
@@ -805,6 +879,7 @@ func TestLabelMsg(t *testing.T) {
 			expectMsg: MsgLabeled,
 		},
 		{
+			name: "remove the only label",
 			obj: &v1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"a": "b"},
@@ -820,6 +895,7 @@ func TestLabelMsg(t *testing.T) {
 			expectMsg: MsgUnLabeled,
 		},
 		{
+			name: "both add and remove labels",
 			obj: &v1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"a": "b", "c": "d"},
@@ -835,26 +911,10 @@ func TestLabelMsg(t *testing.T) {
 					},
 				},
 			},
-			expectMsg: MsgLabeled,
+			expectMsg: MsgModified,
 		},
 		{
-			obj: &v1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{"status": "unhealthy"},
-				},
-			},
-			labels:    map[string]string{"status": "healthy"},
-			overwrite: true,
-			expectObj: &v1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"status": "healthy",
-					},
-				},
-			},
-			expectMsg: MsgLabeled,
-		},
-		{
+			name: "reject modification when overwrite unset",
 			obj: &v1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"status": "unhealthy"},
@@ -869,34 +929,27 @@ func TestLabelMsg(t *testing.T) {
 					},
 				},
 			},
-			expectMsg: MsgNotLabeled,
 			expectErr: true,
 		},
 	}
 
 	for _, test := range tests {
-		oldData, err := json.Marshal(test.obj)
-		if err != nil {
-			t.Errorf("unexpected error: %v %v", err, test)
-		}
+		t.Run(test.name, func(t *testing.T) {
+			added, removed, err := labelFunc(test.obj, test.overwrite, test.resourceVersion, test.labels, test.remove)
+			if test.expectErr {
+				if err == nil {
+					t.Errorf("unexpected non-error: %v", test)
+				}
+				return
+			}
+			if !test.expectErr && err != nil {
+				t.Errorf("unexpected error: %v %v", err, test)
+			}
 
-		err = labelFunc(test.obj, test.overwrite, test.resourceVersion, test.labels, test.remove)
-		if test.expectErr && err == nil {
-			t.Errorf("unexpected non-error: %v", test)
-			continue
-		}
-		if !test.expectErr && err != nil {
-			t.Errorf("unexpected error: %v %v", err, test)
-		}
-
-		newObj, err := json.Marshal(test.obj)
-		if err != nil {
-			t.Errorf("unexpected error: %v %v", err, test)
-		}
-
-		dataChangeMsg := updateDataChangeMsg(oldData, newObj, test.overwrite)
-		if dataChangeMsg != test.expectMsg {
-			t.Errorf("unexpected dataChangeMsg: %v != %v, %v", dataChangeMsg, test.expectMsg, test)
-		}
+			dataChangeMsg := updateDataChangeMsg(added, removed)
+			if dataChangeMsg != test.expectMsg {
+				t.Errorf("unexpected dataChangeMsg: expected = %v; got = %v (test %#v)", test.expectMsg, dataChangeMsg, test)
+			}
+		})
 	}
 }

@@ -19,6 +19,7 @@ package ttlafterfinished
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	batch "k8s.io/api/batch/v1"
@@ -29,15 +30,15 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	batchinformers "k8s.io/client-go/informers/batch/v1"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	batchlisters "k8s.io/client-go/listers/batch/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
-	"k8s.io/kubectl/pkg/scheme"
 	"k8s.io/kubernetes/pkg/controller"
-	jobutil "k8s.io/kubernetes/pkg/controller/job"
+	jobutil "k8s.io/kubernetes/pkg/controller/job/util"
 	"k8s.io/kubernetes/pkg/controller/ttlafterfinished/metrics"
 	"k8s.io/utils/clock"
 )
@@ -62,7 +63,7 @@ type Controller struct {
 	jListerSynced cache.InformerSynced
 
 	// Jobs that the controller will check its TTL and attempt to delete when the TTL expires.
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 
 	// The clock for tracking time
 	clock clock.Clock
@@ -70,26 +71,34 @@ type Controller struct {
 
 // New creates an instance of Controller
 func New(ctx context.Context, jobInformer batchinformers.JobInformer, client clientset.Interface) *Controller {
-	eventBroadcaster := record.NewBroadcaster()
-	eventBroadcaster.StartStructuredLogging(0)
+	eventBroadcaster := record.NewBroadcaster(record.WithContext(ctx))
+	eventBroadcaster.StartStructuredLogging(3)
 	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: client.CoreV1().Events("")})
 
 	metrics.Register()
+	logger := klog.FromContext(ctx)
 
 	tc := &Controller{
 		client:   client,
 		recorder: eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "ttl-after-finished-controller"}),
-		queue:    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "ttl_jobs_to_delete"),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: &logger,
+				Name:   "ttl_jobs_to_delete",
+			},
+		),
 	}
 
-	logger := klog.FromContext(ctx)
-	jobInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = jobInformer.Informer().AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			tc.addJob(logger, obj)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			tc.updateJob(logger, oldObj, newObj)
 		},
+	}, cache.HandlerOptions{
+		Logger: &logger,
 	})
 
 	tc.jLister = jobInformer.Lister()
@@ -102,21 +111,27 @@ func New(ctx context.Context, jobInformer batchinformers.JobInformer, client cli
 
 // Run starts the workers to clean up Jobs.
 func (tc *Controller) Run(ctx context.Context, workers int) {
-	defer utilruntime.HandleCrash()
-	defer tc.queue.ShutDown()
+	defer utilruntime.HandleCrashWithContext(ctx)
 
 	logger := klog.FromContext(ctx)
 	logger.Info("Starting TTL after finished controller")
-	defer logger.Info("Shutting down TTL after finished controller")
 
-	if !cache.WaitForNamedCacheSync("TTL after finished", ctx.Done(), tc.jListerSynced) {
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down TTL after finished controller")
+		tc.queue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, tc.jListerSynced) {
 		return
 	}
 
 	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, tc.worker, time.Second)
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, tc.worker, time.Second)
+		})
 	}
-
 	<-ctx.Done()
 }
 
@@ -143,17 +158,17 @@ func (tc *Controller) enqueue(logger klog.Logger, job *batch.Job) {
 	logger.V(4).Info("Add job to cleanup", "job", klog.KObj(job))
 	key, err := controller.KeyFunc(job)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", job, err))
+		utilruntime.HandleErrorWithLogger(logger, err, "Failed to get key for job", "job", klog.KObj(job))
 		return
 	}
 
 	tc.queue.Add(key)
 }
 
-func (tc *Controller) enqueueAfter(job *batch.Job, after time.Duration) {
+func (tc *Controller) enqueueAfter(logger klog.Logger, job *batch.Job, after time.Duration) {
 	key, err := controller.KeyFunc(job)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", job, err))
+		utilruntime.HandleErrorWithLogger(logger, err, "Failed to get key for job", "job", klog.KObj(job))
 		return
 	}
 
@@ -172,19 +187,19 @@ func (tc *Controller) processNextWorkItem(ctx context.Context) bool {
 	}
 	defer tc.queue.Done(key)
 
-	err := tc.processJob(ctx, key.(string))
-	tc.handleErr(err, key)
+	err := tc.processJob(ctx, key)
+	tc.handleErr(ctx, err, key)
 
 	return true
 }
 
-func (tc *Controller) handleErr(err error, key interface{}) {
+func (tc *Controller) handleErr(ctx context.Context, err error, key string) {
 	if err == nil {
 		tc.queue.Forget(key)
 		return
 	}
 
-	utilruntime.HandleError(fmt.Errorf("error cleaning up Job %v, will retry: %v", key, err))
+	utilruntime.HandleErrorWithContext(ctx, err, "Failed to clean up job, will retry", "key", key)
 	tc.queue.AddRateLimited(key)
 }
 
@@ -270,7 +285,7 @@ func (tc *Controller) processTTL(logger klog.Logger, job *batch.Job) (expiredAt 
 		return e, nil
 	}
 
-	tc.enqueueAfter(job, *t)
+	tc.enqueueAfter(logger, job, *t)
 	return nil, nil
 }
 

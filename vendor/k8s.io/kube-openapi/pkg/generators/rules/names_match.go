@@ -22,7 +22,8 @@ import (
 
 	"k8s.io/kube-openapi/pkg/util/sets"
 
-	"k8s.io/gengo/types"
+	"k8s.io/gengo/v2/namer"
+	"k8s.io/gengo/v2/types"
 )
 
 var (
@@ -30,14 +31,6 @@ var (
 	jsonTagBlacklist = sets.NewString(
 		// Omitted field is ignored by the package
 		"-",
-	)
-
-	// Blacklist of JSON names that should skip match evaluation
-	jsonNameBlacklist = sets.NewString(
-		// Empty name is used for inline struct field (e.g. metav1.TypeMeta)
-		"",
-		// Special case for object and list meta
-		"metadata",
 	)
 
 	// List of substrings that aren't allowed in Go name and JSON name
@@ -73,12 +66,11 @@ is also considered matched.
 
 	HTTPJSONSpec   httpjsonSpec   true
 
-NOTE: JSON names in jsonNameBlacklist should skip evaluation
+NOTE: an empty JSON name is valid only for inlined structs or pointer to structs.
+It cannot be empty for anything else because capitalization must be set explicitly.
 
-	                              true
-	podSpec                       true
-	podSpec        -              true
-	podSpec        metadata       true
+NOTE: metav1.ListMeta and metav1.ObjectMeta by convention must have "metadata" as name.
+Other fields may have that JSON name if the field name matches.
 */
 type NamesMatch struct{}
 
@@ -96,7 +88,13 @@ func (n *NamesMatch) Validate(t *types.Type) ([]string, error) {
 	// Only validate struct type and ignore the rest
 	switch t.Kind {
 	case types.Struct:
+		_, isMarshaler := t.Methods["MarshalJSON"]
+		_, isUnmarshaler := t.Methods["UnmarshalJSON"]
 		for _, m := range t.Members {
+			// Unexported fields of types with custom JSON serialization are not serialized.
+			if isMarshaler && isUnmarshaler && !m.Embedded && namer.IsPrivateGoName(m.Name) {
+				continue
+			}
 			goName := m.Name
 			jsonTag, ok := reflect.StructTag(m.Tags).Lookup("json")
 			// Distinguish empty JSON tag and missing JSON tag. Empty JSON tag / name is
@@ -109,12 +107,28 @@ func (n *NamesMatch) Validate(t *types.Type) ([]string, error) {
 				continue
 			}
 			jsonName := strings.Split(jsonTag, ",")[0]
-			if !namesMatch(goName, jsonName) {
+			if !nameIsOkay(m, jsonName) {
 				fields = append(fields, goName)
 			}
 		}
 	}
 	return fields, nil
+}
+
+func nameIsOkay(member types.Member, jsonName string) bool {
+	if jsonName == "" {
+		return member.Type.Kind == types.Struct ||
+			member.Type.Kind == types.Pointer && member.Type.Elem.Kind == types.Struct
+	}
+
+	typeName := member.Type.String()
+	switch typeName {
+	case "k8s.io/apimachinery/pkg/apis/meta/v1.ListMeta",
+		"k8s.io/apimachinery/pkg/apis/meta/v1.ObjectMeta":
+		return jsonName == "metadata"
+	}
+
+	return namesMatch(member.Name, jsonName)
 }
 
 // namesMatch evaluates if goName and jsonName match the API rule
@@ -129,13 +143,10 @@ func (n *NamesMatch) Validate(t *types.Type) ([]string, error) {
 //		 about why they don't satisfy our need. What we need can be a function that detects an acronym at the
 //		 beginning of a string.
 func namesMatch(goName, jsonName string) bool {
-	if jsonNameBlacklist.Has(jsonName) {
-		return true
-	}
 	if !isAllowedName(goName) || !isAllowedName(jsonName) {
 		return false
 	}
-	if strings.ToLower(goName) != strings.ToLower(jsonName) {
+	if !strings.EqualFold(goName, jsonName) {
 		return false
 	}
 	// Go field names must be CamelCase. JSON field names must be camelCase.

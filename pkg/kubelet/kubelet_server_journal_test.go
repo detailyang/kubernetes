@@ -17,7 +17,12 @@ limitations under the License.
 package kubelet
 
 import (
+	"bytes"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -27,33 +32,108 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
+	"k8s.io/ktesting"
+	"k8s.io/utils/ptr"
 )
 
-func Test_getLoggingCmd(t *testing.T) {
+func TestJournalServerMethodRestriction(t *testing.T) {
 	tests := []struct {
-		name        string
-		args        nodeLogQuery
-		wantLinux   []string
-		wantWindows []string
-		wantOtherOS []string
+		name           string
+		method         string
+		expectedStatus int
+		expectedAllow  string
 	}{
 		{
-			args:        nodeLogQuery{},
-			wantLinux:   []string{"--utc", "--no-pager", "--output=short-precise"},
-			wantWindows: []string{"-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "Get-WinEvent -FilterHashtable @{LogName='Application'} | Sort-Object TimeCreated | Format-Table -AutoSize -Wrap"},
+			name:           "GET is allowed by method gate",
+			method:         http.MethodGet,
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:           "POST is allowed by method gate",
+			method:         http.MethodPost,
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:           "PUT is rejected",
+			method:         http.MethodPut,
+			expectedStatus: http.StatusMethodNotAllowed,
+			expectedAllow:  "GET, POST",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// invalid sinceTime forces an early validation error (400), so we only
+			// validate method gating and avoid invoking external log commands.
+			req := httptest.NewRequest(tt.method, "/logs?sinceTime=invalid", nil)
+			recorder := httptest.NewRecorder()
+
+			journal.ServeHTTP(recorder, req)
+
+			assert.Equal(t, tt.expectedStatus, recorder.Code)
+			if tt.expectedAllow != "" {
+				assert.Equal(t, tt.expectedAllow, recorder.Header().Get("Allow"))
+			}
+		})
+	}
+}
+
+func Test_getLoggingCmd(t *testing.T) {
+	var emptyCmdEnv []string
+	tests := []struct {
+		name              string
+		args              nodeLogQuery
+		services          []string
+		wantLinux         []string
+		wantWindows       []string
+		wantLinuxCmdEnv   []string
+		wantWindowsCmdEnv []string
+	}{
+		{
+			name:              "basic",
+			args:              nodeLogQuery{},
+			services:          []string{},
+			wantLinux:         []string{"--utc", "--no-pager", "--output=short-precise"},
+			wantLinuxCmdEnv:   emptyCmdEnv,
+			wantWindows:       []string{"-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "Get-WinEvent -FilterHashtable @{LogName='Application'} | Sort-Object TimeCreated | Format-Table -AutoSize -Wrap"},
+			wantWindowsCmdEnv: emptyCmdEnv,
+		},
+		{
+			name:              "two providers",
+			args:              nodeLogQuery{},
+			services:          []string{"p1", "p2"},
+			wantLinux:         []string{"--utc", "--no-pager", "--output=short-precise", "--unit=p1", "--unit=p2"},
+			wantLinuxCmdEnv:   emptyCmdEnv,
+			wantWindows:       []string{"-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName=$Env:kubelet_provider0,$Env:kubelet_provider1} | Sort-Object TimeCreated | Format-Table -AutoSize -Wrap"},
+			wantWindowsCmdEnv: []string{"kubelet_provider0=p1", "kubelet_provider1=p2"},
+		},
+		{
+			name:              "empty provider",
+			args:              nodeLogQuery{},
+			services:          []string{"p1", "", "p2"},
+			wantLinux:         []string{"--utc", "--no-pager", "--output=short-precise", "--unit=p1", "--unit=p2"},
+			wantLinuxCmdEnv:   emptyCmdEnv,
+			wantWindows:       []string{"-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName=$Env:kubelet_provider0,$Env:kubelet_provider2} | Sort-Object TimeCreated | Format-Table -AutoSize -Wrap"},
+			wantWindowsCmdEnv: []string{"kubelet_provider0=p1", "kubelet_provider2=p2"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, got, err := getLoggingCmd(&tt.args, []string{})
+			_, got, gotCmdEnv, err := getLoggingCmd(&tt.args, tt.services)
 			switch os := runtime.GOOS; os {
 			case "linux":
 				if !reflect.DeepEqual(got, tt.wantLinux) {
 					t.Errorf("getLoggingCmd() = %v, want %v", got, tt.wantLinux)
 				}
+				if !reflect.DeepEqual(gotCmdEnv, tt.wantLinuxCmdEnv) {
+					t.Errorf("gotCmdEnv %v, wantLinuxCmdEnv %v", gotCmdEnv, tt.wantLinuxCmdEnv)
+				}
 			case "windows":
 				if !reflect.DeepEqual(got, tt.wantWindows) {
 					t.Errorf("getLoggingCmd() = %v, want %v", got, tt.wantWindows)
+				}
+				if !reflect.DeepEqual(gotCmdEnv, tt.wantWindowsCmdEnv) {
+					t.Errorf("gotCmdEnv %v, wantWindowsCmdEnv %v", gotCmdEnv, tt.wantWindowsCmdEnv)
 				}
 			default:
 				if err == nil {
@@ -92,15 +172,15 @@ func Test_newNodeLogQuery(t *testing.T) {
 		{query: url.Values{"untilTime": []string{validTimeValue}},
 			want: &nodeLogQuery{options: options{UntilTime: &validT}}},
 
-		{query: url.Values{"tailLines": []string{"100"}}, want: &nodeLogQuery{options: options{TailLines: intPtr(100)}}},
+		{query: url.Values{"tailLines": []string{"100"}}, want: &nodeLogQuery{options: options{TailLines: ptr.To(100)}}},
 		{query: url.Values{"tailLines": []string{"foo"}}, wantErr: true},
 		{query: url.Values{"tailLines": []string{" "}}, wantErr: true},
 
 		{query: url.Values{"pattern": []string{"foo"}}, want: &nodeLogQuery{options: options{Pattern: "foo"}}},
 
 		{query: url.Values{"boot": []string{""}}, want: nil},
-		{query: url.Values{"boot": []string{"0"}}, want: &nodeLogQuery{options: options{Boot: intPtr(0)}}},
-		{query: url.Values{"boot": []string{"-23"}}, want: &nodeLogQuery{options: options{Boot: intPtr(-23)}}},
+		{query: url.Values{"boot": []string{"0"}}, want: &nodeLogQuery{options: options{Boot: ptr.To(0)}}},
+		{query: url.Values{"boot": []string{"-23"}}, want: &nodeLogQuery{options: options{Boot: ptr.To(-23)}}},
 		{query: url.Values{"boot": []string{"foo"}}, wantErr: true},
 		{query: url.Values{"boot": []string{" "}}, wantErr: true},
 
@@ -128,10 +208,15 @@ func Test_newNodeLogQuery(t *testing.T) {
 
 func Test_validateServices(t *testing.T) {
 	var (
-		service1 = "svc1"
-		service2 = "svc2"
-		invalid1 = "svc\n"
-		invalid2 = "svc.foo\n"
+		service1                 = "svc1"
+		service2                 = "svc2"
+		serviceDot               = "svc.foo"
+		serviceUnderscore        = "svc_foo"
+		serviceAt                = "svc@foo"
+		serviceColon             = "svc:foo"
+		invalidServiceNewline    = "svc\n"
+		invalidServiceNewlineDot = "svc.foo\n"
+		invalidServiceSlash      = "svc/foo"
 	)
 	tests := []struct {
 		name     string
@@ -140,10 +225,15 @@ func Test_validateServices(t *testing.T) {
 	}{
 		{name: "one service", services: []string{service1}},
 		{name: "two services", services: []string{service1, service2}},
-		{name: "invalid service new line", services: []string{invalid1}, wantErr: true},
-		{name: "invalid service with dot", services: []string{invalid2}, wantErr: true},
+		{name: "dot service", services: []string{serviceDot}},
+		{name: "underscore service", services: []string{serviceUnderscore}},
+		{name: "at service", services: []string{serviceAt}},
+		{name: "colon service", services: []string{serviceColon}},
+		{name: "invalid service new line", services: []string{invalidServiceNewline}, wantErr: true},
+		{name: "invalid service with dot", services: []string{invalidServiceNewlineDot}, wantErr: true},
+		{name: "invalid service with slash", services: []string{invalidServiceSlash}, wantErr: true},
 		{name: "long service", services: []string{strings.Repeat(service1, 100)}, wantErr: true},
-		{name: "max number of services", services: []string{service1, service2, service1, service2, service1}, wantErr: true},
+		{name: "max number of services", services: []string{service1, service2, serviceDot, serviceUnderscore, serviceAt}, wantErr: true},
 	}
 	for _, tt := range tests {
 		errs := validateServices(tt.services)
@@ -190,10 +280,10 @@ func Test_nodeLogQuery_validate(t *testing.T) {
 		{name: "since until", Services: []string{service1}, options: options{SinceTime: &until, UntilTime: &since},
 			wantErr: true},
 		// boot is not supported on Windows.
-		{name: "boot", Services: []string{service1}, options: options{Boot: intPtr(-1)}, wantErr: runtime.GOOS == "windows"},
-		{name: "boot out of range", Services: []string{service1}, options: options{Boot: intPtr(1)}, wantErr: true},
-		{name: "tailLines", Services: []string{service1}, options: options{TailLines: intPtr(100)}},
-		{name: "tailLines out of range", Services: []string{service1}, options: options{TailLines: intPtr(100000)}},
+		{name: "boot", Services: []string{service1}, options: options{Boot: ptr.To(-1)}, wantErr: runtime.GOOS == "windows"},
+		{name: "boot out of range", Services: []string{service1}, options: options{Boot: ptr.To(1)}, wantErr: true},
+		{name: "tailLines", Services: []string{service1}, options: options{TailLines: ptr.To(100)}},
+		{name: "tailLines out of range", Services: []string{service1}, options: options{TailLines: ptr.To(100000)}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -211,6 +301,63 @@ func Test_nodeLogQuery_validate(t *testing.T) {
 	}
 }
 
-func intPtr(i int) *int {
-	return &i
+func Test_heuristicsCopyFileLogs(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	buf := &bytes.Buffer{}
+
+	dir, err := os.MkdirTemp("", "logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	// Check missing logs
+	heuristicsCopyFileLogs(tCtx, buf, dir, "service.log")
+	if !strings.Contains(buf.String(), "log not found for service.log") {
+		t.Fail()
+	}
+	buf.Reset()
+
+	// Check missing service logs
+	heuristicsCopyFileLogs(tCtx, buf, dir, "service")
+	if !strings.Contains(buf.String(), "log not found for service") {
+		t.Fail()
+	}
+	buf.Reset()
+
+	// Check explicitly-named files
+	if err := os.WriteFile(filepath.Join(dir, "service.log"), []byte("valid logs"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	heuristicsCopyFileLogs(tCtx, buf, dir, "service.log")
+	if buf.String() != "valid logs" {
+		t.Fail()
+	}
+	buf.Reset()
+
+	// Check service logs
+	heuristicsCopyFileLogs(tCtx, buf, dir, "service")
+	if buf.String() != "valid logs" {
+		t.Fail()
+	}
+	buf.Reset()
+
+	// Check that a directory doesn't cause errors
+	if err := os.Mkdir(filepath.Join(dir, "service"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	heuristicsCopyFileLogs(tCtx, buf, dir, "service")
+	if buf.String() != "valid logs" {
+		t.Fail()
+	}
+	buf.Reset()
+
+	// Check that service logs return the first matching file
+	if err := os.WriteFile(filepath.Join(dir, "service", "service.log"), []byte("error"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	heuristicsCopyFileLogs(tCtx, buf, dir, "service")
+	if buf.String() != "valid logs" {
+		t.Fail()
+	}
 }

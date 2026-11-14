@@ -29,10 +29,10 @@ import (
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/ktesting"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/controlplane"
 	"k8s.io/kubernetes/test/integration/framework"
-	"k8s.io/kubernetes/test/utils/ktesting"
 )
 
 // Inject into control plane an authorizer that uses user info.
@@ -47,6 +47,16 @@ func (sarAuthorizer) Authorize(ctx context.Context, a authorizer.Attributes) (au
 	return authorizer.DecisionAllow, "you're not dave", nil
 }
 
+// ConditionsAwareAuthorize is not conditions-aware, converts the Authorize decision.
+func (s sarAuthorizer) ConditionsAwareAuthorize(ctx context.Context, a authorizer.Attributes) authorizer.ConditionsAwareDecision {
+	return authorizer.ConditionsAwareDecisionFromParts(s.Authorize(ctx, a))
+}
+
+// EvaluateConditions is not supported by this authorizer.
+func (sarAuthorizer) EvaluateConditions(_ context.Context, _ authorizer.ConditionsAwareDecision, _ authorizer.ConditionsData) (authorizer.Decision, string, error) {
+	return authorizer.DecisionDeny, "", authorizer.ErrorConditionEvaluationNotSupported
+}
+
 func alwaysAlice(req *http.Request) (*authenticator.Response, bool, error) {
 	return &authenticator.Response{
 		User: &user.DefaultInfo{
@@ -58,16 +68,13 @@ func alwaysAlice(req *http.Request) (*authenticator.Response, bool, error) {
 }
 
 func TestSubjectAccessReview(t *testing.T) {
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	clientset, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
+	tCtx := ktesting.Init(t)
+	clientset, _, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
 		ModifyServerConfig: func(config *controlplane.Config) {
 			// Unset BearerToken to disable BearerToken authenticator.
-			config.GenericConfig.LoopbackClientConfig.BearerToken = ""
-			config.GenericConfig.Authentication.Authenticator = authenticator.RequestFunc(alwaysAlice)
-			config.GenericConfig.Authorization.Authorizer = sarAuthorizer{}
+			config.ControlPlane.Generic.LoopbackClientConfig.BearerToken = ""
+			config.ControlPlane.Generic.Authentication.Authenticator = authenticator.RequestFunc(alwaysAlice)
+			config.ControlPlane.Generic.Authorization.Authorizer = sarAuthorizer{}
 		},
 	})
 	defer tearDownFn()
@@ -132,7 +139,7 @@ func TestSubjectAccessReview(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		response, err := clientset.AuthorizationV1().SubjectAccessReviews().Create(ctx, test.sar, metav1.CreateOptions{})
+		response, err := clientset.AuthorizationV1().SubjectAccessReviews().Create(tCtx, test.sar, metav1.CreateOptions{})
 		switch {
 		case err == nil && len(test.expectedError) == 0:
 
@@ -154,9 +161,7 @@ func TestSubjectAccessReview(t *testing.T) {
 }
 
 func TestSelfSubjectAccessReview(t *testing.T) {
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	tCtx := ktesting.Init(t)
 
 	var mutex sync.Mutex
 
@@ -174,15 +179,21 @@ func TestSelfSubjectAccessReview(t *testing.T) {
 		}, true, nil
 	}
 
-	clientset, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
+	clientset, _, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
 		ModifyServerConfig: func(config *controlplane.Config) {
 			// Unset BearerToken to disable BearerToken authenticator.
-			config.GenericConfig.LoopbackClientConfig.BearerToken = ""
-			config.GenericConfig.Authentication.Authenticator = authenticator.RequestFunc(authenticatorFunc)
-			config.GenericConfig.Authorization.Authorizer = sarAuthorizer{}
+			config.ControlPlane.Generic.LoopbackClientConfig.BearerToken = ""
+			config.ControlPlane.Generic.Authentication.Authenticator = authenticator.RequestFunc(authenticatorFunc)
+			config.ControlPlane.Generic.Authorization.Authorizer = sarAuthorizer{}
 		},
 	})
 	defer tearDownFn()
+	// Switch back to a working authorizer so that tests in tear down work as expected.
+	defer func() {
+		mutex.Lock()
+		defer mutex.Unlock()
+		username = "alice"
+	}()
 
 	tests := []struct {
 		name           string
@@ -235,7 +246,7 @@ func TestSelfSubjectAccessReview(t *testing.T) {
 		username = test.username
 		mutex.Unlock()
 
-		response, err := clientset.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, test.sar, metav1.CreateOptions{})
+		response, err := clientset.AuthorizationV1().SelfSubjectAccessReviews().Create(tCtx, test.sar, metav1.CreateOptions{})
 		switch {
 		case err == nil && len(test.expectedError) == 0:
 
@@ -257,16 +268,13 @@ func TestSelfSubjectAccessReview(t *testing.T) {
 }
 
 func TestLocalSubjectAccessReview(t *testing.T) {
-	_, ctx := ktesting.NewTestContext(t)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	clientset, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
+	tCtx := ktesting.Init(t)
+	clientset, _, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
 		ModifyServerConfig: func(config *controlplane.Config) {
 			// Unset BearerToken to disable BearerToken authenticator.
-			config.GenericConfig.LoopbackClientConfig.BearerToken = ""
-			config.GenericConfig.Authentication.Authenticator = authenticator.RequestFunc(alwaysAlice)
-			config.GenericConfig.Authorization.Authorizer = sarAuthorizer{}
+			config.ControlPlane.Generic.LoopbackClientConfig.BearerToken = ""
+			config.ControlPlane.Generic.Authentication.Authenticator = authenticator.RequestFunc(alwaysAlice)
+			config.ControlPlane.Generic.Authorization.Authorizer = sarAuthorizer{}
 		},
 	})
 	defer tearDownFn()
@@ -359,7 +367,7 @@ func TestLocalSubjectAccessReview(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		response, err := clientset.AuthorizationV1().LocalSubjectAccessReviews(test.namespace).Create(ctx, test.sar, metav1.CreateOptions{})
+		response, err := clientset.AuthorizationV1().LocalSubjectAccessReviews(test.namespace).Create(tCtx, test.sar, metav1.CreateOptions{})
 		switch {
 		case err == nil && len(test.expectedError) == 0:
 

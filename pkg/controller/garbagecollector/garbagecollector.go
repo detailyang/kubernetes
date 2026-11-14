@@ -24,7 +24,6 @@ import (
 	"sync"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,12 +44,8 @@ import (
 	"k8s.io/controller-manager/pkg/informerfactory"
 	"k8s.io/klog/v2"
 	c "k8s.io/kubernetes/pkg/controller"
-	"k8s.io/kubernetes/pkg/controller/apis/config/scheme"
 	"k8s.io/kubernetes/pkg/controller/garbagecollector/metrics"
 )
-
-// ResourceResyncTime defines the resync period of the garbage collector's informers.
-const ResourceResyncTime time.Duration = 0
 
 // GarbageCollector runs reflectors to watch for changes of managed API
 // objects, funnels the results to a single-threaded dependencyGraphBuilder,
@@ -67,17 +62,15 @@ type GarbageCollector struct {
 	restMapper     meta.ResettableRESTMapper
 	metadataClient metadata.Interface
 	// garbage collector attempts to delete the items in attemptToDelete queue when the time is ripe.
-	attemptToDelete workqueue.RateLimitingInterface
+	attemptToDelete workqueue.TypedRateLimitingInterface[*node]
 	// garbage collector attempts to orphan the dependents of the items in the attemptToOrphan queue, then deletes the items.
-	attemptToOrphan        workqueue.RateLimitingInterface
+	attemptToOrphan        workqueue.TypedRateLimitingInterface[*node]
 	dependencyGraphBuilder *GraphBuilder
 	// GC caches the owners that do not exist according to the API server.
 	absentOwnerCache *ReferenceCache
 
 	kubeClient       clientset.Interface
 	eventBroadcaster record.EventBroadcaster
-
-	workerLock sync.RWMutex
 }
 
 var _ controller.Interface = (*GarbageCollector)(nil)
@@ -85,6 +78,7 @@ var _ controller.Debuggable = (*GarbageCollector)(nil)
 
 // NewGarbageCollector creates a new GarbageCollector.
 func NewGarbageCollector(
+	ctx context.Context,
 	kubeClient clientset.Interface,
 	metadataClient metadata.Interface,
 	mapper meta.ResettableRESTMapper,
@@ -92,36 +86,28 @@ func NewGarbageCollector(
 	sharedInformers informerfactory.InformerFactory,
 	informersStarted <-chan struct{},
 ) (*GarbageCollector, error) {
+	graphBuilder := NewDependencyGraphBuilder(ctx, metadataClient, mapper, ignoredResources, sharedInformers, informersStarted)
+	return NewComposedGarbageCollector(ctx, kubeClient, metadataClient, mapper, graphBuilder)
+}
 
-	eventBroadcaster := record.NewBroadcaster()
-	eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "garbage-collector-controller"})
+func NewComposedGarbageCollector(
+	ctx context.Context,
+	kubeClient clientset.Interface,
+	metadataClient metadata.Interface,
+	mapper meta.ResettableRESTMapper,
+	graphBuilder *GraphBuilder,
+) (*GarbageCollector, error) {
+	attemptToDelete, attemptToOrphan, absentOwnerCache := graphBuilder.GetGraphResources()
 
-	attemptToDelete := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "garbage_collector_attempt_to_delete")
-	attemptToOrphan := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "garbage_collector_attempt_to_orphan")
-	absentOwnerCache := NewReferenceCache(500)
 	gc := &GarbageCollector{
-		metadataClient:   metadataClient,
-		restMapper:       mapper,
-		attemptToDelete:  attemptToDelete,
-		attemptToOrphan:  attemptToOrphan,
-		absentOwnerCache: absentOwnerCache,
-		kubeClient:       kubeClient,
-		eventBroadcaster: eventBroadcaster,
-	}
-	gc.dependencyGraphBuilder = &GraphBuilder{
-		eventRecorder:    eventRecorder,
-		metadataClient:   metadataClient,
-		informersStarted: informersStarted,
-		restMapper:       mapper,
-		graphChanges:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "garbage_collector_graph_changes"),
-		uidToNode: &concurrentUIDToNode{
-			uidToNode: make(map[types.UID]*node),
-		},
-		attemptToDelete:  attemptToDelete,
-		attemptToOrphan:  attemptToOrphan,
-		absentOwnerCache: absentOwnerCache,
-		sharedInformers:  sharedInformers,
-		ignoredResources: ignoredResources,
+		metadataClient:         metadataClient,
+		restMapper:             mapper,
+		attemptToDelete:        attemptToDelete,
+		attemptToOrphan:        attemptToOrphan,
+		absentOwnerCache:       absentOwnerCache,
+		kubeClient:             kubeClient,
+		eventBroadcaster:       graphBuilder.eventBroadcaster,
+		dependencyGraphBuilder: graphBuilder,
 	}
 
 	metrics.Register()
@@ -140,43 +126,60 @@ func (gc *GarbageCollector) resyncMonitors(logger klog.Logger, deletableResource
 }
 
 // Run starts garbage collector workers.
-func (gc *GarbageCollector) Run(ctx context.Context, workers int) {
-	defer utilruntime.HandleCrash()
-	defer gc.attemptToDelete.ShutDown()
-	defer gc.attemptToOrphan.ShutDown()
-	defer gc.dependencyGraphBuilder.graphChanges.ShutDown()
+func (gc *GarbageCollector) Run(ctx context.Context, workers int, initialSyncTimeout time.Duration) {
+	defer utilruntime.HandleCrashWithContext(ctx)
 
 	// Start events processing pipeline.
-	gc.eventBroadcaster.StartStructuredLogging(0)
+	gc.eventBroadcaster.StartStructuredLogging(3)
 	gc.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: gc.kubeClient.CoreV1().Events("")})
 	defer gc.eventBroadcaster.Shutdown()
 
 	logger := klog.FromContext(ctx)
 	logger.Info("Starting controller", "controller", "garbagecollector")
-	defer logger.Info("Shutting down controller", "controller", "garbagecollector")
 
-	go gc.dependencyGraphBuilder.Run(ctx)
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down controller", "controller", "garbagecollector")
+		gc.dependencyGraphBuilder.graphChanges.ShutDown()
+		gc.attemptToOrphan.ShutDown()
+		gc.attemptToDelete.ShutDown()
+		wg.Wait()
+	}()
 
-	if !cache.WaitForNamedCacheSync("garbage collector", ctx.Done(), func() bool {
+	// Start dependency graph builder.
+	wg.Go(func() {
+		gc.dependencyGraphBuilder.Run(ctx)
+	})
+
+	// Create a new context that is cancelled after the initialSyncTimeout.
+	syncCtx, cancel := context.WithTimeout(ctx, initialSyncTimeout)
+	defer cancel()
+
+	if !cache.WaitForNamedCacheSyncWithContext(syncCtx, func() bool {
 		return gc.dependencyGraphBuilder.IsSynced(logger)
 	}) {
-		return
+		logger.Info("Garbage collector: not all resource monitors could be synced, proceeding anyways")
+	} else {
+		logger.Info("Garbage collector: all resource monitors have synced")
 	}
 
-	logger.Info("All resource monitors have synced. Proceeding to collect garbage")
+	logger.Info("Proceeding to collect garbage")
 
 	// gc workers
 	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, gc.runAttemptToDeleteWorker, 1*time.Second)
-		go wait.Until(func() { gc.runAttemptToOrphanWorker(logger) }, 1*time.Second, ctx.Done())
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, gc.runAttemptToDeleteWorker, 1*time.Second)
+		})
+		wg.Go(func() {
+			wait.Until(func() { gc.runAttemptToOrphanWorker(logger) }, 1*time.Second, ctx.Done())
+		})
 	}
-
 	<-ctx.Done()
 }
 
 // Sync periodically resyncs the garbage collector when new resources are
-// observed from discovery. When new resources are detected, Sync will stop all
-// GC workers, reset gc.restMapper, and resync the monitors.
+// observed from discovery. When new resources are detected, it will reset
+// gc.restMapper, and resync the monitors.
 //
 // Note that discoveryClient should NOT be shared with gc.restMapper, otherwise
 // the mapper's underlying discovery client will be unnecessarily reset during
@@ -187,7 +190,7 @@ func (gc *GarbageCollector) Sync(ctx context.Context, discoveryClient discovery.
 		logger := klog.FromContext(ctx)
 
 		// Get the current resource list from discovery.
-		newResources, err := GetDeletableResources(logger, discoveryClient)
+		newResources, err := GetDeletableResources(ctx, discovery.ToServerResourcesInterfaceWithContext(discoveryClient))
 
 		if len(newResources) == 0 {
 			logger.V(2).Info("no resources reported by discovery, skipping garbage collector sync")
@@ -209,85 +212,51 @@ func (gc *GarbageCollector) Sync(ctx context.Context, discoveryClient discovery.
 			return
 		}
 
-		// Ensure workers are paused to avoid processing events before informers
-		// have resynced.
-		gc.workerLock.Lock()
-		defer gc.workerLock.Unlock()
+		logger.V(2).Info(
+			"syncing garbage collector with updated resources from discovery",
+			"diff", printDiff(oldResources, newResources),
+		)
 
-		// Once we get here, we should not unpause workers until we've successfully synced
-		attempt := 0
-		wait.PollImmediateUntilWithContext(ctx, 100*time.Millisecond, func(ctx context.Context) (bool, error) {
-			attempt++
+		// Resetting the REST mapper will also invalidate the underlying discovery
+		// client. This is a leaky abstraction and assumes behavior about the REST
+		// mapper, but we'll deal with it for now.
+		gc.restMapper.Reset()
+		logger.V(4).Info("reset restmapper")
 
-			// On a reattempt, check if available resources have changed
-			if attempt > 1 {
-				newResources, err = GetDeletableResources(logger, discoveryClient)
+		// Perform the monitor resync and wait for controllers to report cache sync.
+		//
+		// NOTE: It's possible that newResources will diverge from the resources
+		// discovered by restMapper during the call to Reset, since they are
+		// distinct discovery clients invalidated at different times. For example,
+		// newResources may contain resources not returned in the restMapper's
+		// discovery call if the resources appeared in-between the calls. In that
+		// case, the restMapper will fail to map some of newResources until the next
+		// attempt.
+		if err := gc.resyncMonitors(logger, newResources); err != nil {
+			utilruntime.HandleError(fmt.Errorf("failed to sync resource monitors: %w", err))
+			metrics.GarbageCollectorResourcesSyncError.Inc()
+			return
+		}
+		logger.V(4).Info("resynced monitors")
 
-				if len(newResources) == 0 {
-					logger.V(2).Info("no resources reported by discovery", "attempt", attempt)
-					metrics.GarbageCollectorResourcesSyncError.Inc()
-					return false, nil
-				}
-				if groupLookupFailures, isLookupFailure := discovery.GroupDiscoveryFailedErrorGroups(err); isLookupFailure {
-					// In partial discovery cases, preserve existing synced informers for resources in the failed groups, so resyncMonitors will only add informers for newly seen resources
-					for k, v := range oldResources {
-						if _, failed := groupLookupFailures[k.GroupVersion()]; failed && gc.dependencyGraphBuilder.IsResourceSynced(k) {
-							newResources[k] = v
-						}
-					}
-				}
-			}
+		syncCtx, cancel := context.WithTimeout(ctx, period)
+		defer cancel()
 
-			logger.V(2).Info(
-				"syncing garbage collector with updated resources from discovery",
-				"attempt", attempt,
-				"diff", printDiff(oldResources, newResources),
-			)
-
-			// Resetting the REST mapper will also invalidate the underlying discovery
-			// client. This is a leaky abstraction and assumes behavior about the REST
-			// mapper, but we'll deal with it for now.
-			gc.restMapper.Reset()
-			logger.V(4).Info("reset restmapper")
-
-			// Perform the monitor resync and wait for controllers to report cache sync.
-			//
-			// NOTE: It's possible that newResources will diverge from the resources
-			// discovered by restMapper during the call to Reset, since they are
-			// distinct discovery clients invalidated at different times. For example,
-			// newResources may contain resources not returned in the restMapper's
-			// discovery call if the resources appeared in-between the calls. In that
-			// case, the restMapper will fail to map some of newResources until the next
-			// attempt.
-			if err := gc.resyncMonitors(logger, newResources); err != nil {
-				utilruntime.HandleError(fmt.Errorf("failed to sync resource monitors (attempt %d): %v", attempt, err))
-				metrics.GarbageCollectorResourcesSyncError.Inc()
-				return false, nil
-			}
-			logger.V(4).Info("resynced monitors")
-
-			// wait for caches to fill for a while (our sync period) before attempting to rediscover resources and retry syncing.
-			// this protects us from deadlocks where available resources changed and one of our informer caches will never fill.
-			// informers keep attempting to sync in the background, so retrying doesn't interrupt them.
-			// the call to resyncMonitors on the reattempt will no-op for resources that still exist.
-			// note that workers stay paused until we successfully resync.
-			if !cache.WaitForNamedCacheSync("garbage collector", waitForStopOrTimeout(ctx.Done(), period), func() bool {
-				return gc.dependencyGraphBuilder.IsSynced(logger)
-			}) {
-				utilruntime.HandleError(fmt.Errorf("timed out waiting for dependency graph builder sync during GC sync (attempt %d)", attempt))
-				metrics.GarbageCollectorResourcesSyncError.Inc()
-				return false, nil
-			}
-
-			// success, break out of the loop
-			return true, nil
+		// gc worker no longer waits for cache to be synced, but we will keep the periodical check to provide logs & metrics
+		cacheSynced := cache.WaitForNamedCacheSyncWithContext(syncCtx, func() bool {
+			return gc.dependencyGraphBuilder.IsSynced(logger)
 		})
+		if cacheSynced {
+			logger.V(2).Info("synced garbage collector")
+		} else {
+			utilruntime.HandleError(fmt.Errorf("timed out waiting for dependency graph builder sync during GC sync"))
+			metrics.GarbageCollectorResourcesSyncError.Inc()
+		}
 
-		// Finally, keep track of our new state. Do this after all preceding steps
-		// have succeeded to ensure we'll retry on subsequent syncs if an error
-		// occurred.
+		// Finally, keep track of our new resource monitor state.
+		// Monitors where the cache sync times out are still tracked here as
+		// subsequent runs should stop them if their resources were removed.
 		oldResources = newResources
-		logger.V(2).Info("synced garbage collector")
 	}, period)
 }
 
@@ -308,19 +277,6 @@ func printDiff(oldResources, newResources map[schema.GroupVersionResource]struct
 	return fmt.Sprintf("added: %v, removed: %v", added.List(), removed.List())
 }
 
-// waitForStopOrTimeout returns a stop channel that closes when the provided stop channel closes or when the specified timeout is reached
-func waitForStopOrTimeout(stopCh <-chan struct{}, timeout time.Duration) <-chan struct{} {
-	stopChWithTimeout := make(chan struct{})
-	go func() {
-		select {
-		case <-stopCh:
-		case <-time.After(timeout):
-		}
-		close(stopChWithTimeout)
-	}()
-	return stopChWithTimeout
-}
-
 // IsSynced returns true if dependencyGraphBuilder is synced.
 func (gc *GarbageCollector) IsSynced(logger klog.Logger) bool {
 	return gc.dependencyGraphBuilder.IsSynced(logger)
@@ -337,8 +293,6 @@ var namespacedOwnerOfClusterScopedObjectErr = goerrors.New("cluster-scoped objec
 
 func (gc *GarbageCollector) processAttemptToDeleteWorker(ctx context.Context) bool {
 	item, quit := gc.attemptToDelete.Get()
-	gc.workerLock.RLock()
-	defer gc.workerLock.RUnlock()
 	if quit {
 		return false
 	}
@@ -402,8 +356,8 @@ func (gc *GarbageCollector) attemptToDeleteWorker(ctx context.Context, item inte
 			// 2. The reference is to an invalid group/version. We don't currently
 			//    have a way to distinguish this from a valid type we will recognize
 			//    after the next discovery sync.
-			// For now, record the error and retry.
-			logger.V(5).Error(err, "error syncing item", "item", n.identity)
+			// For now, log the error and retry.
+			logger.V(5).Info("error syncing item", "item", n.identity, "err", err)
 		} else {
 			utilruntime.HandleError(fmt.Errorf("error syncing item %s: %v", n, err))
 		}
@@ -668,7 +622,12 @@ func (gc *GarbageCollector) attemptToDeleteItem(ctx context.Context, item *node)
 		// FinalizerDeletingDependents from the item, resulting in the final
 		// deletion of the item.
 		policy := metav1.DeletePropagationForeground
-		return gc.deleteObject(item.identity, &policy)
+		err := gc.deleteObject(item.identity, latest.ResourceVersion, latest.OwnerReferences, &policy)
+		if errors.IsNotFound(err) {
+			gc.dependencyGraphBuilder.enqueueVirtualDeleteEvent(item.identity)
+			return enqueuedVirtualDeleteEventErr
+		}
+		return err
 	default:
 		// item doesn't have any solid owner, so it needs to be garbage
 		// collected. Also, none of item's owners is waiting for the deletion of
@@ -689,7 +648,12 @@ func (gc *GarbageCollector) attemptToDeleteItem(ctx context.Context, item *node)
 			"item", item.identity,
 			"propagationPolicy", policy,
 		)
-		return gc.deleteObject(item.identity, &policy)
+		err := gc.deleteObject(item.identity, latest.ResourceVersion, latest.OwnerReferences, &policy)
+		if errors.IsNotFound(err) {
+			gc.dependencyGraphBuilder.enqueueVirtualDeleteEvent(item.identity)
+			return enqueuedVirtualDeleteEventErr
+		}
+		return err
 	}
 }
 
@@ -763,8 +727,6 @@ func (gc *GarbageCollector) runAttemptToOrphanWorker(logger klog.Logger) {
 // these steps fail.
 func (gc *GarbageCollector) processAttemptToOrphanWorker(logger klog.Logger) bool {
 	item, quit := gc.attemptToOrphan.Get()
-	gc.workerLock.RLock()
-	defer gc.workerLock.RUnlock()
 	if quit {
 		return false
 	}
@@ -828,11 +790,14 @@ func (gc *GarbageCollector) GraphHasUID(u types.UID) bool {
 // All discovery errors are considered temporary. Upon encountering any error,
 // GetDeletableResources will log and return any discovered resources it was
 // able to process (which may be none).
-func GetDeletableResources(logger klog.Logger, discoveryClient discovery.ServerResourcesInterface) (map[schema.GroupVersionResource]struct{}, error) {
-	preferredResources, lookupErr := discoveryClient.ServerPreferredResources()
+func GetDeletableResources(ctx context.Context, discoveryClient discovery.ServerResourcesInterfaceWithContext) (map[schema.GroupVersionResource]struct{}, error) {
+	logger := klog.FromContext(ctx)
+	preferredResources, lookupErr := discoveryClient.ServerPreferredResourcesWithContext(ctx)
 	if lookupErr != nil {
 		if groupLookupFailures, isLookupFailure := discovery.GroupDiscoveryFailedErrorGroups(lookupErr); isLookupFailure {
-			logger.Info("failed to discover some groups", "groups", groupLookupFailures)
+			// Serialize groupLookupFailures here as map[schema.GroupVersion]error is not json encodable, otherwise the
+			// logger would throw internal error.
+			logger.Info("failed to discover some groups", "groups", fmt.Sprintf("%q", groupLookupFailures))
 		} else {
 			logger.Info("failed to discover preferred resources", "error", lookupErr)
 		}
@@ -861,4 +826,9 @@ func GetDeletableResources(logger klog.Logger, discoveryClient discovery.ServerR
 
 func (gc *GarbageCollector) Name() string {
 	return "garbagecollector"
+}
+
+// GetDependencyGraphBuilder return graph builder which is particularly helpful for testing where controllerContext is not available
+func (gc *GarbageCollector) GetDependencyGraphBuilder() *GraphBuilder {
+	return gc.dependencyGraphBuilder
 }

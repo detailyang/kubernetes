@@ -156,14 +156,12 @@ kube::version::ldflags() {
     local key=${1}
     local val=${2}
     ldflags+=(
-      "-X '${KUBE_GO_PACKAGE}/vendor/k8s.io/client-go/pkg/version.${key}=${val}'"
-      "-X '${KUBE_GO_PACKAGE}/vendor/k8s.io/component-base/version.${key}=${val}'"
       "-X 'k8s.io/client-go/pkg/version.${key}=${val}'"
       "-X 'k8s.io/component-base/version.${key}=${val}'"
     )
   }
 
-  kube::util::ensure-gnu-date
+  kube::util::ensure-gnu-compatible-date
 
   add_ldflag "buildDate" "$(${DATE} ${SOURCE_DATE_EPOCH:+"--date=@${SOURCE_DATE_EPOCH}"} -u +'%Y-%m-%dT%H:%M:%SZ')"
   if [[ -n ${KUBE_GIT_COMMIT-} ]]; then

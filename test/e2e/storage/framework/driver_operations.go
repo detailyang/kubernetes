@@ -18,7 +18,6 @@ package framework
 
 import (
 	"context"
-	"fmt"
 
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,14 +26,14 @@ import (
 	"k8s.io/kubernetes/test/e2e/framework"
 )
 
-// GetDriverNameWithFeatureTags returns driver name with feature tags
-// For example)
+// GetDriverNameWithFeatureTags returns parameters that can be passed to framework.Context.
+// For example:
 //   - [Driver: nfs]
-//   - [Driver: rbd][Feature:Volumes]
-func GetDriverNameWithFeatureTags(driver TestDriver) string {
+//   - [Driver: rbd], feature.Volumes
+func GetDriverNameWithFeatureTags(driver TestDriver) []interface{} {
 	dInfo := driver.GetDriverInfo()
 
-	return fmt.Sprintf("[Driver: %s]%s", dInfo.Name, dInfo.FeatureTag)
+	return append([]interface{}{framework.WithLabel("Driver: " + dInfo.Name)}, dInfo.TestTags...)
 }
 
 // CreateVolume creates volume for test unless dynamicPV or CSI ephemeral inline volume test
@@ -91,4 +90,14 @@ func GetStorageClass(
 		Parameters:        parameters,
 		VolumeBindingMode: bindingMode,
 	}
+}
+
+// CopyVolumeAttributesClass constructs a new VolumeAttributesClass instance
+// with a unique name that is based on namespace + suffix
+// using the VolumeAttributesClass passed in as a parameter
+func CopyVolumeAttributesClass(vac *storagev1.VolumeAttributesClass, ns string, suffix string) *storagev1.VolumeAttributesClass {
+	copy := vac.DeepCopy()
+	copy.ObjectMeta.Name = names.SimpleNameGenerator.GenerateName(ns + "-" + suffix)
+	copy.ResourceVersion = ""
+	return copy
 }

@@ -27,7 +27,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -71,6 +71,42 @@ func WithUnaryClientInterceptor(i UnaryClientInterceptor) ClientOpts {
 	}
 }
 
+// WithChainUnaryClientInterceptor sets the provided chain of client interceptors
+func WithChainUnaryClientInterceptor(interceptors ...UnaryClientInterceptor) ClientOpts {
+	return func(c *Client) {
+		if len(interceptors) == 0 {
+			return
+		}
+		if c.interceptor != nil {
+			interceptors = append([]UnaryClientInterceptor{c.interceptor}, interceptors...)
+		}
+		c.interceptor = func(
+			ctx context.Context,
+			req *Request,
+			reply *Response,
+			info *UnaryClientInfo,
+			final Invoker,
+		) error {
+			return interceptors[0](ctx, req, reply, info,
+				chainUnaryInterceptors(interceptors[1:], final, info))
+		}
+	}
+}
+
+func chainUnaryInterceptors(interceptors []UnaryClientInterceptor, final Invoker, info *UnaryClientInfo) Invoker {
+	if len(interceptors) == 0 {
+		return final
+	}
+	return func(
+		ctx context.Context,
+		req *Request,
+		reply *Response,
+	) error {
+		return interceptors[0](ctx, req, reply, info,
+			chainUnaryInterceptors(interceptors[1:], final, info))
+	}
+}
+
 // NewClient creates a new ttrpc client using the given connection
 func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -85,11 +121,14 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		ctx:             ctx,
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
-		interceptor:     defaultClientInterceptor,
 	}
 
 	for _, o := range opts {
 		o(c)
+	}
+
+	if c.interceptor == nil {
+		c.interceptor = defaultClientInterceptor
 	}
 
 	go c.run()
@@ -103,7 +142,7 @@ func (c *Client) send(sid uint32, mt messageType, flags uint8, b []byte) error {
 }
 
 // Call makes a unary request and returns with response
-func (c *Client) Call(ctx context.Context, service, method string, req, resp interface{}) error {
+func (c *Client) Call(ctx context.Context, service, method string, req, resp any) error {
 	payload, err := c.codec.Marshal(req)
 	if err != nil {
 		return err
@@ -155,8 +194,8 @@ type StreamDesc struct {
 // ClientStream is used to send or recv messages on the underlying stream
 type ClientStream interface {
 	CloseSend() error
-	SendMsg(m interface{}) error
-	RecvMsg(m interface{}) error
+	SendMsg(m any) error
+	RecvMsg(m any) error
 }
 
 type clientStream struct {
@@ -183,7 +222,7 @@ func (cs *clientStream) CloseSend() error {
 	return nil
 }
 
-func (cs *clientStream) SendMsg(m interface{}) error {
+func (cs *clientStream) SendMsg(m any) error {
 	if !cs.desc.StreamingClient {
 		return fmt.Errorf("%w: cannot send data from non-streaming client", ErrProtocol)
 	}
@@ -210,7 +249,7 @@ func (cs *clientStream) SendMsg(m interface{}) error {
 	return nil
 }
 
-func (cs *clientStream) RecvMsg(m interface{}) error {
+func (cs *clientStream) RecvMsg(m any) error {
 	if cs.remoteClosed {
 		return io.EOF
 	}
@@ -229,7 +268,8 @@ func (cs *clientStream) RecvMsg(m interface{}) error {
 	case msg = <-cs.s.recv:
 	}
 
-	if msg.header.Type == messageTypeResponse {
+	switch msg.header.Type {
+	case messageTypeResponse:
 		resp := &Response{}
 		err := proto.Unmarshal(msg.payload[:msg.header.Length], resp)
 		// return the payload buffer for reuse
@@ -250,7 +290,7 @@ func (cs *clientStream) RecvMsg(m interface{}) error {
 		cs.remoteClosed = true
 
 		return nil
-	} else if msg.header.Type == messageTypeData {
+	case messageTypeData:
 		if !cs.desc.StreamingServer {
 			cs.c.deleteStream(cs.s)
 			cs.remoteClosed = true
@@ -271,9 +311,9 @@ func (cs *clientStream) RecvMsg(m interface{}) error {
 			return err
 		}
 		return nil
+	default:
+		return fmt.Errorf("unexpected %q message received: %w", msg.header.Type, ErrProtocol)
 	}
-
-	return fmt.Errorf("unexpected %q message received: %w", msg.header.Type, ErrProtocol)
 }
 
 // Close closes the ttrpc connection and underlying connection
@@ -286,7 +326,7 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// UserOnCloseWait is used to blocks untils the user's on-close callback
+// UserOnCloseWait is used to block until the user's on-close callback
 // finishes.
 func (c *Client) UserOnCloseWait(ctx context.Context) error {
 	select {
@@ -329,7 +369,7 @@ func (c *Client) receiveLoop() error {
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
-				logrus.WithField("stream", sid).Errorf("ttrpc: received message on inactive stream")
+				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
 				continue
 			}
 
@@ -337,7 +377,7 @@ func (c *Client) receiveLoop() error {
 				s.closeWithError(err)
 			} else {
 				if err := s.receive(c.ctx, msg); err != nil {
-					logrus.WithError(err).WithField("stream", sid).Errorf("ttrpc: failed to handle message")
+					log.G(c.ctx).WithFields(log.Fields{"error": err, "stream": sid}).Error("ttrpc: failed to handle message")
 				}
 			}
 		}
@@ -346,26 +386,45 @@ func (c *Client) receiveLoop() error {
 
 // createStream creates a new stream and registers it with the client
 // Introduce stream types for multiple or single response
-func (c *Client) createStream(flags uint8, b []byte) (*stream, error) {
-	c.streamLock.Lock()
+func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, error) {
+	// sendLock must be held across both allocation of the stream ID and sending it across the wire.
+	// This ensures that new stream IDs sent on the wire are always increasing, which is a
+	// requirement of the TTRPC protocol.
+	// This use of sendLock could be split into another mutex that covers stream creation + first send,
+	// and just use sendLock to guard writing to the wire, but for now it seems simpler to have fewer mutexes.
+	c.sendLock.Lock()
+	defer c.sendLock.Unlock()
 
 	// Check if closed since lock acquired to prevent adding
 	// anything after cleanup completes
 	select {
 	case <-c.ctx.Done():
-		c.streamLock.Unlock()
 		return nil, ErrClosed
 	default:
 	}
 
-	// Stream ID should be allocated at same time
-	s := newStream(c.nextStreamID, c)
-	c.streams[s.id] = s
-	c.nextStreamID = c.nextStreamID + 2
+	var s *stream
+	if err := func() error {
+		// In the future this could be replaced with a sync.Map instead of streamLock+map.
+		c.streamLock.Lock()
+		defer c.streamLock.Unlock()
 
-	c.sendLock.Lock()
-	defer c.sendLock.Unlock()
-	c.streamLock.Unlock()
+		// Check if closed since lock acquired to prevent adding
+		// anything after cleanup completes
+		select {
+		case <-c.ctx.Done():
+			return ErrClosed
+		default:
+		}
+
+		s = newStream(c.nextStreamID, c, recvBuf)
+		c.streams[s.id] = s
+		c.nextStreamID = c.nextStreamID + 2
+
+		return nil
+	}(); err != nil {
+		return nil, err
+	}
 
 	if err := c.channel.send(uint32(s.id), messageTypeRequest, flags, b); err != nil {
 		return s, filterCloseErr(err)
@@ -431,7 +490,7 @@ func filterCloseErr(err error) error {
 // NewStream creates a new stream with the given stream descriptor to the
 // specified service and method. If not a streaming client, the request object
 // may be provided.
-func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, method string, req interface{}) (ClientStream, error) {
+func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, method string, req any) (ClientStream, error) {
 	var payload []byte
 	if req != nil {
 		var err error
@@ -458,7 +517,7 @@ func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, metho
 	} else {
 		flags = flagRemoteClosed
 	}
-	s, err := c.createStream(flags, p)
+	s, err := c.createStream(flags, p, streamRecvBufferSize)
 	if err != nil {
 		return nil, err
 	}
@@ -477,7 +536,7 @@ func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) err
 		return err
 	}
 
-	s, err := c.createStream(0, p)
+	s, err := c.createStream(0, p, 1)
 	if err != nil {
 		return err
 	}

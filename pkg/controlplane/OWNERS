@@ -3,19 +3,17 @@
 approvers:
   - deads2k
   - derekwaynecarr
-  - mikedanese
   - sttts
   - wojtek-t
   - jpbetz
 reviewers:
+  - aojea
   - thockin
-  - smarterclayton
   - wojtek-t
   - deads2k
   - yujuhong
   - derekwaynecarr
   - caesarxuchao
-  - mikedanese
   - liggitt
   - sttts
   - dchen1107
@@ -23,7 +21,6 @@ reviewers:
   - luxas
   - janetkuo
   - justinsb
-  - ncdc
   - mwielgus
   - soltysh
   - enj
@@ -33,3 +30,5 @@ labels:
 emeritus_approvers:
   - nikhiljindal
   - lavalamp
+emeritus_reviewers:
+  - ncdc

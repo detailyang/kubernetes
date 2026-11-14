@@ -29,7 +29,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"k8s.io/apimachinery/pkg/util/dump"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/utils/dump"
 )
 
 func TestVisitorHttpGet(t *testing.T) {
@@ -153,7 +156,7 @@ func TestVisitorHttpGet(t *testing.T) {
 			actualBytes, actualErr := readHttpWithRetries(tt.httpRetries, tt.args.duration, tt.args.u, tt.args.attempts)
 
 			if tt.isNotNil {
-				assert.Nil(t, actualErr)
+				assert.NoError(t, actualErr)
 				assert.NotNil(t, actualBytes)
 			} else {
 				if tt.expectedErr != nil {
@@ -197,6 +200,46 @@ func TestFlattenListVisitorWithVisitorError(t *testing.T) {
 	}
 	if len(test.Infos) != 6 {
 		t.Fatal(dump.Pretty(test.Infos))
+	}
+}
+
+func TestInfoObjectName(t *testing.T) {
+	newObj := func(apiVersion, kind string) *unstructured.Unstructured {
+		obj := &unstructured.Unstructured{}
+		obj.SetAPIVersion(apiVersion)
+		obj.SetKind(kind)
+		obj.SetName("foo")
+		return obj
+	}
+	tests := []struct {
+		name string
+		info *Info
+		want string
+	}{
+		{
+			name: "with mapping",
+			info: &Info{
+				Name:    "foo",
+				Object:  newObj("apps/v1", "Deployment"),
+				Mapping: &meta.RESTMapping{Resource: schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}},
+			},
+			want: "deployments/foo",
+		},
+		{
+			name: "no mapping, core group",
+			info: &Info{Name: "foo", Object: newObj("v1", "Pod")},
+			want: "pod/foo",
+		},
+		{
+			name: "no mapping, named group",
+			info: &Info{Name: "foo", Object: newObj("apps/v1", "Deployment")},
+			want: "deployment.apps/foo",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.info.ObjectName())
+		})
 	}
 }
 

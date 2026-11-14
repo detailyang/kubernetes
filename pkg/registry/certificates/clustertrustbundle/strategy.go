@@ -16,11 +16,12 @@ limitations under the License.
 
 // Package clustertrustbundle provides Registry interface and its RESTStorage
 // implementation for storing ClusterTrustBundle objects.
-package clustertrustbundle // import "k8s.io/kubernetes/pkg/registry/certificates/clustertrustbundle"
+package clustertrustbundle
 
 import (
 	"context"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/registry/rest"
@@ -32,12 +33,12 @@ import (
 
 // strategy implements behavior for ClusterTrustBundles.
 type strategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the create, update, and delete strategy for ClusterTrustBundles.
-var Strategy = strategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = strategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 var _ rest.RESTCreateStrategy = Strategy
 var _ rest.RESTUpdateStrategy = Strategy
@@ -47,7 +48,10 @@ func (strategy) NamespaceScoped() bool {
 	return false
 }
 
-func (strategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {}
+func (strategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
+	bundle := obj.(*certificates.ClusterTrustBundle)
+	bundle.Generation = 1
+}
 
 func (strategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	bundle := obj.(*certificates.ClusterTrustBundle)
@@ -60,11 +64,18 @@ func (strategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []stri
 
 func (strategy) Canonicalize(obj runtime.Object) {}
 
-func (strategy) AllowCreateOnUpdate() bool {
+func (strategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
-func (s strategy) PrepareForUpdate(ctx context.Context, new, old runtime.Object) {}
+func (s strategy) PrepareForUpdate(ctx context.Context, new, old runtime.Object) {
+	newBundle := new.(*certificates.ClusterTrustBundle)
+	oldBundle := old.(*certificates.ClusterTrustBundle)
+
+	if !apiequality.Semantic.DeepEqual(newBundle.Spec, oldBundle.Spec) {
+		newBundle.Generation = oldBundle.Generation + 1
+	}
+}
 
 func (s strategy) ValidateUpdate(ctx context.Context, new, old runtime.Object) field.ErrorList {
 	newBundle := new.(*certificates.ClusterTrustBundle)
@@ -76,6 +87,6 @@ func (strategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) [
 	return nil
 }
 
-func (strategy) AllowUnconditionalUpdate() bool {
+func (strategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return false
 }

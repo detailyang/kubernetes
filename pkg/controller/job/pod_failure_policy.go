@@ -18,6 +18,7 @@ package job
 
 import (
 	"fmt"
+	"slices"
 
 	batch "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
@@ -47,14 +48,15 @@ func matchPodFailurePolicy(podFailurePolicy *batch.PodFailurePolicy, failedPod *
 				case batch.PodFailurePolicyActionIgnore:
 					return nil, false, &ignore
 				case batch.PodFailurePolicyActionFailIndex:
-					if feature.DefaultFeatureGate.Enabled(features.JobBackoffLimitPerIndex) {
-						return nil, true, &failIndex
-					}
+					return nil, true, &failIndex
 				case batch.PodFailurePolicyActionCount:
 					return nil, true, &count
 				case batch.PodFailurePolicyActionFailJob:
 					msg := fmt.Sprintf("Container %s for pod %s/%s failed with exit code %v matching %v rule at index %d",
 						containerStatus.Name, failedPod.Namespace, failedPod.Name, containerStatus.State.Terminated.ExitCode, podFailurePolicyRule.Action, index)
+					if feature.DefaultFeatureGate.Enabled(features.PodFailurePolicyName) && podFailurePolicyRule.Name != nil {
+						msg += fmt.Sprintf(" (%s)", *podFailurePolicyRule.Name)
+					}
 					return &msg, true, &failJob
 				}
 			}
@@ -64,14 +66,15 @@ func matchPodFailurePolicy(podFailurePolicy *batch.PodFailurePolicy, failedPod *
 				case batch.PodFailurePolicyActionIgnore:
 					return nil, false, &ignore
 				case batch.PodFailurePolicyActionFailIndex:
-					if feature.DefaultFeatureGate.Enabled(features.JobBackoffLimitPerIndex) {
-						return nil, true, &failIndex
-					}
+					return nil, true, &failIndex
 				case batch.PodFailurePolicyActionCount:
 					return nil, true, &count
 				case batch.PodFailurePolicyActionFailJob:
 					msg := fmt.Sprintf("Pod %s/%s has condition %v matching %v rule at index %d",
 						failedPod.Namespace, failedPod.Name, podCondition.Type, podFailurePolicyRule.Action, index)
+					if feature.DefaultFeatureGate.Enabled(features.PodFailurePolicyName) && podFailurePolicyRule.Name != nil {
+						msg += fmt.Sprintf(" (%s)", *podFailurePolicyRule.Name)
+					}
 					return &msg, true, &failJob
 				}
 			}
@@ -122,19 +125,9 @@ func getMatchingContainerFromList(containerStatuses []v1.ContainerStatus, requir
 func isOnExitCodesOperatorMatching(exitCode int32, requirement *batch.PodFailurePolicyOnExitCodesRequirement) bool {
 	switch requirement.Operator {
 	case batch.PodFailurePolicyOnExitCodesOpIn:
-		for _, value := range requirement.Values {
-			if value == exitCode {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(requirement.Values, exitCode)
 	case batch.PodFailurePolicyOnExitCodesOpNotIn:
-		for _, value := range requirement.Values {
-			if value == exitCode {
-				return false
-			}
-		}
-		return true
+		return !slices.Contains(requirement.Values, exitCode)
 	default:
 		return false
 	}

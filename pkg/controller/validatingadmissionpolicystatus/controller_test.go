@@ -23,28 +23,28 @@ import (
 	"time"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
-	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	"k8s.io/apimachinery/pkg/api/meta/testrestmapper"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apiserver/pkg/admission/plugin/validatingadmissionpolicy"
+	validatingadmissionpolicy "k8s.io/apiserver/pkg/admission/plugin/policy/validating"
 	"k8s.io/apiserver/pkg/cel/openapi/resolver"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/pkg/generated/openapi"
 )
 
 func TestTypeChecking(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
-		policy         *admissionregistrationv1beta1.ValidatingAdmissionPolicy
-		assertFieldRef func(warnings []admissionregistrationv1beta1.ExpressionWarning, t *testing.T) // warning.fieldRef
-		assertWarnings func(warnings []admissionregistrationv1beta1.ExpressionWarning, t *testing.T) // warning.warning
+		policy         *admissionregistrationv1.ValidatingAdmissionPolicy
+		assertFieldRef func(warnings []admissionregistrationv1.ExpressionWarning, t *testing.T) // warning.fieldRef
+		assertWarnings func(warnings []admissionregistrationv1.ExpressionWarning, t *testing.T) // warning.warning
 	}{
 		{
 			name: "deployment with correct expression",
-			policy: withGVRMatch([]string{"apps"}, []string{"v1"}, []string{"deployments"}, withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withGVRMatch([]string{"apps"}, []string{"v1"}, []string{"deployments"}, withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "object.spec.replicas > 1",
 				},
@@ -54,7 +54,7 @@ func TestTypeChecking(t *testing.T) {
 		},
 		{
 			name: "deployment with type confusion",
-			policy: withGVRMatch([]string{"apps"}, []string{"v1"}, []string{"deployments"}, withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withGVRMatch([]string{"apps"}, []string{"v1"}, []string{"deployments"}, withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "object.spec.replicas < 100", // this one passes
 				},
@@ -67,7 +67,7 @@ func TestTypeChecking(t *testing.T) {
 		},
 		{
 			name: "two expressions different type checking errors",
-			policy: withGVRMatch([]string{"apps"}, []string{"v1"}, []string{"deployments"}, withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withGVRMatch([]string{"apps"}, []string{"v1"}, []string{"deployments"}, withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "object.spec.nonExistingFirst > 1",
 				},
@@ -83,7 +83,7 @@ func TestTypeChecking(t *testing.T) {
 		},
 		{
 			name: "one expression, two warnings",
-			policy: withGVRMatch([]string{"apps"}, []string{"v1"}, []string{"deployments"}, withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withGVRMatch([]string{"apps"}, []string{"v1"}, []string{"deployments"}, withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "object.spec.replicas < 100", // this one passes
 				},
@@ -96,31 +96,32 @@ func TestTypeChecking(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			defer cancel()
+			tCtx := ktesting.Init(t).WithTimeout(time.Minute, "test timed out")
 			policy := tc.policy.DeepCopy()
 			policy.ObjectMeta.Generation = 1 // fake storage does not do this automatically
 			client := fake.NewSimpleClientset(policy)
 			informerFactory := informers.NewSharedInformerFactory(client, 0)
 			typeChecker := &validatingadmissionpolicy.TypeChecker{
-				SchemaResolver: resolver.NewDefinitionsSchemaResolver(scheme.Scheme, openapi.GetOpenAPIDefinitions),
+				SchemaResolver: resolver.NewDefinitionsSchemaResolver(openapi.GetOpenAPIDefinitions, scheme.Scheme),
 				RestMapper:     testrestmapper.TestOnlyStaticRESTMapper(scheme.Scheme),
 			}
 			controller, err := NewController(
-				informerFactory.Admissionregistration().V1beta1().ValidatingAdmissionPolicies(),
-				client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies(),
+				tCtx,
+				informerFactory.Admissionregistration().V1().ValidatingAdmissionPolicies(),
+				client.AdmissionregistrationV1().ValidatingAdmissionPolicies(),
 				typeChecker,
 			)
 			if err != nil {
 				t.Fatalf("cannot create controller: %v", err)
 			}
-			go informerFactory.Start(ctx.Done())
-			go controller.Run(ctx, 1)
-			err = wait.PollUntilContextCancel(ctx, time.Second, false, func(ctx context.Context) (done bool, err error) {
+			informerFactory.StartWithContext(tCtx)
+			informerFactory.WaitForCacheSyncWithContext(tCtx)
+			go controller.Run(tCtx, 1)
+			err = wait.PollUntilContextCancel(tCtx, time.Second, false, func(ctx context.Context) (done bool, err error) {
 				name := policy.Name
 				// wait until the typeChecking is set, which means the type checking
 				// is complete.
-				updated, err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Get(ctx, name, metav1.GetOptions{})
+				updated, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, name, metav1.GetOptions{})
 				if err != nil {
 					return false, err
 				}
@@ -143,8 +144,8 @@ func TestTypeChecking(t *testing.T) {
 
 }
 
-func toBe(expected ...string) func(warnings []admissionregistrationv1beta1.ExpressionWarning, t *testing.T) {
-	return func(warnings []admissionregistrationv1beta1.ExpressionWarning, t *testing.T) {
+func toBe(expected ...string) func(warnings []admissionregistrationv1.ExpressionWarning, t *testing.T) {
+	return func(warnings []admissionregistrationv1.ExpressionWarning, t *testing.T) {
 		if len(expected) != len(warnings) {
 			t.Fatalf("mismatched length, expect %d, got %d", len(expected), len(warnings))
 		}
@@ -156,8 +157,8 @@ func toBe(expected ...string) func(warnings []admissionregistrationv1beta1.Expre
 	}
 }
 
-func toHaveSubstring(substrings ...string) func(warnings []admissionregistrationv1beta1.ExpressionWarning, t *testing.T) {
-	return func(warnings []admissionregistrationv1beta1.ExpressionWarning, t *testing.T) {
+func toHaveSubstring(substrings ...string) func(warnings []admissionregistrationv1.ExpressionWarning, t *testing.T) {
+	return func(warnings []admissionregistrationv1.ExpressionWarning, t *testing.T) {
 		if len(substrings) != len(warnings) {
 			t.Fatalf("mismatched length, expect %d, got %d", len(substrings), len(warnings))
 		}
@@ -169,8 +170,8 @@ func toHaveSubstring(substrings ...string) func(warnings []admissionregistration
 	}
 }
 
-func toHaveMultipleSubstrings(substrings ...[]string) func(warnings []admissionregistrationv1beta1.ExpressionWarning, t *testing.T) {
-	return func(warnings []admissionregistrationv1beta1.ExpressionWarning, t *testing.T) {
+func toHaveMultipleSubstrings(substrings ...[]string) func(warnings []admissionregistrationv1.ExpressionWarning, t *testing.T) {
+	return func(warnings []admissionregistrationv1.ExpressionWarning, t *testing.T) {
 		if len(substrings) != len(warnings) {
 			t.Fatalf("mismatched length, expect %d, got %d", len(substrings), len(warnings))
 		}
@@ -184,19 +185,19 @@ func toHaveMultipleSubstrings(substrings ...[]string) func(warnings []admissionr
 	}
 }
 
-func toHaveLengthOf(n int) func(warnings []admissionregistrationv1beta1.ExpressionWarning, t *testing.T) {
-	return func(warnings []admissionregistrationv1beta1.ExpressionWarning, t *testing.T) {
+func toHaveLengthOf(n int) func(warnings []admissionregistrationv1.ExpressionWarning, t *testing.T) {
+	return func(warnings []admissionregistrationv1.ExpressionWarning, t *testing.T) {
 		if n != len(warnings) {
 			t.Fatalf("mismatched length, expect %d, got %d", n, len(warnings))
 		}
 	}
 }
 
-func withGVRMatch(groups []string, versions []string, resources []string, policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
-	policy.Spec.MatchConstraints = &admissionregistrationv1beta1.MatchResources{
-		ResourceRules: []admissionregistrationv1beta1.NamedRuleWithOperations{
+func withGVRMatch(groups []string, versions []string, resources []string, policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
+	policy.Spec.MatchConstraints = &admissionregistrationv1.MatchResources{
+		ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{
 			{
-				RuleWithOperations: admissionregistrationv1beta1.RuleWithOperations{
+				RuleWithOperations: admissionregistrationv1.RuleWithOperations{
 					Operations: []admissionregistrationv1.OperationType{
 						"*",
 					},
@@ -212,13 +213,13 @@ func withGVRMatch(groups []string, versions []string, resources []string, policy
 	return policy
 }
 
-func withValidations(validations []admissionregistrationv1beta1.Validation, policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
+func withValidations(validations []admissionregistrationv1.Validation, policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
 	policy.Spec.Validations = validations
 	return policy
 }
 
-func makePolicy(name string) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
-	return &admissionregistrationv1beta1.ValidatingAdmissionPolicy{
+func makePolicy(name string) *admissionregistrationv1.ValidatingAdmissionPolicy {
+	return &admissionregistrationv1.ValidatingAdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 	}
 }

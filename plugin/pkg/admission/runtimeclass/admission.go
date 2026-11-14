@@ -145,7 +145,7 @@ func (r *RuntimeClass) prepareObjects(ctx context.Context, attributes admission.
 		return nil, nil, apierrors.NewBadRequest("Resource was marked with kind Pod but was unable to be converted")
 	}
 
-	if pod.Spec.RuntimeClassName == nil {
+	if pod.Spec.RuntimeClassName == nil || len(*pod.Spec.RuntimeClassName) == 0 {
 		return pod, nil, nil
 	}
 
@@ -175,7 +175,7 @@ func setOverhead(a admission.Attributes, pod *api.Pod, runtimeClass *nodev1.Runt
 	}
 
 	// reject pod if Overhead is already set that differs from what is defined in RuntimeClass
-	if pod.Spec.Overhead != nil && !apiequality.Semantic.DeepEqual(nodeOverhead.PodFixed, pod.Spec.Overhead) {
+	if len(pod.Spec.Overhead) > 0 && !apiequality.Semantic.DeepEqual(nodeOverhead.PodFixed, pod.Spec.Overhead) {
 		return admission.NewForbidden(a, fmt.Errorf("pod rejected: Pod's Overhead doesn't match RuntimeClass's defined Overhead"))
 	}
 
@@ -217,7 +217,7 @@ func setScheduling(a admission.Attributes, pod *api.Pod, runtimeClass *nodev1.Ru
 }
 
 func validateOverhead(a admission.Attributes, pod *api.Pod, runtimeClass *nodev1.RuntimeClass) (err error) {
-	if runtimeClass != nil && runtimeClass.Overhead != nil {
+	if runtimeClass != nil && runtimeClass.Overhead != nil && len(runtimeClass.Overhead.PodFixed) > 0 {
 		// If the Overhead set doesn't match what is provided in the RuntimeClass definition, reject the pod
 		nodeOverhead := &node.Overhead{}
 		if err := apinodev1.Convert_v1_Overhead_To_node_Overhead(runtimeClass.Overhead, nodeOverhead, nil); err != nil {
@@ -228,7 +228,7 @@ func validateOverhead(a admission.Attributes, pod *api.Pod, runtimeClass *nodev1
 		}
 	} else {
 		// If RuntimeClass with Overhead is not defined but an Overhead is set for pod, reject the pod
-		if pod.Spec.Overhead != nil {
+		if len(pod.Spec.Overhead) > 0 {
 			return admission.NewForbidden(a, fmt.Errorf("pod rejected: Pod Overhead set without corresponding RuntimeClass defined Overhead"))
 		}
 	}
